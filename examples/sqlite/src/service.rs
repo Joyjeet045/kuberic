@@ -285,7 +285,10 @@ pub async fn run_service_with_data_loss(
                             st.committed_lsn = lsn;
                             if let Err(e) = crate::framelog::FrameLog::save_meta(
                                 &st.data_dir,
-                                &crate::framelog::FrameLogMeta { committed_lsn: lsn },
+                                &crate::framelog::FrameLogMeta {
+                                    committed_lsn: lsn,
+                                    ..Default::default()
+                                },
                             ).await {
                                 warn!(error = %e, "meta save after copy failed");
                             }

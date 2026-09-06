@@ -5,6 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use kuberic_core::handles::{PartitionHandle, StateReplicatorHandle};
 use kuberic_core::types::{AccessStatus, CancellationToken};
+use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
@@ -16,6 +17,7 @@ pub struct SqliteServer {
     pub partition: Arc<PartitionHandle>,
     pub replicator: StateReplicatorHandle,
     pub token: CancellationToken,
+    write_gate: Arc<Mutex<()>>,
 }
 
 #[tonic::async_trait]
@@ -25,6 +27,8 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
         request: Request<proto::ExecuteRequest>,
     ) -> Result<Response<proto::ExecuteResponse>, Status> {
         self.check_write_access()?;
+
+        let _write = self.write_gate.lock().await;
 
         let req = request.into_inner();
         let params = convert_params(&req.params);
@@ -89,6 +93,8 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
     ) -> Result<Response<proto::ExecuteBatchResponse>, Status> {
         self.check_write_access()?;
 
+        let _write = self.write_gate.lock().await;
+
         let req = request.into_inner();
         let statements = req.statements;
 
@@ -144,37 +150,43 @@ impl SqliteServer {
     /// Capture WAL frames from the last write and replicate to secondaries.
     async fn capture_and_replicate(&self) -> Result<i64, Status> {
         let state = self.state.clone();
-        let frame_set = tokio::task::spawn_blocking(move || {
+        let (offset_before, captured) = tokio::task::spawn_blocking(move || {
             let mut state = state.blocking_lock();
-            state.capture_wal_frames()
+            let before = state.wal_read_offset();
+            state.capture_wal_frames().map(|c| (before, c))
         })
         .await
         .map_err(|e| Status::internal(format!("task join error: {e}")))?
         .map_err(|e| Status::internal(format!("WAL capture failed: {e}")))?;
 
-        if let Some(fs) = frame_set {
-            let data = serde_json::to_vec(&fs)
-                .map_err(|e| Status::internal(format!("serialization failed: {e}")))?;
-
-            let lsn = self
-                .replicator
-                .replicate(Bytes::from(data), self.token.clone())
-                .await
-                .map_err(|e| Status::unavailable(format!("replication failed: {e}")))?;
-
-            // Update state LSN
-            {
-                let mut state = self.state.lock().await;
-                state.last_applied_lsn = lsn;
-                state.committed_lsn = lsn;
-            }
-
-            Ok(lsn)
-        } else {
-            // No WAL frames (no-op write like empty transaction)
+        let Some((frame_set, offset_after)) = captured else {
             let state = self.state.lock().await;
-            Ok(state.last_applied_lsn)
-        }
+            return Ok(state.last_applied_lsn);
+        };
+
+        let data = serde_json::to_vec(&frame_set)
+            .map_err(|e| Status::internal(format!("serialization failed: {e}")))?;
+
+        let lsn = match self
+            .replicator
+            .replicate(Bytes::from(data), self.token.clone())
+            .await
+        {
+            Ok(lsn) => lsn,
+            Err(e) => {
+                self.state.lock().await.rewind_capture(offset_before);
+                return Err(Status::unavailable(format!("replication failed: {e}")));
+            }
+        };
+
+        self.state
+            .lock()
+            .await
+            .mark_confirmed(lsn, offset_after)
+            .await
+            .map_err(|e| Status::internal(format!("confirmation record failed: {e}")))?;
+
+        Ok(lsn)
     }
 }
 
@@ -202,6 +214,7 @@ pub async fn run_client_server(
         partition,
         replicator,
         token,
+        write_gate: Arc::new(Mutex::new(())),
     };
 
     let _ = tonic::transport::Server::builder()

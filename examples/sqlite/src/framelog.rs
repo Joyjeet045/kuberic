@@ -17,6 +17,10 @@ use kuberic_core::types::Lsn;
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct FrameLogMeta {
     pub committed_lsn: Lsn,
+    #[serde(default)]
+    pub confirmed_wal_offset: u64,
+    #[serde(default)]
+    pub confirmed_wal_salt: Option<(u32, u32)>,
 }
 
 /// A single entry in frames.log: one WalFrameSet at one LSN.
@@ -136,25 +140,34 @@ impl FrameLog {
     pub async fn truncate_to(data_dir: &Path, max_lsn: Lsn) -> io::Result<()> {
         let entries = Self::read_all(data_dir).await?;
         let kept: Vec<_> = entries.into_iter().filter(|e| e.lsn <= max_lsn).collect();
+        let kept_len = kept.len();
 
-        let path = data_dir.join("frames.log");
-        let tmp_path = data_dir.join("frames.log.tmp");
-
-        let mut file = tokio::fs::File::create(&tmp_path).await?;
+        let mut buf = Vec::new();
         for entry in &kept {
             let payload = serde_json::to_vec(entry).map_err(io::Error::other)?;
             let len = payload.len() as u32;
             let crc = crc32fast::hash(&payload);
-            file.write_all(&len.to_le_bytes()).await?;
-            file.write_all(&payload).await?;
-            file.write_all(&crc.to_le_bytes()).await?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&payload);
+            buf.extend_from_slice(&crc.to_le_bytes());
         }
-        file.flush().await?;
-        file.sync_data().await?;
-        drop(file);
-        tokio::fs::rename(&tmp_path, &path).await?;
 
-        info!(max_lsn, kept = kept.len(), "frame log truncated");
+        let path = data_dir.join("frames.log");
+        let tmp_path = data_dir.join("frames.log.tmp");
+
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            use std::io::Write;
+            {
+                let mut file = std::fs::File::create(&tmp_path)?;
+                file.write_all(&buf)?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&tmp_path, &path)
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        info!(max_lsn, kept = kept_len, "frame log truncated");
         Ok(())
     }
 
@@ -181,12 +194,21 @@ impl FrameLog {
         let path = data_dir.join("meta.json");
         let tmp = data_dir.join("meta.json.tmp");
         let json = serde_json::to_string(meta).map_err(io::Error::other)?;
-        tokio::fs::write(&tmp, &json).await?;
-        let f = tokio::fs::File::open(&tmp).await?;
-        f.sync_data().await?;
-        drop(f);
-        tokio::fs::rename(&tmp, &path).await?;
-        debug!(committed_lsn = meta.committed_lsn, "saved meta.json");
+        let committed_lsn = meta.committed_lsn;
+
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            use std::io::Write;
+            {
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(json.as_bytes())?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&tmp, &path)
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        debug!(committed_lsn, "saved meta.json");
         Ok(())
     }
 }

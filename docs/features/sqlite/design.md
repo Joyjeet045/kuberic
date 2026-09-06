@@ -360,39 +360,87 @@ design. They are documented for awareness and future mitigation.
 
 ### KP-1: WAL Hook Timing Inversion
 
-`sqlite3_wal_hook` fires AFTER SQLite has committed the transaction
-locally. This means `replicate()` runs after local commit, inverting
+SQLite commits a transaction to its WAL before the frames exist to be
+shipped. `replicate()` therefore runs after the local commit, inverting
 the kvstore's replicate-then-apply ordering.
 
-**Impact:** If the primary crashes between local commit and quorum
-confirmation, locally-committed data is lost on failover. From the
-client's perspective the write failed (no response received), but the
-primary's local DB has the data.
+**Impact:** There is a window between local commit and quorum
+confirmation. From the client's perspective the write failed (no response
+received), but the primary's local DB has the data.
 
-**Why not fixable:** SQLite has no pre-commit hook that allows blocking
-on external I/O. `sqlite3_commit_hook` can abort a transaction but
-cannot pause it while waiting for network I/O — it must return
-synchronously. The WAL hook is the only point where we know frames
-are durably written.
+**Why the window cannot be removed:** SQLite has no pre-commit hook that
+allows blocking on external I/O. `sqlite3_commit_hook` can abort a
+transaction but cannot pause it while waiting for the network — it must
+return synchronously. Frames only exist once the commit has happened.
 
-**Mitigation:** This is the same trade-off LiteFS makes. The window
-is small (sub-millisecond on local commit to start of replicate).
-Client retry on timeout is safe because page-level replication is
-idempotent. On failover, the new primary has a consistent state —
-it just may be missing the last transaction from the old primary.
-This is **not corruption** — the new primary holds a valid prefix of
-the old primary's state, and the client never received a success
-response for the lost transaction.
+**How the window is bounded:** the window cannot be removed, but it is
+prevented from producing a visible divergence.
 
-**VFS alternative:** A custom VFS could fix this by intercepting
-`xWrite()` calls to the WAL file, shipping pages to the replicator
-*before* letting SQLite flush locally (replicate-then-commit). This
-eliminates the timing window entirely. However, implementing a WAL-
-mode VFS requires ~2000 lines (vs ~100 for WAL file reads), including
-`xShmMap`/`xShmLock`/`xShmBarrier` for shared memory, and VFS bugs
-can silently corrupt the database. The current approach is the right
-trade-off for an example app; a production system would consider VFS
-or a purpose-built replication engine (e.g., dqlite).
+1. A write gate serializes commit → capture → replicate. WAL capture is a
+   single cursor over the WAL file, so overlapping writes would otherwise
+   let one request ship another's frames and return success without its
+   own quorum.
+2. After quorum, the confirmed WAL offset and its generation are fsynced
+   to `meta.json` *before* the client is told anything. Success is never
+   reported for a write whose confirmation record is not durable.
+3. On primary open, WAL bytes beyond the confirmed offset are truncated
+   and `-shm` is removed so SQLite rebuilds its index. A transaction that
+   committed locally but never reached quorum is discarded rather than
+   silently resurrected.
+4. If a checkpoint restarted the WAL since the last confirmation, the
+   recorded offset describes a generation that no longer exists. SQLite
+   only restarts a WAL once every frame is backfilled into the database,
+   so nothing in the new generation reached quorum and the whole file is
+   dropped. This also clears a stale WAL left behind when a secondary
+   applied frames straight to the database file.
+
+The result is that a crash in the window yields a clean rollback, matching
+the kvstore's `UpdateEpoch` behaviour, instead of state the cluster never
+agreed on. Covered by `tests/quorum_durability.rs`.
+
+**Residual limitation — graceful shutdown.** Recovery works by truncating
+the WAL, so it can only discard frames that are still *in* the WAL. SQLite
+checkpoints the WAL whenever the last connection closes, and that happens
+regardless of `wal_autocheckpoint=0` or whether the application issues
+`PRAGMA wal_checkpoint` itself — `SQLITE_FCNTL_PERSIST_WAL` suppresses only
+the deletion, not the checkpoint. A write that committed locally, failed to
+reach quorum, and is then followed by a graceful shutdown is therefore
+folded into the database file where truncation can no longer reach it.
+
+Exposure is limited because a restarted pod reports a mismatched epoch and
+the reconciler rebuilds it by copy, discarding the local database. It
+matters where a replica is re-promoted without a rebuild, notably
+`replicas=1`. Closing it properly means reporting a fault when replication
+fails, so the replica is rebuilt rather than resumed — an operator-contract
+change, not a local fix.
+
+**Residual limitation — copy snapshots.** `snapshot_db()` checkpoints before
+reading the database file and does not take the write gate, so an in-flight
+unconfirmed write can be folded into a snapshot shipped to a new secondary.
+The window requires the snapshot to be taken while a write is in flight and
+that write to never reach quorum.
+
+**Residual limitation:** while the primary is *running*, a locally
+committed but unconfirmed transaction is still visible to reads on that
+primary, because SQLite makes a commit visible and durable at the same
+instant. Only a VFS interception approach closes that. If the primary
+survives, the write is retried or the replica is rebuilt; if it crashes,
+recovery discards the transaction.
+
+**Client retry semantics:** retrying a timed-out write is **not**
+automatically safe. Page-level *frame replay* is idempotent, but the
+client's *SQL* is not — a retried `INSERT` after a commit that did land
+produces a second row. Clients that retry need request-level
+idempotency (a deduplicating key), not page-level idempotency.
+
+**VFS alternative:** A custom VFS could eliminate the window entirely by
+intercepting `xWrite()` calls to the WAL file and shipping pages to the
+replicator *before* letting SQLite flush locally (replicate-then-commit).
+However, implementing a WAL-mode VFS requires ~2000 lines (vs ~100 for WAL
+file reads), including `xShmMap`/`xShmLock`/`xShmBarrier` for shared
+memory, and VFS bugs can silently corrupt the database. The current
+approach is the right trade-off for an example app; a production system
+would consider VFS or a purpose-built replication engine (e.g., dqlite).
 
 ### KP-2: Per-Commit Synchronous Replication Throughput
 

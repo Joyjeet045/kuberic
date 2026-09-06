@@ -64,6 +64,24 @@ pub fn read_wal_page_size(wal_path: &Path) -> io::Result<Option<u32>> {
     Ok(Some(page_size))
 }
 
+pub fn read_wal_salt(wal_path: &Path) -> io::Result<Option<(u32, u32)>> {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(wal_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut header = [0u8; 32];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let salt1 = u32::from_be_bytes([header[16], header[17], header[18], header[19]]);
+    let salt2 = u32::from_be_bytes([header[20], header[21], header[22], header[23]]);
+    Ok(Some((salt1, salt2)))
+}
+
 /// Read new WAL frames starting from `offset` in the WAL file.
 /// Returns the frames and the new offset (for tracking position).
 ///

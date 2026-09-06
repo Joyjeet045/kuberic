@@ -15,6 +15,8 @@ use tracing::{debug, info, warn};
 use crate::framelog::{FrameLog, FrameLogMeta};
 use crate::frames::WalFrameSet;
 
+const WAL_HEADER_BYTES: u64 = 32;
+
 /// The SQLite database state.
 pub struct SqliteState {
     /// SQLite connection (only on primary).
@@ -27,6 +29,9 @@ pub struct SqliteState {
     pub page_size: u32,
     /// Current offset in WAL file for frame reading (primary).
     wal_read_offset: u64,
+    wal_salt: Option<(u32, u32)>,
+    confirmed_wal_offset: u64,
+    confirmed_wal_salt: Option<(u32, u32)>,
     /// Last LSN applied to the database.
     pub last_applied_lsn: Lsn,
     /// Last committed LSN (confirmed by quorum).
@@ -52,6 +57,9 @@ impl SqliteState {
             data_dir,
             page_size: 4096,
             wal_read_offset: 0,
+            wal_salt: None,
+            confirmed_wal_offset: meta.confirmed_wal_offset,
+            confirmed_wal_salt: meta.confirmed_wal_salt,
             last_applied_lsn: meta.committed_lsn,
             committed_lsn: meta.committed_lsn,
             frame_log: None,
@@ -60,6 +68,8 @@ impl SqliteState {
 
     /// Open SQLite as primary: WAL mode, single connection, no auto-checkpoint.
     pub fn open_as_primary(&mut self) -> io::Result<()> {
+        self.discard_unconfirmed_wal()?;
+
         let conn = Connection::open_with_flags(
             &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -81,9 +91,6 @@ impl SqliteState {
             .pragma_query_value(None, "page_size", |row| row.get(0))
             .map_err(|e| io::Error::other(format!("failed to read page_size: {e}")))?;
         self.page_size = page_size;
-
-        // Reset WAL read offset (read from beginning of new WAL)
-        self.wal_read_offset = 0;
 
         info!(
             db = %self.db_path.display(),
@@ -159,8 +166,15 @@ impl SqliteState {
 
     /// Capture new WAL frames after a write operation (primary only).
     /// Returns None if no new frames were written.
-    pub fn capture_wal_frames(&mut self) -> io::Result<Option<WalFrameSet>> {
+    pub fn capture_wal_frames(&mut self) -> io::Result<Option<(WalFrameSet, u64)>> {
         let wal_path = self.wal_path();
+
+        let salt = crate::frames::read_wal_salt(&wal_path)?;
+        if salt != self.wal_salt {
+            debug!(?salt, previous = ?self.wal_salt, "WAL generation changed — rewinding capture");
+            self.wal_read_offset = 0;
+            self.wal_salt = salt;
+        }
 
         // Check page size from WAL if needed
         if self.wal_read_offset == 0
@@ -195,7 +209,82 @@ impl SqliteState {
             db_size_pages, "captured WAL frames"
         );
 
-        Ok(Some(frame_set))
+        Ok(Some((frame_set, new_offset)))
+    }
+
+    pub fn wal_read_offset(&self) -> u64 {
+        self.wal_read_offset
+    }
+
+    pub fn rewind_capture(&mut self, offset: u64) {
+        self.wal_read_offset = offset;
+    }
+
+    pub async fn mark_confirmed(&mut self, lsn: Lsn, wal_offset: u64) -> io::Result<()> {
+        self.last_applied_lsn = lsn;
+        self.committed_lsn = lsn;
+        self.confirmed_wal_offset = wal_offset;
+        self.confirmed_wal_salt = self.wal_salt;
+
+        FrameLog::save_meta(
+            &self.data_dir,
+            &FrameLogMeta {
+                committed_lsn: lsn,
+                confirmed_wal_offset: wal_offset,
+                confirmed_wal_salt: self.wal_salt,
+            },
+        )
+        .await
+    }
+
+    fn discard_unconfirmed_wal(&mut self) -> io::Result<()> {
+        let wal_path = self.wal_path();
+        let wal_len = match std::fs::metadata(&wal_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.wal_read_offset = 0;
+                self.wal_salt = None;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        let salt = crate::frames::read_wal_salt(&wal_path)?;
+
+        if salt != self.confirmed_wal_salt {
+            if wal_len > WAL_HEADER_BYTES {
+                warn!(
+                    wal_len,
+                    "discarding WAL from an unconfirmed generation — no frame in \
+                     it reached write quorum"
+                );
+            }
+            let _ = std::fs::remove_file(&wal_path);
+            let _ = std::fs::remove_file(self.shm_path());
+            self.wal_read_offset = 0;
+            self.wal_salt = None;
+            self.confirmed_wal_offset = 0;
+            self.confirmed_wal_salt = None;
+            return Ok(());
+        }
+
+        self.wal_salt = salt;
+
+        if wal_len > self.confirmed_wal_offset {
+            let file = std::fs::OpenOptions::new().write(true).open(&wal_path)?;
+            file.set_len(self.confirmed_wal_offset)?;
+            file.sync_all()?;
+            drop(file);
+            let _ = std::fs::remove_file(self.shm_path());
+            warn!(
+                discarded_bytes = wal_len - self.confirmed_wal_offset,
+                confirmed_wal_offset = self.confirmed_wal_offset,
+                "discarded WAL frames that never reached write quorum"
+            );
+        }
+
+        self.wal_read_offset = self.confirmed_wal_offset;
+        Ok(())
     }
 
     /// Apply a WalFrameSet to the database file (secondary).
@@ -263,6 +352,8 @@ impl SqliteState {
                 &self.data_dir,
                 &FrameLogMeta {
                     committed_lsn: self.committed_lsn,
+                    confirmed_wal_offset: self.confirmed_wal_offset,
+                    confirmed_wal_salt: self.confirmed_wal_salt,
                 },
             )
             .await?;
@@ -313,6 +404,11 @@ impl SqliteState {
         let _ = tokio::fs::remove_file(&wal).await;
         let _ = tokio::fs::remove_file(&shm).await;
 
+        self.wal_read_offset = 0;
+        self.wal_salt = None;
+        self.confirmed_wal_offset = 0;
+        self.confirmed_wal_salt = None;
+
         info!(size = data.len(), "restored DB from snapshot");
         Ok(())
     }
@@ -331,6 +427,13 @@ impl SqliteState {
         let name = wal.file_name().unwrap().to_str().unwrap().to_string();
         wal.set_file_name(format!("{}-wal", name));
         wal
+    }
+
+    fn shm_path(&self) -> PathBuf {
+        let mut shm = self.db_path.clone();
+        let name = shm.file_name().unwrap().to_str().unwrap().to_string();
+        shm.set_file_name(format!("{}-shm", name));
+        shm
     }
 }
 
