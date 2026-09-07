@@ -179,15 +179,25 @@ impl MaintenancePhase {
             ),
             Self::Preparing => matches!(
                 next,
-                Self::Prepared | Self::Blocked | Self::Failed | Self::Expired | Self::Releasing
+                Self::Requested
+                    | Self::Prepared
+                    | Self::Blocked
+                    | Self::Failed
+                    | Self::Expired
+                    | Self::Releasing
             ),
             Self::Prepared => matches!(
                 next,
-                Self::Preparing | Self::Blocked | Self::Failed | Self::Expired | Self::Releasing
+                Self::Requested
+                    | Self::Preparing
+                    | Self::Blocked
+                    | Self::Failed
+                    | Self::Expired
+                    | Self::Releasing
             ),
             Self::Blocked => matches!(
                 next,
-                Self::Preparing | Self::Failed | Self::Expired | Self::Releasing
+                Self::Requested | Self::Preparing | Self::Failed | Self::Expired | Self::Releasing
             ),
             Self::Releasing => matches!(next, Self::Released | Self::Failed),
             Self::Failed | Self::Expired | Self::Released => false,
@@ -263,6 +273,20 @@ mod tests {
     fn preparation_cannot_be_skipped() {
         assert!(!MaintenancePhase::Requested.can_transition_to(MaintenancePhase::Prepared));
         assert!(!MaintenancePhase::Blocked.can_transition_to(MaintenancePhase::Prepared));
+    }
+
+    #[test]
+    fn an_active_request_can_return_to_requested() {
+        for phase in [
+            MaintenancePhase::Preparing,
+            MaintenancePhase::Prepared,
+            MaintenancePhase::Blocked,
+        ] {
+            assert!(
+                phase.can_transition_to(MaintenancePhase::Requested),
+                "{phase:?} must be able to wait for its window again"
+            );
+        }
     }
 
     #[test]

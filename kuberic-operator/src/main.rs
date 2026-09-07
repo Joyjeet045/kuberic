@@ -82,7 +82,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "node maintenance status updated"
                             );
                         }
-                        Action::requeue(std::time::Duration::from_secs(30))
+                        if outcome.status.phase.is_terminal() {
+                            Action::await_change()
+                        } else {
+                            Action::requeue(std::time::Duration::from_secs(30))
+                        }
                     })
                     .map_err(OperatorError)
                 },

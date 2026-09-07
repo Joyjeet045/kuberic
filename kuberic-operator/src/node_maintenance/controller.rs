@@ -60,7 +60,7 @@ where
                 previous: ctx.previous,
                 node: node.as_ref(),
                 pods: &pods,
-                now: &ctx.now.to_string(),
+                now: ctx.now,
             })
         }
     };
@@ -320,6 +320,10 @@ mod tests {
             Some(MaintenanceDesiredState::Complete)
         );
         assert_no_discovery(&api);
+
+        let repeat = run_spec(&api, &spec, &outcome.status).await.unwrap();
+        assert!(!repeat.persisted);
+        assert_eq!(api.patches.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

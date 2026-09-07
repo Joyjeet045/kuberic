@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use k8s_openapi::jiff::Timestamp;
+
 use crate::crd::StatusCondition;
 
 use super::api::{
@@ -30,7 +32,7 @@ pub struct DiscoveryInput<'a> {
     pub previous: &'a NodeMaintenanceRequestStatus,
     pub node: Option<&'a NodeRef>,
     pub pods: &'a [MaintenancePod],
-    pub now: &'a str,
+    pub now: Timestamp,
 }
 
 pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestStatus {
@@ -141,17 +143,17 @@ pub(super) fn finish(
     phase: MaintenancePhase,
     reason: Option<MaintenanceBlockedReason>,
     message: Option<String>,
-    now: &str,
+    now: Timestamp,
 ) -> NodeMaintenanceRequestStatus {
     if status.phase.can_transition_to(phase) {
         status.phase = phase;
+        status.blocked_reason = reason;
+        status.message = message;
     }
-    status.blocked_reason = reason;
-    status.message = message;
     if status.phase != MaintenancePhase::Prepared {
         status.prepared_at = None;
     }
-    set_prepared_condition(&mut status, now);
+    set_prepared_condition(&mut status, &now.to_string());
     status
 }
 
@@ -203,6 +205,10 @@ mod tests {
 
     const NOW: &str = "2026-09-06T20:00:00Z";
 
+    fn at(text: &str) -> Timestamp {
+        text.parse().expect("timestamp")
+    }
+
     fn spec(node: &str) -> NodeMaintenanceRequestSpec {
         NodeMaintenanceRequestSpec {
             node_name: node.to_string(),
@@ -245,7 +251,7 @@ mod tests {
             previous,
             node,
             pods,
-            now: NOW,
+            now: at(NOW),
         })
     }
 
@@ -392,7 +398,7 @@ mod tests {
             previous: &NodeMaintenanceRequestStatus::default(),
             node: Some(&node("uid-a")),
             pods: &pods,
-            now: NOW,
+            now: at(NOW),
         });
         let later = reconcile_discovery(DiscoveryInput {
             spec: &spec,
@@ -400,7 +406,7 @@ mod tests {
             previous: &first,
             node: Some(&node("uid-a")),
             pods: &pods,
-            now: "2026-09-06T21:30:00Z",
+            now: at("2026-09-06T21:30:00Z"),
         });
         assert_eq!(
             first, later,
@@ -417,7 +423,7 @@ mod tests {
             previous: &NodeMaintenanceRequestStatus::default(),
             node: Some(&node("uid-a")),
             pods: &[pod("kv-0", "kv", Some("worker-04"), false)],
-            now: NOW,
+            now: at(NOW),
         });
         let later = reconcile_discovery(DiscoveryInput {
             spec: &spec,
@@ -428,7 +434,7 @@ mod tests {
                 pod("kv-0", "kv", Some("worker-04"), false),
                 pod("kv-1", "kv", Some("worker-04"), true),
             ],
-            now: "2026-09-06T21:30:00Z",
+            now: at("2026-09-06T21:30:00Z"),
         });
         assert_ne!(first.affected_sets, later.affected_sets);
         assert_eq!(
@@ -446,7 +452,7 @@ mod tests {
             previous: &NodeMaintenanceRequestStatus::default(),
             node: Some(&node("uid-a")),
             pods: &[pod("kv-0", "kv", Some("worker-04"), false)],
-            now: NOW,
+            now: at(NOW),
         });
         let first_condition = first.conditions.first().expect("condition").clone();
         assert_eq!(first_condition.status, "False");
@@ -460,7 +466,7 @@ mod tests {
                 pod("kv-0", "kv", Some("worker-04"), false),
                 pod("kv-1", "kv", Some("worker-04"), true),
             ],
-            now: "2026-09-06T22:00:00Z",
+            now: at("2026-09-06T22:00:00Z"),
         });
         let later_condition = later.conditions.first().expect("condition");
 
@@ -513,5 +519,29 @@ mod tests {
             &reversed,
         );
         assert_eq!(a.affected_sets, b.affected_sets);
+    }
+
+    #[test]
+    fn a_refused_transition_keeps_the_previous_explanation() {
+        let previous = NodeMaintenanceRequestStatus {
+            phase: MaintenancePhase::Releasing,
+            blocked_reason: Some(MaintenanceBlockedReason::NodeNotFound),
+            message: Some("node worker-04 not found".to_string()),
+            ..Default::default()
+        };
+        let status = finish(
+            previous,
+            MaintenancePhase::Preparing,
+            None,
+            Some("discovered 1 affected set(s)".to_string()),
+            at(NOW),
+        );
+
+        assert_eq!(status.phase, MaintenancePhase::Releasing);
+        assert_eq!(
+            status.blocked_reason,
+            Some(MaintenanceBlockedReason::NodeNotFound)
+        );
+        assert_eq!(status.message.as_deref(), Some("node worker-04 not found"));
     }
 }

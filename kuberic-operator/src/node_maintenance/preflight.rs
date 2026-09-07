@@ -17,7 +17,6 @@ pub fn preflight(
     previous: &NodeMaintenanceRequestStatus,
     now: Timestamp,
 ) -> Preflight {
-    let now_text = now.to_string();
     let mut status = previous.clone();
     status.observed_generation = generation;
     status.observed_desired_state = Some(spec.desired_state);
@@ -27,7 +26,18 @@ pub fn preflight(
     }
 
     if spec.desired_state.releases_request() {
-        return Preflight::Settled(status);
+        let phase = status.phase;
+        let reason = status.blocked_reason;
+        return Preflight::Settled(finish(
+            status,
+            phase,
+            reason,
+            Some(format!(
+                "{:?} observed; this controller does not yet perform release reconciliation",
+                spec.desired_state
+            )),
+            now,
+        ));
     }
 
     if previous.phase == MaintenancePhase::Releasing {
@@ -44,7 +54,7 @@ pub fn preflight(
                 Some(format!(
                     "notBefore is not a valid RFC 3339 timestamp: {reported}"
                 )),
-                &now_text,
+                now,
             ));
         }
     };
@@ -59,7 +69,7 @@ pub fn preflight(
                 Some(format!(
                     "deadline is not a valid RFC 3339 timestamp: {reported}"
                 )),
-                &now_text,
+                now,
             ));
         }
     };
@@ -70,7 +80,7 @@ pub fn preflight(
             MaintenancePhase::Expired,
             Some(MaintenanceBlockedReason::DeadlineExceeded),
             Some("deadline exceeded before preparation completed".to_string()),
-            &now_text,
+            now,
         ));
     }
 
@@ -82,7 +92,7 @@ pub fn preflight(
             MaintenancePhase::Requested,
             None,
             Some(format!("waiting until {not_before}")),
-            &now_text,
+            now,
         ));
     }
 
@@ -326,7 +336,48 @@ mod tests {
             assert_eq!(status.phase, MaintenancePhase::Preparing, "{desired:?}");
             assert_ne!(status.phase, MaintenancePhase::Releasing, "{desired:?}");
             assert_eq!(status.observed_desired_state, Some(desired));
+            assert!(
+                status
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("release reconciliation")),
+                "{desired:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_release_does_not_erase_why_a_request_is_blocked() {
+        let mut spec = spec();
+        spec.desired_state = MaintenanceDesiredState::Cancel;
+        let previous = NodeMaintenanceRequestStatus {
+            phase: MaintenancePhase::Blocked,
+            blocked_reason: Some(MaintenanceBlockedReason::NodeNotFound),
+            ..Default::default()
+        };
+        let status = settled(preflight(&spec, Some(1), &previous, now()));
+
+        assert_eq!(status.phase, MaintenancePhase::Blocked);
+        assert_eq!(
+            status.blocked_reason,
+            Some(MaintenanceBlockedReason::NodeNotFound)
+        );
+    }
+
+    #[test]
+    fn a_window_moved_into_the_future_parks_a_blocked_request_without_a_stale_reason() {
+        let mut spec = spec();
+        spec.not_before = Some("2026-09-06T23:00:00Z".to_string());
+        let previous = NodeMaintenanceRequestStatus {
+            phase: MaintenancePhase::Blocked,
+            blocked_reason: Some(MaintenanceBlockedReason::NodeNotFound),
+            message: Some("node worker-04 not found".to_string()),
+            ..Default::default()
+        };
+        let status = settled(preflight(&spec, Some(2), &previous, now()));
+
+        assert_eq!(status.phase, MaintenancePhase::Requested);
+        assert_eq!(status.blocked_reason, None);
     }
 
     #[test]
