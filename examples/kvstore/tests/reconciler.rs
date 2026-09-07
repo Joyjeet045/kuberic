@@ -869,6 +869,10 @@ impl ClusterApi for KvClusterApi {
         Ok(self.pods.lock().unwrap().clone())
     }
 
+    async fn list_maintenance_nodes(&self) -> Result<std::collections::BTreeSet<String>, String> {
+        Ok(std::collections::BTreeSet::new())
+    }
+
     async fn create_pod(&self, _ns: &str, pod: &Pod) -> Result<(), String> {
         let pod_name = pod.metadata.name.as_deref().unwrap().to_string();
 
