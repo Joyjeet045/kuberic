@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +58,7 @@ use crate::durable::{
     record_observation, start_add_replica, start_create_partition, start_failover,
     start_remove_replica, start_switchover,
 };
+use crate::node_maintenance::{PlacementCandidate, switchover_target_for_maintenance};
 
 /// Shared state across reconciliation loops.
 pub struct ReconcilerState {
@@ -1332,7 +1333,34 @@ pub async fn reconcile_set(
             }
 
             // --- Switchover check (only when all replicas are healthy) ---
-            let target_primary = set.status.as_ref().and_then(|s| s.target_primary.clone());
+            let requested_primary = set.status.as_ref().and_then(|s| s.target_primary.clone());
+            let target_primary = match requested_primary {
+                Some(requested) => Some(requested),
+                None => {
+                    let maintenance_nodes =
+                        api.list_maintenance_nodes().await.unwrap_or_else(|error| {
+                            warn!(
+                                name,
+                                error,
+                                "maintenance node lookup failed; leaving primary placement unchanged"
+                            );
+                            BTreeSet::new()
+                        });
+                    let candidates: Vec<PlacementCandidate> = current_pods
+                        .iter()
+                        .map(|(id, _, pod)| PlacementCandidate {
+                            replica_id: *id,
+                            pod_name: pod.name_any(),
+                            node_name: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
+                        })
+                        .collect();
+                    switchover_target_for_maintenance(
+                        &candidates,
+                        current_primary.as_deref(),
+                        &maintenance_nodes,
+                    )
+                }
+            };
             info!(
                 name,
                 ?current_primary,
@@ -4908,6 +4936,11 @@ mod dispatch_planning_tests {
     impl ClusterApi for BridgeTestApi {
         async fn list_pods(&self, _: &str, _: &str) -> Result<Vec<Pod>, String> {
             Err("unused".to_string())
+        }
+        async fn list_maintenance_nodes(
+            &self,
+        ) -> Result<std::collections::BTreeSet<String>, String> {
+            Ok(std::collections::BTreeSet::new())
         }
         async fn create_pod(&self, _: &str, _: &Pod) -> Result<(), String> {
             Err("unused".to_string())

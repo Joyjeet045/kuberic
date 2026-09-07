@@ -99,6 +99,9 @@ pub struct AffectedKubericSetStatus {
     pub primary_moved: bool,
 
     #[serde(default)]
+    pub no_eligible_target: bool,
+
+    #[serde(default)]
     pub quorum_without_node: bool,
 }
 
@@ -419,6 +422,9 @@ mod tests {
             "affectedSets",
             "podUid",
             "isPrimary",
+            "primaryMoved",
+            "noEligibleTarget",
+            "quorumWithoutNode",
             "blockedReason",
             "InvalidNotBefore",
             "InvalidDeadline",
