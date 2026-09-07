@@ -2074,6 +2074,205 @@ spec:
       type: date
       jsonPath: .metadata.creationTimestamp
 ---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nodemaintenancerequests.kuberic.io
+spec:
+  group: kuberic.io
+  names:
+    kind: NodeMaintenanceRequest
+    plural: nodemaintenancerequests
+    shortNames:
+      - nmr
+    singular: nodemaintenancerequest
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .spec.nodeName
+          name: Node
+          type: string
+        - jsonPath: .spec.operation
+          name: Operation
+          type: string
+        - jsonPath: .spec.desiredState
+          name: Desired
+          type: string
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .spec.deadline
+          name: Deadline
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: Auto-generated derived type for NodeMaintenanceRequestSpec via `CustomResource`
+          properties:
+            spec:
+              properties:
+                deadline:
+                  format: date-time
+                  maxLength: 64
+                  nullable: true
+                  type: string
+                desiredState:
+                  default: Prepare
+                  enum:
+                    - Prepare
+                    - Complete
+                    - Cancel
+                  type: string
+                nodeName:
+                  minLength: 1
+                  type: string
+                notBefore:
+                  format: date-time
+                  maxLength: 64
+                  nullable: true
+                  type: string
+                operation:
+                  default: Reboot
+                  enum:
+                    - Reboot
+                    - Reimage
+                    - OsUpgrade
+                    - Replace
+                    - Shutdown
+                  type: string
+                provider:
+                  nullable: true
+                  type: string
+                providerEventId:
+                  nullable: true
+                  type: string
+              required:
+                - nodeName
+              type: object
+            status:
+              nullable: true
+              properties:
+                affectedSets:
+                  items:
+                    properties:
+                      hostsPrimary:
+                        default: false
+                        type: boolean
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      primaryMoved:
+                        default: false
+                        type: boolean
+                      quorumWithoutNode:
+                        default: false
+                        type: boolean
+                      replicas:
+                        items:
+                          properties:
+                            isPrimary:
+                              default: false
+                              type: boolean
+                            podName:
+                              type: string
+                            podUid:
+                              type: string
+                          required:
+                            - podName
+                            - podUid
+                          type: object
+                        type: array
+                    required:
+                      - name
+                      - namespace
+                    type: object
+                  type: array
+                blockedReason:
+                  enum:
+                    - NodeNotFound
+                    - NodeIncarnationChanged
+                    - InvalidNotBefore
+                    - InvalidDeadline
+                    - BlockedByQuorum
+                    - NoEligibleTarget
+                    - SwitchoverFailed
+                    - DeadlineExceeded
+                    - ConflictingOperation
+                    - ApplicationCloseIncomplete
+                    - null
+                  nullable: true
+                  type: string
+                conditions:
+                  items:
+                    properties:
+                      lastTransitionTime:
+                        type: string
+                      message:
+                        type: string
+                      reason:
+                        type: string
+                      status:
+                        type: string
+                      type:
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                discoveryCompletedAt:
+                  nullable: true
+                  type: string
+                message:
+                  nullable: true
+                  type: string
+                nodeUid:
+                  nullable: true
+                  type: string
+                observedDesiredState:
+                  enum:
+                    - Prepare
+                    - Complete
+                    - Cancel
+                    - null
+                  nullable: true
+                  type: string
+                observedGeneration:
+                  format: int64
+                  nullable: true
+                  type: integer
+                phase:
+                  default: Requested
+                  enum:
+                    - Requested
+                    - Preparing
+                    - Prepared
+                    - Blocked
+                    - Failed
+                    - Expired
+                    - Releasing
+                    - Released
+                  type: string
+                preparedAt:
+                  nullable: true
+                  type: string
+              type: object
+          required:
+            - spec
+          title: NodeMaintenanceRequest
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -2094,6 +2293,18 @@ rules:
 - apiGroups: ["kuberic.io"]
   resources: ["kubericsets/finalizers"]
   verbs: ["update"]
+- apiGroups: ["kuberic.io"]
+  resources: ["nodemaintenancerequests"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["kuberic.io"]
+  resources: ["nodemaintenancerequests/status"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["kuberic.io"]
+  resources: ["nodemaintenancerequests/finalizers"]
+  verbs: ["update"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

@@ -82,3 +82,4 @@ kubectl apply -f examples/kvstore/deploy/kubericset.yaml
 | `crd.rs` | `KubericSet` CRD definition and status types |
 | `reconciler.rs` | Main reconcile loop — pod management, lifecycle orchestration |
 | `cluster_api.rs` | Kubernetes API helpers for pod/service operations |
+| `node_maintenance/` | `NodeMaintenanceRequest` CRD, preflight decisions and affected-replica discovery |
