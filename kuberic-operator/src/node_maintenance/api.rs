@@ -24,6 +24,7 @@ pub const PREPARED_CONDITION_TYPE: &str = "KubericPrepared";
 )]
 #[serde(rename_all = "camelCase")]
 pub struct NodeMaintenanceRequestSpec {
+    #[schemars(extend("minLength" = 1))]
     pub node_name: String,
 
     #[serde(default)]
@@ -39,11 +40,11 @@ pub struct NodeMaintenanceRequestSpec {
     pub provider_event_id: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("format" = "date-time"))]
+    #[schemars(extend("format" = "date-time", "maxLength" = 64))]
     pub not_before: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("format" = "date-time"))]
+    #[schemars(extend("format" = "date-time", "maxLength" = 64))]
     pub deadline: Option<String>,
 }
 
@@ -404,6 +405,7 @@ mod tests {
         );
 
         let generated = serde_json::to_string(&crd).unwrap();
+        let deployment = include_str!("../../deploy/deployment.yaml");
         for required in [
             "nodeName",
             "desiredState",
@@ -418,12 +420,23 @@ mod tests {
             "podUid",
             "isPrimary",
             "blockedReason",
+            "InvalidNotBefore",
+            "InvalidDeadline",
         ] {
             assert!(
                 generated.contains(required),
                 "missing generated schema {required}"
             );
+            assert!(
+                deployment.contains(required),
+                "missing deployment schema {required}"
+            );
         }
+
+        assert!(generated.contains(r#""format":"date-time""#));
+        assert!(deployment.contains("format: date-time"));
+        assert!(generated.contains(r#""minLength":1"#));
+        assert!(deployment.contains("minLength: 1"));
     }
 
     #[test]

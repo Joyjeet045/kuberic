@@ -2084,6 +2084,7 @@ spec:
               properties:
                 deadline:
                   format: date-time
+                  maxLength: 64
                   nullable: true
                   type: string
                 desiredState:
@@ -2094,9 +2095,11 @@ spec:
                     - Cancel
                   type: string
                 nodeName:
+                  minLength: 1
                   type: string
                 notBefore:
                   format: date-time
+                  maxLength: 64
                   nullable: true
                   type: string
                 operation:

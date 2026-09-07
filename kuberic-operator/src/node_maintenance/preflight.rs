@@ -128,8 +128,10 @@ mod tests {
         text.parse().expect("timestamp")
     }
 
+    const NOW: &str = "2026-09-06T20:00:00Z";
+
     fn now() -> Timestamp {
-        at("2026-09-06T20:00:00Z")
+        at(NOW)
     }
 
     fn spec() -> NodeMaintenanceRequestSpec {
@@ -292,6 +294,19 @@ mod tests {
             now(),
         ));
         assert_eq!(status.phase, MaintenancePhase::Expired);
+    }
+
+    #[test]
+    fn the_window_is_open_on_both_boundaries() {
+        let mut spec = spec();
+        spec.not_before = Some(NOW.to_string());
+        spec.deadline = Some(NOW.to_string());
+        assert_discovers(preflight(
+            &spec,
+            Some(1),
+            &NodeMaintenanceRequestStatus::default(),
+            now(),
+        ));
     }
 
     #[test]
