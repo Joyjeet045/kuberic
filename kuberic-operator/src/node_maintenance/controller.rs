@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Node, Pod};
 use k8s_openapi::jiff::Timestamp;
+use std::collections::BTreeSet;
 
 use crate::crd::KubericSet;
 
@@ -9,7 +10,7 @@ use super::api::{
 };
 use super::discovery::{DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
 use super::preflight::{Preflight, preflight};
-use super::safety::{SetTopology, reconcile_preparation};
+use super::safety::{SetPlacement, SetTopology, reconcile_preparation};
 
 pub const SET_LABEL: &str = "kuberic.io/set";
 pub const ROLE_LABEL: &str = "kuberic.io/role";
@@ -75,11 +76,19 @@ where
             if discovered.blocked_reason.is_some() {
                 discovered
             } else {
-                let mut topologies = Vec::with_capacity(discovered.affected_sets.len());
+                let mut placements = Vec::with_capacity(discovered.affected_sets.len());
                 for set in &discovered.affected_sets {
-                    topologies.push(api.get_set_topology(&set.namespace, &set.name).await?);
+                    placements.push(SetPlacement {
+                        topology: api.get_set_topology(&set.namespace, &set.name).await?,
+                        promotable_pod_uids: promotable_pod_uids(
+                            &pods,
+                            &set.namespace,
+                            &set.name,
+                            &ctx.spec.node_name,
+                        ),
+                    });
                 }
-                reconcile_preparation(discovered, &topologies, ctx.now)
+                reconcile_preparation(discovered, &placements, ctx.now)
             }
         }
     };
@@ -96,6 +105,23 @@ where
         status,
         persisted: true,
     })
+}
+
+fn promotable_pod_uids(
+    pods: &[MaintenancePod],
+    namespace: &str,
+    set_name: &str,
+    node_name: &str,
+) -> BTreeSet<String> {
+    pods.iter()
+        .filter(|pod| pod.namespace == namespace && pod.set_name == set_name)
+        .filter(|pod| {
+            pod.node_name
+                .as_deref()
+                .is_some_and(|node| node != node_name)
+        })
+        .map(|pod| pod.uid.clone())
+        .collect()
 }
 
 pub struct KubeMaintenanceApi {
@@ -445,10 +471,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sole_replica_hosting_the_primary_has_no_eligible_target() {
+    async fn a_primary_on_the_node_waits_while_a_replica_elsewhere_can_take_over() {
         let api = MockApi {
             node: Some(node()),
-            pods: vec![pod("kv-0", Some("worker-04"), true)],
+            pods: vec![
+                pod("kv-0", Some("worker-04"), true),
+                pod("kv-1", Some("worker-05"), false),
+                pod("kv-2", Some("worker-06"), false),
+            ],
             topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
             ..Default::default()
         };
@@ -458,7 +488,33 @@ mod tests {
 
         assert_eq!(outcome.status.phase, MaintenancePhase::Preparing);
         assert!(!outcome.status.affected_sets[0].primary_moved);
+        assert!(!outcome.status.affected_sets[0].no_eligible_target);
         assert!(outcome.status.affected_sets[0].quorum_without_node);
+    }
+
+    #[tokio::test]
+    async fn a_primary_with_no_scheduled_replica_elsewhere_is_blocked() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![
+                pod("kv-0", Some("worker-04"), true),
+                pod("kv-1", None, false),
+                pod("kv-2", None, false),
+            ],
+            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Blocked);
+        assert_eq!(
+            outcome.status.blocked_reason,
+            Some(MaintenanceBlockedReason::NoEligibleTarget)
+        );
+        assert!(outcome.status.affected_sets[0].no_eligible_target);
+        assert!(outcome.status.prepared_at.is_none());
     }
 
     #[tokio::test]
@@ -547,7 +603,11 @@ mod tests {
     async fn a_primary_that_moves_away_advances_the_request_to_prepared() {
         let blocked = MockApi {
             node: Some(node()),
-            pods: vec![pod("kv-0", Some("worker-04"), true)],
+            pods: vec![
+                pod("kv-0", Some("worker-04"), true),
+                pod("kv-1", Some("worker-05"), false),
+                pod("kv-2", Some("worker-06"), false),
+            ],
             topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
             ..Default::default()
         };
@@ -559,7 +619,11 @@ mod tests {
 
         let moved = MockApi {
             node: Some(node()),
-            pods: vec![pod("kv-0", Some("worker-04"), false)],
+            pods: vec![
+                pod("kv-0", Some("worker-04"), false),
+                pod("kv-1", Some("worker-05"), true),
+                pod("kv-2", Some("worker-06"), false),
+            ],
             topology: Some(topology(Some("kv-1"), &["kv-0", "kv-1", "kv-2"], 2)),
             ..Default::default()
         };
@@ -567,6 +631,7 @@ mod tests {
 
         assert_eq!(outcome.status.phase, MaintenancePhase::Prepared);
         assert!(outcome.status.affected_sets[0].primary_moved);
+        assert!(outcome.status.prepared_at.is_some());
     }
 
     #[tokio::test]

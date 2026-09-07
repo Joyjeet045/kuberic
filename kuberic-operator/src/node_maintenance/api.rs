@@ -168,6 +168,10 @@ impl MaintenancePhase {
         matches!(self, Self::Prepared)
     }
 
+    pub fn excludes_primary_placement(self) -> bool {
+        matches!(self, Self::Preparing | Self::Prepared | Self::Blocked)
+    }
+
     pub fn requires_reason(self) -> bool {
         matches!(self, Self::Blocked | Self::Failed | Self::Expired)
     }
@@ -334,6 +338,20 @@ mod tests {
                 "{phase:?}"
             );
         }
+    }
+
+    #[test]
+    fn placement_is_excluded_only_once_preparation_has_started() {
+        for phase in all_phases() {
+            let expected = matches!(
+                phase,
+                MaintenancePhase::Preparing
+                    | MaintenancePhase::Prepared
+                    | MaintenancePhase::Blocked
+            );
+            assert_eq!(phase.excludes_primary_placement(), expected, "{phase:?}");
+        }
+        assert!(!MaintenancePhase::Requested.excludes_primary_placement());
     }
 
     #[test]
