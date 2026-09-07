@@ -16,4 +16,6 @@ pub use controller::{
 pub use discovery::{DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
 pub use placement::{PlacementCandidate, switchover_target_for_maintenance};
 pub use preflight::{Preflight, preflight};
-pub use safety::{SetEvaluation, SetReadiness, SetTopology, evaluate_set, reconcile_preparation};
+pub use safety::{
+    SetEvaluation, SetPlacement, SetReadiness, SetTopology, evaluate_set, reconcile_preparation,
+};

@@ -162,7 +162,7 @@ impl ClusterApi for KubeClusterApi {
                 request
                     .status
                     .as_ref()
-                    .is_none_or(|status| !status.phase.is_terminal())
+                    .is_some_and(|status| status.phase.excludes_primary_placement())
             })
             .map(|request| request.spec.node_name)
             .collect())

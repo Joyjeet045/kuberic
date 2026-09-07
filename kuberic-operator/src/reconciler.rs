@@ -1336,6 +1336,11 @@ pub async fn reconcile_set(
             let requested_primary = set.status.as_ref().and_then(|s| s.target_primary.clone());
             let target_primary = match requested_primary {
                 Some(requested) => Some(requested),
+                None if validate_new_switchover_engine(set.spec.switchover_execution_mode)
+                    .is_err() =>
+                {
+                    None
+                }
                 None => {
                     let maintenance_nodes =
                         api.list_maintenance_nodes().await.unwrap_or_else(|error| {
