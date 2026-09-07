@@ -8,7 +8,7 @@ use crate::crd::KubericSet;
 use super::api::{
     NodeMaintenanceRequest, NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus,
 };
-use super::discovery::{DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
+use super::discovery::{Discovery, DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
 use super::preflight::{Preflight, preflight};
 use super::safety::{SetPlacement, SetTopology, reconcile_preparation};
 
@@ -73,22 +73,23 @@ where
                 now: ctx.now,
             });
 
-            if discovered.blocked_reason.is_some() {
-                discovered
-            } else {
-                let mut placements = Vec::with_capacity(discovered.affected_sets.len());
-                for set in &discovered.affected_sets {
-                    placements.push(SetPlacement {
-                        topology: api.get_set_topology(&set.namespace, &set.name).await?,
-                        promotable_pod_uids: promotable_pod_uids(
-                            &pods,
-                            &set.namespace,
-                            &set.name,
-                            &ctx.spec.node_name,
-                        ),
-                    });
+            match discovered {
+                Discovery::Blocked(status) => status,
+                Discovery::Discovered(status) => {
+                    let mut placements = Vec::with_capacity(status.affected_sets.len());
+                    for set in &status.affected_sets {
+                        placements.push(SetPlacement {
+                            topology: api.get_set_topology(&set.namespace, &set.name).await?,
+                            promotable_pod_uids: promotable_pod_uids(
+                                &pods,
+                                &set.namespace,
+                                &set.name,
+                                &ctx.spec.node_name,
+                            ),
+                        });
+                    }
+                    reconcile_preparation(status, &placements, ctx.now)
                 }
-                reconcile_preparation(discovered, &placements, ctx.now)
             }
         }
     };
