@@ -2133,6 +2133,9 @@ spec:
                         type: string
                       namespace:
                         type: string
+                      noEligibleTarget:
+                        default: false
+                        type: boolean
                       primaryMoved:
                         default: false
                         type: boolean

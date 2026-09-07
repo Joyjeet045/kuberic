@@ -121,6 +121,7 @@ fn discover_affected_sets(
                 replicas: Vec::new(),
                 hosts_primary: false,
                 primary_moved: false,
+                no_eligible_target: false,
                 quorum_without_node: false,
             });
         entry.replicas.push(AffectedReplicaStatus {

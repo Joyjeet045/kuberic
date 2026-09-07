@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Service};
@@ -7,6 +7,7 @@ use kuberic_core::driver::ReplicaHandle;
 use kuberic_core::types::{ReplicaId, ReplicaInstanceId};
 
 use crate::crd::{KubericSetSpec, KubericSetStatus};
+use crate::node_maintenance::NodeMaintenanceRequest;
 
 fn uid_fenced_label_patch(
     pod: &Pod,
@@ -48,6 +49,9 @@ fn uid_fenced_label_patch(
 pub trait ClusterApi: Send + Sync {
     /// List pods matching the label selector.
     async fn list_pods(&self, namespace: &str, selector: &str) -> Result<Vec<Pod>, String>;
+
+    /// Names of nodes with an active NodeMaintenanceRequest.
+    async fn list_maintenance_nodes(&self) -> Result<BTreeSet<String>, String>;
 
     /// Create a pod.
     async fn create_pod(&self, namespace: &str, pod: &Pod) -> Result<(), String>;
@@ -141,6 +145,27 @@ impl ClusterApi for KubeClusterApi {
             .await
             .map(|list| list.items)
             .map_err(|e| e.to_string())
+    }
+
+    async fn list_maintenance_nodes(&self) -> Result<BTreeSet<String>, String> {
+        let api: kube::Api<NodeMaintenanceRequest> = kube::Api::all(self.client.clone());
+        let list = api
+            .list(&kube::api::ListParams::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(list
+            .items
+            .into_iter()
+            .filter(|request| request.metadata.deletion_timestamp.is_none())
+            .filter(|request| !request.spec.desired_state.releases_request())
+            .filter(|request| {
+                request
+                    .status
+                    .as_ref()
+                    .is_none_or(|status| !status.phase.is_terminal())
+            })
+            .map(|request| request.spec.node_name)
+            .collect())
     }
 
     async fn create_pod(&self, namespace: &str, pod: &Pod) -> Result<(), String> {
