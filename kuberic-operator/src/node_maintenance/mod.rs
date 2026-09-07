@@ -13,7 +13,7 @@ pub use api::{
 pub use controller::{
     KubeMaintenanceApi, MaintenanceApi, ReconcileOutcome, RequestContext, reconcile_request,
 };
-pub use discovery::{DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
+pub use discovery::{Discovery, DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
 pub use placement::{PlacementCandidate, switchover_target_for_maintenance};
 pub use preflight::{Preflight, preflight};
 pub use safety::{

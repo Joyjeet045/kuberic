@@ -35,25 +35,30 @@ pub struct DiscoveryInput<'a> {
     pub now: Timestamp,
 }
 
-pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestStatus {
+pub enum Discovery {
+    Blocked(NodeMaintenanceRequestStatus),
+    Discovered(NodeMaintenanceRequestStatus),
+}
+
+pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> Discovery {
     let mut status = input.previous.clone();
     status.observed_generation = input.generation;
     status.observed_desired_state = Some(input.spec.desired_state);
 
     let Some(node) = input.node else {
-        return finish(
+        return Discovery::Blocked(finish(
             status,
             MaintenancePhase::Blocked,
             Some(MaintenanceBlockedReason::NodeNotFound),
             Some(format!("node {} not found", input.spec.node_name)),
             input.now,
-        );
+        ));
     };
 
     if let Some(known) = input.previous.node_uid.as_deref()
         && known != node.uid
     {
-        return finish(
+        return Discovery::Blocked(finish(
             status,
             MaintenancePhase::Blocked,
             Some(MaintenanceBlockedReason::NodeIncarnationChanged),
@@ -62,7 +67,7 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestS
                 input.spec.node_name, node.uid
             )),
             input.now,
-        );
+        ));
     }
 
     let node_uid = Some(node.uid.clone());
@@ -74,32 +79,7 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestS
         status.discovery_completed_at = Some(input.now.to_string());
     }
 
-    let message = if status.affected_sets.is_empty() {
-        format!("no kuberic replicas on node {}", input.spec.node_name)
-    } else {
-        format!(
-            "discovered {} affected set(s), {} replica(s), {} hosting a primary",
-            status.affected_sets.len(),
-            status
-                .affected_sets
-                .iter()
-                .map(|set| set.replicas.len())
-                .sum::<usize>(),
-            status
-                .affected_sets
-                .iter()
-                .filter(|set| set.hosts_primary)
-                .count()
-        )
-    };
-
-    finish(
-        status,
-        MaintenancePhase::Preparing,
-        None,
-        Some(message),
-        input.now,
-    )
+    Discovery::Discovered(status)
 }
 
 fn discover_affected_sets(
@@ -210,6 +190,12 @@ mod tests {
         text.parse().expect("timestamp")
     }
 
+    fn discovered(result: Discovery) -> NodeMaintenanceRequestStatus {
+        match result {
+            Discovery::Blocked(status) | Discovery::Discovered(status) => status,
+        }
+    }
+
     fn spec(node: &str) -> NodeMaintenanceRequestSpec {
         NodeMaintenanceRequestSpec {
             node_name: node.to_string(),
@@ -246,14 +232,16 @@ mod tests {
         node: Option<&NodeRef>,
         pods: &[MaintenancePod],
     ) -> NodeMaintenanceRequestStatus {
-        reconcile_discovery(DiscoveryInput {
+        match reconcile_discovery(DiscoveryInput {
             spec,
             generation: Some(1),
             previous,
             node,
             pods,
             now: at(NOW),
-        })
+        }) {
+            Discovery::Blocked(status) | Discovery::Discovered(status) => status,
+        }
     }
 
     #[test]
@@ -271,7 +259,6 @@ mod tests {
             &pods,
         );
 
-        assert_eq!(status.phase, MaintenancePhase::Preparing);
         assert_eq!(status.node_uid.as_deref(), Some("uid-a"));
         assert_eq!(status.affected_sets.len(), 2);
 
@@ -296,7 +283,6 @@ mod tests {
             &pods,
         );
         assert!(status.affected_sets.is_empty());
-        assert_eq!(status.phase, MaintenancePhase::Preparing);
     }
 
     #[test]
@@ -312,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_never_reports_prepared() {
+    fn discovery_records_facts_without_deciding_readiness() {
         let pods = [pod("kv-1", "kv", Some("worker-04"), true)];
         let status = run(
             &spec("worker-04"),
@@ -320,24 +306,26 @@ mod tests {
             Some(&node("uid-a")),
             &pods,
         );
-        assert_ne!(status.phase, MaintenancePhase::Prepared);
+        assert_eq!(status.phase, MaintenancePhase::Requested);
         assert!(!status.phase.is_safe_to_drain());
-        let condition = status.conditions.first().expect("condition");
-        assert_eq!(condition.type_, PREPARED_CONDITION_TYPE);
-        assert_eq!(condition.status, "False");
+        assert!(
+            status.conditions.is_empty(),
+            "readiness is published by preparation, not discovery"
+        );
+        assert!(status.prepared_at.is_none());
     }
 
     #[test]
-    fn empty_affected_sets_still_do_not_report_prepared() {
+    fn empty_affected_sets_are_recorded_without_readiness() {
         let status = run(
             &spec("worker-04"),
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &[],
         );
-        assert_eq!(status.phase, MaintenancePhase::Preparing);
         assert!(status.affected_sets.is_empty());
-        assert!(status.message.unwrap().contains("no kuberic replicas"));
+        assert!(status.conditions.is_empty());
+        assert!(status.discovery_completed_at.is_some());
     }
 
     #[test]
@@ -393,22 +381,22 @@ mod tests {
     fn unchanged_discovery_does_not_move_with_the_clock() {
         let pods = [pod("kv-1", "kv", Some("worker-04"), true)];
         let spec = spec("worker-04");
-        let first = reconcile_discovery(DiscoveryInput {
+        let first = discovered(reconcile_discovery(DiscoveryInput {
             spec: &spec,
             generation: Some(1),
             previous: &NodeMaintenanceRequestStatus::default(),
             node: Some(&node("uid-a")),
             pods: &pods,
             now: at(NOW),
-        });
-        let later = reconcile_discovery(DiscoveryInput {
+        }));
+        let later = discovered(reconcile_discovery(DiscoveryInput {
             spec: &spec,
             generation: Some(1),
             previous: &first,
             node: Some(&node("uid-a")),
             pods: &pods,
             now: at("2026-09-06T21:30:00Z"),
-        });
+        }));
         assert_eq!(
             first, later,
             "an unchanged request must not produce a new status on every reconcile"
@@ -418,15 +406,15 @@ mod tests {
     #[test]
     fn rediscovery_refreshes_the_completion_timestamp() {
         let spec = spec("worker-04");
-        let first = reconcile_discovery(DiscoveryInput {
+        let first = discovered(reconcile_discovery(DiscoveryInput {
             spec: &spec,
             generation: Some(1),
             previous: &NodeMaintenanceRequestStatus::default(),
             node: Some(&node("uid-a")),
             pods: &[pod("kv-0", "kv", Some("worker-04"), false)],
             now: at(NOW),
-        });
-        let later = reconcile_discovery(DiscoveryInput {
+        }));
+        let later = discovered(reconcile_discovery(DiscoveryInput {
             spec: &spec,
             generation: Some(1),
             previous: &first,
@@ -436,46 +424,11 @@ mod tests {
                 pod("kv-1", "kv", Some("worker-04"), true),
             ],
             now: at("2026-09-06T21:30:00Z"),
-        });
+        }));
         assert_ne!(first.affected_sets, later.affected_sets);
         assert_eq!(
             later.discovery_completed_at.as_deref(),
             Some("2026-09-06T21:30:00Z")
-        );
-    }
-
-    #[test]
-    fn condition_transition_time_survives_a_message_only_change() {
-        let spec = spec("worker-04");
-        let first = reconcile_discovery(DiscoveryInput {
-            spec: &spec,
-            generation: Some(1),
-            previous: &NodeMaintenanceRequestStatus::default(),
-            node: Some(&node("uid-a")),
-            pods: &[pod("kv-0", "kv", Some("worker-04"), false)],
-            now: at(NOW),
-        });
-        let first_condition = first.conditions.first().expect("condition").clone();
-        assert_eq!(first_condition.status, "False");
-
-        let later = reconcile_discovery(DiscoveryInput {
-            spec: &spec,
-            generation: Some(1),
-            previous: &first,
-            node: Some(&node("uid-a")),
-            pods: &[
-                pod("kv-0", "kv", Some("worker-04"), false),
-                pod("kv-1", "kv", Some("worker-04"), true),
-            ],
-            now: at("2026-09-06T22:00:00Z"),
-        });
-        let later_condition = later.conditions.first().expect("condition");
-
-        assert_ne!(first.message, later.message);
-        assert_eq!(later_condition.status, "False");
-        assert_eq!(
-            later_condition.last_transition_time, first_condition.last_transition_time,
-            "lastTransitionTime must change only when the condition status changes"
         );
     }
 
@@ -493,7 +446,6 @@ mod tests {
         let resumed = run(&spec, &persisted, Some(&node("uid-a")), &pods);
         assert_eq!(resumed.node_uid, persisted.node_uid);
         assert_eq!(resumed.affected_sets, persisted.affected_sets);
-        assert_eq!(resumed.phase, MaintenancePhase::Preparing);
     }
 
     #[test]

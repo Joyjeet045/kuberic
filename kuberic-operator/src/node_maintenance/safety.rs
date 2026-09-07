@@ -23,6 +23,11 @@ pub fn reconcile_preparation(
     }
 
     let outcome = evaluate_preparation(&status.affected_sets, &readiness);
+    if !status.phase.can_transition_to(outcome.phase)
+        && status.phase.can_transition_to(MaintenancePhase::Preparing)
+    {
+        status.phase = MaintenancePhase::Preparing;
+    }
     let mut status = finish(
         status,
         outcome.phase,
@@ -195,6 +200,10 @@ fn severity(readiness: SetReadiness) -> u8 {
 mod tests {
     use super::*;
     use crate::node_maintenance::api::AffectedReplicaStatus;
+
+    fn at(text: &str) -> Timestamp {
+        text.parse().expect("timestamp")
+    }
 
     fn replica(pod: &str, primary: bool) -> AffectedReplicaStatus {
         AffectedReplicaStatus {
@@ -418,5 +427,88 @@ mod tests {
 
         assert_eq!(outcome.phase, MaintenancePhase::Preparing);
         assert_eq!(outcome.reason, None);
+    }
+
+    fn requested(sets: Vec<AffectedKubericSetStatus>) -> NodeMaintenanceRequestStatus {
+        NodeMaintenanceRequestStatus {
+            affected_sets: sets,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_prepared_request_does_not_move_with_the_clock() {
+        let placements = [placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let first = reconcile_preparation(
+            requested(vec![affected(vec![replica("kv-2", false)])]),
+            &placements,
+            at("2026-09-06T20:00:00Z"),
+        );
+        assert_eq!(first.phase, MaintenancePhase::Prepared);
+        assert!(first.prepared_at.is_some());
+
+        let later = reconcile_preparation(first.clone(), &placements, at("2026-09-06T23:45:00Z"));
+
+        assert_eq!(
+            first, later,
+            "a prepared request must not produce a new status on every reconcile"
+        );
+    }
+
+    #[test]
+    fn a_blocked_request_does_not_move_with_the_clock() {
+        let placements = [placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let sets = vec![affected(vec![
+            replica("kv-1", false),
+            replica("kv-2", false),
+        ])];
+        let first = reconcile_preparation(requested(sets), &placements, at("2026-09-06T20:00:00Z"));
+        assert_eq!(first.phase, MaintenancePhase::Blocked);
+
+        let later = reconcile_preparation(first.clone(), &placements, at("2026-09-06T23:45:00Z"));
+        assert_eq!(first, later);
+    }
+
+    #[test]
+    fn readiness_lost_again_retracts_the_prepared_condition() {
+        let safe = [placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let prepared = reconcile_preparation(
+            requested(vec![affected(vec![replica("kv-2", false)])]),
+            &safe,
+            at("2026-09-06T20:00:00Z"),
+        );
+        assert_eq!(prepared.phase, MaintenancePhase::Prepared);
+
+        let regressed = [placement(Some("kv-2"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let later = reconcile_preparation(prepared, &regressed, at("2026-09-06T21:00:00Z"));
+
+        assert_ne!(later.phase, MaintenancePhase::Prepared);
+        assert!(later.prepared_at.is_none());
+        let condition = later.conditions.first().expect("condition");
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.last_transition_time, "2026-09-06T21:00:00Z");
+    }
+
+    #[test]
+    fn a_blocked_request_can_still_reach_prepared_once_it_is_safe() {
+        let unsafe_placement = [placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let blocked = reconcile_preparation(
+            requested(vec![affected(vec![
+                replica("kv-1", false),
+                replica("kv-2", false),
+            ])]),
+            &unsafe_placement,
+            at("2026-09-06T20:00:00Z"),
+        );
+        assert_eq!(blocked.phase, MaintenancePhase::Blocked);
+
+        let recovered = NodeMaintenanceRequestStatus {
+            affected_sets: vec![affected(vec![replica("kv-2", false)])],
+            ..blocked
+        };
+        let later = reconcile_preparation(recovered, &unsafe_placement, at("2026-09-06T21:00:00Z"));
+
+        assert_eq!(later.phase, MaintenancePhase::Prepared);
+        assert_eq!(later.blocked_reason, None);
     }
 }
