@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Watching KubericSets");
 
     let maintenance_client = client.clone();
-    let maintenance = tokio::spawn(async move {
+    let maintenance = async move {
         let requests: Api<NodeMaintenanceRequest> = Api::all(maintenance_client.clone());
         let maintenance_api = Arc::new(KubeMaintenanceApi {
             client: maintenance_client,
@@ -62,20 +62,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .clone()
                         .ok_or_else(|| OperatorError("request has no name".to_string()))?;
                     let previous = request.status.clone().unwrap_or_default();
-                    let now_ts = k8s_openapi::jiff::Timestamp::now();
-                    let now = now_ts.to_string();
-                    let not_before_reached = request
-                        .spec
-                        .not_before
-                        .as_deref()
-                        .and_then(|at| at.parse::<k8s_openapi::jiff::Timestamp>().ok())
-                        .is_none_or(|at| now_ts >= at);
-                    let deadline_exceeded = request
-                        .spec
-                        .deadline
-                        .as_deref()
-                        .and_then(|deadline| deadline.parse::<k8s_openapi::jiff::Timestamp>().ok())
-                        .is_some_and(|deadline| now_ts > deadline);
 
                     reconcile_request(
                         api.as_ref(),
@@ -84,9 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             spec: &request.spec,
                             generation: request.metadata.generation,
                             previous: &previous,
-                            now: &now,
-                            not_before_reached,
-                            deadline_exceeded,
+                            now: k8s_openapi::jiff::Timestamp::now(),
                         },
                     )
                     .await
@@ -115,35 +99,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
             .await;
-    });
+    };
 
     info!("Watching NodeMaintenanceRequests");
 
-    Controller::new(sets, watcher::Config::default())
-        .owns(pods, watcher::Config::default())
-        .run(
-            |set: Arc<KubericSet>, ctx: Arc<Context>| async move {
-                match kuberic_operator::reconciler::reconcile_set(&set, &ctx.api, &ctx.state).await
-                {
-                    Ok(ReconcileAction::Requeue(d)) => Ok(Action::requeue(d)),
-                    Err(e) => Err(OperatorError(e)),
+    let sets_controller = async move {
+        Controller::new(sets, watcher::Config::default())
+            .owns(pods, watcher::Config::default())
+            .run(
+                |set: Arc<KubericSet>, ctx: Arc<Context>| async move {
+                    match kuberic_operator::reconciler::reconcile_set(&set, &ctx.api, &ctx.state)
+                        .await
+                    {
+                        Ok(ReconcileAction::Requeue(d)) => Ok(Action::requeue(d)),
+                        Err(e) => Err(OperatorError(e)),
+                    }
+                },
+                |_set: Arc<KubericSet>, error, _ctx: Arc<Context>| {
+                    tracing::warn!(?error, "controller error");
+                    Action::requeue(std::time::Duration::from_secs(10))
+                },
+                ctx,
+            )
+            .for_each(|res| async move {
+                match res {
+                    Ok(o) => info!("reconciled {:?}", o),
+                    Err(e) => tracing::warn!("reconcile failed: {}", e),
                 }
-            },
-            |_set: Arc<KubericSet>, error, _ctx: Arc<Context>| {
-                tracing::warn!(?error, "controller error");
-                Action::requeue(std::time::Duration::from_secs(10))
-            },
-            ctx,
-        )
-        .for_each(|res| async move {
-            match res {
-                Ok(o) => info!("reconciled {:?}", o),
-                Err(e) => tracing::warn!("reconcile failed: {}", e),
-            }
-        })
-        .await;
+            })
+            .await;
+    };
 
-    maintenance.abort();
+    let exited = tokio::select! {
+        _ = maintenance => "node maintenance",
+        _ = sets_controller => "kubericset",
+    };
 
-    Ok(())
+    tracing::error!(controller = exited, "controller stream ended unexpectedly");
+    Err(format!("{exited} controller exited").into())
 }

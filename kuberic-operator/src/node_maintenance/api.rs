@@ -39,9 +39,11 @@ pub struct NodeMaintenanceRequestSpec {
     pub provider_event_id: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub not_before: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
     pub deadline: Option<String>,
 }
 
@@ -197,6 +199,8 @@ impl MaintenancePhase {
 pub enum MaintenanceBlockedReason {
     NodeNotFound,
     NodeIncarnationChanged,
+    InvalidNotBefore,
+    InvalidDeadline,
     BlockedByQuorum,
     NoEligibleTarget,
     SwitchoverFailed,

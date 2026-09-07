@@ -31,55 +31,12 @@ pub struct DiscoveryInput<'a> {
     pub node: Option<&'a NodeRef>,
     pub pods: &'a [MaintenancePod],
     pub now: &'a str,
-    pub not_before_reached: bool,
-    pub deadline_exceeded: bool,
 }
 
 pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestStatus {
     let mut status = input.previous.clone();
     status.observed_generation = input.generation;
     status.observed_desired_state = Some(input.spec.desired_state);
-
-    if input.previous.phase.is_terminal() {
-        return status;
-    }
-
-    if input.spec.desired_state.releases_request() {
-        return finish(
-            status,
-            MaintenancePhase::Releasing,
-            None,
-            Some(format!("release requested: {:?}", input.spec.desired_state)),
-            input.now,
-        );
-    }
-
-    if input.previous.phase == MaintenancePhase::Releasing {
-        return status;
-    }
-
-    if input.deadline_exceeded && !input.previous.phase.is_safe_to_drain() {
-        return finish(
-            status,
-            MaintenancePhase::Expired,
-            Some(MaintenanceBlockedReason::DeadlineExceeded),
-            Some("deadline exceeded before preparation completed".to_string()),
-            input.now,
-        );
-    }
-
-    if !input.not_before_reached {
-        return finish(
-            status,
-            MaintenancePhase::Requested,
-            None,
-            Some(format!(
-                "waiting until {}",
-                input.spec.not_before.as_deref().unwrap_or("notBefore")
-            )),
-            input.now,
-        );
-    }
 
     let Some(node) = input.node else {
         return finish(
@@ -179,7 +136,7 @@ fn discover_affected_sets(
     sets
 }
 
-fn finish(
+pub(super) fn finish(
     mut status: NodeMaintenanceRequestStatus,
     phase: MaintenancePhase,
     reason: Option<MaintenanceBlockedReason>,
@@ -281,7 +238,6 @@ mod tests {
         previous: &NodeMaintenanceRequestStatus,
         node: Option<&NodeRef>,
         pods: &[MaintenancePod],
-        deadline_exceeded: bool,
     ) -> NodeMaintenanceRequestStatus {
         reconcile_discovery(DiscoveryInput {
             spec,
@@ -290,50 +246,7 @@ mod tests {
             node,
             pods,
             now: NOW,
-            not_before_reached: true,
-            deadline_exceeded,
         })
-    }
-
-    #[test]
-    fn preparation_waits_until_not_before() {
-        let mut spec = spec("worker-04");
-        spec.not_before = Some("2026-09-06T23:00:00Z".to_string());
-        let pods = [pod("kv-1", "kv", Some("worker-04"), true)];
-
-        let status = reconcile_discovery(DiscoveryInput {
-            spec: &spec,
-            generation: Some(1),
-            previous: &NodeMaintenanceRequestStatus::default(),
-            node: Some(&node("uid-a")),
-            pods: &pods,
-            now: NOW,
-            not_before_reached: false,
-            deadline_exceeded: false,
-        });
-
-        assert_eq!(status.phase, MaintenancePhase::Requested);
-        assert!(status.affected_sets.is_empty());
-        assert!(status.node_uid.is_none());
-        assert!(!status.phase.is_safe_to_drain());
-    }
-
-    #[test]
-    fn discovery_proceeds_once_not_before_is_reached() {
-        let mut spec = spec("worker-04");
-        spec.not_before = Some("2026-09-06T19:00:00Z".to_string());
-        let pods = [pod("kv-1", "kv", Some("worker-04"), true)];
-
-        let status = run(
-            &spec,
-            &NodeMaintenanceRequestStatus::default(),
-            Some(&node("uid-a")),
-            &pods,
-            false,
-        );
-
-        assert_eq!(status.phase, MaintenancePhase::Preparing);
-        assert_eq!(status.affected_sets.len(), 1);
     }
 
     #[test]
@@ -349,7 +262,6 @@ mod tests {
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &pods,
-            false,
         );
 
         assert_eq!(status.phase, MaintenancePhase::Preparing);
@@ -375,7 +287,6 @@ mod tests {
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &pods,
-            false,
         );
         assert!(status.affected_sets.is_empty());
         assert_eq!(status.phase, MaintenancePhase::Preparing);
@@ -389,7 +300,6 @@ mod tests {
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &pods,
-            false,
         );
         assert!(status.affected_sets.is_empty());
     }
@@ -402,7 +312,6 @@ mod tests {
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &pods,
-            false,
         );
         assert_ne!(status.phase, MaintenancePhase::Prepared);
         assert!(!status.phase.is_safe_to_drain());
@@ -418,7 +327,6 @@ mod tests {
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &[],
-            false,
         );
         assert_eq!(status.phase, MaintenancePhase::Preparing);
         assert!(status.affected_sets.is_empty());
@@ -432,7 +340,6 @@ mod tests {
             &NodeMaintenanceRequestStatus::default(),
             None,
             &[],
-            false,
         );
         assert_eq!(status.phase, MaintenancePhase::Blocked);
         assert_eq!(
@@ -449,126 +356,13 @@ mod tests {
             ..Default::default()
         };
 
-        let status = run(
-            &spec("worker-04"),
-            &previous,
-            Some(&node("uid-b")),
-            &[],
-            false,
-        );
+        let status = run(&spec("worker-04"), &previous, Some(&node("uid-b")), &[]);
         assert_eq!(status.phase, MaintenancePhase::Blocked);
         assert_eq!(
             status.blocked_reason,
             Some(MaintenanceBlockedReason::NodeIncarnationChanged)
         );
         assert_eq!(status.node_uid.as_deref(), Some("uid-a"));
-    }
-
-    #[test]
-    fn deadline_expires_before_preparation_completes() {
-        let status = run(
-            &spec("worker-04"),
-            &NodeMaintenanceRequestStatus::default(),
-            Some(&node("uid-a")),
-            &[],
-            true,
-        );
-        assert_eq!(status.phase, MaintenancePhase::Expired);
-        assert_eq!(
-            status.blocked_reason,
-            Some(MaintenanceBlockedReason::DeadlineExceeded)
-        );
-    }
-
-    #[test]
-    fn release_request_moves_to_releasing_from_any_active_phase() {
-        let mut spec = spec("worker-04");
-        spec.desired_state = MaintenanceDesiredState::Complete;
-        for phase in [
-            MaintenancePhase::Requested,
-            MaintenancePhase::Preparing,
-            MaintenancePhase::Blocked,
-        ] {
-            let previous = NodeMaintenanceRequestStatus {
-                phase,
-                ..Default::default()
-            };
-            let status = run(&spec, &previous, Some(&node("uid-a")), &[], false);
-            assert_eq!(status.phase, MaintenancePhase::Releasing, "from {phase:?}");
-            assert_eq!(
-                status.observed_desired_state,
-                Some(MaintenanceDesiredState::Complete)
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_requests_are_not_redriven() {
-        let previous = NodeMaintenanceRequestStatus {
-            phase: MaintenancePhase::Expired,
-            blocked_reason: Some(MaintenanceBlockedReason::DeadlineExceeded),
-            ..Default::default()
-        };
-        let status = run(
-            &spec("worker-04"),
-            &previous,
-            Some(&node("uid-a")),
-            &[pod("kv-0", "kv", Some("worker-04"), false)],
-            false,
-        );
-        assert_eq!(status.phase, MaintenancePhase::Expired);
-        assert!(status.affected_sets.is_empty());
-    }
-
-    #[test]
-    fn a_releasing_request_is_not_redriven_by_a_reverted_desired_state() {
-        let previous = NodeMaintenanceRequestStatus {
-            phase: MaintenancePhase::Releasing,
-            message: Some("release requested: Complete".to_string()),
-            ..Default::default()
-        };
-        let status = run(
-            &spec("worker-04"),
-            &previous,
-            Some(&node("uid-a")),
-            &[pod("kv-0", "kv", Some("worker-04"), false)],
-            false,
-        );
-        assert_eq!(status.phase, MaintenancePhase::Releasing);
-        assert!(status.affected_sets.is_empty());
-        assert!(status.discovery_completed_at.is_none());
-        assert_eq!(
-            status.message.as_deref(),
-            Some("release requested: Complete")
-        );
-    }
-
-    #[test]
-    fn a_terminal_request_is_not_disturbed_by_a_release_request() {
-        let mut spec = spec("worker-04");
-        spec.desired_state = MaintenanceDesiredState::Complete;
-        let previous = NodeMaintenanceRequestStatus {
-            phase: MaintenancePhase::Expired,
-            blocked_reason: Some(MaintenanceBlockedReason::DeadlineExceeded),
-            message: Some("deadline exceeded before preparation completed".to_string()),
-            ..Default::default()
-        };
-
-        let status = run(&spec, &previous, Some(&node("uid-a")), &[], false);
-
-        assert_eq!(status.phase, MaintenancePhase::Expired);
-        assert_eq!(
-            status.blocked_reason,
-            Some(MaintenanceBlockedReason::DeadlineExceeded)
-        );
-        assert_eq!(
-            status.message.as_deref(),
-            Some("deadline exceeded before preparation completed")
-        );
-        assert_eq!(
-            status.observed_desired_state,
-            Some(MaintenanceDesiredState::Complete)
-        );
     }
 
     #[test]
@@ -583,9 +377,8 @@ mod tests {
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &pods,
-            false,
         );
-        let second = run(&spec, &first, Some(&node("uid-a")), &pods, false);
+        let second = run(&spec, &first, Some(&node("uid-a")), &pods);
         assert_eq!(first, second);
     }
 
@@ -600,8 +393,6 @@ mod tests {
             node: Some(&node("uid-a")),
             pods: &pods,
             now: NOW,
-            not_before_reached: true,
-            deadline_exceeded: false,
         });
         let later = reconcile_discovery(DiscoveryInput {
             spec: &spec,
@@ -610,8 +401,6 @@ mod tests {
             node: Some(&node("uid-a")),
             pods: &pods,
             now: "2026-09-06T21:30:00Z",
-            not_before_reached: true,
-            deadline_exceeded: false,
         });
         assert_eq!(
             first, later,
@@ -629,8 +418,6 @@ mod tests {
             node: Some(&node("uid-a")),
             pods: &[pod("kv-0", "kv", Some("worker-04"), false)],
             now: NOW,
-            not_before_reached: true,
-            deadline_exceeded: false,
         });
         let later = reconcile_discovery(DiscoveryInput {
             spec: &spec,
@@ -642,8 +429,6 @@ mod tests {
                 pod("kv-1", "kv", Some("worker-04"), true),
             ],
             now: "2026-09-06T21:30:00Z",
-            not_before_reached: true,
-            deadline_exceeded: false,
         });
         assert_ne!(first.affected_sets, later.affected_sets);
         assert_eq!(
@@ -662,8 +447,6 @@ mod tests {
             node: Some(&node("uid-a")),
             pods: &[pod("kv-0", "kv", Some("worker-04"), false)],
             now: NOW,
-            not_before_reached: true,
-            deadline_exceeded: false,
         });
         let first_condition = first.conditions.first().expect("condition").clone();
         assert_eq!(first_condition.status, "False");
@@ -678,8 +461,6 @@ mod tests {
                 pod("kv-1", "kv", Some("worker-04"), true),
             ],
             now: "2026-09-06T22:00:00Z",
-            not_before_reached: true,
-            deadline_exceeded: false,
         });
         let later_condition = later.conditions.first().expect("condition");
 
@@ -692,45 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn deadline_expires_even_when_the_node_is_gone() {
-        let status = run(
-            &spec("worker-04"),
-            &NodeMaintenanceRequestStatus::default(),
-            None,
-            &[],
-            true,
-        );
-        assert_eq!(status.phase, MaintenancePhase::Expired);
-        assert_eq!(
-            status.blocked_reason,
-            Some(MaintenanceBlockedReason::DeadlineExceeded)
-        );
-    }
-
-    #[test]
-    fn an_elapsed_window_expires_even_before_not_before() {
-        let mut spec = spec("worker-04");
-        spec.not_before = Some("2026-09-06T23:00:00Z".to_string());
-
-        let status = reconcile_discovery(DiscoveryInput {
-            spec: &spec,
-            generation: Some(1),
-            previous: &NodeMaintenanceRequestStatus::default(),
-            node: Some(&node("uid-a")),
-            pods: &[],
-            now: NOW,
-            not_before_reached: false,
-            deadline_exceeded: true,
-        });
-
-        assert_eq!(status.phase, MaintenancePhase::Expired);
-        assert_eq!(
-            status.blocked_reason,
-            Some(MaintenanceBlockedReason::DeadlineExceeded)
-        );
-    }
-
-    #[test]
     fn restart_resumes_from_persisted_status() {
         let pods = [pod("kv-1", "kv", Some("worker-04"), true)];
         let spec = spec("worker-04");
@@ -739,10 +481,9 @@ mod tests {
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &pods,
-            false,
         );
 
-        let resumed = run(&spec, &persisted, Some(&node("uid-a")), &pods, false);
+        let resumed = run(&spec, &persisted, Some(&node("uid-a")), &pods);
         assert_eq!(resumed.node_uid, persisted.node_uid);
         assert_eq!(resumed.affected_sets, persisted.affected_sets);
         assert_eq!(resumed.phase, MaintenancePhase::Preparing);
@@ -764,14 +505,12 @@ mod tests {
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &forward,
-            false,
         );
         let b = run(
             &spec,
             &NodeMaintenanceRequestStatus::default(),
             Some(&node("uid-a")),
             &reversed,
-            false,
         );
         assert_eq!(a.affected_sets, b.affected_sets);
     }

@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Node, Pod};
+use k8s_openapi::jiff::Timestamp;
 
 use super::api::{
     NodeMaintenanceRequest, NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus,
 };
 use super::discovery::{DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
+use super::preflight::{Preflight, preflight};
 
 pub const SET_LABEL: &str = "kuberic.io/set";
 pub const ROLE_LABEL: &str = "kuberic.io/role";
@@ -32,9 +34,7 @@ pub struct RequestContext<'a> {
     pub spec: &'a NodeMaintenanceRequestSpec,
     pub generation: Option<i64>,
     pub previous: &'a NodeMaintenanceRequestStatus,
-    pub now: &'a str,
-    pub not_before_reached: bool,
-    pub deadline_exceeded: bool,
+    pub now: Timestamp,
 }
 
 pub async fn reconcile_request<A>(
@@ -44,23 +44,26 @@ pub async fn reconcile_request<A>(
 where
     A: MaintenanceApi + ?Sized,
 {
-    let node = api.get_node(&ctx.spec.node_name).await?;
-    let pods = if node.is_some() {
-        api.list_maintenance_pods().await?
-    } else {
-        Vec::new()
-    };
+    let status = match preflight(ctx.spec, ctx.generation, ctx.previous, ctx.now) {
+        Preflight::Settled(status) => status,
+        Preflight::Discover => {
+            let node = api.get_node(&ctx.spec.node_name).await?;
+            let pods = if node.is_some() {
+                api.list_maintenance_pods().await?
+            } else {
+                Vec::new()
+            };
 
-    let status = reconcile_discovery(DiscoveryInput {
-        spec: ctx.spec,
-        generation: ctx.generation,
-        previous: ctx.previous,
-        node: node.as_ref(),
-        pods: &pods,
-        now: ctx.now,
-        not_before_reached: ctx.not_before_reached,
-        deadline_exceeded: ctx.deadline_exceeded,
-    });
+            reconcile_discovery(DiscoveryInput {
+                spec: ctx.spec,
+                generation: ctx.generation,
+                previous: ctx.previous,
+                node: node.as_ref(),
+                pods: &pods,
+                now: &ctx.now.to_string(),
+            })
+        }
+    };
 
     if &status == ctx.previous {
         return Ok(ReconcileOutcome {
@@ -157,13 +160,19 @@ mod tests {
         node: Option<NodeRef>,
         pods: Vec<MaintenancePod>,
         patches: Mutex<Vec<NodeMaintenanceRequestStatus>>,
+        node_calls: Mutex<usize>,
         list_calls: Mutex<usize>,
         fail_patch: bool,
+        fail_get_node: bool,
     }
 
     #[async_trait]
     impl MaintenanceApi for MockApi {
         async fn get_node(&self, _name: &str) -> Result<Option<NodeRef>, String> {
+            *self.node_calls.lock().unwrap() += 1;
+            if self.fail_get_node {
+                return Err("node read rejected".to_string());
+            }
             Ok(self.node.clone())
         }
 
@@ -219,19 +228,140 @@ mod tests {
         api: &MockApi,
         previous: &NodeMaintenanceRequestStatus,
     ) -> Result<ReconcileOutcome, String> {
+        run_spec(api, &spec(), previous).await
+    }
+
+    async fn run_spec(
+        api: &MockApi,
+        spec: &NodeMaintenanceRequestSpec,
+        previous: &NodeMaintenanceRequestStatus,
+    ) -> Result<ReconcileOutcome, String> {
         reconcile_request(
             api,
             RequestContext {
                 name: "req-1",
-                spec: &spec(),
+                spec,
                 generation: Some(1),
                 previous,
-                now: NOW,
-                not_before_reached: true,
-                deadline_exceeded: false,
+                now: NOW.parse().expect("timestamp"),
             },
         )
         .await
+    }
+
+    fn assert_no_discovery(api: &MockApi) {
+        assert_eq!(*api.node_calls.lock().unwrap(), 0);
+        assert_eq!(*api.list_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_expired_request_does_not_depend_on_reading_the_node() {
+        let api = MockApi {
+            fail_get_node: true,
+            pods: vec![pod("kv-0", Some("worker-04"), true)],
+            ..Default::default()
+        };
+        let spec = NodeMaintenanceRequestSpec {
+            deadline: Some("2026-09-06T19:00:00Z".to_string()),
+            ..spec()
+        };
+        let outcome = run_spec(&api, &spec, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Expired);
+        assert_eq!(
+            outcome.status.blocked_reason,
+            Some(MaintenanceBlockedReason::DeadlineExceeded)
+        );
+        assert_no_discovery(&api);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_request_does_not_perform_discovery() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-0", Some("worker-04"), true)],
+            ..Default::default()
+        };
+        let previous = NodeMaintenanceRequestStatus {
+            phase: MaintenancePhase::Released,
+            observed_generation: Some(1),
+            observed_desired_state: Some(MaintenanceDesiredState::Prepare),
+            ..Default::default()
+        };
+        let outcome = run(&api, &previous).await.unwrap();
+
+        assert_eq!(outcome.status, previous);
+        assert!(!outcome.persisted);
+        assert_no_discovery(&api);
+    }
+
+    #[tokio::test]
+    async fn a_release_request_does_not_perform_discovery() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-0", Some("worker-04"), true)],
+            ..Default::default()
+        };
+        let spec = NodeMaintenanceRequestSpec {
+            desired_state: MaintenanceDesiredState::Complete,
+            ..spec()
+        };
+        let previous = NodeMaintenanceRequestStatus {
+            phase: MaintenancePhase::Prepared,
+            observed_generation: Some(1),
+            ..Default::default()
+        };
+        let outcome = run_spec(&api, &spec, &previous).await.unwrap();
+
+        assert_eq!(
+            outcome.status.observed_desired_state,
+            Some(MaintenanceDesiredState::Complete)
+        );
+        assert_no_discovery(&api);
+    }
+
+    #[tokio::test]
+    async fn a_request_before_its_window_does_not_list_pods() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-0", Some("worker-04"), true)],
+            ..Default::default()
+        };
+        let spec = NodeMaintenanceRequestSpec {
+            not_before: Some("2026-09-06T21:00:00Z".to_string()),
+            ..spec()
+        };
+        let outcome = run_spec(&api, &spec, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Requested);
+        assert_no_discovery(&api);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_deadline_blocks_without_discovery() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-0", Some("worker-04"), true)],
+            ..Default::default()
+        };
+        let spec = NodeMaintenanceRequestSpec {
+            deadline: Some("tomorrow".to_string()),
+            ..spec()
+        };
+        let outcome = run_spec(&api, &spec, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Blocked);
+        assert_eq!(
+            outcome.status.blocked_reason,
+            Some(MaintenanceBlockedReason::InvalidDeadline)
+        );
+        assert_no_discovery(&api);
     }
 
     #[tokio::test]

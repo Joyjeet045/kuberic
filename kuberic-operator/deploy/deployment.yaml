@@ -2083,6 +2083,7 @@ spec:
             spec:
               properties:
                 deadline:
+                  format: date-time
                   nullable: true
                   type: string
                 desiredState:
@@ -2095,6 +2096,7 @@ spec:
                 nodeName:
                   type: string
                 notBefore:
+                  format: date-time
                   nullable: true
                   type: string
                 operation:
@@ -2158,6 +2160,8 @@ spec:
                   enum:
                     - NodeNotFound
                     - NodeIncarnationChanged
+                    - InvalidNotBefore
+                    - InvalidDeadline
                     - BlockedByQuorum
                     - NoEligibleTarget
                     - SwitchoverFailed
