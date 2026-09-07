@@ -40,6 +40,96 @@ struct PredicateEvidence {
     passed: bool,
 }
 
+fn library_dependency_lines(manifest: &str) -> Vec<&str> {
+    let mut library_dependencies = false;
+    manifest
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                library_dependencies = trimmed == "[dependencies]"
+                    || (trimmed.starts_with("[target.") && trimmed.ends_with(".dependencies]"));
+                return false;
+            }
+            library_dependencies
+        })
+        .collect()
+}
+
+fn library_dependencies_are_runtime_neutral(manifest: &str) -> bool {
+    let dependencies = library_dependency_lines(manifest);
+    if dependencies.is_empty() {
+        return false;
+    }
+    const ASYNC_RUNTIMES: [&str; 4] = ["tokio", "async-std", "smol", "glommio"];
+    !dependencies.into_iter().any(|line| {
+        let line = line.split('#').next().unwrap_or_default();
+        let Some((name, declaration)) = line.split_once('=') else {
+            return false;
+        };
+        let name = name
+            .trim()
+            .trim_matches('"')
+            .strip_suffix(".workspace")
+            .unwrap_or_else(|| name.trim().trim_matches('"'));
+        ASYNC_RUNTIMES.contains(&name)
+            || ASYNC_RUNTIMES
+                .iter()
+                .any(|runtime| declaration.contains(&format!("package = \"{runtime}\"")))
+    })
+}
+
+#[test]
+fn runtime_neutrality_inspects_only_root_library_dependencies() {
+    let test_only_runtime = r#"
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[features]
+runtime-test = ["tokio/test-util"]
+"#;
+    assert!(library_dependencies_are_runtime_neutral(test_only_runtime));
+
+    let library_runtime = r#"
+[dependencies]
+serde.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+"#;
+    assert!(!library_dependencies_are_runtime_neutral(library_runtime));
+
+    let target_runtime_is_a_library_dependency = r#"
+[dependencies]
+serde.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+tokio.workspace = true
+
+["dev-dependencies"]
+tokio.workspace = true
+"#;
+    assert!(!library_dependencies_are_runtime_neutral(
+        target_runtime_is_a_library_dependency
+    ));
+
+    let renamed_library_runtime = r#"
+[dependencies]
+runtime = { package = "tokio", version = "1" }
+"#;
+    assert!(!library_dependencies_are_runtime_neutral(
+        renamed_library_runtime
+    ));
+
+    assert!(!library_dependencies_are_runtime_neutral(
+        "[dev-dependencies]\ntokio.workspace = true\n"
+    ));
+}
+
 #[test]
 fn mechanically_assesses_the_selected_surface_and_full_denominator() {
     let scenarios = block_on(run_conformance_matrix());
@@ -178,7 +268,7 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         && store_source.contains("async fn compare_and_swap")
         && host_source.contains("pub async fn turn")
         && host_source.contains("pub async fn observe")
-        && !crate_manifest.contains("tokio");
+        && library_dependencies_are_runtime_neutral(crate_manifest);
     let readme = include_str!("../README.md");
     let kernel_scope_documented = readme.contains("not an end-user runtime")
         && readme.contains("Deferred usability roadmap")

@@ -14,10 +14,20 @@ mod failover;
 pub mod failover_election;
 #[cfg(feature = "durable-switchover-pilot")]
 pub mod pilot;
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
 pub mod pilot_store;
 mod remove_replica;
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub mod remove_replica_pilot;
 mod switchover;
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
+pub mod workflow_host;
 
 pub(crate) use add_replica::final_attestation as attest_add_replica;
 pub use add_replica::{decide_add_replica, start_add_replica};
@@ -36,7 +46,7 @@ pub use switchover::{decide, start_switchover};
 pub const ACTION_DEADLINE_SECONDS: i64 = 10;
 const MAX_ERROR_LENGTH: usize = 512;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ReplicaObservation {
     pub status: ReplicaStatusInfo,
     pub control_address: String,

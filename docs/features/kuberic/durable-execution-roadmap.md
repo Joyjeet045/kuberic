@@ -39,9 +39,9 @@ The implemented kernel provides:
   test command after the one-control-plane KinD CI job is provisioned;
 - real-API spike measurements for checkpoint/object size, accepted writes,
   canonical typed watch-event bytes, and unknown-outcome recovery.
-- a feature-gated operator workflow pilot for sets with at most three members
-  that reuses the explicit switchover decisions and `ReplicaAgent` mutation
-  boundary;
+- feature-gated operator workflow pilots for switchover and remove-replica on
+  sets with at most three members, each retaining its explicit implementation
+  as the default and preserving the `ReplicaAgent` mutation boundary;
 - direct kube-controller integration through Send workflow/store futures,
   without another executor or scheduler;
 - same-namespace owner-bound pilot checkpoints, owner garbage-collection
@@ -160,10 +160,10 @@ spike:
    feature-gated real-API coverage through the existing all-features workspace
    test command after the one-control-plane KinD CI job is provisioned.
 
-The operator pilot remains behind two explicit gates and does not authorize a
-workflow-ownership change or broader migration. Its effect-boundary redesign
-uses compact mutable state, combines deterministic transitions in memory, and
-uses fused host progression while preserving exact durable commands,
+The operator integrations remain behind explicit default-off Cargo and runtime
+selection gates and do not authorize a workflow-ownership change or broader
+migration. Both use compact mutable state, combine deterministic transitions in
+memory, and use fused host progression while preserving exact durable commands,
 authoritative observations, and conservative quarantine.
 
 A representative successful three-member execution now records exactly nine
@@ -208,17 +208,59 @@ infrastructure is 1,208/110; operator integration is 1,047/55; the honestly
 charged non-overlapping total is 4,161/326. The explicit implementation remains
 measured at 1,449/172. Charging it as well yields a combined 5,610/498. The
 measurement script rejects overlapping charged scopes. Shared code may
-amortize across later workflows, but this pilot does not claim that
-amortization yet.
+amortize across workflows; the remove-replica port below tests that claim.
 
 A public compact reducer remains deferred. The achieved write gate comes from
 atomic prepared exposure, not history compaction, and no reducer prototype or
 API is introduced.
 
-The remaining step stays deferred: generalize only if later evidence justifies
-the additional operational and implementation cost. No other workflow,
-generic worker, queue, lease, scheduler, retry framework, or compact-envelope
-migration is authorized.
+The second kernel-hosted workflow did **not** demonstrate source-cost
+amortization. The explicit remove-replica baseline is 1,611 executable lines /
+213 decision points. The complete kernel remove workflow is 1,632/162,
+remove-specific operator integration is 1,114/81, and shared reusable
+infrastructure grew by 374/3 from the frozen 1,208/110 baseline. The resulting
+marginal cost is 3,120/246: 1.9367 times the explicit baseline in executable
+lines and 1.1549 times in decision points. Shared growth is 30.96% in lines and
+2.73% in decisions. Both dimensions therefore classify as negative under the
+fixed measurement thresholds.
+
+The isolated async remove workflow body is small at 138/18, but it is not
+representative of the cost of safely hosting the workflow. Workflow-specific
+state, admission, terminal and replay support plus operator effect, recovery,
+routing, and publication integration eliminate that local advantage. This
+answers the roadmap's amortization question: it was tested and was not
+demonstrated.
+
+Three representative successful no-fault three-member ScaleDown executions
+recorded three external effects and two passive observations: five completed
+durable boundaries and six accepted checkpoint writes. The original unfused
+production reconcile loop recorded 11 accepted writes—one exposure and one
+observation write per activity plus terminal persistence. That amplification
+was an integration artifact, not an intrinsic workflow requirement. Fused
+observation/progression now records one initial exposure plus five fused writes
+without changing the three effects, two observations, or five boundaries.
+
+Each run reached an active-checkpoint maximum of approximately 91.6 KiB. The
+reported 5,005–93,837-byte interval is the aggregate lifecycle
+minimum-to-maximum range
+within those executions, not a range of per-run maxima. Repeated local
+validation observed terminal checkpoints from 8,117 to 8,129 bytes, and the
+terminal payload was 2,188 bytes.
+These are run-specific snapshots, not exact byte contracts.
+
+The approximately 91.6 KiB active maximum passes the stable 770,048-byte
+encoded-checkpoint admission ceiling, but exceeds both switchover comparison
+gates: the 65,536-byte (64 KiB) baseline and 32,768-byte (32 KiB) stretch gate.
+This does not violate a formal remove-replica acceptance gate because those
+smaller gates were defined for switchover and were not assigned to this
+workflow. Active checkpoint size grows approximately with the number of durable
+activities multiplied by serialized workflow-state size. The dominant
+contributors are complete retained activity history and repeated full-state
+projections in activity inputs and results. The stable terminal-payload ceiling
+remains 4,096 bytes.
+
+No other workflow, generic worker, queue, lease, scheduler, retry framework, or
+compact-envelope migration is authorized by this result.
 
 ## Explicitly Deferred
 
@@ -229,4 +271,4 @@ The roadmap does not currently commit to:
 - generic automatic compensation;
 - worker queues, leases, or a distributed scheduler;
 - a public orchestration platform;
-- adoption by existing Kuberic workflows.
+- additional Kuberic workflow ports.

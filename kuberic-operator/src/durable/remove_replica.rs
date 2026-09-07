@@ -1,3 +1,4 @@
+// COMPLEXITY-BOUNDARY: explicit-remove:start
 use std::collections::HashSet;
 
 use kuberic_core::remove_replica::{
@@ -1230,6 +1231,7 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
             operation.version, REMOVE_REPLICA_OPERATION_VERSION
         ));
     }
+
     if operation.kind != DurableOperationKind::RemoveReplica {
         return Err("remove decision received another operation kind".to_string());
     }
@@ -1333,6 +1335,13 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
         return Err("remove disposition is not pinned in Poisoned".to_string());
     }
     Ok(())
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub(crate) fn validate_remove_replica_operation(
+    operation: &DurableOperationStatus,
+) -> Result<(), String> {
+    validate_operation(operation)
 }
 
 fn validate_snapshot(snapshot: &StablePartitionSnapshotStatus) -> Result<(), String> {
@@ -1526,7 +1535,10 @@ fn failed_precommit(operation: &DurableOperationStatus, reason: &str) -> Durable
     poison(&next, reason)
 }
 
-fn invalid_removal(operation: &DurableOperationStatus, reason: &str) -> DurableOperationStatus {
+pub(crate) fn invalid_removal(
+    operation: &DurableOperationStatus,
+    reason: &str,
+) -> DurableOperationStatus {
     let mut next = operation.clone();
     let intent = next.remove_intent.as_ref();
     next.removal_disposition = Some(RemoveReplicaDispositionStatus::InvalidRemovalState {
@@ -1657,6 +1669,7 @@ impl From<TargetRetirementObservation> for TargetRetirementObservationStatus {
     }
 }
 
+// COMPLEXITY-BOUNDARY: explicit-remove:end
 #[cfg(test)]
 mod tests {
     use super::*;

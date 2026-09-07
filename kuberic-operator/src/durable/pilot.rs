@@ -6,21 +6,25 @@
 //! lifecycle policy.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, OnceLock},
 };
 
 use async_trait::async_trait;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kuberic_durable_execution::{
-    ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome, CheckpointEnvelope,
-    CheckpointLimits, CheckpointPayload, CheckpointStore, DispatchPermit, DurableActivity,
-    DurableHost, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch,
-    InMemoryCheckpointStore, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
-    KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, LogicalActivityId,
-    PreparedActivityError, PreparedActivityResolver, StorageRevision, StoreError, StoredCheckpoint,
-    TerminalOutcome, Workflow, WorkflowContext, decode_activity_input, decode_activity_result,
-    encode_activity_input, encode_activity_result,
+    ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CheckpointEnvelope,
+    CheckpointLimits, CheckpointPayload, DispatchPermit, DurableActivity, ExactBytes,
+    ExecutionContract, ExecutionId, ExecutionSpec, InMemoryCheckpointStore,
+    KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope, KubernetesCheckpointStore,
+    KubernetesCheckpointStoreOptions, LogicalActivityId, PreparedActivityError,
+    PreparedActivityResolver, TerminalOutcome, Workflow, WorkflowContext, decode_activity_input,
+    decode_activity_result, encode_activity_input, encode_activity_result,
+};
+#[cfg(test)]
+use kuberic_durable_execution::{
+    CasOutcome, CheckpointStore, DurableHost, HostEpoch, StorageRevision, StoreError,
+    StoredCheckpoint,
 };
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -35,7 +39,13 @@ use super::effects::{
     LabelEffectCommand, PilotEffectPreparationError, ReplicaEffectCommand, exact_label_command,
     prepare_replica_effect_command, validate_pilot_replica_action_kind,
 };
+pub use super::pilot_store::DurableCheckpointStore as PilotCheckpointStore;
+#[cfg(test)]
 use super::pilot_store::MeasuredPilotCheckpointStore;
+use super::pilot_store::{
+    CheckpointMeasurementDecoder, DurableActivityAccounting, DurableActivityClass,
+};
+use super::workflow_host::{DurableOperatorHost, DurablePermitGuard, DurableWorkflowRuntime};
 use super::{
     Decision, OperationObservations, decide, start_switchover,
     switchover::{
@@ -57,91 +67,30 @@ pub const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = 752 * 1_024;
 
 const PILOT_ACTIVITY_NAME: &str = "kuberic.switchover.effect-boundary";
 const PILOT_ACTIVITY_VERSION: u32 = 1;
-const MAX_COMPLETED_MEASUREMENT_SNAPSHOTS: usize = 64;
-
-#[derive(Clone)]
-pub enum PilotCheckpointStore {
-    Kubernetes(Box<KubernetesCheckpointStore>),
-    InMemory(InMemoryCheckpointStore),
-}
-
-#[async_trait]
-impl CheckpointStore for PilotCheckpointStore {
-    async fn load(
-        &self,
-        execution_id: ExecutionId,
-    ) -> Result<Option<StoredCheckpoint>, StoreError> {
-        match self {
-            Self::Kubernetes(store) => store.load(execution_id).await,
-            Self::InMemory(store) => store.load(execution_id).await,
-        }
-    }
-
-    async fn compare_and_swap(
-        &self,
-        execution_id: ExecutionId,
-        expected: Option<StorageRevision>,
-        checkpoint: CheckpointEnvelope,
-    ) -> Result<CasOutcome, StoreError> {
-        match self {
-            Self::Kubernetes(store) => {
-                store
-                    .compare_and_swap(execution_id, expected, checkpoint)
-                    .await
-            }
-            Self::InMemory(store) => {
-                store
-                    .compare_and_swap(execution_id, expected, checkpoint)
-                    .await
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-enum PilotStoreFactory {
-    Kubernetes(kube::Client),
-    InMemory(InMemoryCheckpointStore),
-}
-
-pub type PilotHost = DurableHost<MeasuredPilotCheckpointStore>;
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct PilotHostKey {
-    namespace: String,
-    set_name: String,
-    set_uid: String,
-    execution_id: String,
-}
+pub type PilotHost = DurableOperatorHost;
 
 /// Process-local host cache. Checkpoints, rather than this cache, remain the
 /// recovery authority; retaining hosts preserves monotonic attempt counters
 /// within one process epoch.
 pub struct DurableSwitchoverPilotRuntime {
-    factory: PilotStoreFactory,
-    host_epoch: HostEpoch,
-    hosts: Mutex<HashMap<PilotHostKey, Arc<Mutex<PilotHost>>>>,
-    completed_measurements:
-        Mutex<HashMap<PilotHostKey, super::pilot_store::PilotCheckpointMeasurementsSnapshot>>,
+    inner: Arc<DurableWorkflowRuntime>,
 }
 
 impl DurableSwitchoverPilotRuntime {
     pub fn kubernetes(client: kube::Client) -> Self {
         Self {
-            factory: PilotStoreFactory::Kubernetes(client),
-            host_epoch: HostEpoch::from_bytes(random()),
-            hosts: Mutex::new(HashMap::new()),
-            completed_measurements: Mutex::new(HashMap::new()),
+            inner: Arc::new(DurableWorkflowRuntime::kubernetes(client)),
         }
     }
 
     pub fn in_memory(store: InMemoryCheckpointStore) -> Self {
         Self {
-            factory: PilotStoreFactory::InMemory(store),
-            host_epoch: HostEpoch::from_bytes(random()),
-            hosts: Mutex::new(HashMap::new()),
-            completed_measurements: Mutex::new(HashMap::new()),
+            inner: Arc::new(DurableWorkflowRuntime::in_memory(store)),
         }
+    }
+
+    pub fn shared(inner: Arc<DurableWorkflowRuntime>) -> Self {
+        Self { inner }
     }
 
     pub async fn host(
@@ -152,65 +101,30 @@ impl DurableSwitchoverPilotRuntime {
         reference: &DurableSwitchoverPilotStatus,
     ) -> Result<Arc<Mutex<PilotHost>>, String> {
         let execution_id = execution_id(reference)?;
-        let key = PilotHostKey {
-            namespace: namespace.to_string(),
-            set_name: set_name.to_string(),
-            set_uid: set_uid.to_string(),
-            execution_id: reference.execution_id.clone(),
-        };
-        let mut hosts = self.hosts.lock().await;
-        if let Some(host) = hosts.get(&key) {
-            return Ok(host.clone());
-        }
-        self.completed_measurements.lock().await.remove(&key);
-        let store = match &self.factory {
-            PilotStoreFactory::Kubernetes(client) => {
-                let options = checkpoint_store_options(namespace, set_name, set_uid)?;
-                PilotCheckpointStore::Kubernetes(Box::new(
-                    KubernetesCheckpointStore::with_options(client.clone(), namespace, options)
-                        .map_err(|error| {
-                            format!("construct durable switchover checkpoint store: {error}")
-                        })?,
-                ))
-            }
-            PilotStoreFactory::InMemory(store) => PilotCheckpointStore::InMemory(store.clone()),
-        };
-        let host = Arc::new(Mutex::new(DurableHost::new(
-            MeasuredPilotCheckpointStore::new(execution_id, store),
-            self.host_epoch,
-            checkpoint_limits(),
-        )));
-        hosts.insert(key.clone(), host.clone());
-        let expected_name = KubernetesCheckpointStore::object_name(execution_id);
-        if expected_name != reference.checkpoint_name {
-            hosts.remove(&key);
-            return Err("durable switchover checkpoint identity changed".to_string());
-        }
-        Ok(host)
+        self.inner
+            .host(
+                namespace,
+                set_name,
+                set_uid,
+                "switchover",
+                execution_id,
+                &reference.execution_id,
+                &reference.checkpoint_name,
+                checkpoint_store_options(namespace, set_name, set_uid)?,
+                checkpoint_limits(),
+                checkpoint_measurement_decoder(),
+            )
+            .await
     }
 
     pub async fn forget(&self, namespace: &str, set_name: &str, set_uid: &str, execution_id: &str) {
-        let key = PilotHostKey {
-            namespace: namespace.to_string(),
-            set_name: set_name.to_string(),
-            set_uid: set_uid.to_string(),
-            execution_id: execution_id.to_string(),
-        };
-        let host = self.hosts.lock().await.remove(&key);
-        if let Some(host) = host {
-            let measurements = host.lock().await.store().measurements();
-            let mut completed = self.completed_measurements.lock().await;
-            if completed.len() == MAX_COMPLETED_MEASUREMENT_SNAPSHOTS {
-                if let Some(eviction_candidate) = completed.keys().next().cloned() {
-                    completed.remove(&eviction_candidate);
-                }
-            }
-            completed.insert(key, measurements);
-        }
+        self.inner
+            .forget(namespace, set_name, set_uid, "switchover", execution_id)
+            .await;
     }
 
     pub async fn host_count(&self) -> usize {
-        self.hosts.lock().await.len()
+        self.inner.host_count().await
     }
 
     pub async fn measurements(
@@ -220,16 +134,9 @@ impl DurableSwitchoverPilotRuntime {
         set_uid: &str,
         execution_id: &str,
     ) -> Option<super::pilot_store::PilotCheckpointMeasurementsSnapshot> {
-        let key = PilotHostKey {
-            namespace: namespace.to_string(),
-            set_name: set_name.to_string(),
-            set_uid: set_uid.to_string(),
-            execution_id: execution_id.to_string(),
-        };
-        if let Some(host) = self.hosts.lock().await.get(&key).cloned() {
-            return Some(host.lock().await.store().measurements());
-        }
-        self.completed_measurements.lock().await.get(&key).copied()
+        self.inner
+            .measurements(namespace, set_name, set_uid, "switchover", execution_id)
+            .await
     }
 }
 
@@ -676,6 +583,37 @@ pub fn decode_pilot_activity_input(
         ));
     }
     Ok(input)
+}
+
+fn classify_checkpoint_activity(input: &ExactBytes) -> Option<DurableActivityClass> {
+    let input = decode_pilot_activity_input(input).ok()?;
+    Some(match input.kind {
+        PilotActivityKind::PassiveObservation => DurableActivityClass::PassiveObservation,
+        PilotActivityKind::PreparedReplica { .. } | PilotActivityKind::PreparedLabel { .. } => {
+            DurableActivityClass::ExternalEffect
+        }
+    })
+}
+
+fn decode_checkpoint_terminal_accounting(
+    outcome: &TerminalOutcome,
+    completed_activity_count: u64,
+) -> Option<DurableActivityAccounting> {
+    decode_terminal_activity_accounting(outcome, completed_activity_count)
+        .ok()
+        .flatten()
+        .map(|accounting| DurableActivityAccounting {
+            external_effect_count: accounting.external_effect_count,
+            passive_observation_count: accounting.passive_observation_count,
+        })
+}
+
+pub fn checkpoint_measurement_decoder() -> CheckpointMeasurementDecoder {
+    CheckpointMeasurementDecoder::new(
+        "switchover",
+        classify_checkpoint_activity,
+        decode_checkpoint_terminal_accounting,
+    )
 }
 
 pub fn validate_prepared_activity(
@@ -1166,13 +1104,13 @@ fn preparation_error(error: PilotEffectPreparationError) -> PreparedActivityErro
 }
 
 pub struct PilotPermitGuard {
-    permit: Option<DispatchPermit>,
+    inner: DurablePermitGuard,
 }
 
 impl PilotPermitGuard {
     pub fn new(permit: DispatchPermit) -> Self {
         Self {
-            permit: Some(permit),
+            inner: DurablePermitGuard::new(permit),
         }
     }
 
@@ -1188,27 +1126,12 @@ impl PilotPermitGuard {
             state: DurableSwitchoverState::from_operation(operation),
             kind: prepared.clone(),
         })?;
-        let permit = self
-            .permit
-            .as_ref()
-            .ok_or_else(|| "durable switchover dispatch permit was already consumed".to_string())?;
-        if permit.attempt_id() != attempt_id
-            || permit.activity() != expected_activity
-            || permit.activity().spec() != &expected
-        {
-            return Err(
-                "durable switchover dispatch permit does not match prepared operation or attempt"
-                    .to_string(),
-            );
-        }
-        Ok(self
-            .permit
-            .take()
-            .expect("permit existence checked before consumption"))
+        self.inner
+            .consume(&expected, expected_activity, attempt_id, "switchover")
     }
 
     pub fn activity(&self) -> Option<&LogicalActivityId> {
-        self.permit.as_ref().map(DispatchPermit::activity)
+        self.inner.activity()
     }
 }
 

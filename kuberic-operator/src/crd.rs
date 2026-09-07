@@ -54,6 +54,14 @@ pub struct KubericSetSpec {
     #[serde(default)]
     pub switchover_execution_mode: SwitchoverExecutionMode,
 
+    /// Execution engine for newly accepted replica removals.
+    ///
+    /// The durable pilot also requires an operator binary built with the
+    /// matching compile-time feature. Existing and omitted values remain on
+    /// the explicit CRD-backed state machine.
+    #[serde(default)]
+    pub remove_replica_execution_mode: RemoveReplicaExecutionMode,
+
     /// Port for the application container.
     #[serde(default = "default_port")]
     pub port: i32,
@@ -124,6 +132,11 @@ pub struct KubericSetStatus {
     /// switchover pilot. Per-phase progress lives only in its checkpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durable_switchover_pilot: Option<DurableSwitchoverPilotStatus>,
+
+    /// Immutable reference for the current or most recent durable-execution
+    /// remove-replica pilot. Per-phase progress lives only in its checkpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durable_remove_replica_pilot: Option<DurableRemoveReplicaPilotStatus>,
 
     /// Kubernetes-style conditions describing durable operation state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -200,6 +213,31 @@ pub struct DurableSwitchoverPilotStatus {
     /// creation or effect dispatch.
     pub initial_operation_json: String,
 }
+
+// COMPLEXITY-BOUNDARY: remove-replica-crd-integration:start
+/// Execution engine selected when a new replica removal is accepted.
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoveReplicaExecutionMode {
+    #[default]
+    Explicit,
+    DurablePilot,
+}
+
+/// Immutable authority needed to reconstruct one durable remove execution.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableRemoveReplicaPilotStatus {
+    pub version: u32,
+    /// Lowercase hexadecimal kernel execution identity.
+    pub execution_id: String,
+    /// Deterministic provider object name derived from `execution_id`.
+    pub checkpoint_name: String,
+    /// Exact JSON encoding of the initial operation accepted before checkpoint
+    /// creation or effect dispatch.
+    pub initial_operation_json: String,
+}
+// COMPLEXITY-BOUNDARY: remove-replica-crd-integration:end
 
 /// Schema-safe persisted form of the core stable partition snapshot.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -1002,6 +1040,7 @@ mod tests {
         assert!(status.stable_snapshot.is_none());
         assert!(status.operation.is_none());
         assert!(status.durable_switchover_pilot.is_none());
+        assert!(status.durable_remove_replica_pilot.is_none());
         assert!(status.conditions.is_empty());
         assert!(
             serde_json::to_value(status)
@@ -1046,6 +1085,45 @@ mod tests {
             assert!(
                 deployment.contains(required),
                 "missing deployed pilot schema {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_replica_execution_mode_defaults_to_explicit_and_round_trips_pilot() {
+        let explicit: KubericSetSpec =
+            serde_json::from_value(serde_json::json!({"image": "test:latest"})).unwrap();
+        assert_eq!(
+            explicit.remove_replica_execution_mode,
+            RemoveReplicaExecutionMode::Explicit
+        );
+
+        let pilot: KubericSetSpec = serde_json::from_value(serde_json::json!({
+            "image": "test:latest",
+            "removeReplicaExecutionMode": "durablePilot"
+        }))
+        .unwrap();
+        assert_eq!(
+            pilot.remove_replica_execution_mode,
+            RemoveReplicaExecutionMode::DurablePilot
+        );
+
+        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
+        let deployment = include_str!("../deploy/deployment.yaml");
+        for required in [
+            "removeReplicaExecutionMode",
+            "durablePilot",
+            "durableRemoveReplicaPilot",
+            "checkpointName",
+            "initialOperationJson",
+        ] {
+            assert!(
+                generated.contains(required),
+                "missing generated durable remove schema {required}"
+            );
+            assert!(
+                deployment.contains(required),
+                "missing deployed durable remove schema {required}"
             );
         }
     }

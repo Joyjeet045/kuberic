@@ -34,10 +34,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sets: Api<KubericSet> = Api::all(client.clone());
     let pods: Api<Pod> = Api::all(client.clone());
 
-    #[cfg(feature = "durable-switchover-pilot")]
-    let state = ReconcilerState::with_durable_switchover_client(client.clone());
-    #[cfg(not(feature = "durable-switchover-pilot"))]
+    // COMPLEXITY-BOUNDARY: shared-durable-main-wiring:start
+    #[cfg(any(
+        feature = "durable-switchover-pilot",
+        feature = "durable-remove-replica-pilot"
+    ))]
+    let state = ReconcilerState::with_durable_client(client.clone());
+    #[cfg(not(any(
+        feature = "durable-switchover-pilot",
+        feature = "durable-remove-replica-pilot"
+    )))]
     let state = ReconcilerState::default();
+    // COMPLEXITY-BOUNDARY: shared-durable-main-wiring:end
 
     let ctx = Arc::new(Context {
         api: KubeClusterApi {

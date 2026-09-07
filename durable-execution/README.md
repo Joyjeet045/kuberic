@@ -368,11 +368,12 @@ not reproduction of an actual network fault.
 The feasibility test reruns the sole conformance registry, emits every
 assertion, measures the FR-012 surface, and applies the exhaustive FR-014
 three-way classifier. The revised evidence contains 45 unique contiguous
-scenarios and 134 structured assertions; all pass. All five FR-012 authoring
+scenarios and 135 structured assertions; all pass. All five FR-012 authoring
 predicates and all five provider, bounding, lifecycle, and documentation
-predicates also pass. The mechanically derived result is **conditionally
-feasible** within this kernel's stated boundary because the operator pilot
-retains a documented write-efficiency exception.
+predicates also pass. The async runtime-neutrality predicate examines the
+library `[dependencies]` table rather than test-only dependencies and retains a
+negative fixture for a real library runtime dependency. The mechanically
+derived result is **feasible** within this kernel's stated boundary.
 
 ## Deferred usability roadmap
 
@@ -403,6 +404,18 @@ passive convergence, tracing/inspection, timers, retries, parallelism, generic
 lifecycle APIs, queries, external events, child workflows, workers, queues,
 leases, and distributed runtime ownership are excluded. So are migrations,
 upgrade guarantees, broad rollout, and production diagnostics. The
-feature-gated pilot integrates typed calls and operator-owned effect adapters;
-it does not change `ReplicaAgent`, the gRPC protocol, default explicit
-switchover, or any other topology workflow.
+feature-gated switchover and remove-replica pilots integrate typed calls and
+operator-owned effect adapters. Both Cargo features are default-off, and both
+workflows retain their explicit implementations as the runtime default. Neither
+changes `ReplicaAgent` or the gRPC protocol.
+
+The second workflow did not demonstrate source-cost amortization. The explicit
+remove baseline is 1,611 executable lines / 213 decision points; the complete
+kernel workflow is 1,632/162; remove-specific operator integration is 1,114/81;
+and shared infrastructure grew by 374/3. The resulting marginal cost is
+3,120/246, or 1.9367 times the explicit lines and 1.1549 times the explicit
+decisions. Shared growth is 30.96%/2.73%, so both dimensions classify as
+negative. The isolated async workflow body is 138/18, but that scope is not
+representative once workflow-specific support and operator integration are
+charged. The full measured result and boundary are recorded in the
+[Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).

@@ -16,6 +16,11 @@ durable-switchover-pilot = [
     "kuberic-durable-execution/kubernetes",
     "dep:rand",
 ]
+durable-remove-replica-pilot = [
+    "dep:kuberic-durable-execution",
+    "kuberic-durable-execution/kubernetes",
+    "dep:rand",
+]
 
 [[bin]]
 name = "kuberic-operator"

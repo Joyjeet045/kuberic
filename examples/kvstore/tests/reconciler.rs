@@ -36,6 +36,8 @@ use kuberic_core::types::{
 };
 
 use kuberic_operator::cluster_api::ClusterApi;
+#[cfg(feature = "durable-remove-replica-pilot")]
+use kuberic_operator::crd::RemoveReplicaExecutionMode;
 use kuberic_operator::crd::{
     DurableActionKind, DurableAddMode, DurableOperationKind, DurableOperationPhase,
     DurableRemoveMode, KubericSet, KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy,
@@ -1177,6 +1179,7 @@ fn make_set_with_min(
             failover_delay: 0,
             switchover_delay: 3600,
             switchover_execution_mode: Default::default(),
+            remove_replica_execution_mode: Default::default(),
             port: 8080,
             control_port: 9090,
             data_port: 9091,
@@ -1367,6 +1370,17 @@ fn make_pilot_set(name: &str, replicas: i32, status: Option<KubericSetStatus>) -
     set
 }
 
+#[cfg(feature = "durable-remove-replica-pilot")]
+fn make_remove_pilot_set(
+    name: &str,
+    replicas: i32,
+    status: Option<KubericSetStatus>,
+) -> KubericSet {
+    let mut set = make_set(name, replicas, status);
+    set.spec.remove_replica_execution_mode = RemoveReplicaExecutionMode::DurablePilot;
+    set
+}
+
 async fn drive_pilot_switchover(
     api: &KvClusterApi,
     state: &ReconcilerState,
@@ -1389,6 +1403,194 @@ async fn drive_pilot_switchover(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("durable execution switchover pilot did not reach Healthy: {status:?}");
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn drive_remove_pilot(
+    api: &KvClusterApi,
+    state: &ReconcilerState,
+    store: &kuberic_durable_execution::InMemoryCheckpointStore,
+    name: &str,
+    replicas: i32,
+    mut status: KubericSetStatus,
+) -> KubericSetStatus {
+    for _ in 0..240 {
+        reconcile_set(
+            &make_remove_pilot_set(name, replicas, Some(status.clone())),
+            api,
+            state,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    use kuberic_durable_execution::CheckpointStore;
+    let reference = status.durable_remove_replica_pilot.as_ref().unwrap();
+    let execution =
+        kuberic_operator::durable::remove_replica_pilot::execution_spec(reference).unwrap();
+    let stored = store.load(execution.execution_id()).await.unwrap().unwrap();
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(
+            &execution,
+            kuberic_operator::durable::remove_replica_pilot::checkpoint_limits(),
+        )
+        .unwrap();
+    let checkpoint_summary = if let Some((outcome, count)) = payload.terminal_outcome() {
+        format!("terminal count={count} outcome={outcome:?}")
+    } else if let Some(last) = payload
+        .active_activities()
+        .and_then(|activities| activities.last())
+    {
+        let input = kuberic_operator::durable::remove_replica_pilot::decode_remove_activity_input(
+            last.input(),
+        )
+        .unwrap();
+        let kind = match input.kind {
+            kuberic_operator::durable::remove_replica_pilot::RemoveReplicaActivityKind::PassiveObservation => "passive",
+            kuberic_operator::durable::remove_replica_pilot::RemoveReplicaActivityKind::PreparedReplica { .. } => "replica",
+            kuberic_operator::durable::remove_replica_pilot::RemoveReplicaActivityKind::PreparedLabel { .. } => "label",
+            kuberic_operator::durable::remove_replica_pilot::RemoveReplicaActivityKind::PreparedDelete { .. } => "delete",
+        };
+        let state = match last.state() {
+            kuberic_durable_execution::ActivityState::Scheduled => "scheduled",
+            kuberic_durable_execution::ActivityState::DispatchExposed { .. } => "exposed",
+            kuberic_durable_execution::ActivityState::Completed { .. } => "completed",
+        };
+        format!(
+            "active phase={:?} kind={kind} state={state}",
+            input.state.phase
+        )
+    } else {
+        "active without activities".to_string()
+    };
+    panic!(
+        "durable execution remove-replica pilot did not reach Healthy: condition={:?} checkpoint={checkpoint_summary}",
+        status.conditions.last()
+    );
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn accept_remove_pilot(
+    api: &KvClusterApi,
+    state: &ReconcilerState,
+    name: &str,
+    desired_replicas: i32,
+    status: KubericSetStatus,
+) -> KubericSetStatus {
+    reconcile_set(
+        &make_remove_pilot_set(name, desired_replicas, Some(status)),
+        api,
+        state,
+    )
+    .await
+    .unwrap();
+    let accepted = api.last_status().unwrap();
+    assert_eq!(accepted.phase, Phase::RemovingReplica);
+    assert!(accepted.operation.is_none());
+    assert!(accepted.durable_remove_replica_pilot.is_some());
+    accepted
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn current_remove_pilot_operation(
+    store: &kuberic_durable_execution::InMemoryCheckpointStore,
+    status: &KubericSetStatus,
+) -> Option<kuberic_operator::crd::DurableOperationStatus> {
+    use kuberic_durable_execution::{ActivityState, CheckpointStore};
+    use kuberic_operator::durable::remove_replica_pilot::{
+        DurableRemoveReplicaStepResult, checkpoint_limits, decode_activity_step_result,
+        decode_remove_activity_input, execution_id, execution_spec, initial_operation,
+    };
+
+    let reference = status.durable_remove_replica_pilot.as_ref()?;
+    let stored = store.load(execution_id(reference).ok()?).await.ok()??;
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(&execution_spec(reference).ok()?, checkpoint_limits())
+        .ok()?;
+    let last = payload.active_activities()?.last()?;
+    let initial = initial_operation(reference).ok()?;
+    let state = match last.state() {
+        ActivityState::Scheduled | ActivityState::DispatchExposed { .. } => {
+            decode_remove_activity_input(last.input()).ok()?.state
+        }
+        ActivityState::Completed { result } => match decode_activity_step_result(result).ok()? {
+            DurableRemoveReplicaStepResult::Advance { operation, .. }
+            | DurableRemoveReplicaStepResult::ProvenNoAdmission { operation, .. } => operation,
+        },
+    };
+    state.apply_to(&initial).ok()
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn live_remove_pilot_progress(
+    api: &KvClusterApi,
+    store: &kuberic_durable_execution::InMemoryCheckpointStore,
+    name: &str,
+    replicas: i32,
+    status: &KubericSetStatus,
+) -> Option<RemoveReplicaProgress> {
+    let operation = current_remove_pilot_operation(store, status).await?;
+    let intent = operation.remove_intent.as_ref()?;
+    let primary = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| {
+            pod.metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("kuberic.io/pod-index"))
+                .and_then(|index| index.parse::<i64>().ok())
+                .map(|index| index + 1)
+                == Some(operation.old_primary_id)
+        })
+        .cloned()?;
+    let handle = api
+        .create_replica_handle(
+            operation.old_primary_id,
+            &primary,
+            &make_set(name, replicas, None).spec,
+        )
+        .await
+        .ok()?;
+    let observed = handle.get_status().await.ok()?;
+    observed
+        .agent
+        .current_action
+        .as_ref()
+        .into_iter()
+        .chain(observed.agent.retained_terminal_actions.iter().rev())
+        .find(|observation| observation.action.action_id == intent.action_id)
+        .and_then(|observation| observation.action.remove_replica_progress.clone())
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn remove_pilot_checkpoint_is_terminal(
+    store: &kuberic_durable_execution::InMemoryCheckpointStore,
+    status: &KubericSetStatus,
+) -> bool {
+    use kuberic_durable_execution::CheckpointStore;
+    use kuberic_operator::durable::remove_replica_pilot::{
+        checkpoint_limits, execution_id, execution_spec,
+    };
+
+    let Some(reference) = status.durable_remove_replica_pilot.as_ref() else {
+        return false;
+    };
+    let Ok(Some(stored)) = store.load(execution_id(reference).unwrap()).await else {
+        return false;
+    };
+    stored
+        .checkpoint()
+        .decode_and_validate(&execution_spec(reference).unwrap(), checkpoint_limits())
+        .is_ok_and(|payload| payload.terminal_outcome().is_some())
 }
 
 async fn pilot_checkpoint_ready_for_terminal(
@@ -6335,6 +6537,762 @@ async fn test_committed_degraded_fences_unreachable_target_from_serving() {
             .conditions
             .iter()
             .any(|condition| { condition.reason == "CommittedDegraded" })
+    );
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_happy_path() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-happy", 3).await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+
+    reconcile_set(
+        &make_remove_pilot_set("remove-pilot-happy", 2, Some(status)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let accepted = api.last_status().unwrap();
+    assert_eq!(accepted.phase, Phase::RemovingReplica);
+    assert!(accepted.operation.is_none());
+    assert!(accepted.durable_remove_replica_pilot.is_some());
+    let reference = accepted.durable_remove_replica_pilot.clone().unwrap();
+
+    api.reset_operations();
+    let completed =
+        drive_remove_pilot(&api, &state, &store, "remove-pilot-happy", 2, accepted).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.stable_snapshot.as_ref().unwrap().members.len(), 2);
+    assert!(completed.operation.is_none());
+    assert_eq!(
+        completed
+            .durable_remove_replica_pilot
+            .as_ref()
+            .unwrap()
+            .execution_id,
+        reference.execution_id
+    );
+    assert_one_coarse_remove_intent_and_no_fine_grained_controls(&api.operations());
+
+    use kuberic_durable_execution::CheckpointStore;
+    let execution =
+        kuberic_operator::durable::remove_replica_pilot::execution_spec(&reference).unwrap();
+    let terminal = store.load(execution.execution_id()).await.unwrap().unwrap();
+    let terminal_bytes = terminal.checkpoint().encoded_len().unwrap();
+    let payload = terminal
+        .checkpoint()
+        .decode_and_validate(
+            &execution,
+            kuberic_operator::durable::remove_replica_pilot::checkpoint_limits(),
+        )
+        .unwrap();
+    let (outcome, durable_boundaries) = payload.terminal_outcome().unwrap();
+    let terminal_payload_bytes = outcome.payload().as_slice().len();
+    let measurements = state
+        .durable_remove_replica_pilot
+        .as_ref()
+        .unwrap()
+        .measurements(
+            "default",
+            "remove-pilot-happy",
+            "test-uid",
+            &reference.execution_id,
+        )
+        .await
+        .unwrap();
+    println!(
+        concat!(
+            "KUBERIC_REMOVE_REPLICA_MEASUREMENT sample=1 ",
+            "external_effects={} passive_observations={} durable_boundaries={} ",
+            "checkpoint_accepted_writes={} active_checkpoint_bytes={} ",
+            "maximum_active_checkpoint_bytes={} terminal_checkpoint_bytes={} ",
+            "terminal_payload_bytes={}"
+        ),
+        measurements.completed_external_effect_count.unwrap(),
+        measurements.completed_passive_observation_count.unwrap(),
+        durable_boundaries,
+        measurements.accepted_writes,
+        measurements.latest_active_checkpoint_bytes.unwrap(),
+        measurements.maximum_active_checkpoint_bytes,
+        terminal_bytes,
+        terminal_payload_bytes,
+    );
+    assert!(
+        measurements.maximum_active_checkpoint_bytes
+            <= kuberic_operator::durable::remove_replica_pilot::REMOVE_REPLICA_PILOT_MAX_ENCODED_CHECKPOINT_BYTES
+    );
+    assert!(
+        terminal_payload_bytes
+            <= usize::try_from(
+                kuberic_operator::durable::remove_replica_pilot::REMOVE_REPLICA_PILOT_MAX_TERMINAL_BYTES
+            )
+            .unwrap()
+    );
+
+    reconcile_set(
+        &make_set("remove-pilot-happy", 3, Some(completed)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    let restored = drive_add_replica(
+        &api,
+        &state,
+        "remove-pilot-happy",
+        3,
+        api.last_status().unwrap(),
+    )
+    .await;
+    reconcile_set(
+        &make_set("remove-pilot-happy", 2, Some(restored)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let later_default = api.last_status().unwrap();
+    assert_eq!(later_default.phase, Phase::RemovingReplica);
+    assert!(later_default.operation.is_some());
+    assert!(
+        later_default.durable_remove_replica_pilot.is_none(),
+        "a retained terminal durable remove reference must not hijack a later default removal"
+    );
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_default_remains_explicit() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-default-explicit", 3).await;
+    let state = ReconcilerState::with_durable_remove_replica_store(
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    );
+
+    reconcile_set(
+        &make_set("remove-default-explicit", 2, Some(status)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let accepted = api.last_status().unwrap();
+    assert_eq!(accepted.phase, Phase::RemovingReplica);
+    assert!(accepted.operation.is_some());
+    assert!(accepted.durable_remove_replica_pilot.is_none());
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_unsupported_feature_rejected() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-no-runtime", 3).await;
+    let status_count = api.statuses.lock().unwrap().len();
+
+    let error = reconcile_set(
+        &make_remove_pilot_set("remove-no-runtime", 2, Some(status)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .err()
+    .expect("durable selection without a configured runtime must be rejected");
+    assert!(error.contains("runtime is not configured"), "{error}");
+    assert_eq!(api.statuses.lock().unwrap().len(), status_count);
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_every_turn_restart() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-restart", 3).await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let initial_state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let mut status =
+        accept_remove_pilot(&api, &initial_state, "remove-pilot-restart", 2, status).await;
+    let execution_id = status
+        .durable_remove_replica_pilot
+        .as_ref()
+        .unwrap()
+        .execution_id
+        .clone();
+    api.reset_operations();
+
+    for _ in 0..240 {
+        let restarted = ReconcilerState::with_durable_remove_replica_store(store.clone());
+        reconcile_set(
+            &make_remove_pilot_set("remove-pilot-restart", 2, Some(status.clone())),
+            &api,
+            &restarted,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(status.phase, Phase::Healthy);
+    assert_eq!(
+        status
+            .durable_remove_replica_pilot
+            .as_ref()
+            .unwrap()
+            .execution_id,
+        execution_id
+    );
+    assert_one_coarse_remove_intent_and_no_fine_grained_controls(&api.operations());
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_lost_reply() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-lost-reply", 3).await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let accepted = accept_remove_pilot(&api, &state, "remove-pilot-lost-reply", 2, status).await;
+    api.reset_operations();
+    api.fail_after_next_durable_action(ControlOperation::RemoveReplicaIntent);
+
+    let completed =
+        drive_remove_pilot(&api, &state, &store, "remove-pilot-lost-reply", 2, accepted).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_one_coarse_remove_intent_and_no_fine_grained_controls(&api.operations());
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_proven_no_admission() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-no-admission", 3).await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let accepted = accept_remove_pilot(&api, &state, "remove-pilot-no-admission", 2, status).await;
+    api.reset_operations();
+    api.reject_before_next_durable_action(ControlOperation::RemoveReplicaIntent);
+
+    let completed = drive_remove_pilot(
+        &api,
+        &state,
+        &store,
+        "remove-pilot-no-admission",
+        2,
+        accepted,
+    )
+    .await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RemoveReplicaIntent)
+            .count(),
+        2,
+        "one proven non-admission permits exactly one fresh redelivery"
+    );
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_checkpoint_conflict() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-conflict", 3).await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let accepted = accept_remove_pilot(&api, &state, "remove-pilot-conflict", 2, status).await;
+    store
+        .fail_next_compare_and_swap(kuberic_durable_execution::InMemoryFault::ConflictWithoutApply);
+    reconcile_set(
+        &make_remove_pilot_set("remove-pilot-conflict", 2, Some(accepted.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let after_conflict = api.last_status().unwrap();
+    assert!(after_conflict.conditions.iter().any(|condition| {
+        condition.type_ == "DurableRemoveReplicaPilot" && condition.reason == "ReloadRequired"
+    }));
+
+    api.reset_operations();
+    let completed = drive_remove_pilot(
+        &api,
+        &state,
+        &store,
+        "remove-pilot-conflict",
+        2,
+        after_conflict,
+    )
+    .await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_one_coarse_remove_intent_and_no_fine_grained_controls(&api.operations());
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_unknown_checkpoint_outcome() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-unknown", 3).await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let accepted = accept_remove_pilot(&api, &state, "remove-pilot-unknown", 2, status).await;
+    store.fail_next_compare_and_swap(
+        kuberic_durable_execution::InMemoryFault::OutcomeUnknownAfterApply,
+    );
+    reconcile_set(
+        &make_remove_pilot_set("remove-pilot-unknown", 2, Some(accepted)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let after_unknown = api.last_status().unwrap();
+    assert!(after_unknown.conditions.iter().any(|condition| {
+        condition.type_ == "DurableRemoveReplicaPilot" && condition.reason == "ReloadRequired"
+    }));
+
+    api.reset_operations();
+    let completed = drive_remove_pilot(
+        &api,
+        &state,
+        &store,
+        "remove-pilot-unknown",
+        2,
+        after_unknown,
+    )
+    .await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_one_coarse_remove_intent_and_no_fine_grained_controls(&api.operations());
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_stale_uid() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-stale-uid", 3).await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store);
+    let accepted = accept_remove_pilot(&api, &state, "remove-pilot-stale-uid", 2, status).await;
+    let target_name = "remove-pilot-stale-uid-2".to_string();
+    api.crash_pod(&target_name);
+    api.restart_pod(&target_name).await;
+    api.reset_operations();
+
+    reconcile_set(
+        &make_remove_pilot_set("remove-pilot-stale-uid", 2, Some(accepted)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !api.operations()
+            .contains(&ControlOperation::RemoveReplicaIntent)
+    );
+    assert_eq!(api.last_status().unwrap().phase, Phase::RemovingReplica);
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_stale_incarnation() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-stale-incarnation", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store);
+    let accepted =
+        accept_remove_pilot(&api, &state, "remove-pilot-stale-incarnation", 2, status).await;
+    api.crash_pod(&primary);
+    api.restart_pod(&primary).await;
+    api.reset_operations();
+
+    reconcile_set(
+        &make_remove_pilot_set("remove-pilot-stale-incarnation", 2, Some(accepted)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !api.operations()
+            .contains(&ControlOperation::RemoveReplicaIntent)
+    );
+    assert_eq!(api.last_status().unwrap().phase, Phase::RemovingReplica);
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_stale_generation() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-stale-generation", 3).await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store);
+    let accepted =
+        accept_remove_pilot(&api, &state, "remove-pilot-stale-generation", 2, status).await;
+    let target_name = "remove-pilot-stale-generation-2";
+    api.crash_pod(target_name);
+    api.restart_process_same_pod_uid(target_name).await;
+    api.reset_operations();
+
+    reconcile_set(
+        &make_remove_pilot_set("remove-pilot-stale-generation", 2, Some(accepted)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !api.operations()
+            .contains(&ControlOperation::RemoveReplicaIntent)
+    );
+    assert_eq!(api.last_status().unwrap().phase, Phase::RemovingReplica);
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_force_authority() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-force", 3).await;
+    let target = status
+        .stable_snapshot
+        .as_ref()
+        .unwrap()
+        .members
+        .iter()
+        .filter(|member| member.id != status.stable_snapshot.as_ref().unwrap().primary_id)
+        .max_by_key(|member| member.id)
+        .unwrap()
+        .clone();
+    api.delete_pod(
+        "default",
+        &format!("remove-pilot-force-{}", target.id - 1),
+        &target.instance_id,
+    )
+    .await
+    .unwrap();
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let accepted = accept_remove_pilot(&api, &state, "remove-pilot-force", 3, status).await;
+    let initial = kuberic_operator::durable::remove_replica_pilot::initial_operation(
+        accepted.durable_remove_replica_pilot.as_ref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(initial.remove_mode, Some(DurableRemoveMode::Force));
+    assert!(initial.remove_target_agent_generation.is_none());
+
+    api.reset_operations();
+    let completed =
+        drive_remove_pilot(&api, &state, &store, "remove-pilot-force", 3, accepted).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.stable_snapshot.as_ref().unwrap().members.len(), 2);
+    assert_one_coarse_remove_intent_and_no_fine_grained_controls(&api.operations());
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_repeated_execution_identity() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-identities", 3).await;
+    let state = ReconcilerState::with_durable_remove_replica_store(
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    );
+    let first =
+        accept_remove_pilot(&api, &state, "remove-pilot-identities", 2, status.clone()).await;
+    let second = accept_remove_pilot(&api, &state, "remove-pilot-identities", 2, status).await;
+    let first = first.durable_remove_replica_pilot.unwrap();
+    let second = second.durable_remove_replica_pilot.unwrap();
+    assert_ne!(first.execution_id, second.execution_id);
+    assert_ne!(first.checkpoint_name, second.checkpoint_name);
+    assert_ne!(first.initial_operation_json, second.initial_operation_json);
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn assert_remove_terminal_reload_after_status_failure(name: &str) {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, name, 3).await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let mut status = accept_remove_pilot(&api, &state, name, 2, status).await;
+
+    for _ in 0..240 {
+        let ready_for_terminal = current_remove_pilot_operation(&store, &status)
+            .await
+            .is_some_and(|operation| {
+                operation.phase == DurableOperationPhase::RemoveDeleteTargetPod
+            });
+        if ready_for_terminal && !remove_pilot_checkpoint_is_terminal(&store, &status).await {
+            break;
+        }
+        reconcile_set(
+            &make_remove_pilot_set(name, 2, Some(status.clone())),
+            &api,
+            &state,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(status.phase, Phase::RemovingReplica);
+    assert_eq!(status.stable_snapshot.as_ref().unwrap().members.len(), 3);
+    assert!(!remove_pilot_checkpoint_is_terminal(&store, &status).await);
+
+    api.fail_next_status_patch();
+    reconcile_set(
+        &make_remove_pilot_set(name, 2, Some(status.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let unpublished = api.last_status().unwrap();
+    assert!(remove_pilot_checkpoint_is_terminal(&store, &unpublished).await);
+    assert_eq!(unpublished.phase, Phase::RemovingReplica);
+    assert_eq!(
+        unpublished.stable_snapshot.as_ref().unwrap().members.len(),
+        3,
+        "terminal persistence must precede reduced topology publication"
+    );
+
+    api.reset_operations();
+    api.pods.lock().unwrap().clear();
+    let restarted = ReconcilerState::with_durable_remove_replica_store(store);
+    reconcile_set(
+        &make_remove_pilot_set(name, 2, Some(unpublished)),
+        &api,
+        &restarted,
+    )
+    .await
+    .unwrap();
+    let completed = api.last_status().unwrap();
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.stable_snapshot.as_ref().unwrap().members.len(), 2);
+    assert!(
+        api.operations().is_empty(),
+        "terminal reload must not poll or dispatch workflow effects"
+    );
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_terminal_reload_after_status_failure() {
+    assert_remove_terminal_reload_after_status_failure("remove-pilot-terminal-reload").await;
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_terminal_precedes_status_publication() {
+    assert_remove_terminal_reload_after_status_failure("remove-pilot-terminal-order").await;
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_post_commit_ambiguity() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "remove-pilot-post-commit", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let mut status = accept_remove_pilot(&api, &state, "remove-pilot-post-commit", 2, status).await;
+    api.reset_operations();
+    api.fail_after_next_durable_action(ControlOperation::RemoveReplicaIntent);
+
+    for _ in 0..240 {
+        reconcile_set(
+            &make_remove_pilot_set("remove-pilot-post-commit", 2, Some(status.clone())),
+            &api,
+            &state,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if api
+            .operations()
+            .contains(&ControlOperation::RemoveReplicaIntent)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        api.operations()
+            .contains(&ControlOperation::RemoveReplicaIntent),
+        "test must dispatch the coarse remove intent before primary restart"
+    );
+    assert!(
+        current_remove_pilot_operation(&store, &status)
+            .await
+            .is_some_and(|operation| operation.remove_commit_evidence.is_none()),
+        "lost reply must leave commit evidence absent from the checkpoint"
+    );
+    assert!(
+        live_remove_pilot_progress(&api, &store, "remove-pilot-post-commit", 2, &status)
+            .await
+            .is_some_and(|progress| progress.current_install_dispatched),
+        "the primary must report current-install dispatch before the ambiguous restart"
+    );
+
+    api.crash_pod(&primary);
+    api.restart_process_same_pod_uid(&primary).await;
+    for _ in 0..80 {
+        reconcile_set(
+            &make_remove_pilot_set("remove-pilot-post-commit", 2, Some(status.clone())),
+            &api,
+            &state,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.conditions.iter().any(|condition| {
+            condition.type_ == "DurableRemoveReplicaPilot" && condition.reason == "Quarantined"
+        }) || status.phase != Phase::RemovingReplica
+        {
+            break;
+        }
+    }
+    assert_eq!(status.phase, Phase::RemovingReplica);
+    assert_eq!(status.stable_snapshot.as_ref().unwrap().members.len(), 3);
+    assert!(status.conditions.iter().any(|condition| {
+        condition.type_ == "DurableRemoveReplicaPilot" && condition.reason == "Quarantined"
+    }));
+    assert_no_same_epoch_primary_restoration(&api.operations());
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_remove_replica_pilot_three_no_fault_measurement_samples() {
+    let mut samples = Vec::new();
+    for (sample, suffix) in ["a", "b", "c"].into_iter().enumerate() {
+        let name = format!("remove-pilot-measure-{suffix}");
+        let api = KvClusterApi::new();
+        let bootstrap = ReconcilerState::default();
+        let status = create_healthy_set(&api, &bootstrap, &name, 3).await;
+        let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+        let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+        let accepted = accept_remove_pilot(&api, &state, &name, 2, status).await;
+        let reference = accepted.durable_remove_replica_pilot.clone().unwrap();
+        let completed = drive_remove_pilot(&api, &state, &store, &name, 2, accepted).await;
+        assert_eq!(completed.phase, Phase::Healthy);
+
+        use kuberic_durable_execution::CheckpointStore;
+        let execution =
+            kuberic_operator::durable::remove_replica_pilot::execution_spec(&reference).unwrap();
+        let stored = store.load(execution.execution_id()).await.unwrap().unwrap();
+        let terminal_bytes = stored.checkpoint().encoded_len().unwrap();
+        let payload = stored
+            .checkpoint()
+            .decode_and_validate(
+                &execution,
+                kuberic_operator::durable::remove_replica_pilot::checkpoint_limits(),
+            )
+            .unwrap();
+        let (outcome, durable_boundaries) = payload.terminal_outcome().unwrap();
+        let terminal_payload_bytes = outcome.payload().as_slice().len();
+        let measurements = state
+            .durable_remove_replica_pilot
+            .as_ref()
+            .unwrap()
+            .measurements("default", &name, "test-uid", &reference.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            measurements.latest_terminal_checkpoint_bytes,
+            Some(terminal_bytes)
+        );
+        let evidence = (
+            measurements.completed_external_effect_count.unwrap(),
+            measurements.completed_passive_observation_count.unwrap(),
+            durable_boundaries,
+            measurements.accepted_writes,
+            measurements.minimum_active_checkpoint_bytes.unwrap(),
+            measurements.maximum_active_checkpoint_bytes,
+            measurements.minimum_terminal_checkpoint_bytes.unwrap(),
+            measurements.maximum_terminal_checkpoint_bytes,
+            terminal_payload_bytes,
+        );
+        println!(
+            concat!(
+                "KUBERIC_REMOVE_REPLICA_MEASUREMENT sample={} ",
+                "external_effects={} passive_observations={} durable_boundaries={} ",
+                "checkpoint_accepted_writes={} active_checkpoint_bytes_range={}-{} ",
+                "terminal_checkpoint_bytes_range={}-{} ",
+                "terminal_payload_bytes={}"
+            ),
+            sample + 1,
+            evidence.0,
+            evidence.1,
+            evidence.2,
+            evidence.3,
+            evidence.4,
+            evidence.5,
+            evidence.6,
+            evidence.7,
+            evidence.8,
+        );
+        assert_eq!(evidence.0, 3);
+        assert_eq!(evidence.1, 2);
+        assert_eq!(evidence.2, 5);
+        assert_eq!(evidence.3, 6);
+        assert!(
+            evidence.5
+                <= kuberic_operator::durable::remove_replica_pilot::REMOVE_REPLICA_PILOT_MAX_ENCODED_CHECKPOINT_BYTES
+        );
+        assert!(
+            evidence.7
+                <= kuberic_operator::durable::remove_replica_pilot::REMOVE_REPLICA_PILOT_MAX_ENCODED_CHECKPOINT_BYTES
+        );
+        assert!(
+            evidence.8
+                <= usize::try_from(
+                    kuberic_operator::durable::remove_replica_pilot::REMOVE_REPLICA_PILOT_MAX_TERMINAL_BYTES
+                )
+                .unwrap()
+        );
+        samples.push(evidence);
+    }
+    let active_min = samples.iter().map(|sample| sample.4).min().unwrap();
+    let active_max = samples.iter().map(|sample| sample.5).max().unwrap();
+    let terminal_min = samples.iter().map(|sample| sample.6).min().unwrap();
+    let terminal_max = samples.iter().map(|sample| sample.7).max().unwrap();
+    println!(
+        "KUBERIC_REMOVE_REPLICA_MEASUREMENT aggregate_samples=3 active_checkpoint_bytes_range={active_min}-{active_max} terminal_checkpoint_bytes_range={terminal_min}-{terminal_max}"
     );
 }
 

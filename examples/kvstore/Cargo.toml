@@ -6,6 +6,7 @@ publish = false
 
 [features]
 testing = []
+durable-remove-replica-pilot = ["kuberic-operator/durable-remove-replica-pilot"]
 
 [[bin]]
 name = "kvstore"

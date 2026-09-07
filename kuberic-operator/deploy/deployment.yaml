@@ -67,6 +67,13 @@ spec:
                 - Delete
                 - Retain
                 type: string
+              removeReplicaExecutionMode:
+                default: explicit
+                description: Execution engine for newly accepted replica removals.
+                enum:
+                - explicit
+                - durablePilot
+                type: string
               replicas:
                 default: 3
                 description: Total number of replicas (1 primary + N-1 secondaries).
@@ -122,6 +129,31 @@ spec:
                 description: Pod name of the current primary.
                 nullable: true
                 type: string
+              durableRemoveReplicaPilot:
+                description: Immutable reference for the current or most recent durable-execution
+                  remove-replica pilot. Per-phase progress lives only in its checkpoint.
+                nullable: true
+                properties:
+                  checkpointName:
+                    description: Deterministic provider object name derived from `execution_id`.
+                    type: string
+                  executionId:
+                    description: Lowercase hexadecimal kernel execution identity.
+                    type: string
+                  initialOperationJson:
+                    description: Exact JSON encoding of the initial operation accepted before
+                      checkpoint creation or effect dispatch.
+                    type: string
+                  version:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                required:
+                - checkpointName
+                - executionId
+                - initialOperationJson
+                - version
+                type: object
               durableSwitchoverPilot:
                 description: Immutable reference for the current or most recent durable-execution
                   switchover pilot. Per-phase progress lives only in its checkpoint.

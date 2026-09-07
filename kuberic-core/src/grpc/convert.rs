@@ -1732,6 +1732,15 @@ pub fn encode_direct_correlated_action_payload(
             "agent-owned replica lifecycle intent has no direct payload projection".to_string(),
         );
     }
+    encode_correlated_action_payload(action)
+}
+
+/// Serialize any correlated action for a prepared durable dispatch command.
+///
+/// Unlike the explicit-path direct projection, this representation may carry
+/// an agent-owned lifecycle intent because the complete prepared command is
+/// the durable dispatch authority.
+pub fn encode_correlated_action_payload(action: &DurableReplicaAction) -> Result<String, String> {
     let encoded = proto::ExecuteCorrelatedControlActionRequest {
         protocol_version: 0,
         action_id: String::new(),
@@ -1751,6 +1760,20 @@ pub fn encode_direct_correlated_action_payload(
 pub fn decode_direct_correlated_action_payload(
     encoded: &str,
 ) -> Result<DurableReplicaAction, String> {
+    let action = decode_correlated_action_payload(encoded)?;
+    if matches!(
+        action,
+        DurableReplicaAction::AddReplicaIntent { .. }
+            | DurableReplicaAction::RemoveReplicaIntent { .. }
+    ) {
+        return Err("persisted replica lifecycle payload projection is unsupported".to_string());
+    }
+    Ok(action)
+}
+
+/// Decode a prepared correlated action, including an agent-owned lifecycle
+/// intent whose complete command was durably exposed before dispatch.
+pub fn decode_correlated_action_payload(encoded: &str) -> Result<DurableReplicaAction, String> {
     let encoded = encoded.as_bytes();
     if encoded.is_empty()
         || encoded.len() % 2 != 0
@@ -1775,19 +1798,11 @@ pub fn decode_direct_correlated_action_payload(
         .collect::<Vec<_>>();
     let request = proto::ExecuteCorrelatedControlActionRequest::decode(bytes.as_slice())
         .map_err(|error| format!("invalid persisted correlated action payload: {error}"))?;
-    let action = strict_correlated_action(
+    strict_correlated_action(
         request
             .action
             .ok_or_else(|| "persisted correlated action payload is missing action".to_string())?,
-    )?;
-    if matches!(
-        action,
-        DurableReplicaAction::AddReplicaIntent { .. }
-            | DurableReplicaAction::RemoveReplicaIntent { .. }
-    ) {
-        return Err("persisted replica lifecycle payload projection is unsupported".to_string());
-    }
-    Ok(action)
+    )
 }
 
 impl TryFrom<proto::ExecuteCorrelatedControlActionRequest> for CorrelatedControlActionRequest {
@@ -3003,6 +3018,12 @@ mod tests {
             encode_direct_correlated_action_payload(&action)
                 .unwrap_err()
                 .contains("no direct")
+        );
+        assert_eq!(
+            decode_correlated_action_payload(&encode_correlated_action_payload(&action).unwrap())
+                .unwrap()
+                .signature(),
+            action.signature()
         );
 
         assert_eq!(

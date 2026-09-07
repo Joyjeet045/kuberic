@@ -496,6 +496,55 @@ When no authorized cluster is available, the required local measurement,
 fault, replay, and bounds gates above remain authoritative; absence of the
 optional environment is not evidence of real-API coverage.
 
+**Pattern 7b: Feature-gated durable-execution remove-replica pilot** ✅
+`test_durable_execution_remove_replica_pilot_*` keeps explicit
+remove-replica as the default and exercises the opt-in kernel path through
+prepared replica, exact-UID label, and exact-UID deletion effects. The matrix
+covers unsupported feature selection, every-turn restart, lost replies,
+proven-no-admission redelivery, checkpoint conflict and unknown outcomes,
+terminal reload after status failure, identity drift, Force authority,
+post-commit ambiguity, and repeated execution identity.
+
+Run the durable remove-replica operator and reconciler gates with:
+
+```console
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-operator \
+  --features durable-remove-replica-pilot remove_replica_pilot_
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
+  -p kvstore --features durable-remove-replica-pilot --test reconciler \
+  test_durable_execution_remove_replica_pilot_ -- --nocapture
+```
+
+Run the representative three-sample measurement separately:
+
+```console
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
+  -p kvstore --features durable-remove-replica-pilot --test reconciler \
+  test_durable_execution_remove_replica_pilot_three_no_fault_measurement_samples \
+  -- --nocapture
+```
+
+The sampled no-fault ScaleDown path records three external effects, two passive
+observations, five durable boundaries, and six accepted writes. The earlier 11
+accepted writes came from an unfused production loop that persisted exposure
+and observation separately for each activity. The fused runner persists one
+initial exposure plus five fused observation/progression writes without
+changing the semantic boundary counts.
+
+Run-specific active-checkpoint maxima are approximately 91.6 KiB. The
+5,005–93,837-byte interval is the aggregate lifecycle minimum-to-maximum range,
+not a range of per-run maxima. Terminal checkpoints range from 8,121 to 8,125
+bytes in the representative three-sample command; repeated local validation
+observed 8,117–8,129 bytes. The terminal payload is 2,188 bytes.
+
+The active maximum passes the stable 770,048-byte encoded-checkpoint admission
+ceiling but exceeds the switchover 65,536-byte baseline gate and 32,768-byte
+stretch gate. Those smaller gates were not assigned as formal remove-replica
+acceptance gates. Active size grows approximately as durable-activity count
+multiplied by serialized workflow-state size; retained full activity history
+and repeated full-state activity inputs and results dominate the measurement.
+The stable terminal-payload ceiling remains 4,096 bytes.
+
 **Pattern 8: Durable add/rejoin boundary and ambiguity recovery** ✅
 `test_durable_add_survives_state_loss_and_every_lost_runtime_reply` loses the
 single coarse operator-to-primary reply, replaces controller state, and proves
