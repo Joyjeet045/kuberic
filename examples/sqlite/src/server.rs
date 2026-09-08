@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use kuberic_core::handles::{PartitionHandle, StateReplicatorHandle};
+use kuberic_core::handles::PartitionHandle;
 use kuberic_core::types::{AccessStatus, CancellationToken};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
@@ -14,8 +14,6 @@ use crate::state::SharedState;
 pub struct SqliteServer {
     pub state: SharedState,
     pub partition: Arc<PartitionHandle>,
-    pub replicator: StateReplicatorHandle,
-    pub token: CancellationToken,
     write_gate: Arc<Mutex<()>>,
 }
 
@@ -167,8 +165,6 @@ pub async fn run_client_server(
     bind: String,
     state: SharedState,
     partition: Arc<PartitionHandle>,
-    replicator: StateReplicatorHandle,
-    token: CancellationToken,
     shutdown: CancellationToken,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind).await {
@@ -184,8 +180,6 @@ pub async fn run_client_server(
     let server = SqliteServer {
         state,
         partition,
-        replicator,
-        token,
         write_gate: Arc::new(Mutex::new(())),
     };
 

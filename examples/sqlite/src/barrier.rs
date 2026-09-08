@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
@@ -26,6 +26,7 @@ struct Request {
 pub struct ReplicationBarrier {
     sender: Mutex<Option<mpsc::UnboundedSender<Request>>>,
     last_lsn: AtomicI64,
+    abandoned: AtomicBool,
 }
 
 impl ReplicationBarrier {
@@ -74,6 +75,11 @@ impl ReplicationBarrier {
 
 impl CommitBarrier for ReplicationBarrier {
     fn publish(&self, transaction: &Transaction<'_>) -> Result<(), BarrierError> {
+        if self.abandoned.load(Ordering::SeqCst) {
+            return Err(BarrierError::new(
+                "replica is behind the cluster and must be rebuilt",
+            ));
+        }
         let frames = frames_from_wal_bytes(
             transaction.wal_offset,
             transaction.frames,
@@ -111,6 +117,12 @@ impl CommitBarrier for ReplicationBarrier {
             Ok(Err(error)) => Err(BarrierError::new(error)),
             Err(_) => Err(BarrierError::new("replication task dropped the commit")),
         }
+    }
+
+    fn abandon(&self, error: &str) {
+        self.abandoned.store(true, Ordering::SeqCst);
+        self.uninstall();
+        tracing::error!(error, "replica lost a replicated transaction locally");
     }
 }
 

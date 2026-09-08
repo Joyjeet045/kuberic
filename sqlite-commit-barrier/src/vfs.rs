@@ -96,7 +96,16 @@ unsafe fn publish_stage(file: *mut ffi::sqlite3_file) -> c_int {
         match barrier.publish(&transaction) {
             Ok(()) => {
                 let (start, bytes) = stage.take();
-                real_write(file, start as i64, &bytes)
+                let rc = real_write(file, start as i64, &bytes);
+                if rc != ffi::SQLITE_OK {
+                    let message = format!(
+                        "a replicated transaction could not be stored locally: {}",
+                        describe_error(rc)
+                    );
+                    tracing::error!(message, "local publication failed after quorum");
+                    barrier.abandon(&message);
+                }
+                rc
             }
             Err(error) => {
                 tracing::warn!(%error, "commit barrier rejected a transaction");

@@ -42,6 +42,12 @@ pub trait CommitBarrier: Send + Sync + 'static {
     /// Returns once the transaction is durable elsewhere, or an error to abort
     /// the commit. Called on the thread driving SQLite.
     fn publish(&self, transaction: &Transaction<'_>) -> Result<(), BarrierError>;
+
+    /// Called when a published transaction could not be written locally.
+    ///
+    /// The transaction is durable elsewhere but absent here, so this replica is
+    /// behind the rest of the cluster and must not keep serving.
+    fn abandon(&self, _error: &str) {}
 }
 
 #[derive(Debug)]

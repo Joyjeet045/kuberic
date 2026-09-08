@@ -358,45 +358,38 @@ checkpoint integration is exercised by the durable KV reconciler suite.
 These are inherent limitations that cannot be fully resolved in this
 design. They are documented for awareness and future mitigation.
 
-### KP-1: WAL Hook Timing Inversion
+### KP-1: Commit ordering
 
-SQLite commits a transaction to its WAL before the frames exist to be
-shipped. `replicate()` therefore runs after the local commit, inverting
-the kvstore's replicate-then-apply ordering.
+SQLite offers no pre-commit hook that can block on external I/O, so a hook
+based design has to ship frames after the local commit and cannot avoid a
+window in which the primary holds a transaction the cluster never
+confirmed.
 
-**Impact:** There is a window between local commit and quorum
-confirmation. From the client's perspective the write failed (no response
-received), but the primary's local DB has the data.
+The primary therefore opens SQLite against a commit-barrier VFS instead of
+using a hook. SQLite publishes a WAL transaction by writing a commit
+frame, the frame whose header carries a non-zero database page count, and
+recovery, checkpointing and readers all stop at the last valid commit
+frame. The VFS buffers the WAL bytes of the transaction in progress and
+releases them only once the frames have reached durable quorum, serving
+reads from the buffer meanwhile so SQLite observes a file that behaves
+normally.
 
-**Why the window cannot be removed:** SQLite has no pre-commit hook that
-allows blocking on external I/O. `sqlite3_commit_hook` can abort a
-transaction but cannot pause it while waiting for the network — it must
-return synchronously. Frames only exist once the commit has happened.
+**Result:** replication happens before the commit is visible, matching the
+kvstore's replicate-then-apply ordering. A transaction that cannot reach
+quorum fails its sync, SQLite rolls it back, and no commit frame is left
+behind, so the transaction is invisible to queries, to checkpoints, to
+copy snapshots and to recovery after a crash.
 
-**How the window is bounded:** the window cannot be removed, but it is
-prevented from producing a visible divergence.
+**Cost:** a synchronous transaction waits a quorum round trip inside the
+commit, and the transaction is buffered in memory until it is published.
+Group commit would amortise the round trip and is not implemented.
 
-1. A write gate serializes commit → capture → replicate. WAL capture is a
-   single cursor over the WAL file, so overlapping writes would otherwise
-   let one request ship another's frames and return success without its
-   own quorum.
-2. After quorum, the confirmed WAL offset and its generation are fsynced
-   to `meta.json` *before* the client is told anything. Success is never
-   reported for a write whose confirmation record is not durable.
-3. On primary open, WAL bytes beyond the confirmed offset are truncated
-   and `-shm` is removed so SQLite rebuilds its index. A transaction that
-   committed locally but never reached quorum is discarded rather than
-   silently resurrected.
-4. If a checkpoint restarted the WAL since the last confirmation, the
-   recorded offset describes a generation that no longer exists. SQLite
-   only restarts a WAL once every frame is backfilled into the database,
-   so nothing in the new generation reached quorum and the whole file is
-   dropped. This also clears a stale WAL left behind when a secondary
-   applied frames straight to the database file.
+**Requirements:** the primary opens with `locking_mode=EXCLUSIVE`, which
+keeps the wal-index in heap memory rather than a shared-memory file, and
+`synchronous=FULL`, which guarantees the sync the barrier runs in.
 
-The result is that a crash in the window yields a clean rollback, matching
-the kvstore's `UpdateEpoch` behaviour, instead of state the cluster never
-agreed on. Covered by `tests/quorum_durability.rs`.
+Covered by `sqlite-commit-barrier/tests/barrier.rs` and
+`examples/sqlite/tests/quorum_durability.rs`.
 
 **Residual limitation — graceful shutdown.** Recovery works by truncating
 the WAL, so it can only discard frames that are still *in* the WAL. SQLite

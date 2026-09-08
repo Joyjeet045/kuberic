@@ -373,8 +373,6 @@ pub async fn run_service_with_data_loss(
                             } else if client_server_handle.is_none() {
                                 let srv_state = state.clone();
                                 let p = partition.as_ref().unwrap().clone();
-                                let r = replicator.as_ref().unwrap().clone();
-                                let srv_token = token.as_ref().unwrap().clone();
                                 let shutdown = CancellationToken::new();
                                 let shutdown_cp = shutdown.clone();
                                 let bind = client_bind.clone();
@@ -382,8 +380,7 @@ pub async fn run_service_with_data_loss(
                                 client_server_shutdown = Some(shutdown);
                                 client_server_handle = Some(tokio::spawn(async move {
                                     run_client_server(
-                                        bind, srv_state, p, r,
-                                        srv_token, shutdown_cp,
+                                        bind, srv_state, p, shutdown_cp,
                                     ).await;
                                 }));
                             }

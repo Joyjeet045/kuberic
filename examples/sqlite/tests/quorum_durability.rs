@@ -49,6 +49,68 @@ fn count(state: &SqliteState) -> i64 {
     rows[0][0].as_i64().expect("count")
 }
 
+/// Issue #42 asks for a fault injected after the local commit and before
+/// quorum completes. The process cannot be killed inside a test, so the data
+/// directory is copied at the moment the barrier is holding the transaction,
+/// which is exactly what a crashed primary would have left on disk.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_crash_while_awaiting_quorum_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let salvage = dir.path().join("salvage");
+    std::fs::create_dir_all(&salvage).expect("mkdir");
+
+    let sink = sink();
+    let captured = Arc::new(AtomicBool::new(false));
+    {
+        let source = dir.path().to_path_buf();
+        let target = salvage.clone();
+        let captured = captured.clone();
+        let lsn = sink.lsn.clone();
+        let replicated = sink.replicated.clone();
+        let accept = sink.accept.clone();
+        barrier().install_sink(move |_payload| {
+            if !accept.load(Ordering::SeqCst) {
+                for name in ["db.sqlite", "db.sqlite-wal"] {
+                    let from = source.join(name);
+                    if from.exists() {
+                        std::fs::copy(&from, target.join(name)).expect("copy");
+                    }
+                }
+                captured.store(true, Ordering::SeqCst);
+                return Err("crashed before quorum".to_string());
+            }
+            replicated.fetch_add(1, Ordering::SeqCst);
+            Ok(lsn.fetch_add(1, Ordering::SeqCst) + 1)
+        });
+    }
+
+    let mut state = primary(dir.path()).await;
+    state
+        .execute_batch_sql(&["CREATE TABLE t(v INTEGER)".to_string()])
+        .expect("create");
+    state
+        .execute_sql("INSERT INTO t VALUES (1)", &[])
+        .expect("replicated insert");
+
+    sink.accept.store(false, Ordering::SeqCst);
+    assert!(state.execute_sql("INSERT INTO t VALUES (2)", &[]).is_err());
+    assert!(
+        captured.load(Ordering::SeqCst),
+        "the barrier must have held the transaction"
+    );
+
+    sink.accept.store(true, Ordering::SeqCst);
+    install(&sink);
+
+    let recovered = primary(&salvage).await;
+    assert_eq!(
+        count(&recovered),
+        1,
+        "a transaction still awaiting quorum must not survive a crash"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_replicated_write_is_visible_and_durable() {
