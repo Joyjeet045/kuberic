@@ -41,7 +41,7 @@ pub enum Attestation {
     Verified,
     Incomplete,
     QuorumLost,
-    PrimaryOnNode,
+    PrimaryNotAttested,
 }
 
 pub fn attest(
@@ -86,7 +86,7 @@ pub fn attest(
         return Attestation::QuorumLost;
     }
     if !attested_primary {
-        return Attestation::PrimaryOnNode;
+        return Attestation::PrimaryNotAttested;
     }
     Attestation::Verified
 }
@@ -295,7 +295,7 @@ mod tests {
             )),
             &on_node(&["a"]),
         );
-        assert_eq!(attestation, Attestation::PrimaryOnNode);
+        assert_eq!(attestation, Attestation::PrimaryNotAttested);
     }
 
     #[test]
@@ -315,7 +315,33 @@ mod tests {
             )),
             &on_node(&["c"]),
         );
-        assert_eq!(attestation, Attestation::PrimaryOnNode);
+        assert_eq!(attestation, Attestation::PrimaryNotAttested);
+    }
+
+    #[test]
+    fn an_unhealthy_primary_off_the_node_is_not_readiness() {
+        let attestation = attest(
+            Some(&committed(
+                &[
+                    (1, "a", true),
+                    (2, "b", false),
+                    (3, "c", false),
+                    (4, "d", false),
+                ],
+                2,
+            )),
+            Some(&live(
+                &[
+                    (1, "a", true, false),
+                    (2, "b", false, true),
+                    (3, "c", false, true),
+                    (4, "d", false, true),
+                ],
+                Some("a"),
+            )),
+            &on_node(&["d"]),
+        );
+        assert_eq!(attestation, Attestation::PrimaryNotAttested);
     }
 
     #[test]

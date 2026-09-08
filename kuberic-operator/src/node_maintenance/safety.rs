@@ -52,7 +52,7 @@ pub fn evaluate_set(
         Attestation::Verified => SetReadiness::Ready,
         Attestation::Incomplete => SetReadiness::EvidenceIncomplete,
         Attestation::QuorumLost => SetReadiness::QuorumAtRisk,
-        Attestation::PrimaryOnNode => {
+        Attestation::PrimaryNotAttested => {
             if has_promotable_survivor(placement, &on_node) {
                 SetReadiness::AwaitingPrimaryMove
             } else {
@@ -66,7 +66,7 @@ pub fn evaluate_set(
         primary_moved: attestation == Attestation::Verified,
         quorum_without_node: matches!(
             attestation,
-            Attestation::Verified | Attestation::PrimaryOnNode
+            Attestation::Verified | Attestation::PrimaryNotAttested
         ),
     }
 }
@@ -138,7 +138,7 @@ pub fn evaluate_preparation(
         Some(SetReadiness::AwaitingPrimaryMove) => PreparationOutcome {
             phase: MaintenancePhase::Preparing,
             reason: None,
-            message: format!("{blocked_set} is waiting for its primary to move off the node"),
+            message: format!("{blocked_set} has no healthy primary attested outside the node"),
         },
     }
 }
