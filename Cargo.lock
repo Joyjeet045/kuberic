@@ -2474,6 +2474,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlite-commit-barrier"
+version = "0.1.0"
+dependencies = [
+ "libsqlite3-sys",
+ "rusqlite",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "sqlite-replicated"
 version = "0.1.0"
 dependencies = [

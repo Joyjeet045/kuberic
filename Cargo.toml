@@ -8,6 +8,7 @@ members = [
   "kuberic-core",
   "kuberic-operator",
   "kuberic-tests",
+  "sqlite-commit-barrier",
 ]
 
 [workspace.package]

@@ -1,0 +1,13 @@
+[package]
+name = "sqlite-commit-barrier"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+tracing.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile = "3"
