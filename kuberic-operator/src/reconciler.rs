@@ -58,7 +58,9 @@ use crate::durable::{
     record_observation, start_add_replica, start_create_partition, start_failover,
     start_remove_replica, start_switchover,
 };
-use crate::node_maintenance::{PlacementCandidate, switchover_target_for_maintenance};
+use crate::node_maintenance::{
+    PlacementCandidate, explicit_target_is_eligible, switchover_target_for_maintenance,
+};
 
 /// Shared state across reconciliation loops.
 pub struct ReconcilerState {
@@ -1334,37 +1336,50 @@ pub async fn reconcile_set(
 
             // --- Switchover check (only when all replicas are healthy) ---
             let requested_primary = set.status.as_ref().and_then(|s| s.target_primary.clone());
+            let switchover_engine_ready =
+                validate_new_switchover_engine(set.spec.switchover_execution_mode).is_ok();
+            let maintenance_nodes = if requested_primary.is_some() || switchover_engine_ready {
+                api.list_maintenance_nodes().await.unwrap_or_else(|error| {
+                    warn!(
+                        name,
+                        error,
+                        "maintenance node lookup failed; leaving primary placement unchanged"
+                    );
+                    BTreeSet::new()
+                })
+            } else {
+                BTreeSet::new()
+            };
+            let candidates: Vec<PlacementCandidate> = current_pods
+                .iter()
+                .map(|(id, _, pod)| PlacementCandidate {
+                    replica_id: *id,
+                    pod_name: pod.name_any(),
+                    node_name: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
+                })
+                .collect();
             let target_primary = match requested_primary {
-                Some(requested) => Some(requested),
-                None if validate_new_switchover_engine(set.spec.switchover_execution_mode)
-                    .is_err() =>
+                Some(requested)
+                    if !explicit_target_is_eligible(
+                        &candidates,
+                        &requested,
+                        &maintenance_nodes,
+                    ) =>
                 {
+                    warn!(
+                        name,
+                        target = %requested,
+                        "requested primary is on a node under maintenance; refusing switchover"
+                    );
                     None
                 }
-                None => {
-                    let maintenance_nodes =
-                        api.list_maintenance_nodes().await.unwrap_or_else(|error| {
-                            warn!(
-                                name,
-                                error,
-                                "maintenance node lookup failed; leaving primary placement unchanged"
-                            );
-                            BTreeSet::new()
-                        });
-                    let candidates: Vec<PlacementCandidate> = current_pods
-                        .iter()
-                        .map(|(id, _, pod)| PlacementCandidate {
-                            replica_id: *id,
-                            pod_name: pod.name_any(),
-                            node_name: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
-                        })
-                        .collect();
-                    switchover_target_for_maintenance(
-                        &candidates,
-                        current_primary.as_deref(),
-                        &maintenance_nodes,
-                    )
-                }
+                Some(requested) => Some(requested),
+                None if !switchover_engine_ready => None,
+                None => switchover_target_for_maintenance(
+                    &candidates,
+                    current_primary.as_deref(),
+                    &maintenance_nodes,
+                ),
             };
             info!(
                 name,

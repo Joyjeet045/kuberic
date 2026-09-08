@@ -3,17 +3,31 @@ use k8s_openapi::api::core::v1::{Node, Pod};
 use k8s_openapi::jiff::Timestamp;
 use std::collections::BTreeSet;
 
-use crate::crd::KubericSet;
+use crate::crd::{KubericSet, Phase, ReconfigurationPhase};
 
 use super::api::{
     NodeMaintenanceRequest, NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus,
 };
+use super::attestation::{CommittedMember, CommittedTopology, Epoch, LiveMember, LiveObservation};
 use super::discovery::{Discovery, DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
 use super::preflight::{Preflight, preflight};
-use super::safety::{SetPlacement, SetTopology, reconcile_preparation};
+use super::safety::{SetPlacement, reconcile_preparation};
 
 pub const SET_LABEL: &str = "kuberic.io/set";
 pub const ROLE_LABEL: &str = "kuberic.io/role";
+
+#[derive(Debug, PartialEq, Clone, Default)]
+pub struct SetEvidence {
+    pub committed: Option<CommittedTopology>,
+    pub live: Option<LiveObservation>,
+}
+
+fn epoch_of(epoch: &crate::crd::EpochStatus) -> Epoch {
+    Epoch {
+        data_loss_number: epoch.data_loss_number,
+        configuration_number: epoch.configuration_number,
+    }
+}
 
 #[async_trait]
 pub trait MaintenanceApi: Send + Sync {
@@ -21,11 +35,7 @@ pub trait MaintenanceApi: Send + Sync {
 
     async fn list_maintenance_pods(&self) -> Result<Vec<MaintenancePod>, String>;
 
-    async fn get_set_topology(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<SetTopology>, String>;
+    async fn get_set_evidence(&self, namespace: &str, name: &str) -> Result<SetEvidence, String>;
 
     async fn patch_request_status(
         &self,
@@ -78,8 +88,10 @@ where
                 Discovery::Discovered(status) => {
                     let mut placements = Vec::with_capacity(status.affected_sets.len());
                     for set in &status.affected_sets {
+                        let evidence = api.get_set_evidence(&set.namespace, &set.name).await?;
                         placements.push(SetPlacement {
-                            topology: api.get_set_topology(&set.namespace, &set.name).await?,
+                            committed: evidence.committed,
+                            live: evidence.live,
                             promotable_pod_uids: promotable_pod_uids(
                                 &pods,
                                 &set.namespace,
@@ -176,33 +188,57 @@ impl MaintenanceApi for KubeMaintenanceApi {
             .collect())
     }
 
-    async fn get_set_topology(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<SetTopology>, String> {
+    async fn get_set_evidence(&self, namespace: &str, name: &str) -> Result<SetEvidence, String> {
         let api: kube::Api<KubericSet> = kube::Api::namespaced(self.client.clone(), namespace);
-        let set = match api.get_opt(name).await.map_err(|e| e.to_string())? {
-            Some(set) => set,
-            None => return Ok(None),
+        let Some(set) = api.get_opt(name).await.map_err(|e| e.to_string())? else {
+            return Ok(SetEvidence::default());
         };
-        let Some(snapshot) = set.status.and_then(|status| status.stable_snapshot) else {
-            return Ok(None);
+        let Some(status) = set.status else {
+            return Ok(SetEvidence::default());
         };
-        let primary_pod_uid = snapshot
-            .members
-            .iter()
-            .find(|member| member.id == snapshot.primary_id)
-            .map(|member| member.instance_id.clone());
-        Ok(Some(SetTopology {
-            primary_pod_uid,
-            member_pod_uids: snapshot
+        let committed = status
+            .stable_snapshot
+            .as_ref()
+            .map(|snapshot| CommittedTopology {
+                epoch: epoch_of(&snapshot.epoch),
+                write_quorum: snapshot.write_quorum,
+                members: snapshot
+                    .members
+                    .iter()
+                    .map(|member| CommittedMember {
+                        id: member.id,
+                        pod_uid: member.instance_id.clone(),
+                        is_primary: member.id == snapshot.primary_id,
+                    })
+                    .collect(),
+            });
+        let primary_pod_uid = status.current_primary.as_deref().and_then(|primary| {
+            status
                 .members
                 .iter()
+                .find(|member| member.name == primary)
                 .map(|member| member.instance_id.clone())
+        });
+        let live = LiveObservation {
+            epoch: epoch_of(&status.epoch),
+            settled: status.phase == Phase::Healthy
+                && status.reconfiguration_phase == ReconfigurationPhase::None,
+            primary_pod_uid,
+            members: status
+                .members
+                .iter()
+                .map(|member| LiveMember {
+                    id: member.id,
+                    pod_uid: member.instance_id.clone(),
+                    is_primary: member.role == "primary",
+                    healthy: member.healthy,
+                })
                 .collect(),
-            write_quorum: snapshot.write_quorum,
-        }))
+        };
+        Ok(SetEvidence {
+            committed,
+            live: Some(live),
+        })
     }
 
     async fn patch_request_status(
@@ -235,7 +271,7 @@ mod tests {
     struct MockApi {
         node: Option<NodeRef>,
         pods: Vec<MaintenancePod>,
-        topology: Option<SetTopology>,
+        evidence: SetEvidence,
         patches: Mutex<Vec<NodeMaintenanceRequestStatus>>,
         node_calls: Mutex<usize>,
         list_calls: Mutex<usize>,
@@ -259,13 +295,13 @@ mod tests {
             Ok(self.pods.clone())
         }
 
-        async fn get_set_topology(
+        async fn get_set_evidence(
             &self,
             _namespace: &str,
             _name: &str,
-        ) -> Result<Option<SetTopology>, String> {
+        ) -> Result<SetEvidence, String> {
             *self.topology_calls.lock().unwrap() += 1;
-            Ok(self.topology.clone())
+            Ok(self.evidence.clone())
         }
 
         async fn patch_request_status(
@@ -336,11 +372,41 @@ mod tests {
         .await
     }
 
-    fn topology(primary: Option<&str>, members: &[&str], write_quorum: u32) -> SetTopology {
-        SetTopology {
-            primary_pod_uid: primary.map(|pod| format!("uid-{pod}")),
-            member_pod_uids: members.iter().map(|pod| format!("uid-{pod}")).collect(),
-            write_quorum,
+    fn evidence(primary: &str, members: &[&str], write_quorum: u32) -> SetEvidence {
+        let uid = |pod: &str| format!("uid-{pod}");
+        let epoch = Epoch {
+            data_loss_number: 0,
+            configuration_number: 1,
+        };
+        SetEvidence {
+            committed: Some(CommittedTopology {
+                epoch,
+                write_quorum,
+                members: members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pod)| CommittedMember {
+                        id: index as i64 + 1,
+                        pod_uid: uid(pod),
+                        is_primary: *pod == primary,
+                    })
+                    .collect(),
+            }),
+            live: Some(LiveObservation {
+                epoch,
+                settled: true,
+                primary_pod_uid: Some(uid(primary)),
+                members: members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pod)| LiveMember {
+                        id: index as i64 + 1,
+                        pod_uid: uid(pod),
+                        is_primary: *pod == primary,
+                        healthy: true,
+                    })
+                    .collect(),
+            }),
         }
     }
 
@@ -426,7 +492,7 @@ mod tests {
         let api = MockApi {
             node: Some(node()),
             pods: vec![pod("kv-2", Some("worker-04"), false)],
-            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
@@ -449,6 +515,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unhealthy_survivor_is_never_reported_as_prepared() {
+        let mut evidence = evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2);
+        evidence
+            .live
+            .as_mut()
+            .expect("live")
+            .members
+            .iter_mut()
+            .find(|member| member.pod_uid == "uid-kv-1")
+            .expect("member")
+            .healthy = false;
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence,
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_ne!(outcome.status.phase, MaintenancePhase::Prepared);
+        assert_eq!(
+            outcome.status.blocked_reason,
+            Some(MaintenanceBlockedReason::BlockedByQuorum)
+        );
+        assert!(!outcome.status.affected_sets[0].quorum_without_node);
+    }
+
+    #[tokio::test]
+    async fn a_reconfiguring_set_is_never_reported_as_prepared() {
+        let mut evidence = evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2);
+        evidence.live.as_mut().expect("live").settled = false;
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence,
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Preparing);
+        assert!(outcome.status.prepared_at.is_none());
+        assert!(!outcome.status.affected_sets[0].quorum_without_node);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_incarnation_is_never_reported_as_prepared() {
+        let mut evidence = evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2);
+        evidence
+            .live
+            .as_mut()
+            .expect("live")
+            .members
+            .iter_mut()
+            .find(|member| member.pod_uid == "uid-kv-1")
+            .expect("member")
+            .pod_uid = "uid-kv-1-restarted".to_string();
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence,
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Preparing);
+        assert!(outcome.status.prepared_at.is_none());
+    }
+
+    #[tokio::test]
     async fn losing_write_quorum_blocks_preparation() {
         let api = MockApi {
             node: Some(node()),
@@ -456,7 +597,7 @@ mod tests {
                 pod("kv-1", Some("worker-04"), false),
                 pod("kv-2", Some("worker-04"), false),
             ],
-            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
@@ -480,7 +621,7 @@ mod tests {
                 pod("kv-1", Some("worker-05"), false),
                 pod("kv-2", Some("worker-06"), false),
             ],
-            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
@@ -502,7 +643,7 @@ mod tests {
                 pod("kv-1", None, false),
                 pod("kv-2", None, false),
             ],
-            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
@@ -523,7 +664,7 @@ mod tests {
         let api = MockApi {
             node: Some(node()),
             pods: vec![pod("kv-0", Some("worker-04"), true)],
-            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
@@ -544,7 +685,7 @@ mod tests {
         let api = MockApi {
             node: Some(node()),
             pods: vec![pod("kv-2", Some("worker-04"), false)],
-            topology: None,
+            evidence: SetEvidence::default(),
             ..Default::default()
         };
         let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
@@ -560,7 +701,7 @@ mod tests {
         let api = MockApi {
             node: Some(node()),
             pods: vec![pod("kv-2", Some("worker-04"), false)],
-            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let first = run(&api, &NodeMaintenanceRequestStatus::default())
@@ -579,7 +720,7 @@ mod tests {
         let api = MockApi {
             node: Some(node()),
             pods: vec![pod("kv-2", Some("worker-04"), false)],
-            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let persisted = run(&api, &NodeMaintenanceRequestStatus::default())
@@ -590,7 +731,7 @@ mod tests {
         let restarted = MockApi {
             node: Some(node()),
             pods: vec![pod("kv-2", Some("worker-04"), false)],
-            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let resumed = run(&restarted, &persisted).await.unwrap();
@@ -609,7 +750,7 @@ mod tests {
                 pod("kv-1", Some("worker-05"), false),
                 pod("kv-2", Some("worker-06"), false),
             ],
-            topology: Some(topology(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let preparing = run(&blocked, &NodeMaintenanceRequestStatus::default())
@@ -625,7 +766,7 @@ mod tests {
                 pod("kv-1", Some("worker-05"), true),
                 pod("kv-2", Some("worker-06"), false),
             ],
-            topology: Some(topology(Some("kv-1"), &["kv-0", "kv-1", "kv-2"], 2)),
+            evidence: evidence("kv-1", &["kv-0", "kv-1", "kv-2"], 2),
             ..Default::default()
         };
         let outcome = run(&moved, &preparing).await.unwrap();

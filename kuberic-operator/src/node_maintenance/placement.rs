@@ -7,6 +7,23 @@ pub struct PlacementCandidate {
     pub node_name: Option<String>,
 }
 
+pub fn is_eligible_primary(node_name: Option<&str>, maintenance_nodes: &BTreeSet<String>) -> bool {
+    !node_name.is_some_and(|node| maintenance_nodes.contains(node))
+}
+
+pub fn explicit_target_is_eligible(
+    candidates: &[PlacementCandidate],
+    target: &str,
+    maintenance_nodes: &BTreeSet<String>,
+) -> bool {
+    candidates
+        .iter()
+        .find(|candidate| candidate.pod_name == target)
+        .is_none_or(|candidate| {
+            is_eligible_primary(candidate.node_name.as_deref(), maintenance_nodes)
+        })
+}
+
 pub fn switchover_target_for_maintenance(
     candidates: &[PlacementCandidate],
     current_primary: Option<&str>,
@@ -19,7 +36,7 @@ pub fn switchover_target_for_maintenance(
     let primary = candidates
         .iter()
         .find(|candidate| Some(candidate.pod_name.as_str()) == current_primary)?;
-    if !is_under_maintenance(primary, maintenance_nodes) {
+    if is_eligible_primary(primary.node_name.as_deref(), maintenance_nodes) {
         return None;
     }
 
@@ -27,19 +44,9 @@ pub fn switchover_target_for_maintenance(
         .iter()
         .filter(|candidate| candidate.pod_name != primary.pod_name)
         .filter(|candidate| candidate.node_name.is_some())
-        .filter(|candidate| !is_under_maintenance(candidate, maintenance_nodes))
+        .filter(|candidate| is_eligible_primary(candidate.node_name.as_deref(), maintenance_nodes))
         .min_by_key(|candidate| candidate.replica_id)
         .map(|candidate| candidate.pod_name.clone())
-}
-
-fn is_under_maintenance(
-    candidate: &PlacementCandidate,
-    maintenance_nodes: &BTreeSet<String>,
-) -> bool {
-    candidate
-        .node_name
-        .as_deref()
-        .is_some_and(|node| maintenance_nodes.contains(node))
 }
 
 #[cfg(test)]
@@ -144,5 +151,57 @@ mod tests {
             switchover_target_for_maintenance(&candidates, None, &nodes(&["worker-04"])),
             None
         );
+    }
+
+    #[test]
+    fn a_pod_on_a_maintenance_node_is_never_an_eligible_primary() {
+        assert!(!is_eligible_primary(
+            Some("worker-04"),
+            &nodes(&["worker-04"])
+        ));
+        assert!(is_eligible_primary(
+            Some("worker-05"),
+            &nodes(&["worker-04"])
+        ));
+        assert!(is_eligible_primary(None, &nodes(&["worker-04"])));
+        assert!(is_eligible_primary(Some("worker-04"), &nodes(&[])));
+    }
+
+    #[test]
+    fn an_explicit_target_on_a_maintenance_node_is_refused() {
+        let candidates = [
+            candidate(1, Some("worker-04")),
+            candidate(2, Some("worker-05")),
+        ];
+        assert!(!explicit_target_is_eligible(
+            &candidates,
+            "kv-0",
+            &nodes(&["worker-04"])
+        ));
+        assert!(explicit_target_is_eligible(
+            &candidates,
+            "kv-1",
+            &nodes(&["worker-04"])
+        ));
+    }
+
+    #[test]
+    fn an_explicit_target_that_is_not_a_current_pod_is_left_to_other_validation() {
+        let candidates = [candidate(1, Some("worker-04"))];
+        assert!(explicit_target_is_eligible(
+            &candidates,
+            "kv-9",
+            &nodes(&["worker-04"])
+        ));
+    }
+
+    #[test]
+    fn an_explicit_target_is_unaffected_without_maintenance() {
+        let candidates = [candidate(1, Some("worker-04"))];
+        assert!(explicit_target_is_eligible(
+            &candidates,
+            "kv-0",
+            &nodes(&[])
+        ));
     }
 }
