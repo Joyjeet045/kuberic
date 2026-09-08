@@ -2,7 +2,7 @@
 //!
 //! A stateful SQLite database using kuberic-core's PodRuntime.
 //! Demonstrates WAL frame shipping replication:
-//! - Primary captures WAL frames after each commit
+//! - Primary replicates each transaction before its commit becomes visible
 //! - Secondary persists frames to frames.log, applies on commit
 //! - StateProvider callbacks for copy/catchup/epoch management
 //! - Client-facing gRPC API for Execute/Query/ExecuteBatch

@@ -67,7 +67,7 @@ Clients (SQL over gRPC)
 │  │               │    │                              │    │
 │  │ control gRPC ◄┤    │  ┌────────────────────────┐  │    │
 │  │ data gRPC    ◄┤    │  │  SQLite DB (WAL mode)  │  │    │
-│  │               │    │  │  + WAL hook callback    │  │    │
+│  │               │    │  │  + commit barrier VFS   │  │    │
 │  │ lifecycle_tx ─┼───►│  └────────────────────────┘  │    │
 │  │ state_prov_tx─┼───►│                              │    │
 │  └──────────────┘    │  client gRPC ◄── Clients     │    │
@@ -86,16 +86,24 @@ Client ──SQL write──► SqliteServer
                    COMMIT
                          │
                          ▼
-                   WAL hook fires:
-                     read new WAL frames from file
-                     serialize as WalFrameSet { pages, db_size }
+                   Commit-barrier VFS holds the WAL bytes:
+                     the commit frame has not reached the file,
+                     so the transaction does not yet exist
                          │
                          ▼
                    replicator.replicate(WalFrameSet)
-                     (quorum — blocks until ACKed)
+                     (quorum — blocks the commit until ACKed)
                          │
-                         ▼
-Client ◄──Result──
+                    ┌────┴────┐
+                 quorum      no quorum
+                    │            │
+                    ▼            ▼
+            write the WAL   drop the buffer,
+            bytes, sync,    fail the sync,
+            commit stands   SQLite rolls back
+                    │            │
+                    ▼            ▼
+Client ◄──Result──         Client ◄──Error──
 ```
 
 ### Secondary Flow
@@ -155,14 +163,17 @@ content: which pages changed and what their new content is.
 
 ### Primary: Capturing WAL Frames
 
-After each SQL write, the primary reads new frames from the WAL file
-(tracking the last-read offset), packages them as `WalFrameSet` with
-CRC32 checksum, and calls `replicator.replicate()` which blocks until
-quorum ACK. Auto-checkpoint is disabled (`wal_autocheckpoint=0`);
-single connection enforced.
+The primary opens SQLite against a commit-barrier VFS. The VFS buffers the
+WAL bytes of the transaction in progress, and when SQLite syncs the commit
+the barrier packages them as a `WalFrameSet` with a CRC32 checksum and calls
+`replicator.replicate()`, which blocks until quorum ACK. Only then are the
+bytes written to the WAL file. Auto-checkpoint is disabled
+(`wal_autocheckpoint=0`); single connection enforced.
 
-**Timing:** WAL frames are read AFTER SQLite commits locally. See
-Known Problems (KP-1) for the timing inversion trade-off.
+**Timing:** frames reach quorum before the commit is visible. The barrier
+runs inside the sync that publishes the commit frame, so SQLite never
+considers a transaction committed that the cluster has not accepted. See
+Known Problems (KP-1).
 
 ### Secondary: Persist-then-ACK, Deferred Apply
 
@@ -210,6 +221,21 @@ gRPC service `SqliteStore` with three RPCs (primary only):
 
 See `proto/sqlitestore.proto` for full message definitions.
 
+### Durability contract
+
+- **Success** means the transaction reached durable quorum. It is committed on
+  this replica and on enough secondaries to survive the loss of this one.
+- **An error** means the transaction did not commit. The commit barrier failed
+  the sync, SQLite rolled the transaction back, and no commit frame was written,
+  so nothing is visible to queries, checkpoints, copy snapshots or recovery.
+- **A timeout, or an error raised after the commit returned**, leaves the
+  outcome unknown. Quorum may have completed while the response or the local
+  confirmation record did not. Retrying is only safe for a statement that is
+  itself idempotent; the API has no request-level idempotency key.
+- **Reads** observe only quorum-confirmed state. A transaction that has not
+  reached quorum is not visible on the primary, so no client can read a value
+  the cluster has not agreed on.
+
 ---
 
 ## Lifecycle Integration
@@ -237,7 +263,7 @@ Same two-channel pattern as kvstore (`LifecycleEvent` + `StateProviderEvent`).
   work — we ship the result of execution, not the instructions.
 - **Application-layer interception (not VFS):** WAL file read after
   commit gives us the same data as a custom VFS with ~100 lines vs
-  ~2000. Uses rusqlite's WAL hook for notification.
+  ~2000. Uses a commit-barrier VFS to gate each transaction.
 - **Logical page content (not raw WAL bytes):** WAL files contain
   file-specific salts and checksums. We extract `(page_number, data)`
   pairs — simpler and portable across WAL file instances.
@@ -289,7 +315,8 @@ examples/sqlite/
 ```
 
 Key dependency: `rusqlite = { features = ["bundled", "hooks"] }` —
-statically links SQLite, enables WAL hook. Also `crc32fast` for checksums.
+statically links SQLite. `sqlite-commit-barrier` registers the VFS. Also
+`crc32fast` for checksums.
 
 ---
 
