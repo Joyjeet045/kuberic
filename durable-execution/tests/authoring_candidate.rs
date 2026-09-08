@@ -37,7 +37,7 @@ fn one_activity_is_an_ordinary_async_method_with_one_framework_call() {
             1024,
         ),
         None,
-        CheckpointLimits::new(16, 100_000).unwrap(),
+        CheckpointLimits::new(16, 100_000, 100_000).unwrap(),
     );
 
     assert!(matches!(outcome, Evaluation::Scheduled { .. }));

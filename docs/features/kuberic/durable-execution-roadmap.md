@@ -1,9 +1,10 @@
 # Durable Execution Framework Roadmap
 
-This document tracks deferred work for the experimental
-`kuberic-durable-execution` crate. The current crate is a replay and persistence
-safety kernel, not an end-user orchestration runtime. Items below are ordered
-possibilities, not commitments.
+This document tracks deferred work for the
+`kuberic-durable-execution` crate. The crate is a replay and persistence safety
+kernel, not an end-user orchestration runtime. Production remove-replica and
+optional switchover consume it through an in-process operator runner. Items
+below are ordered possibilities, not commitments.
 
 The ordering is informed by the broader user and provider surfaces in
 [Azure Durable Task Framework](https://github.com/Azure/durabletask) and
@@ -22,15 +23,18 @@ The implemented kernel provides:
 - opaque provider revision tokens and conservative unknown outcomes;
 - conservative separately persisted schedule/dispatch exposure for low-level
   callers, plus opt-in atomic schedule/exposure fusion;
-- bounded activity count and encoded checkpoint size;
+- bounded activity count plus independent active and terminal encoded
+  checkpoint sizes;
 - maximum-result capacity reservation before dispatch;
 - immutable execution-level terminal payload and admitted capacity;
 - completion-only active-to-terminal checkpoint compaction;
 - direct terminal outcome reload without workflow polling;
 - ambiguity quarantine and authoritative observation recovery;
 - opt-in atomic observation/replay/next-exposure or terminal progression;
-- an optional, isolated ConfigMap checkpoint-provider spike using opaque
-  Kubernetes `resourceVersion` compare-and-swap;
+- a feature-gated ConfigMap checkpoint provider using opaque Kubernetes
+  `resourceVersion` compare-and-swap; standalone kernel builds may omit it,
+  while the production operator enables it unconditionally for
+  framework-native remove-replica;
 - independently retained checkpoints by default, with validated optional
   non-controlling owner references and separately authorized orphan cleanup;
 - a configurable conservative ConfigMap data budget with documented headroom;
@@ -38,15 +42,15 @@ The implemented kernel provides:
 - feature-gated real-API coverage through the existing all-features workspace
   test command after the one-control-plane KinD CI job is provisioned;
 - real-API spike measurements for checkpoint/object size, accepted writes,
-  canonical typed watch-event bytes, and unknown-outcome recovery.
-- feature-gated operator workflow pilots for switchover and remove-replica on
-  sets with at most three members, each retaining its explicit implementation
-  as the default and preserving the `ReplicaAgent` mutation boundary;
+  canonical typed watch-event bytes, and unknown-outcome recovery;
+- a shared bounded operator runner used by production framework-native
+  remove-replica and the optional switchover workflow while preserving the
+  `ReplicaAgent` mutation boundary;
 - direct kube-controller integration through Send workflow/store futures,
   without another executor or scheduler;
-- same-namespace owner-bound pilot checkpoints, owner garbage-collection
-  validation, execution-keyed write/outcome and active/terminal size telemetry,
-  and a reproducible explicit-versus-pilot source-complexity command.
+- same-namespace owner-bound checkpoints, owner garbage-collection validation,
+  execution-keyed write/outcome and active/terminal size telemetry, and
+  separately authorized orphan cleanup.
 
 The bounds prevent unlimited growth and ensure a declared-valid result remains
 persistable after dispatch. Active history is never compacted: every completed
@@ -71,15 +75,16 @@ The as-built lifecycle compacts only completed workflows:
    discarded history.
 
 The execution contract declares one immutable terminal payload bound and
-persists the encoded-checkpoint capacity under which it was admitted. Before
-workflow evaluation can approach its first external effect, the kernel proves
-that both terminal variants at the declared maximum fit that capacity. A later
-smaller configured capacity is rejected. Exact-bound outcomes succeed;
-oversized outcomes violate the predeclared contract.
+persists the active and terminal encoded-checkpoint capacities under which it
+was admitted. Before workflow evaluation can approach its first external
+effect, the kernel proves that both terminal variants at the declared maximum
+fit that capacity. Any later configured-capacity change is rejected.
+Exact-bound outcomes succeed; oversized outcomes violate the predeclared
+contract.
 
 ### No Generic Mid-Operation Compaction
 
-Mid-operation compaction is not planned for the initial Kuberic pilot.
+Mid-operation compaction is not planned for the current Kuberic workflows.
 Deterministic replay may depend on any previous activity result, so deleting an
 active prefix requires a new durable continuation state and changes the
 workflow authoring contract. The framework must not silently discard history
@@ -132,17 +137,19 @@ cancellation remain deferred until demonstrated by a specific workflow.
 ### Runtime and Operations
 
 Generic instance lifecycle and query APIs, workers, queues, leases, routing,
-and distributed ownership are not required for the first operator-hosted
-pilot. The Kubernetes operator already supplies reconciliation wakeups and
-effect ownership.
+and distributed ownership are not required for the operator-hosted workflows.
+The Kubernetes operator already supplies reconciliation wakeups and effect
+ownership.
 
 If the framework later serves applications outside the operator, reassess
 those runtime facilities rather than growing the kernel speculatively.
 
 ### Kubernetes Integration
 
-The provider and its readiness prerequisites are implemented as an isolated
-spike:
+The provider began as an isolated feasibility spike and its readiness
+prerequisites are implemented. It is now production-required by
+framework-native remove-replica; the crate feature remains optional only for
+standalone kernel consumers that do not host that workflow:
 
 1. **Implemented:** Kubernetes ConfigMap checkpoint storage using opaque
    `resourceVersion` create/replace compare-and-swap, portable errors, and
@@ -160,115 +167,78 @@ spike:
    feature-gated real-API coverage through the existing all-features workspace
    test command after the one-control-plane KinD CI job is provisioned.
 
-The operator integrations remain behind explicit default-off Cargo and runtime
-selection gates and do not authorize a workflow-ownership change or broader
-migration. Both use compact mutable state, combine deterministic transitions in
-memory, and use fused host progression while preserving exact durable commands,
-authoritative observations, and conservative quarantine.
+### Operator Adoption
 
-A representative successful three-member execution now records exactly nine
-external effects and three passive observations: 12 durable boundaries and 13
-accepted checkpoint writes, including terminal persistence. Seven
-ReplicaAgent preparation-only records were removed by preparing the exact
-command inside the same accepted exposure that authorizes dispatch; no effect
-or required observation was removed. In the authoritative happy-path
-measurement, checkpoint write attempts and accepted writes were both 13, with
-no conflict, unknown, or definite-failure outcomes. Six repeated remediation
-runs observed maximum active checkpoints from 31,597 to 31,605 bytes and compact
-terminal checkpoints from 4,077 to 4,081 bytes. These values are run-specific
-snapshots, not exact byte contracts; runtime-generated serialized values can
-change their lengths. The stable admission contracts remain the configured
-770,048-byte (752 KiB) encoded-checkpoint ceiling and 4,096-byte terminal
-payload ceiling. The executable measurement checks authoritative
-self-consistency and those limits.
+The shared in-process runner owns load/reload, terminal short-circuit,
+bounded-fuel requeue, one-use dispatch permits, fused progression, quarantine,
+conflict and unknown-write reload, persistence failures, and nondeterminism.
+Operation adapters retain observation collection, authority and exact-command
+preparation, effect/quarantine handling, deadlines, terminal validation, and
+publication. The Kubernetes reconciler remains the scheduler; no worker,
+queue, lease, watcher, distributed owner, or retry scheduler was added.
 
-The terminal carries authoritative external-effect and passive-observation
-accounting, making the classification recoverable after a process restart.
-Successful terminal semantics require exactly three passive observations and
-the base nine external effects plus only the reachable per-effect bounded
-redeliveries. Only the seven ReplicaAgent effects have such retry slots; the
-two UID-fenced label effects do not. The no-redelivery path therefore remains
-exactly 9/3, while fault paths may use additional boundaries and writes. Compensation uses the
-exact reachable accounting pairs for the terminal operation's restore or
-failed-promotion transcript rather than a broad rollback upper bound. Active
-size passes both the 64 KiB baseline and 32 KiB stretch gates, and terminal
-size passes its baseline gate.
+Switchover remains optional and retains its existing public selection model.
+Its representative no-redelivery path remains nine external effects, three
+passive observations, 12 boundaries, and 13 accepted writes. Its byte
+measurements and lifecycle limits remain operation-specific.
 
-These fields have deliberately different meanings. External effects are the
-seven ReplicaAgent mutations and two UID-fenced label patches. Passive
-observations are the three durable evidence-only steps. Their sum is the
-completed durable-boundary count. A write attempt is any checkpoint CAS call,
-whereas an accepted write is confirmed only by an authoritative accepted
-revision. Active and terminal sizes are canonical encoded checkpoint sizes for
-different lifecycle states and are reported separately.
+### Graduated: Framework-Native Remove Replica
 
-The lexical report distinguishes a 201-line/29-decision workflow body and the
-comparable 930/108 legacy-marker scope. Shared typed, fused, and effect-adapter
-infrastructure is 1,208/110; operator integration is 1,047/55; the honestly
-charged non-overlapping total is 4,161/326. The explicit implementation remains
-measured at 1,449/172. Charging it as well yields a combined 5,610/498. The
-measurement script rejects overlapping charged scopes. Shared code may
-amortize across workflows; the remove-replica port below tests that claim.
+Remove-replica is the first production framework-native consumer. It has one
+default execution path and no build or resource mode selector. Legacy pilot
+and explicit remove records are converted to durable incompatibility markers;
+they are never resumed, migrated, cleared as absent, or used to admit a new
+execution. The `ReplicaAgent`, correlated control v3,
+`RemoveReplicaIntent` v1, and lifecycle-peer v2 protocol are unchanged.
 
-A public compact reducer remains deferred. The achieved write gate comes from
-atomic prepared exposure, not history compaction, and no reducer prototype or
-API is introduced.
+`status.removeReplicaExecution` owns immutable admission, checkpoint identity,
+and incompatibility state. Its referenced same-namespace ConfigMap owns compact
+boundary history, exact prepared commands, and terminal evidence; the other
+explicit operator workflows retain their operation-specific CRD status
+checkpoints.
 
-The second kernel-hosted workflow did **not** demonstrate source-cost
-amortization. The explicit remove-replica baseline is 1,611 executable lines /
-213 decision points. The complete kernel remove workflow is 1,632/162,
-remove-specific operator integration is 1,114/81, and shared reusable
-infrastructure grew by 374/3 from the frozen 1,208/110 baseline. The resulting
-marginal cost is 3,120/246: 1.9367 times the explicit baseline in executable
-lines and 1.1549 times in decision points. Shared growth is 30.96% in lines and
-2.73% in decisions. Both dimensions therefore classify as negative under the
-fixed measurement thresholds.
+The version-3 compact contract stores immutable admission once and records only
+tagged observations, exact prepared commands, compact effect results, or
+bounded proven-no-admission evidence at durable boundaries. The version bump
+stores the already encoded protobuf action as binary exact bytes rather than
+hexadecimal text. A public reducer and mid-operation compaction remain
+unnecessary.
 
-The isolated async remove workflow body is small at 138/18, but it is not
-representative of the cost of safely hosting the workflow. Workflow-specific
-state, admission, terminal and replay support plus operator effect, recovery,
-routing, and publication integration eliminate that local advantage. This
-answers the roadmap's amortization question: it was tested and was not
-demonstrated.
+The canonical three-member no-fault `ScaleDown` path is exactly three external
+effects, two passive observations, five completed durable boundaries, and six
+accepted writes. Across the final three samples, the active-record lifecycle
+range was 3,373–18,693 bytes; the per-run maxima were 18,685, 18,685, and
+18,693 bytes. The terminal record was 4,245 bytes and its payload was 683
+bytes. These are run-specific measurements, not compatibility constants. Every
+sample remains below the 49,152-byte (48 KiB) acceptance gate.
 
-Three representative successful no-fault three-member ScaleDown executions
-recorded three external effects and two passive observations: five completed
-durable boundaries and six accepted checkpoint writes. The original unfused
-production reconcile loop recorded 11 accepted writes—one exposure and one
-observation write per activity plus terminal persistence. That amplification
-was an integration artifact, not an intrinsic workflow requirement. Fused
-observation/progression now records one initial exposure plus five fused writes
-without changing the three effects, two observations, or five boundaries.
+The immutable lifecycle limits are 16 history records, 4,096 decoded input
+bytes, 2,048 decoded result bytes, 262,144 active encoded bytes, 12,288
+terminal encoded bytes, and 4,096 terminal-payload bytes. The maximum-fault
+projection measured 182,589 active bytes, 11,453 terminal bytes, and a
+4,096-byte terminal payload. Exact one-byte-over tests reject every bound
+independently.
 
-Each run reached an active-checkpoint maximum of approximately 91.6 KiB. The
-reported 5,005–93,837-byte interval is the aggregate lifecycle
-minimum-to-maximum range
-within those executions, not a range of per-run maxima. Repeated local
-validation observed terminal checkpoints from 8,117 to 8,129 bytes, and the
-terminal payload was 2,188 bytes.
-These are run-specific snapshots, not exact byte contracts.
+External effects, passive observations, completed boundaries, accepted writes,
+active record, terminal record, and terminal payload are deliberately separate
+measurements. A write is accepted only when persistence returns an
+authoritative revision.
 
-The approximately 91.6 KiB active maximum passes the stable 770,048-byte
-encoded-checkpoint admission ceiling, but exceeds both switchover comparison
-gates: the 65,536-byte (64 KiB) baseline and 32,768-byte (32 KiB) stretch gate.
-This does not violate a formal remove-replica acceptance gate because those
-smaller gates were defined for switchover and were not assigned to this
-workflow. Active checkpoint size grows approximately with the number of durable
-activities multiplied by serialized workflow-state size. The dominant
-contributors are complete retained activity history and repeated full-state
-projections in activity inputs and results. The stable terminal-payload ceiling
-remains 4,096 bytes.
+### Next Operation Extension
 
-No other workflow, generic worker, queue, lease, scheduler, retry framework, or
-compact-envelope migration is authorized by this result.
+Add-replica was not migrated. A future framework-native add adapter can reuse
+the runner outcomes and supply its own observation, authority/preparation,
+exact effect and quarantine, deadline, terminal-validation, and publication
+rules. It must declare an independent compact versioned contract and limits.
+No additional service is required by that extension point.
 
 ## Explicitly Deferred
 
 The roadmap does not currently commit to:
 
-- production migration or mixed-version checkpoint support;
+- mixed-version checkpoint migration;
 - exactly-once activity execution;
 - generic automatic compensation;
 - worker queues, leases, or a distributed scheduler;
 - a public orchestration platform;
-- additional Kuberic workflow ports.
+- additional Kuberic workflow ports, including add-replica.

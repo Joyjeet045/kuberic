@@ -13,7 +13,6 @@ use tracing::info;
 
 const MAX_RECENT_CHECKPOINT_EVENTS: usize = 64;
 
-// COMPLEXITY-BOUNDARY: shared-operator-checkpoint-support:start
 /// Workflow-independent checkpoint provider used by operator-hosted workflows.
 #[derive(Clone)]
 pub enum DurableCheckpointStore {
@@ -105,11 +104,9 @@ impl CheckpointMeasurementDecoder {
         (self.terminal)(outcome, completed_activity_count)
     }
 }
-// COMPLEXITY-BOUNDARY: shared-operator-checkpoint-support:end
 
-// COMPLEXITY-BOUNDARY: pilot-store:start
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PilotCheckpointMeasurementsSnapshot {
+pub struct DurableCheckpointMeasurementsSnapshot {
     pub load_attempts: u64,
     pub write_attempts: u64,
     pub accepted_writes: u64,
@@ -130,7 +127,7 @@ pub struct PilotCheckpointMeasurementsSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PilotCheckpointEventResult {
+pub enum DurableCheckpointEventResult {
     Accepted,
     Conflict,
     OutcomeUnknown,
@@ -138,33 +135,33 @@ pub enum PilotCheckpointEventResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PilotCheckpointEvent {
+pub struct DurableCheckpointEvent {
     pub sequence: u64,
     pub execution_id: ExecutionId,
-    pub result: PilotCheckpointEventResult,
+    pub result: DurableCheckpointEventResult,
     pub attempted_checkpoint_bytes: usize,
     pub authoritative_checkpoint_bytes: Option<usize>,
     pub boundary: Option<PersistenceBoundary>,
 }
 
 #[derive(Clone, Default)]
-pub struct PilotCheckpointEventCollector {
-    events: Arc<Mutex<Vec<PilotCheckpointEvent>>>,
+pub struct DurableCheckpointEventCollector {
+    events: Arc<Mutex<Vec<DurableCheckpointEvent>>>,
 }
 
-impl PilotCheckpointEventCollector {
-    pub fn events(&self) -> Vec<PilotCheckpointEvent> {
+impl DurableCheckpointEventCollector {
+    pub fn events(&self) -> Vec<DurableCheckpointEvent> {
         self.events
             .lock()
-            .expect("pilot checkpoint event collector lock poisoned")
+            .expect("durable checkpoint event collector lock poisoned")
             .clone()
     }
 
-    fn push(&self, event: PilotCheckpointEvent) {
+    fn push(&self, event: DurableCheckpointEvent) {
         let mut events = self
             .events
             .lock()
-            .expect("pilot checkpoint event collector lock poisoned");
+            .expect("durable checkpoint event collector lock poisoned");
         if events.len() == MAX_RECENT_CHECKPOINT_EVENTS {
             events.remove(0);
         }
@@ -175,7 +172,7 @@ impl PilotCheckpointEventCollector {
         if let Some(event) = self
             .events
             .lock()
-            .expect("pilot checkpoint event collector lock poisoned")
+            .expect("durable checkpoint event collector lock poisoned")
             .iter_mut()
             .rev()
             .find(|event| event.boundary.is_none())
@@ -186,33 +183,26 @@ impl PilotCheckpointEventCollector {
 }
 
 #[derive(Clone)]
-pub struct MeasuredPilotCheckpointStore {
+pub struct MeasuredDurableCheckpointStore {
     execution_id: ExecutionId,
     inner: DurableCheckpointStore,
     decoder: CheckpointMeasurementDecoder,
-    measurements: Arc<Mutex<PilotCheckpointMeasurementsSnapshot>>,
-    collector: PilotCheckpointEventCollector,
+    measurements: Arc<Mutex<DurableCheckpointMeasurementsSnapshot>>,
+    collector: DurableCheckpointEventCollector,
 }
 
-impl MeasuredPilotCheckpointStore {
+impl MeasuredDurableCheckpointStore {
+    #[cfg(not(feature = "durable-switchover-pilot"))]
+    pub fn new(execution_id: ExecutionId, inner: DurableCheckpointStore) -> Self {
+        Self::with_native_remove_decoder(execution_id, inner)
+    }
+
     #[cfg(feature = "durable-switchover-pilot")]
     pub fn new(execution_id: ExecutionId, inner: DurableCheckpointStore) -> Self {
         Self::with_decoder(
             execution_id,
             inner,
             super::pilot::checkpoint_measurement_decoder(),
-        )
-    }
-
-    #[cfg(all(
-        feature = "durable-remove-replica-pilot",
-        not(feature = "durable-switchover-pilot")
-    ))]
-    pub fn new(execution_id: ExecutionId, inner: DurableCheckpointStore) -> Self {
-        Self::with_decoder(
-            execution_id,
-            inner,
-            super::remove_replica_pilot::checkpoint_measurement_decoder(),
         )
     }
 
@@ -224,8 +214,19 @@ impl MeasuredPilotCheckpointStore {
         Self::with_collector_and_decoder(
             execution_id,
             inner,
-            PilotCheckpointEventCollector::default(),
+            DurableCheckpointEventCollector::default(),
             decoder,
+        )
+    }
+
+    pub fn with_native_remove_decoder(
+        execution_id: ExecutionId,
+        inner: DurableCheckpointStore,
+    ) -> Self {
+        Self::with_decoder(
+            execution_id,
+            inner,
+            super::remove_replica_execution::checkpoint_measurement_decoder(),
         )
     }
 
@@ -233,7 +234,7 @@ impl MeasuredPilotCheckpointStore {
     pub fn with_collector(
         execution_id: ExecutionId,
         inner: DurableCheckpointStore,
-        collector: PilotCheckpointEventCollector,
+        collector: DurableCheckpointEventCollector,
     ) -> Self {
         Self::with_collector_and_decoder(
             execution_id,
@@ -243,46 +244,29 @@ impl MeasuredPilotCheckpointStore {
         )
     }
 
-    #[cfg(all(
-        feature = "durable-remove-replica-pilot",
-        not(feature = "durable-switchover-pilot")
-    ))]
-    pub fn with_collector(
-        execution_id: ExecutionId,
-        inner: DurableCheckpointStore,
-        collector: PilotCheckpointEventCollector,
-    ) -> Self {
-        Self::with_collector_and_decoder(
-            execution_id,
-            inner,
-            collector,
-            super::remove_replica_pilot::checkpoint_measurement_decoder(),
-        )
-    }
-
     pub fn with_collector_and_decoder(
         execution_id: ExecutionId,
         inner: DurableCheckpointStore,
-        collector: PilotCheckpointEventCollector,
+        collector: DurableCheckpointEventCollector,
         decoder: CheckpointMeasurementDecoder,
     ) -> Self {
         Self {
             execution_id,
             inner,
             decoder,
-            measurements: Arc::new(Mutex::new(PilotCheckpointMeasurementsSnapshot::default())),
+            measurements: Arc::new(Mutex::new(DurableCheckpointMeasurementsSnapshot::default())),
             collector,
         }
     }
 
-    pub fn measurements(&self) -> PilotCheckpointMeasurementsSnapshot {
+    pub fn measurements(&self) -> DurableCheckpointMeasurementsSnapshot {
         *self
             .measurements
             .lock()
-            .expect("pilot checkpoint measurements lock poisoned")
+            .expect("durable checkpoint measurements lock poisoned")
     }
 
-    pub fn collector(&self) -> PilotCheckpointEventCollector {
+    pub fn collector(&self) -> DurableCheckpointEventCollector {
         self.collector.clone()
     }
 
@@ -334,7 +318,7 @@ impl MeasuredPilotCheckpointStore {
         let mut measurements = self
             .measurements
             .lock()
-            .expect("pilot checkpoint measurements lock poisoned");
+            .expect("durable checkpoint measurements lock poisoned");
         measurements.latest_authoritative_checkpoint_bytes = Some(bytes);
         measurements.maximum_authoritative_checkpoint_bytes = measurements
             .maximum_authoritative_checkpoint_bytes
@@ -400,7 +384,7 @@ impl MeasuredPilotCheckpointStore {
 }
 
 #[async_trait]
-impl CheckpointStore for MeasuredPilotCheckpointStore {
+impl CheckpointStore for MeasuredDurableCheckpointStore {
     async fn load(
         &self,
         execution_id: ExecutionId,
@@ -410,7 +394,7 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
             let mut measurements = self
                 .measurements
                 .lock()
-                .expect("pilot checkpoint measurements lock poisoned");
+                .expect("durable checkpoint measurements lock poisoned");
             measurements.load_attempts = measurements.load_attempts.saturating_add(1);
         }
         let result = self.inner.load(execution_id).await;
@@ -469,7 +453,7 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
             let mut measurements = self
                 .measurements
                 .lock()
-                .expect("pilot checkpoint measurements lock poisoned");
+                .expect("durable checkpoint measurements lock poisoned");
             measurements.write_attempts = measurements.write_attempts.saturating_add(1);
         }
         let result = self
@@ -481,7 +465,7 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
                 let mut measurements = self
                     .measurements
                     .lock()
-                    .expect("pilot checkpoint measurements lock poisoned");
+                    .expect("durable checkpoint measurements lock poisoned");
                 measurements.accepted_writes = measurements.accepted_writes.saturating_add(1);
                 drop(measurements);
                 self.record_authoritative_checkpoint(&attempted_checkpoint, attempted_bytes);
@@ -491,7 +475,7 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
                 let mut measurements = self
                     .measurements
                     .lock()
-                    .expect("pilot checkpoint measurements lock poisoned");
+                    .expect("durable checkpoint measurements lock poisoned");
                 measurements.conflicts = measurements.conflicts.saturating_add(1);
                 "conflict"
             }
@@ -499,7 +483,7 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
                 let mut measurements = self
                     .measurements
                     .lock()
-                    .expect("pilot checkpoint measurements lock poisoned");
+                    .expect("durable checkpoint measurements lock poisoned");
                 measurements.unknown_outcomes = measurements.unknown_outcomes.saturating_add(1);
                 "outcome_unknown"
             }
@@ -507,20 +491,20 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
                 let mut measurements = self
                     .measurements
                     .lock()
-                    .expect("pilot checkpoint measurements lock poisoned");
+                    .expect("durable checkpoint measurements lock poisoned");
                 measurements.definite_failures = measurements.definite_failures.saturating_add(1);
                 "definite_failure"
             }
         };
         let snapshot = self.measurements();
-        self.collector.push(PilotCheckpointEvent {
+        self.collector.push(DurableCheckpointEvent {
             sequence: snapshot.write_attempts,
             execution_id,
             result: match &result {
-                Ok(CasOutcome::Accepted(_)) => PilotCheckpointEventResult::Accepted,
-                Ok(CasOutcome::Conflict) => PilotCheckpointEventResult::Conflict,
-                Ok(CasOutcome::OutcomeUnknown) => PilotCheckpointEventResult::OutcomeUnknown,
-                Err(_) => PilotCheckpointEventResult::DefiniteFailure,
+                Ok(CasOutcome::Accepted(_)) => DurableCheckpointEventResult::Accepted,
+                Ok(CasOutcome::Conflict) => DurableCheckpointEventResult::Conflict,
+                Ok(CasOutcome::OutcomeUnknown) => DurableCheckpointEventResult::OutcomeUnknown,
+                Err(_) => DurableCheckpointEventResult::DefiniteFailure,
             },
             attempted_checkpoint_bytes: attempted_bytes,
             authoritative_checkpoint_bytes: matches!(result, Ok(CasOutcome::Accepted(_)))
@@ -540,17 +524,17 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
     }
 }
 
-pub type MeasuredDurableCheckpointStore = MeasuredPilotCheckpointStore;
-pub type PilotCheckpointStore = DurableCheckpointStore;
-pub type DurableCheckpointMeasurementsSnapshot = PilotCheckpointMeasurementsSnapshot;
-pub type DurableCheckpointEvent = PilotCheckpointEvent;
-pub type DurableCheckpointEventCollector = PilotCheckpointEventCollector;
-pub type DurableCheckpointEventResult = PilotCheckpointEventResult;
-
-// COMPLEXITY-BOUNDARY: pilot-store:end
 #[cfg(test)]
-mod durable_switchover_pilot_tests {
+mod checkpoint_store_tests {
     use super::*;
+    use crate::crd::DurableOperationPhase;
+    use crate::durable::effects::{DeleteEffectCommand, LabelEffectCommand};
+    use crate::durable::remove_replica_execution::{
+        CompactReplicaEffectCommand, REMOVE_REPLICA_MAX_ACTIVE_ENCODED_BYTES,
+        REMOVE_REPLICA_MAX_TERMINAL_ENCODED_BYTES, REMOVE_REPLICA_MAX_TERMINAL_PAYLOAD_BYTES,
+        RemoveReplicaActivityAccounting, RemoveReplicaBoundaryInput, RemoveReplicaTerminal,
+        activity_spec, checkpoint_limits,
+    };
     use kuberic_durable_execution::{
         ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ExactBytes,
         ExecutionContract, ExecutionSpec, InMemoryFault, ReloadReason, TerminalOutcome,
@@ -640,7 +624,7 @@ mod durable_switchover_pilot_tests {
             ],
         ))
         .unwrap();
-        let store = MeasuredPilotCheckpointStore::with_decoder(
+        let store = MeasuredDurableCheckpointStore::with_decoder(
             execution_id,
             DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
             CheckpointMeasurementDecoder::new(
@@ -662,21 +646,133 @@ mod durable_switchover_pilot_tests {
         assert_eq!(measurements.completed_passive_observation_count, Some(1));
     }
 
+    #[tokio::test]
+    async fn native_remove_measurements_classify_six_writes_and_both_lifecycles() {
+        let execution_id = ExecutionId::from_bytes([32; 16]);
+        let execution = ExecutionSpec::new(
+            execution_id,
+            ExactBytes::new(b"native-remove-measurement"),
+            REMOVE_REPLICA_MAX_TERMINAL_PAYLOAD_BYTES,
+        );
+        let contract = ExecutionContract::with_encoded_limits(
+            execution,
+            REMOVE_REPLICA_MAX_ACTIVE_ENCODED_BYTES as u64,
+            REMOVE_REPLICA_MAX_TERMINAL_ENCODED_BYTES as u64,
+        );
+        let inputs = [
+            RemoveReplicaBoundaryInput::Observe {
+                phase: DurableOperationPhase::RemoveFreezeIntent,
+                attempt: 0,
+            },
+            RemoveReplicaBoundaryInput::ReplicaCommand {
+                command: CompactReplicaEffectCommand {
+                    expected_agent_generation: "generation".to_string(),
+                    expected_control_version: 1,
+                    observed_runtime_epoch: [1, 1],
+                    action_payload: ExactBytes::new(b"payload"),
+                },
+            },
+            RemoveReplicaBoundaryInput::Observe {
+                phase: DurableOperationPhase::RemoveAwaitCleanup,
+                attempt: 1,
+            },
+            RemoveReplicaBoundaryInput::LabelCommand {
+                command: LabelEffectCommand::new(
+                    3,
+                    "set-2".to_string(),
+                    "target-uid".to_string(),
+                    "retired".to_string(),
+                ),
+            },
+            RemoveReplicaBoundaryInput::DeleteCommand {
+                command: DeleteEffectCommand::new(3, "set-2".to_string(), "target-uid".to_string()),
+            },
+        ];
+        let activities = inputs
+            .iter()
+            .enumerate()
+            .map(|(sequence, input)| {
+                ActivityRecord::completed(
+                    ActivitySequence::new(sequence as u64),
+                    activity_spec(input).unwrap(),
+                    ExactBytes::new(b"{}".to_vec()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let store = MeasuredDurableCheckpointStore::with_native_remove_decoder(
+            execution_id,
+            DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+        );
+        let mut revision = None;
+        for completed in 1..=activities.len() {
+            let checkpoint = CheckpointEnvelope::encode_with_limits(
+                &CheckpointPayload::active(contract.clone(), activities[..completed].to_vec()),
+                checkpoint_limits(),
+            )
+            .unwrap();
+            let CasOutcome::Accepted(next_revision) = store
+                .compare_and_swap(execution_id, revision, checkpoint)
+                .await
+                .unwrap()
+            else {
+                panic!("native active measurement write must be accepted");
+            };
+            revision = Some(next_revision);
+        }
+        let terminal_payload = serde_json::to_vec(&RemoveReplicaTerminal::Rejected {
+            message: "fixture".to_string(),
+            accounting: RemoveReplicaActivityAccounting {
+                external_effect_count: 3,
+                passive_observation_count: 2,
+            },
+        })
+        .unwrap();
+        let terminal = CheckpointEnvelope::encode_with_limits(
+            &CheckpointPayload::terminal(
+                contract,
+                TerminalOutcome::failed(ExactBytes::new(terminal_payload)),
+                5,
+            ),
+            checkpoint_limits(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .compare_and_swap(execution_id, revision, terminal)
+                .await
+                .unwrap(),
+            CasOutcome::Accepted(_)
+        ));
+
+        let measurements = store.measurements();
+        assert_eq!(measurements.accepted_writes, 6);
+        assert_eq!(measurements.completed_activity_count, Some(5));
+        assert_eq!(measurements.completed_external_effect_count, Some(3));
+        assert_eq!(measurements.completed_passive_observation_count, Some(2));
+        assert!(measurements.minimum_active_checkpoint_bytes.is_some());
+        assert!(measurements.maximum_active_checkpoint_bytes > 0);
+        assert!(measurements.latest_terminal_checkpoint_bytes.is_some());
+        assert!(measurements.minimum_terminal_checkpoint_bytes.is_some());
+        assert!(measurements.maximum_terminal_checkpoint_bytes > 0);
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
     async fn terminal_accounting_measurements(
         seed: u8,
         terminal_payload: &[u8],
         completed_activity_count: u64,
-    ) -> PilotCheckpointMeasurementsSnapshot {
+    ) -> DurableCheckpointMeasurementsSnapshot {
         let execution_id = ExecutionId::from_bytes([seed; 16]);
         let contract = ExecutionContract::new(
             ExecutionSpec::new(execution_id, ExactBytes::new(b"workflow"), 128),
             100_000,
         );
-        let store = MeasuredPilotCheckpointStore::new(
+        let store = MeasuredDurableCheckpointStore::with_decoder(
             execution_id,
-            PilotCheckpointStore::InMemory(
+            DurableCheckpointStore::InMemory(
                 kuberic_durable_execution::InMemoryCheckpointStore::new(),
             ),
+            super::super::pilot::checkpoint_measurement_decoder(),
         );
         let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
             contract,
@@ -694,6 +790,7 @@ mod durable_switchover_pilot_tests {
         store.measurements()
     }
 
+    #[cfg(feature = "durable-switchover-pilot")]
     fn terminal_accounting_payload(
         compensated: bool,
         phase: &str,
@@ -747,6 +844,7 @@ mod durable_switchover_pilot_tests {
         .unwrap()
     }
 
+    #[cfg(feature = "durable-switchover-pilot")]
     fn two_member_terminal_accounting_payload() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "status": "complete",
@@ -791,9 +889,9 @@ mod durable_switchover_pilot_tests {
     async fn measurements_distinguish_authoritative_and_unknown_bytes() {
         let execution_id = ExecutionId::from_bytes([9; 16]);
         let backend = kuberic_durable_execution::InMemoryCheckpointStore::new();
-        let store = MeasuredPilotCheckpointStore::new(
+        let store = MeasuredDurableCheckpointStore::new(
             execution_id,
-            PilotCheckpointStore::InMemory(backend.clone()),
+            DurableCheckpointStore::InMemory(backend.clone()),
         );
         let accepted = store
             .compare_and_swap(execution_id, None, checkpoint(b"first"))
@@ -804,8 +902,10 @@ mod durable_switchover_pilot_tests {
         };
         store.correlate_host_outcome(&HostOutcome::WorkflowCompleted {
             outcome: TerminalOutcome::succeeded(ExactBytes::new(b"terminal")),
+            completed_activity_count: 0,
             revision: revision.clone(),
             boundary: PersistenceBoundary::Completion,
+            checkpoint_status: kuberic_durable_execution::TerminalCheckpointStatus::Accepted,
         });
         let accepted_bytes = store
             .load(execution_id)
@@ -905,9 +1005,15 @@ mod durable_switchover_pilot_tests {
         let execution = ExecutionSpec::new(execution_id, ExactBytes::new(b"workflow"), 128);
         let contract = ExecutionContract::new(execution, 100_000);
         let backend = kuberic_durable_execution::InMemoryCheckpointStore::new();
-        let store = MeasuredPilotCheckpointStore::new(
+        let decoder = CheckpointMeasurementDecoder::new(
+            "fixture",
+            fixture_activity_decoder,
+            fixture_terminal_decoder,
+        );
+        let store = MeasuredDurableCheckpointStore::with_decoder(
             execution_id,
-            PilotCheckpointStore::InMemory(backend.clone()),
+            DurableCheckpointStore::InMemory(backend.clone()),
+            decoder,
         );
         let active =
             CheckpointEnvelope::encode(&CheckpointPayload::active(contract.clone(), Vec::new()))
@@ -920,12 +1026,10 @@ mod durable_switchover_pilot_tests {
         else {
             panic!("active checkpoint was not accepted");
         };
-        let terminal_payload =
-            terminal_accounting_payload(false, "completed", Some(42), 1, None, 9, 3);
         let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
             contract,
-            TerminalOutcome::succeeded(ExactBytes::new(terminal_payload)),
-            12,
+            TerminalOutcome::succeeded(ExactBytes::new(b"fixture")),
+            3,
         ))
         .unwrap();
         let terminal_bytes = terminal.encoded_len().unwrap();
@@ -947,30 +1051,32 @@ mod durable_switchover_pilot_tests {
             measurements.maximum_terminal_checkpoint_bytes,
             terminal_bytes
         );
-        assert_eq!(measurements.completed_activity_count, Some(12));
-        assert_eq!(measurements.completed_external_effect_count, Some(9));
-        assert_eq!(measurements.completed_passive_observation_count, Some(3));
+        assert_eq!(measurements.completed_activity_count, Some(3));
+        assert_eq!(measurements.completed_external_effect_count, Some(2));
+        assert_eq!(measurements.completed_passive_observation_count, Some(1));
 
-        let restarted = MeasuredPilotCheckpointStore::new(
+        let restarted = MeasuredDurableCheckpointStore::with_decoder(
             execution_id,
-            PilotCheckpointStore::InMemory(backend),
+            DurableCheckpointStore::InMemory(backend),
+            decoder,
         );
         restarted.load(execution_id).await.unwrap();
         let reloaded = restarted.measurements();
-        assert_eq!(reloaded.completed_activity_count, Some(12));
+        assert_eq!(reloaded.completed_activity_count, Some(3));
         assert_eq!(
             reloaded.latest_terminal_checkpoint_bytes,
             Some(terminal_bytes)
         );
-        assert_eq!(reloaded.completed_external_effect_count, Some(9));
-        assert_eq!(reloaded.completed_passive_observation_count, Some(3));
+        assert_eq!(reloaded.completed_external_effect_count, Some(2));
+        assert_eq!(reloaded.completed_passive_observation_count, Some(1));
 
         let mismatched_execution_id = ExecutionId::from_bytes([11; 16]);
-        let mismatched_store = MeasuredPilotCheckpointStore::new(
+        let mismatched_store = MeasuredDurableCheckpointStore::with_decoder(
             mismatched_execution_id,
-            PilotCheckpointStore::InMemory(
+            DurableCheckpointStore::InMemory(
                 kuberic_durable_execution::InMemoryCheckpointStore::new(),
             ),
+            decoder,
         );
         let mismatched_contract = ExecutionContract::new(
             ExecutionSpec::new(mismatched_execution_id, ExactBytes::new(b"workflow"), 128),
@@ -978,16 +1084,8 @@ mod durable_switchover_pilot_tests {
         );
         let mismatched_terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
             mismatched_contract,
-            TerminalOutcome::succeeded(ExactBytes::new(terminal_accounting_payload(
-                false,
-                "completed",
-                Some(42),
-                1,
-                None,
-                9,
-                3,
-            ))),
-            11,
+            TerminalOutcome::succeeded(ExactBytes::new(b"fixture")),
+            2,
         ))
         .unwrap();
         assert!(matches!(
@@ -998,10 +1096,14 @@ mod durable_switchover_pilot_tests {
             CasOutcome::Accepted(_)
         ));
         let mismatched = mismatched_store.measurements();
-        assert_eq!(mismatched.completed_activity_count, Some(11));
+        assert_eq!(mismatched.completed_activity_count, Some(2));
         assert_eq!(mismatched.completed_external_effect_count, None);
         assert_eq!(mismatched.completed_passive_observation_count, None);
+    }
 
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[tokio::test]
+    async fn switchover_terminal_accounting_rejects_inconsistent_claims() {
         let wrong_split_payload =
             terminal_accounting_payload(false, "completed", Some(42), 1, None, 10, 2);
         let wrong_split = terminal_accounting_measurements(12, &wrong_split_payload, 12).await;
@@ -1089,9 +1191,9 @@ mod durable_switchover_pilot_tests {
     async fn production_event_history_is_bounded() {
         let execution_id = ExecutionId::from_bytes([10; 16]);
         let backend = kuberic_durable_execution::InMemoryCheckpointStore::new();
-        let store = MeasuredPilotCheckpointStore::new(
+        let store = MeasuredDurableCheckpointStore::new(
             execution_id,
-            PilotCheckpointStore::InMemory(backend.clone()),
+            DurableCheckpointStore::InMemory(backend.clone()),
         );
         for sequence in 1..=70_u64 {
             backend.fail_next_compare_and_swap(InMemoryFault::ConflictWithoutApply);

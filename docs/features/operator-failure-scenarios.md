@@ -533,22 +533,26 @@ an ambiguous activity did not run.
 `currentPrimary` is refreshed from recovered driver state and is not trusted
 as input. Legacy status without `stableSnapshot` is rejected. Stable topology
 changes persist a fresh snapshot; multi-member add/remove loops patch after
-each committed change. If runtime mutation succeeds but status persistence
-does not, the live operator retries that exact pending status before another
-action.
+each committed change. If runtime mutation succeeds but its next Kubernetes
+durable-record write does not, the live operator retries that exact pending
+status or ConfigMap checkpoint before another action.
 
-During `Creating`, `Switchover`, `AddingReplica`, `RemovingReplica`, and
-`FailingOver`,
+During `Creating`, explicit `Switchover`, `AddingReplica`, and `FailingOver`,
 `status.operation` is the authoritative compact checkpoint. Creation records
 explicit no previous topology and an optional committed bootstrap snapshot;
-the other protocols record previous/target stable snapshots. Each operation
-stores exact target incarnations, current phase, and one write-ahead correlated
-action. Add/rebuild and removal additionally store structured frozen intents
-with primary/target generations and endpoints, exact configuration
-descriptors, deadlines, and commit evidence. Each reconcile reconstructs fresh handles, observes
-role/epoch/incarnation/progress/write/configuration/activity state, and either
-advances one checkpoint, dispatches one activity, waits, compensates, or
-poisons. The operator sends only the appropriate `AddReplicaIntent` or
+the other CRD-status protocols record previous/target stable snapshots. During
+`RemovingReplica`, `status.removeReplicaExecution` owns immutable admission,
+checkpoint identity, and incompatibility state, while the referenced
+same-namespace ConfigMap owns compact boundary history, exact prepared
+commands, and terminal evidence. The CRD-backed operations store exact target
+incarnations, current phase, and one write-ahead correlated action.
+Add/rebuild also stores its structured frozen intent in `status.operation`;
+native removal reconstructs its intent from immutable admission and the
+ConfigMap's tagged evidence. Each reconcile reconstructs fresh handles,
+observes role/epoch/incarnation/progress/write/configuration/activity state,
+and either advances one checkpoint, dispatches one activity, waits,
+compensates, or poisons. The operator sends only the appropriate
+`AddReplicaIntent` or
 `RemoveReplicaIntent` to the primary; peer/runtime phases are transient.
 Add/rebuild observes coarse phase and tracked copy,
 restores previous current configuration before pre-commit cleanup when needed,

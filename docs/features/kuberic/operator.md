@@ -2,7 +2,7 @@
 
 The Kuberic operator acts as SF's Failover Manager on Kubernetes.
 It watches `KubericSet` CRDs and orchestrates pod lifecycle, failover,
-switchover, and scaling through CRD-backed durable workflows.
+switchover, and scaling through Kubernetes-backed durable workflows.
 
 > Part of the [Kuberic Design](../kuberic-replicator-design.md).
 > Failure scenarios documented in [operator-failure-scenarios.md](../operator-failure-scenarios.md).
@@ -26,14 +26,14 @@ switchover, and scaling through CRD-backed durable workflows.
   complete member logical/incarnation identities and roles, write quorum, and
   optional last-known election progress/deactivation metadata
 - optional compact versioned `operation` checkpoint for durable creation,
-  switchover, replica add/rebuild, and configuration-first replica removal
+  explicit switchover, replica add/rebuild, and failover
 - structured add-replica attempt with frozen primary/target generations,
   endpoints, configuration descriptors, semantic build key, deadlines, and
   commit observation
-- structured remove-replica attempt with exact primary/target authority,
-  previous/reduced configuration descriptors, three-attempt and deadline
-  bounds, bounded coordinator phase/result, exact commit evidence,
-  post-commit cleanup, and typed poison disposition
+- optional `removeReplicaExecution` reference with immutable remove admission,
+  exact checkpoint identity, contract version, and incompatibility marker;
+  compact boundary history, exact prepared commands, and terminal evidence
+  live in the referenced same-namespace ConfigMap
 - Phase-1 failover/data-loss recovery, including optional
   previous/committed topology, target snapshot, one pending correlated action,
   failover observations/assessment/epoch intents, and optional pod-local
@@ -45,20 +45,24 @@ switchover, and scaling through CRD-backed durable workflows.
 - `conditions`
 
 **Reconciliation:** `PartitionDriver` performs read-only stable recovery with
-`GrpcReplicaHandle`; CRD-backed state machines own every mutation. A stable
-operation is complete only after its resulting snapshot is persisted. Durable
-creation persists partial committed bootstrap topology after primary-only and
-each expanded current configuration, so process loss rolls forward from live
-committed authority instead of replaying `Open(New)`.
+`GrpcReplicaHandle`; Kubernetes-backed state machines own every mutation. A
+stable operation is complete only after its resulting snapshot is persisted.
+Durable creation persists partial committed bootstrap topology after
+primary-only and each expanded current configuration, so process loss rolls
+forward from live committed authority instead of replaying `Open(New)`.
 
-Reconciler-driven creation, switchover, replica add/rebuild, replica removal,
-and failover persist a versioned operation checkpoint, reconstruct fresh
-handles and observations on every reconcile, and advance one status transition
-or one mutating activity at a time. Bounded read observations may precede
-either, but a mutation and status patch never share a reconcile. Pending action
-intent is durable before RPC, pod-label, or UID-fenced pod-delete mutation.
-Status patches include the observed Kubernetes `resourceVersion`; no lock is
-held across a durable activity.
+Creation, explicit switchover, replica add/rebuild, and failover persist their
+versioned checkpoints in `status.operation`. Replica removal instead stores
+immutable admission and checkpoint identity in
+`status.removeReplicaExecution`; the referenced owner-bound ConfigMap stores
+its compact boundary history, exact prepared commands, and terminal evidence.
+Every workflow reconstructs fresh handles and observations on reconcile and
+advances one durable transition or one mutating activity at a time. Bounded
+read observations may precede either, but a mutation and durable-record patch
+never share a reconcile. Pending action intent is durable before RPC,
+pod-label, or UID-fenced pod-delete mutation. Status and ConfigMap writes use
+Kubernetes `resourceVersion` fencing; no lock is held across a durable
+activity.
 
 ---
 
@@ -158,8 +162,10 @@ the new incarnation. A missing or unreachable old incarnation enters coarse
 Every control request reaches a pod-local `ReplicaAgent` before
 `PodRuntime`. The agent owns local admission, correlation, serialization and
 bounded completion replay; the runtime owns ordered service/replicator
-effects. This is intentionally narrower than Service Fabric RA: CRD status and
-the operator remain the only owners of distributed workflow state.
+effects. This is intentionally narrower than Service Fabric RA: the operator
+owns distributed workflow progression, CRD status owns stable topology and
+operation admission, and the framework-native remove ConfigMap owns remove
+boundary history and terminal evidence.
 
 Before a pending runtime action is dispatched, reconciliation requires
 replica-agent control protocol version 3 and exact agreement among the
@@ -167,8 +173,9 @@ addressed, runtime, and pending Pod incarnations. It persists the observed
 agent generation, agent control version, and runtime epoch.
 Direct non-add/non-remove actions also freeze their exact encoded payload so
 observation and retry signatures cannot drift with live progress. Add/rebuild
-and removal use structured `operation.addIntent` and
-`operation.removeIntent` as their payload authority.
+uses structured `operation.addIntent` as its payload authority. Removal derives
+its structured intent from immutable `status.removeReplicaExecution` admission
+and persists the exact prepared command in the referenced ConfigMap.
 
 Missing, malformed, or unsupported agent status fails closed. There is no
 capability negotiation or old-peer fallback.
@@ -202,10 +209,12 @@ Legacy resources without a snapshot fail closed. A missing or inconsistent
 stable primary routes directly into durable failover before driver recovery;
 non-primary incarnation changes are handled by topology reconciliation or the
 phase-specific failover fence. Durable `Creating`, `Switchover`,
-`AddingReplica`, `RemovingReplica`, and `FailingOver` resume from
-`status.operation`. Completed topology snapshots are refreshed with exact
-election metadata before they are used as unavailable-candidate comparison
-evidence. See `operator-failure-scenarios.md` §8.
+`AddingReplica`, and `FailingOver` resume from `status.operation`.
+`RemovingReplica` resumes from the production
+`status.removeReplicaExecution` reference and its ConfigMap checkpoint.
+Completed topology snapshots are refreshed with exact election metadata before
+they are used as unavailable-candidate comparison evidence. See
+`operator-failure-scenarios.md` §8.
 
 A container restart can keep the Pod UID while resetting role, epoch and all
 agent/runtime process-local state. Status exposes a new `AgentGeneration`, so
@@ -215,6 +224,38 @@ runtime role/epoch is persisted into the established durable
 force-remove/rebuild path before mutation. A stale primary enters durable
 failover. Missing prior-generation local state is never proof that an
 ambiguous effect did not run.
+
+## Framework-Native Durable Runner
+
+The operator hosts one bounded in-process runner for production
+remove-replica and optional switchover. It owns authoritative load/reload,
+terminal short-circuit, bounded host-outcome fuel, one-use dispatch permits,
+fused observation/progression, quarantine, persistence outcome classification,
+and deadline-clamped requeues. Its common outcomes are active, terminal,
+incompatible, rejected, isolated, conflict reload, unknown-write reload,
+persistence failure, and nondeterminism.
+
+Topology policy remains outside the runner. Each adapter independently owns
+observation collection, authority and exact-command preparation, effect
+dispatch and quarantine interpretation, deadline policy, terminal validation,
+and publication/conditions. This boundary is the extension point for a future
+add-replica migration; add-replica is not migrated now.
+
+The runner uses the existing kube controller as its scheduler and normal
+Set/Pod watches as wakeups. It does not add a worker, queue, lease, watcher,
+distributed execution owner, or retry scheduler.
+
+Each framework checkpoint is a same-namespace ConfigMap with a non-controlling,
+non-blocking owner reference to the exact `KubericSet` UID. The writer has
+`get`, `create`, and `update`, not delete. Active history is replaced by a
+compact terminal record, which remains until owner garbage collection or a
+separately authorized orphan-cleanup actor applies retention and recovery
+policy. Loads and replacements reject a changed owner relationship.
+
+Terminal acceptance alone cannot publish topology. The runner reloads and
+validates terminal state through the operation adapter before producing the
+publication handoff. A status conflict can therefore retry publication from
+the retained terminal without polling replicas or redispatching effects.
 
 ## Durable Partition Creation
 
@@ -365,18 +406,33 @@ authorize `Force`.
 The operator then:
 
 1. validates `minReplicas` and retained previous-write-quorum safety;
-2. persists remove operation v2 with the previous and frozen reduced
-   snapshots, exact target incarnation/pod UID, mode, deadlines, and a maximum
-   of three pre-commit attempts;
-3. freezes one generation-qualified `RemoveReplicaIntent` v1 and dispatches it
+2. persists framework-native remove contract v3 with immutable previous
+   topology, exact target incarnation/pod UID/authority, mode, minimum, and
+   deadlines; the reduced topology and domain remove operation v2 are derived;
+3. records compact passive-observation or exact-command boundaries through the
+   shared runner, which grants one dispatch permit only after exact exposure is
+   accepted;
+4. freezes one generation-qualified `RemoveReplicaIntent` v1 and dispatches it
    only to the exact current primary through correlated control v3;
-4. observes bounded primary coordinator evidence until the exact reduced
+5. observes bounded primary coordinator evidence until the exact reduced
    Current configuration commits, compensation succeeds, redrive is safe, or
    the operation poisons;
-5. persists the primary's exact commit timestamp, configuration signature, and
+6. persists the primary's exact commit timestamp, configuration signature, and
    the reduced workflow-scoped `committedSnapshot` before global cleanup;
-6. fences the old pod's role label to `retired`, deletes only the frozen UID,
-   and publishes the reduced `stableSnapshot`.
+7. fences the old pod's role label to `retired` and deletes only the frozen
+   UID through exact prepared boundaries; and
+8. persists and reloads the compact terminal before publishing the reduced
+   `stableSnapshot`.
+
+There is no remove execution-mode selector or build feature. Legacy pilot and
+explicit remove records become durable incompatibility markers and never
+authorize a fresh execution. The compact contract limits history to 16
+records, boundary inputs/results to 4,096/2,048 bytes, active/terminal records
+to 262,144/12,288 bytes, and terminal payloads to 4,096 bytes. The
+representative no-fault path is exactly three external effects, two passive
+observations, five durable boundaries, and six accepted writes; final
+three-sample active records ranged from 3,373 to 18,693 bytes, with a
+4,245-byte terminal record and 683-byte terminal payload.
 
 The primary `ReplicaAgent` owns the transient sequence:
 
@@ -407,9 +463,11 @@ frozen reachable peer authority, while `Force` permits missing authority and
 degraded post-commit retirement. Neither mode weakens exact target admission
 or quorum.
 
-Primary progress is volatile and bounded; CRD status is the durable authority.
-A new primary-agent generation may receive a new pre-commit attempt only when
-exact previous Current or reduced CatchUp survives, up to three attempts.
+Primary progress is volatile and bounded. Immutable CRD admission plus the
+framework checkpoint are the durable execution authority, and the published
+CRD snapshot remains the topology authority. A new primary-agent generation
+may receive a new pre-commit attempt only when exact previous Current or
+reduced CatchUp survives, up to three attempts.
 The three terminal operator dispositions are:
 
 - `FailedPreCommitIncomplete` for a known pre-commit state after deadline or

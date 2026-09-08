@@ -37,7 +37,9 @@ pub fn find_pg_bin() -> PathBuf {
 
 /// Create a temporary data directory for testing.
 pub fn temp_data_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kuberic-pg-test-{name}-{}", std::process::id()));
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/postgres-tests")
+        .join(format!("{name}-{}", std::process::id()));
     // Clean up any leftover from previous run
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp data dir");

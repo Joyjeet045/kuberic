@@ -8,25 +8,17 @@ use crate::crd::{
 };
 
 mod add_replica;
+pub mod checkpoint_store;
 mod create_partition;
 pub mod effects;
 mod failover;
 pub mod failover_election;
 #[cfg(feature = "durable-switchover-pilot")]
 pub mod pilot;
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
-pub mod pilot_store;
 mod remove_replica;
-#[cfg(feature = "durable-remove-replica-pilot")]
-pub mod remove_replica_pilot;
+pub mod remove_replica_execution;
+pub mod runner;
 mod switchover;
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 pub mod workflow_host;
 
 pub(crate) use add_replica::final_attestation as attest_add_replica;

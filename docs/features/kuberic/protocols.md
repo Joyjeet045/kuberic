@@ -15,7 +15,7 @@ replica add/rebuild and removal use separate coarse primary-agent-owned
 actions:
 
 ```
-persist pending action in CRD status
+persist the operation-specific pending boundary in CRD status or checkpoint
 observe target Pod UID + runtime epoch + agent generation/control version
 persist generation/control-version/runtime-epoch fences
   + exact payload for direct non-coarse actions
@@ -36,8 +36,10 @@ Prepare/Activate/Cleanup, while removal uses Retire. The primary's
 `PodRuntime` performs ordered local copy, configuration, quorum, or exact
 connection effects. The operator does not mutate either target runtime.
 Coarse payloads are constructed directly from structured
-`status.operation.addIntent` or `status.operation.removeIntent`; there is no
-second encoded payload projection.
+`status.operation.addIntent` for add/rebuild. Remove-replica reconstructs the
+same structured intent from immutable `status.removeReplicaExecution`
+admission and persists the exact compact prepared command in its framework
+checkpoint; there is no second mutable-state projection.
 
 `ReplicaInstanceId` remains the Pod UID. `AgentGeneration` identifies one
 process inside that Pod, and changes after a container restart.
@@ -259,19 +261,26 @@ label and repaired by existing Healthy/failover/rebuild behavior.
 
 ## Protocol: Remove Secondary
 
-Healthy scale-down and permanent stale/dead-secondary eviction use one durable
-`RemovingReplica` operation with `ScaleDown` or `Force` mode.
+Healthy scale-down and permanent stale/dead-secondary eviction use one
+production framework-native `RemovingReplica` workflow. There is no remove
+build feature or resource execution-mode selector. `ScaleDown` and `Force` are
+immutable domain safety modes chosen at admission, not alternative execution
+engines.
 
 ```
 1. Validate one stable non-primary target, minReplicas, retained previous
    write quorum, and exact historical runtime/pod UID
 2. For ScaleDown, prove exact target lifecycle-peer v2 reachability before
    persisting an operation; Force may freeze no target peer authority
-3. Persist remove operation v2 with previous/reduced snapshots, mode, exact
-   identities, deadlines, and attempt bound
-4. Freeze and dispatch one RemoveReplicaIntent v1 to the exact current
+3. Persist remove execution contract v3 with immutable admission: previous
+   snapshot, mode, exact target identity/UID/authority, minimum, and deadlines;
+   derive the reduced topology and domain remove operation v2 deterministically
+4. Through the shared runner, durably expose compact tagged observation or
+   exact-command boundaries; an accepted exact command yields one private,
+   one-use dispatch permit
+5. Freeze and dispatch one RemoveReplicaIntent v1 to the exact current
    primary through correlated control v3
-5. Primary coordinator:
+6. Primary coordinator:
    a. observe previous Current / reduced CatchUp / reduced Current
    b. install reduced CatchUp with the frozen previous configuration
    c. run tracked WaitForCatchUpQuorum(Write)
@@ -280,11 +289,29 @@ Healthy scale-down and permanent stale/dead-secondary eviction use one durable
    f. remove only the exact old-incarnation primary connection
    g. after commit, send ReplicaLifecyclePeer Retire stage v1 when authorized
    h. attest CommittedClean or CommittedDegraded
-6. Operator persists commit evidence plus the reduced workflow-scoped
+7. Operator persists commit evidence plus the reduced workflow-scoped
    committedSnapshot; stableSnapshot remains previous
-7. Operator observes cleanup, exact-UID labels the old pod role=retired,
-   exact-UID deletes it, then publishes the reduced stableSnapshot
+8. Operator observes cleanup and durably records exact-UID label and delete
+   effects
+9. Persist and reload a compact terminal checkpoint, validate it against
+   immutable admission and boundary accounting, then publish the reduced
+   stableSnapshot
 ```
+
+The compact boundary contract stores only passive observation requests, exact
+prepared replica/label/delete commands, compact evidence/effect results, or
+bounded proven-no-admission redelivery evidence. It does not repeat the
+complete mutable operation or full multi-configuration state at every
+boundary. A compare-and-swap conflict or unknown write outcome always reloads
+before a later permit; an unresolved exposed command remains quarantined until
+authoritative evidence resolves it.
+
+Contract versions other than native remove v3 are incompatible. Legacy pilot
+and explicit remove status is converted to a durable incompatibility marker
+and is never resumed, migrated, cleared as absent, or treated as permission for
+fresh admission. This is an execution-contract clean break only: correlated
+control v3, `RemoveReplicaIntent` v1, lifecycle-peer v2/Retire v1, intent
+signatures, and `ReplicaAgent` ownership are unchanged.
 
 Exact reduced Current is the irreversible commit. Before current-install
 dispatch, failure can restore exact previous Current. After dispatch, a

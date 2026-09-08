@@ -13,23 +13,29 @@ pub const CHECKPOINT_FORMAT_VERSION: u32 = 3;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointLimits {
     max_activity_records: usize,
-    max_encoded_bytes: usize,
+    max_active_encoded_bytes: usize,
+    max_terminal_encoded_bytes: usize,
 }
 
 impl CheckpointLimits {
     pub fn new(
         max_activity_records: usize,
-        max_encoded_bytes: usize,
+        max_active_encoded_bytes: usize,
+        max_terminal_encoded_bytes: usize,
     ) -> Result<Self, CheckpointError> {
         if max_activity_records == 0 {
             return Err(CheckpointError::ZeroActivityRecordLimit);
         }
-        if max_encoded_bytes == 0 {
+        if max_active_encoded_bytes == 0 {
             return Err(CheckpointError::ZeroEncodedCheckpointLimit);
+        }
+        if max_terminal_encoded_bytes == 0 {
+            return Err(CheckpointError::ZeroTerminalEncodedCheckpointLimit);
         }
         Ok(Self {
             max_activity_records,
-            max_encoded_bytes,
+            max_active_encoded_bytes,
+            max_terminal_encoded_bytes,
         })
     }
 
@@ -37,8 +43,12 @@ impl CheckpointLimits {
         self.max_activity_records
     }
 
-    pub const fn max_encoded_bytes(self) -> usize {
-        self.max_encoded_bytes
+    pub const fn max_active_encoded_bytes(self) -> usize {
+        self.max_active_encoded_bytes
+    }
+
+    pub const fn max_terminal_encoded_bytes(self) -> usize {
+        self.max_terminal_encoded_bytes
     }
 }
 
@@ -71,7 +81,7 @@ impl CheckpointEnvelope {
     ) -> Result<Self, CheckpointError> {
         payload.validate_internal(limits)?;
         let checkpoint = Self::encode(payload)?;
-        checkpoint.validate_encoded_size(limits)?;
+        checkpoint.validate_lifecycle_encoded_size(payload.state(), limits)?;
         Ok(checkpoint)
     }
 
@@ -107,23 +117,50 @@ impl CheckpointEnvelope {
                 supported: CHECKPOINT_FORMAT_VERSION,
             });
         }
-        self.validate_encoded_size(limits)?;
+        self.validate_active_encoded_size(limits)?;
 
         let payload: CheckpointPayload =
             serde_json::from_slice(self.payload.as_slice()).map_err(invalid_json)?;
+        self.validate_lifecycle_encoded_size(payload.state(), limits)?;
         payload.validate(expected, limits)?;
         Ok(payload)
     }
 
-    fn validate_encoded_size(&self, limits: CheckpointLimits) -> Result<(), CheckpointError> {
+    fn validate_active_encoded_size(
+        &self,
+        limits: CheckpointLimits,
+    ) -> Result<(), CheckpointError> {
         let actual = self.encoded_len()?;
-        if actual > limits.max_encoded_bytes {
+        if actual > limits.max_active_encoded_bytes {
             return Err(CheckpointError::EncodedCheckpointLimitExceeded {
                 actual,
-                maximum: limits.max_encoded_bytes,
+                maximum: limits.max_active_encoded_bytes,
             });
         }
         Ok(())
+    }
+
+    fn validate_lifecycle_encoded_size(
+        &self,
+        state: &CheckpointState,
+        limits: CheckpointLimits,
+    ) -> Result<(), CheckpointError> {
+        let actual = self.encoded_len()?;
+        match state {
+            CheckpointState::Active { .. } if actual > limits.max_active_encoded_bytes => {
+                Err(CheckpointError::EncodedCheckpointLimitExceeded {
+                    actual,
+                    maximum: limits.max_active_encoded_bytes,
+                })
+            }
+            CheckpointState::Terminal { .. } if actual > limits.max_terminal_encoded_bytes => {
+                Err(CheckpointError::TerminalEncodedCheckpointLimitExceeded {
+                    actual,
+                    maximum: limits.max_terminal_encoded_bytes,
+                })
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -133,6 +170,8 @@ impl CheckpointEnvelope {
 pub struct ExecutionContract {
     spec: ExecutionSpec,
     admitted_max_encoded_checkpoint_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admitted_max_terminal_encoded_checkpoint_bytes: Option<u64>,
 }
 
 impl ExecutionContract {
@@ -140,6 +179,21 @@ impl ExecutionContract {
         Self {
             spec,
             admitted_max_encoded_checkpoint_bytes,
+            admitted_max_terminal_encoded_checkpoint_bytes: None,
+        }
+    }
+
+    pub const fn with_encoded_limits(
+        spec: ExecutionSpec,
+        admitted_max_encoded_checkpoint_bytes: u64,
+        admitted_max_terminal_encoded_checkpoint_bytes: u64,
+    ) -> Self {
+        Self {
+            spec,
+            admitted_max_encoded_checkpoint_bytes,
+            admitted_max_terminal_encoded_checkpoint_bytes: Some(
+                admitted_max_terminal_encoded_checkpoint_bytes,
+            ),
         }
     }
 
@@ -149,6 +203,13 @@ impl ExecutionContract {
 
     pub const fn admitted_max_encoded_checkpoint_bytes(&self) -> u64 {
         self.admitted_max_encoded_checkpoint_bytes
+    }
+
+    pub const fn admitted_max_terminal_encoded_checkpoint_bytes(&self) -> u64 {
+        match self.admitted_max_terminal_encoded_checkpoint_bytes {
+            Some(limit) => limit,
+            None => self.admitted_max_encoded_checkpoint_bytes,
+        }
     }
 }
 
@@ -344,21 +405,38 @@ impl CheckpointPayload {
     }
 
     fn validate_internal(&self, limits: CheckpointLimits) -> Result<(), CheckpointError> {
-        let configured = u64::try_from(limits.max_encoded_bytes)
+        let configured = u64::try_from(limits.max_active_encoded_bytes)
             .map_err(|_| CheckpointError::EncodedLengthOverflow)?;
         let admitted = self.execution.admitted_max_encoded_checkpoint_bytes;
+        let configured_terminal = u64::try_from(limits.max_terminal_encoded_bytes)
+            .map_err(|_| CheckpointError::EncodedLengthOverflow)?;
+        let admitted_terminal = self
+            .execution
+            .admitted_max_terminal_encoded_checkpoint_bytes();
+        let required = self.maximum_terminal_encoded_len()?;
+        let required =
+            u64::try_from(required).map_err(|_| CheckpointError::EncodedLengthOverflow)?;
+        if required > admitted_terminal {
+            return Err(CheckpointError::AdmittedTerminalCapacityInsufficient {
+                required,
+                admitted: admitted_terminal,
+            });
+        }
+        if configured_terminal != admitted_terminal {
+            return Err(CheckpointError::TerminalEncodedCheckpointCapacityMismatch {
+                configured: configured_terminal,
+                admitted: admitted_terminal,
+            });
+        }
         if configured < admitted {
             return Err(CheckpointError::ConfiguredCapacityBelowAdmission {
                 configured,
                 admitted,
             });
         }
-        let required = self.maximum_terminal_encoded_len()?;
-        let required =
-            u64::try_from(required).map_err(|_| CheckpointError::EncodedLengthOverflow)?;
-        if required > admitted {
-            return Err(CheckpointError::AdmittedTerminalCapacityInsufficient {
-                required,
+        if configured > admitted {
+            return Err(CheckpointError::ConfiguredCapacityAboveAdmission {
+                configured,
                 admitted,
             });
         }
@@ -479,14 +557,26 @@ pub enum CheckpointError {
     ZeroActivityRecordLimit,
     #[error("maximum encoded checkpoint bytes must be greater than zero")]
     ZeroEncodedCheckpointLimit,
+    #[error("maximum terminal encoded checkpoint bytes must be greater than zero")]
+    ZeroTerminalEncodedCheckpointLimit,
     #[error("checkpoint has {actual} activity records; configured maximum is {maximum}")]
     ActivityRecordLimitExceeded { actual: usize, maximum: usize },
     #[error("encoded checkpoint uses {actual} bytes; configured maximum is {maximum}")]
     EncodedCheckpointLimitExceeded { actual: usize, maximum: usize },
+    #[error("terminal encoded checkpoint uses {actual} bytes; configured maximum is {maximum}")]
+    TerminalEncodedCheckpointLimitExceeded { actual: usize, maximum: usize },
     #[error(
         "configured encoded checkpoint capacity {configured} is below admitted capacity {admitted}"
     )]
     ConfiguredCapacityBelowAdmission { configured: u64, admitted: u64 },
+    #[error(
+        "configured encoded checkpoint capacity {configured} is above admitted capacity {admitted}"
+    )]
+    ConfiguredCapacityAboveAdmission { configured: u64, admitted: u64 },
+    #[error(
+        "configured terminal encoded checkpoint capacity {configured} differs from admitted capacity {admitted}"
+    )]
+    TerminalEncodedCheckpointCapacityMismatch { configured: u64, admitted: u64 },
     #[error(
         "admitted terminal checkpoint capacity {admitted} is below required capacity {required}"
     )]
@@ -671,5 +761,13 @@ mod tests {
             }
             assert!(serde_json::from_value::<CheckpointPayload>(value).is_err());
         }
+    }
+
+    #[test]
+    fn terminal_encoded_limit_must_be_nonzero() {
+        assert_eq!(
+            CheckpointLimits::new(1, 1024, 0),
+            Err(CheckpointError::ZeroTerminalEncodedCheckpointLimit)
+        );
     }
 }

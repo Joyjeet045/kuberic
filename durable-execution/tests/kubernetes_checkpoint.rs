@@ -913,7 +913,7 @@ async fn host_rejects_unsupported_format_and_reloads_after_unit_conflict() {
     let mut unsupported_host = DurableHost::new(
         unsupported_store,
         HostEpoch::from_bytes([1; 16]),
-        CheckpointLimits::new(8, 4096).expect("limits"),
+        CheckpointLimits::new(8, 4096, 4096).expect("limits"),
     );
     let execution_spec = ExecutionSpec::new(execution_id, ExactBytes::default(), 64);
     assert!(matches!(
@@ -933,7 +933,7 @@ async fn host_rejects_unsupported_format_and_reloads_after_unit_conflict() {
     let mut reload_host = DurableHost::new(
         reload_store,
         HostEpoch::from_bytes([2; 16]),
-        CheckpointLimits::new(8, 4096).expect("limits"),
+        CheckpointLimits::new(8, 4096, 4096).expect("limits"),
     );
     assert!(matches!(
         reload_host

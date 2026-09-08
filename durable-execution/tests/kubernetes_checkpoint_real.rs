@@ -593,7 +593,7 @@ fn fixed_fixture(
         ExactBytes::new(b"measurement-input".to_vec()),
         64,
     );
-    let limits = CheckpointLimits::new(8, CHECKPOINT_LIMIT)?;
+    let limits = CheckpointLimits::new(8, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT)?;
     let contract = ExecutionContract::new(execution.clone(), CHECKPOINT_LIMIT as u64);
     let active = CheckpointEnvelope::encode_with_limits(
         &CheckpointPayload::active(

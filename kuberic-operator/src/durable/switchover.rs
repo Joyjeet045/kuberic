@@ -29,7 +29,6 @@ enum ActionObservation {
     Impossible,
 }
 
-// COMPLEXITY-BOUNDARY: explicit-switchover:start
 pub fn start_switchover(
     set_uid: &str,
     previous: StablePartitionSnapshotStatus,
@@ -1522,7 +1521,6 @@ fn switchover_label_uid(
         .ok_or_else(|| format!("switchover label target {target_id} is not in its snapshots"))
 }
 
-// COMPLEXITY-BOUNDARY: explicit-switchover:end
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -407,11 +407,6 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
   --test reconciler test_durable_execution_switchover_pilot_ -- --nocapture
 ```
 
-`python3 scripts/measure-switchover-complexity.py` reports stable lexical
-implementation boundaries split into workflow body, comparable workflow scope,
-shared typed/fused/effect-adapter infrastructure, operator integration, and
-honestly charged total, and rejects overlap among charged scopes.
-
 The authoritative happy-path gate expects exactly nine external effects plus
 three passive observations, giving 12 completed durable boundaries and 13
 accepted checkpoint writes including terminal persistence. Seven former
@@ -447,10 +442,9 @@ their sizes. The output also reports persistence outcomes, status
 attempts/outcomes, UID-label calls, Pod-list calls, and an explicit reason
 requeues are unavailable in the direct-reconcile harness.
 
-Run the exact measurement and projection gates with:
+Run the exact operational measurement and projection gates with:
 
 ```console
-python3 scripts/measure-switchover-complexity.py
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
   --features durable-switchover-pilot success_and_rollback_transcripts_fit_with_redelivery_headroom
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
@@ -496,54 +490,79 @@ When no authorized cluster is available, the required local measurement,
 fault, replay, and bounds gates above remain authoritative; absence of the
 optional environment is not evidence of real-API coverage.
 
-**Pattern 7b: Feature-gated durable-execution remove-replica pilot** ✅
-`test_durable_execution_remove_replica_pilot_*` keeps explicit
-remove-replica as the default and exercises the opt-in kernel path through
-prepared replica, exact-UID label, and exact-UID deletion effects. The matrix
-covers unsupported feature selection, every-turn restart, lost replies,
-proven-no-admission redelivery, checkpoint conflict and unknown outcomes,
-terminal reload after status failure, identity drift, Force authority,
-post-commit ambiguity, and repeated execution identity.
+**Pattern 7b: Framework-native remove-replica** ✅
+`test_framework_native_remove_replica_*` exercises the only production remove
+path through the shared bounded runner, an exact prepared
+`RemoveReplicaIntent`, exact-UID label fencing, and exact-UID deletion. No
+remove execution-mode selector or remove-specific Cargo feature is required.
+The matrix includes default routing, legacy and unsupported-contract
+incompatibility, every-boundary restart, uncertain effect recovery, terminal
+reload before publication, status-gap waits without churn, malformed agent
+isolation, and live data preservation.
 
 Run the durable remove-replica operator and reconciler gates with:
 
 ```console
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-operator \
-  --features durable-remove-replica-pilot remove_replica_pilot_
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
-  -p kvstore --features durable-remove-replica-pilot --test reconciler \
-  test_durable_execution_remove_replica_pilot_ -- --nocapture
+cargo test -p kuberic-operator framework_native_remove_replica
+cargo test -p kuberic-operator durable_runner_tests
+cargo test -p kuberic-operator checkpoint_store
+cargo test -p kvstore --test reconciler test_framework_native_remove_replica_
 ```
 
-Run the representative three-sample measurement separately:
+The no-fault measurement is exact: three external effects, two passive
+observations, five completed durable boundaries, and six accepted writes. The
+three final samples observed an active-record lifecycle range of
+3,373–18,693 bytes, per-run maxima of 18,685, 18,685, and 18,693 bytes, a
+4,245-byte terminal record, and a 683-byte terminal payload. These bytes are
+run-specific measurements; the active acceptance gate is 49,152 bytes
+(48 KiB).
 
 ```console
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
-  -p kvstore --features durable-remove-replica-pilot --test reconciler \
-  test_durable_execution_remove_replica_pilot_three_no_fault_measurement_samples \
-  -- --nocapture
+cargo test -p kvstore --test reconciler \
+  test_framework_native_remove_replica_three_no_fault_measurement_samples -- --nocapture
 ```
 
-The sampled no-fault ScaleDown path records three external effects, two passive
-observations, five durable boundaries, and six accepted writes. The earlier 11
-accepted writes came from an unfused production loop that persisted exposure
-and observation separately for each activity. The fused runner persists one
-initial exposure plus five fused observation/progression writes without
-changing the semantic boundary counts.
+The independent contract bounds are 16 records, 4,096-byte boundary input,
+2,048-byte boundary result, 262,144-byte active record, 12,288-byte terminal
+record, and 4,096-byte terminal payload. The maximum-fault projection measures
+182,589 active bytes and 11,453 terminal bytes at the full 4,096-byte payload
+ceiling. The one-byte-over matrix rejects 17, 4,097, 2,049, 262,145, 12,289,
+and 4,097 respectively:
 
-Run-specific active-checkpoint maxima are approximately 91.6 KiB. The
-5,005–93,837-byte interval is the aggregate lifecycle minimum-to-maximum range,
-not a range of per-run maxima. Terminal checkpoints range from 8,121 to 8,125
-bytes in the representative three-sample command; repeated local validation
-observed 8,117–8,129 bytes. The terminal payload is 2,188 bytes.
+```console
+cargo test -p kuberic-operator \
+  remove_replica_execution_rejects_all_six_one_byte_over_bounds
+cargo test -p kuberic-operator \
+  remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds -- --nocapture
+```
 
-The active maximum passes the stable 770,048-byte encoded-checkpoint admission
-ceiling but exceeds the switchover 65,536-byte baseline gate and 32,768-byte
-stretch gate. Those smaller gates were not assigned as formal remove-replica
-acceptance gates. Active size grows approximately as durable-activity count
-multiplied by serialized workflow-state size; retained full activity history
-and repeated full-state activity inputs and results dominate the measurement.
-The stable terminal-payload ceiling remains 4,096 bytes.
+The deletion safety inventory is retained by named native workflow,
+shared-runner/kernel, reconciler, Kubernetes-provider, authorization, and
+live-cluster tests in the committed source tree. The six operation-adapter
+responsibilities have dedicated `framework_native_remove_replica_fr019_*`
+tests.
+
+For isolated live validation, use only the dedicated Kuberic Kind kubeconfig:
+
+```console
+KUBECONFIG="$HOME/.kube/kuberic-kind-config" kubectl \
+  --kubeconfig "$HOME/.kube/kuberic-kind-config" cluster-info
+KUBECONFIG="$HOME/.kube/kuberic-kind-config" just images
+KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test \
+  -p kuberic-durable-execution --features kubernetes \
+  --test kubernetes_checkpoint_real -- --nocapture
+KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests \
+  test_kvstore_k8s_status_healthy -- --nocapture
+KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests \
+  test_kvstore_k8s_write_read -- --nocapture
+KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests \
+  test_kvstore_k8s_framework_native_remove_replica -- --nocapture
+```
+
+The live removal test verifies selector-free admission, the owner-bound
+terminal checkpoint, exact removal of one pod, preservation of the two
+admitted surviving UIDs, and restoration of the shared fixture to three
+healthy replicas.
 
 **Pattern 8: Durable add/rejoin boundary and ambiguity recovery** ✅
 `test_durable_add_survives_state_loss_and_every_lost_runtime_reply` loses the
@@ -596,8 +615,8 @@ protection, 10/30/60/600-second budgets, and bounded terminal retention.
 Commit/publication resource-version conflicts are refetched without duplicate
 mutation. Exact-UID label/delete tests prove a same-name replacement is not
 relabelled or deleted. Schema and source searches require remove operation v2,
-control v3, lifecycle peer v2, add operation v3, and no superseded removal
-cursor or peer alias.
+framework-native remove contract v3, control v3, lifecycle peer v2, add
+operation v3, and no superseded removal cursor or peer alias.
 
 **Pattern 10: Durable Phase-1 failover and data loss** ✅
 

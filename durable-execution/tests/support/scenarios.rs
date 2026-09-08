@@ -7,7 +7,8 @@ use kuberic_durable_execution::{
     ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore,
     InMemoryFault, LogicalActivityId, Nondeterminism, ObservationRejection, PersistenceBoundary,
     PreparedActivityError, PreparedActivityResolver, ReloadReason, StorageRevision, StoreError,
-    StoreErrorKind, StoreOperation, StoredCheckpoint, TerminalOutcome, Workflow, WorkflowContext,
+    StoreErrorKind, StoreOperation, StoredCheckpoint, TerminalCheckpointStatus, TerminalOutcome,
+    Workflow, WorkflowContext,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -488,7 +489,7 @@ fn activity_spec(name: &str, version: u32, input: &[u8], max_result_bytes: u64) 
 }
 
 fn generous_limits() -> CheckpointLimits {
-    CheckpointLimits::new(128, 1_000_000).unwrap()
+    CheckpointLimits::new(128, 1_000_000, 1_000_000).unwrap()
 }
 
 fn host(store: InMemoryCheckpointStore, epoch_value: u8) -> DurableHost<InMemoryCheckpointStore> {
@@ -1122,7 +1123,31 @@ async fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
                     } if result == &bytes(b"recorded")
                 ),
             ),
-            ("second replay is semantically identical", first == second),
+            (
+                "accepted completion and authoritative reload are semantically identical",
+                matches!(
+                    (&first, &second),
+                    (
+                        HostOutcome::WorkflowCompleted {
+                            outcome: first_outcome,
+                            completed_activity_count: first_count,
+                            revision: first_revision,
+                            boundary: first_boundary,
+                            checkpoint_status: TerminalCheckpointStatus::Accepted,
+                        },
+                        HostOutcome::WorkflowCompleted {
+                            outcome: second_outcome,
+                            completed_activity_count: second_count,
+                            revision: second_revision,
+                            boundary: second_boundary,
+                            checkpoint_status: TerminalCheckpointStatus::Reloaded,
+                        },
+                    ) if first_outcome == second_outcome
+                        && first_count == second_count
+                        && first_revision == second_revision
+                        && first_boundary == second_boundary
+                ),
+            ),
             (
                 "neither completed replay grants dispatch",
                 !matches!(first, HostOutcome::DispatchPermitted { .. })
@@ -1139,7 +1164,7 @@ async fn unsupported_format(id: ScenarioId) -> ScenarioEvidence {
     let valid = CheckpointEnvelope::encode(&CheckpointPayload::active(
         ExecutionContract::new(
             execution_spec(execution_id, input.clone()),
-            generous_limits().max_encoded_bytes() as u64,
+            generous_limits().max_active_encoded_bytes() as u64,
         ),
         Vec::new(),
     ))
@@ -1881,7 +1906,7 @@ async fn activity_count_and_growing_history(id: ScenarioId) -> ScenarioEvidence 
     let store = InMemoryCheckpointStore::new();
     let execution_id = execution(128);
     let input = bytes(b"workflow");
-    let limits = CheckpointLimits::new(3, 1_000_000).unwrap();
+    let limits = CheckpointLimits::new(3, 1_000_000, 1_000_000).unwrap();
     let workflow = LinearWorkflow {
         activities: vec![
             activity_spec("first", 1, b"A", 16),
@@ -1982,19 +2007,21 @@ async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
     let input = bytes(b"workflow");
     let activity = activity_spec("bounded", 1, b"input", MAX_RESULT as u64);
     let exact_execution = ExecutionSpec::new(execution_id, input.clone(), MAX_RESULT as u64);
+    let terminal_capacity = generous_limits().max_terminal_encoded_bytes() as u64;
     let mut exact_completed = 1_000_000_u64;
     for _ in 0..8 {
         let probe = CheckpointPayload::active(
-            ExecutionContract::new(exact_execution.clone(), exact_completed),
+            ExecutionContract::with_encoded_limits(
+                exact_execution.clone(),
+                exact_completed,
+                terminal_capacity,
+            ),
             vec![kuberic_durable_execution::ActivityRecord::scheduled(
                 ActivitySequence::new(0),
                 activity.clone(),
             )],
         );
-        let required = probe
-            .maximum_activity_completed_encoded_len()
-            .unwrap()
-            .max(probe.maximum_terminal_encoded_len().unwrap());
+        let required = probe.maximum_activity_completed_encoded_len().unwrap();
         let required = u64::try_from(required).unwrap();
         if required == exact_completed {
             break;
@@ -2004,7 +2031,8 @@ async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
     let exact_completed = usize::try_from(exact_completed).unwrap();
 
     let exact_store = InMemoryCheckpointStore::new();
-    let exact_limits = CheckpointLimits::new(1, exact_completed).unwrap();
+    let exact_limits =
+        CheckpointLimits::new(1, exact_completed, terminal_capacity as usize).unwrap();
     let workflow = LinearWorkflow {
         activities: vec![activity.clone()],
     };
@@ -2034,7 +2062,8 @@ async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
         .and_then(|stored| stored.checkpoint().encoded_len().ok());
 
     let tight_store = InMemoryCheckpointStore::new();
-    let tight_limits = CheckpointLimits::new(1, exact_completed - 1).unwrap();
+    let tight_limits =
+        CheckpointLimits::new(1, exact_completed - 1, terminal_capacity as usize).unwrap();
     let mut tight_host = DurableHost::new(tight_store, epoch(130), tight_limits);
     let tight_execution = ExecutionSpec::new(execution_id, input.clone(), MAX_RESULT as u64);
     let tight_schedule = tight_host.turn(&workflow, tight_execution.clone()).await;
@@ -2045,7 +2074,7 @@ async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
     let mut huge_host = DurableHost::new(
         huge_store,
         epoch(132),
-        CheckpointLimits::new(1, 100_000).unwrap(),
+        CheckpointLimits::new(1, 100_000, 100_000).unwrap(),
     );
     let huge_execution = ExecutionSpec::new(
         execution(131),
@@ -2273,8 +2302,29 @@ async fn terminal_reload_without_poll(id: ScenarioId) -> ScenarioEvidence {
                 ),
             ),
             (
-                "terminal reload returns the same outcome and revision",
-                accepted == reloaded,
+                "terminal reload returns the same outcome and revision with authoritative status",
+                matches!(
+                    (&accepted, &reloaded),
+                    (
+                        HostOutcome::WorkflowCompleted {
+                            outcome: accepted_outcome,
+                            completed_activity_count: accepted_count,
+                            revision: accepted_revision,
+                            boundary: accepted_boundary,
+                            checkpoint_status: TerminalCheckpointStatus::Accepted,
+                        },
+                        HostOutcome::WorkflowCompleted {
+                            outcome: reloaded_outcome,
+                            completed_activity_count: reloaded_count,
+                            revision: reloaded_revision,
+                            boundary: reloaded_boundary,
+                            checkpoint_status: TerminalCheckpointStatus::Reloaded,
+                        },
+                    ) if accepted_outcome == reloaded_outcome
+                        && accepted_count == reloaded_count
+                        && accepted_revision == reloaded_revision
+                        && accepted_boundary == reloaded_boundary
+                ),
             ),
             (
                 "terminal reload does not poll workflow code",
@@ -2455,7 +2505,7 @@ fn exact_terminal_capacity(execution: &ExecutionSpec) -> usize {
     let mut admitted = 1_000_000_u64;
     for _ in 0..16 {
         let payload = CheckpointPayload::active(
-            ExecutionContract::new(execution.clone(), admitted),
+            ExecutionContract::with_encoded_limits(execution.clone(), 1_000_000, admitted),
             Vec::new(),
         );
         let required = u64::try_from(payload.maximum_terminal_encoded_len().unwrap()).unwrap();
@@ -2474,7 +2524,7 @@ async fn terminal_capacity_admission(id: ScenarioId) -> ScenarioEvidence {
     let mut exact_host = DurableHost::new(
         exact_store,
         epoch(141),
-        CheckpointLimits::new(1, exact_capacity).unwrap(),
+        CheckpointLimits::new(1, 1_000_000, exact_capacity).unwrap(),
     );
     let exact = exact_host
         .turn(
@@ -2491,7 +2541,7 @@ async fn terminal_capacity_admission(id: ScenarioId) -> ScenarioEvidence {
     let mut tight_host = DurableHost::new(
         tight_store.clone(),
         epoch(142),
-        CheckpointLimits::new(1, exact_capacity - 1).unwrap(),
+        CheckpointLimits::new(1, 1_000_000, exact_capacity - 1).unwrap(),
     );
     let tight = tight_host
         .turn(
@@ -2860,7 +2910,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     let valid_payload = CheckpointPayload::active(
         ExecutionContract::new(
             missing_execution.clone(),
-            generous_limits().max_encoded_bytes() as u64,
+            generous_limits().max_active_encoded_bytes() as u64,
         ),
         Vec::new(),
     );
@@ -2951,7 +3001,12 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     let mut active_downgrade_host = DurableHost::new(
         active_downgrade_store,
         epoch(156),
-        CheckpointLimits::new(128, generous_limits().max_encoded_bytes() - 1).unwrap(),
+        CheckpointLimits::new(
+            128,
+            generous_limits().max_active_encoded_bytes() - 1,
+            generous_limits().max_terminal_encoded_bytes(),
+        )
+        .unwrap(),
     );
     let active_downgrade_polls = Cell::new(0);
     let active_downgrade = active_downgrade_host
@@ -2977,7 +3032,12 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     let mut terminal_downgrade_host = DurableHost::new(
         terminal_downgrade_store,
         epoch(158),
-        CheckpointLimits::new(128, generous_limits().max_encoded_bytes() - 1).unwrap(),
+        CheckpointLimits::new(
+            128,
+            generous_limits().max_active_encoded_bytes(),
+            generous_limits().max_terminal_encoded_bytes() - 1,
+        )
+        .unwrap(),
     );
     let terminal_downgrade_polls = Cell::new(0);
     let terminal_downgrade = terminal_downgrade_host
@@ -2999,7 +3059,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
                     active_identity_caller.workflow_input().clone(),
                     MAX_TERMINAL_PAYLOAD_BYTES,
                 ),
-                generous_limits().max_encoded_bytes() as u64,
+                generous_limits().max_active_encoded_bytes() as u64,
             ),
             Vec::new(),
         ))
@@ -3021,7 +3081,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
                     bytes(b"different-active-input"),
                     MAX_TERMINAL_PAYLOAD_BYTES,
                 ),
-                generous_limits().max_encoded_bytes() as u64,
+                generous_limits().max_active_encoded_bytes() as u64,
             ),
             Vec::new(),
         ))
@@ -3043,7 +3103,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
                     terminal_identity_caller.workflow_input().clone(),
                     MAX_TERMINAL_PAYLOAD_BYTES,
                 ),
-                generous_limits().max_encoded_bytes() as u64,
+                generous_limits().max_active_encoded_bytes() as u64,
             ),
             TerminalOutcome::succeeded(bytes(b"done")),
             0,
@@ -3066,7 +3126,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
                     bytes(b"different-terminal-input"),
                     MAX_TERMINAL_PAYLOAD_BYTES,
                 ),
-                generous_limits().max_encoded_bytes() as u64,
+                generous_limits().max_active_encoded_bytes() as u64,
             ),
             TerminalOutcome::succeeded(bytes(b"done")),
             0,
@@ -3084,7 +3144,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     let mut terminal_missing_value = serde_json::to_value(CheckpointPayload::terminal(
         ExecutionContract::new(
             terminal_missing_caller.clone(),
-            generous_limits().max_encoded_bytes() as u64,
+            generous_limits().max_active_encoded_bytes() as u64,
         ),
         TerminalOutcome::succeeded(bytes(b"done")),
         0,
@@ -3111,7 +3171,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     let mut mixed_terminal_value = serde_json::to_value(CheckpointPayload::terminal(
         ExecutionContract::new(
             mixed_terminal_caller.clone(),
-            generous_limits().max_encoded_bytes() as u64,
+            generous_limits().max_active_encoded_bytes() as u64,
         ),
         TerminalOutcome::succeeded(bytes(b"done")),
         0,
@@ -3135,7 +3195,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     let mut active_unknown_value = serde_json::to_value(CheckpointPayload::active(
         ExecutionContract::new(
             active_unknown_caller.clone(),
-            generous_limits().max_encoded_bytes() as u64,
+            generous_limits().max_active_encoded_bytes() as u64,
         ),
         Vec::new(),
     ))
@@ -3158,7 +3218,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     let mut terminal_unknown_value = serde_json::to_value(CheckpointPayload::terminal(
         ExecutionContract::new(
             terminal_unknown_caller.clone(),
-            generous_limits().max_encoded_bytes() as u64,
+            generous_limits().max_active_encoded_bytes() as u64,
         ),
         TerminalOutcome::succeeded(bytes(b"done")),
         0,
@@ -3182,7 +3242,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     let mut nested_history_value = serde_json::to_value(CheckpointPayload::terminal(
         ExecutionContract::new(
             nested_history_caller.clone(),
-            generous_limits().max_encoded_bytes() as u64,
+            generous_limits().max_active_encoded_bytes() as u64,
         ),
         TerminalOutcome::succeeded(bytes(b"done")),
         0,
@@ -3255,7 +3315,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
                 ) && matches!(
                     terminal_downgrade,
                     HostOutcome::CheckpointRejected(
-                        CheckpointError::ConfiguredCapacityBelowAdmission { .. }
+                        CheckpointError::TerminalEncodedCheckpointCapacityMismatch { .. }
                     )
                 ) && active_downgrade_polls.get() == 0
                     && terminal_downgrade_polls.get() == 0,

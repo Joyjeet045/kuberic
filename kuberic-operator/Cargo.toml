@@ -11,16 +11,7 @@ publish = false
 
 [features]
 default = []
-durable-switchover-pilot = [
-    "dep:kuberic-durable-execution",
-    "kuberic-durable-execution/kubernetes",
-    "dep:rand",
-]
-durable-remove-replica-pilot = [
-    "dep:kuberic-durable-execution",
-    "kuberic-durable-execution/kubernetes",
-    "dep:rand",
-]
+durable-switchover-pilot = []
 
 [[bin]]
 name = "kuberic-operator"
@@ -28,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 kuberic-core = { path = "../kuberic-core" }
-kuberic-durable-execution = { path = "../durable-execution", optional = true }
+kuberic-durable-execution = { path = "../durable-execution", features = ["kubernetes"] }
 kube.workspace = true
 k8s-openapi.workspace = true
 schemars.workspace = true
@@ -41,7 +32,7 @@ tracing-subscriber.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
-rand = { workspace = true, optional = true }
+rand.workspace = true
 
 [dev-dependencies]
 kuberic-core = { path = "../kuberic-core", features = ["testing"] }

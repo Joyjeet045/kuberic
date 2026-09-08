@@ -10,12 +10,11 @@ use kuberic_durable_execution::{
 use rand::random;
 use tokio::sync::Mutex;
 
-use super::pilot_store::{
+use super::checkpoint_store::{
     CheckpointMeasurementDecoder, DurableCheckpointMeasurementsSnapshot, DurableCheckpointStore,
     MeasuredDurableCheckpointStore,
 };
 
-// COMPLEXITY-BOUNDARY: shared-operator-workflow-host:start
 const MAX_COMPLETED_MEASUREMENT_SNAPSHOTS: usize = 64;
 
 pub type DurableOperatorHost = DurableHost<MeasuredDurableCheckpointStore>;
@@ -59,6 +58,10 @@ impl DurablePermitGuard {
 
     pub fn activity(&self) -> Option<&LogicalActivityId> {
         self.permit.as_ref().map(DispatchPermit::activity)
+    }
+
+    pub fn attempt_id(&self) -> Option<AttemptId> {
+        self.permit.as_ref().map(DispatchPermit::attempt_id)
     }
 }
 
@@ -208,4 +211,3 @@ impl DurableWorkflowRuntime {
         self.completed_measurements.lock().await.get(&key).copied()
     }
 }
-// COMPLEXITY-BOUNDARY: shared-operator-workflow-host:end

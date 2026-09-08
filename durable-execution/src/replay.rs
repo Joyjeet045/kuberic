@@ -85,14 +85,24 @@ pub fn evaluate_prepared<W: Workflow>(
             Err(error) => return Evaluation::CheckpointRejected(error),
         },
         None => {
-            let admitted = match u64::try_from(limits.max_encoded_bytes()) {
+            let admitted_active = match u64::try_from(limits.max_active_encoded_bytes()) {
+                Ok(admitted) => admitted,
+                Err(_) => {
+                    return Evaluation::CheckpointRejected(CheckpointError::EncodedLengthOverflow);
+                }
+            };
+            let admitted_terminal = match u64::try_from(limits.max_terminal_encoded_bytes()) {
                 Ok(admitted) => admitted,
                 Err(_) => {
                     return Evaluation::CheckpointRejected(CheckpointError::EncodedLengthOverflow);
                 }
             };
             let payload = CheckpointPayload::active(
-                ExecutionContract::new(execution.clone(), admitted),
+                ExecutionContract::with_encoded_limits(
+                    execution.clone(),
+                    admitted_active,
+                    admitted_terminal,
+                ),
                 Vec::new(),
             );
             if let Err(error) = payload.validate(execution, limits) {

@@ -19,4 +19,6 @@ kube-lease-manager.workspace = true
 kube-leader-election.workspace = true
 rand.workspace = true
 tokio-util.workspace = true
+serial_test.workspace = true
 kvstore = { path = "../examples/kvstore" }
+kuberic-durable-execution = { path = "../durable-execution" }

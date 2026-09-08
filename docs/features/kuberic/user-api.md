@@ -260,7 +260,11 @@ Individual mutation RPCs and `execute_durable_action()` are retired.
 `AddReplicaIntent` and `RemoveReplicaIntent` are the compound actions. Each is
 addressed to the exact current primary and freezes its own identities,
 configuration semantics, safety constraints, and deadlines. Their primary
-coordinators are transient; CRD status remains the durable authority.
+coordinators are transient. Add/build authority remains in
+`status.operation`; remove admission and checkpoint identity live in
+`status.removeReplicaExecution`, while its owner-bound ConfigMap stores compact
+execution history and terminal evidence. Stable topology remains authoritative
+in CRD status.
 
 The internal lifecycle-peer protocol is version 2. Add/build uses typed
 Prepare/Activate/Cleanup stages; removal uses typed Retire. Sharing the peer

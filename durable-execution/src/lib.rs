@@ -33,6 +33,7 @@ pub use checkpoint::{
 pub use host::{
     ActivityObservation, DispatchPermit, DurableHost, HOST_OUTCOME_VARIANTS, HostOutcome,
     ObservationRejection, PersistenceBoundary, ReloadReason, StoreOperation,
+    TerminalCheckpointStatus,
 };
 pub use identity::{
     ActivityName, ActivitySequence, ActivitySpec, AttemptId, ExactBytes, ExecutionId,

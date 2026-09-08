@@ -46,11 +46,6 @@ jobs:
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
 
-    - name: Measure durable workflow complexity
-      run: |
-        python3 scripts/measure-switchover-complexity.py
-        python3 -m unittest scripts.tests.test_measure_switchover_complexity
-    
     - name: Run cargo clippy
       run: cargo clippy --all-targets -- -D warnings
 
@@ -63,14 +58,17 @@ jobs:
         cargo test -p kuberic-operator --features durable-switchover-pilot measurements_ -- --nocapture
         cargo test -p kvstore --test reconciler test_durable_execution_switchover_pilot_happy_path -- --nocapture
 
-    - name: Run durable remove-replica gates
+    - name: Run framework-native remove-replica gates
       env:
         RUST_MIN_STACK: 4194304
       run: |
-        cargo test -p kuberic-operator --features durable-remove-replica-pilot remove_replica_pilot
-        cargo test -p kuberic-operator --features durable-switchover-pilot,durable-remove-replica-pilot durable_effect_outcome
-        cargo test -p kvstore --features durable-remove-replica-pilot --test reconciler test_durable_execution_remove_replica_pilot_ -- --skip test_durable_execution_remove_replica_pilot_three_no_fault_measurement_samples
-        cargo test -p kvstore --features durable-remove-replica-pilot --test reconciler test_durable_execution_remove_replica_pilot_three_no_fault_measurement_samples -- --nocapture
+        cargo test -p kuberic-operator framework_native_remove_replica
+        cargo test -p kuberic-operator durable_runner_tests
+        cargo test -p kuberic-operator checkpoint_store
+        cargo test -p kuberic-operator remove_replica_execution_rejects_all_six_one_byte_over_bounds
+        cargo test -p kuberic-operator remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds -- --nocapture
+        cargo test -p kvstore --test reconciler test_framework_native_remove_replica_
+        cargo test -p kvstore --test reconciler test_framework_native_remove_replica_three_no_fault_measurement_samples -- --nocapture
 
     - name: Build all targets
       run: cargo build --all-targets

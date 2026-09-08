@@ -34,7 +34,7 @@ the new primary is active. Pre-promotion fencing is unnecessary because:
 - **Failover:** old primary is dead → can't send ops
 - **Switchover:** old primary's writes are revoked → can't send new ops
 
-**Fix:** The CRD-backed workflows persist every transition and execute one
+**Fix:** The Kubernetes-backed workflows persist every transition and execute one
 correlated activity at a time. Promotion is followed by durable epoch and
 configuration convergence. Unavailable members are retained in the workflow
 denominator and cannot be silently dropped; impossible convergence fails
@@ -700,7 +700,7 @@ design work needed — just implementation.
 ## Category E: Rolling Upgrade Review Findings
 
 Discovered during review of `rolling-upgrade-design.md`. The original
-mutable-driver findings below are superseded by CRD-backed durable workflows
+mutable-driver findings below are superseded by Kubernetes-backed durable workflows
 and the read-only production `PartitionDriver`.
 
 ### E1. `add_replica` zombie on failure — ✅ Fixed
@@ -947,11 +947,13 @@ roll-forward only; unattested committed membership becomes
 
 **Affects:** Healthy scale-down and stale/dead-secondary eviction
 
-The operator now freezes one remove operation v2 and dispatches one
-`RemoveReplicaIntent` v1 to the exact current primary through correlated
-control v3. CRD status retains desired topology, `ScaleDown`/`Force`
-authorization, frozen previous/reduced descriptors, attempt/deadline state,
-commit recognition, Kubernetes cleanup, and final stable publication.
+The operator now admits native remove contract v3 in
+`status.removeReplicaExecution` and dispatches one `RemoveReplicaIntent` v1 to
+the exact current primary through correlated control v3. CRD status retains
+desired topology, immutable `ScaleDown`/`Force` admission, checkpoint identity,
+and final stable publication. The referenced owner-bound ConfigMap retains
+compact attempt/deadline progress, exact prepared commands, commit and cleanup
+evidence, and the terminal record.
 
 The primary `ReplicaAgent` transiently installs reduced CatchUp with the
 previous configuration, waits for the frozen write quorum, installs reduced
@@ -1039,13 +1041,15 @@ service/replicator callbacks
 (`ReconfigurationAgentProxy.cpp`, `FailoverUnitProxy.cpp`,
 `ProxyActionsList.cpp`).
 
-Kuberic does not add a durable local LFUM. CRD status remains the sole durable
-global store. Agent state lasts one process generation and retains 16 terminal
-records. A same-Pod process restart changes `AgentGeneration`; prior local
-state is not inherited, and the operator observes durable postconditions
-before refreshing fences or redriving. When stable secondary runtime
-continuity cannot be proven, recovery enters the existing durable
-force-remove/rebuild protocol.
+Kuberic does not add a durable local LFUM. Kubernetes control-plane records
+remain the only durable global state: CRD status owns topology and
+operation admission, while the owner-bound native remove ConfigMap owns that
+workflow's boundary history and terminal evidence. Agent state lasts one
+process generation and retains 16 terminal records. A same-Pod process restart
+changes `AgentGeneration`; prior local state is not inherited, and the
+operator observes durable postconditions before refreshing fences or
+redriving. When stable secondary runtime continuity cannot be proven, recovery
+enters the existing durable force-remove/rebuild protocol.
 
 `ExecuteCorrelatedControlAction` is the only production mutation path, and
 `current_action` plus `retained_terminal_actions` is the only local

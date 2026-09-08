@@ -1,4 +1,3 @@
-// COMPLEXITY-BOUNDARY: explicit-remove:start
 use std::collections::HashSet;
 
 use kuberic_core::remove_replica::{
@@ -1337,7 +1336,6 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
     Ok(())
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
 pub(crate) fn validate_remove_replica_operation(
     operation: &DurableOperationStatus,
 ) -> Result<(), String> {
@@ -1669,7 +1667,6 @@ impl From<TargetRetirementObservation> for TargetRetirementObservationStatus {
     }
 }
 
-// COMPLEXITY-BOUNDARY: explicit-remove:end
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1932,31 +1929,6 @@ mod tests {
             )
             .unwrap_err()
             .contains("duplicate")
-        );
-    }
-
-    #[test]
-    fn remove_v1_is_rejected_without_compatibility() {
-        let mut operation = start_remove_replica(
-            "set",
-            snapshot(),
-            target(3, "three"),
-            DurableRemoveMode::Force,
-            2,
-            10,
-        )
-        .unwrap();
-        operation.version = 1;
-        assert!(
-            decide_remove_replica(
-                &operation,
-                &OperationObservations::new(),
-                &OperationPodIdentities::new(),
-                None,
-                10,
-            )
-            .unwrap_err()
-            .contains("unsupported")
         );
     }
 

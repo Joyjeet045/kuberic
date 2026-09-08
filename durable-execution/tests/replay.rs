@@ -47,7 +47,7 @@ fn spec(value: &str, version: u32, input: &[u8]) -> ActivitySpec {
 }
 
 fn limits() -> CheckpointLimits {
-    CheckpointLimits::new(128, 1_000_000).unwrap()
+    CheckpointLimits::new(128, 1_000_000, 1_000_000).unwrap()
 }
 
 #[derive(Clone)]
@@ -93,7 +93,7 @@ fn envelope(
     CheckpointEnvelope::encode(&CheckpointPayload::active(
         ExecutionContract::new(
             execution_spec(execution_id, workflow_input),
-            limits().max_encoded_bytes() as u64,
+            limits().max_active_encoded_bytes() as u64,
         ),
         activities,
     ))
@@ -446,7 +446,7 @@ fn identity_input_and_format_validation_happen_before_workflow_polling() {
     let valid_payload = CheckpointPayload::active(
         ExecutionContract::new(
             execution_spec(execution(10), bytes(b"expected")),
-            limits().max_encoded_bytes() as u64,
+            limits().max_active_encoded_bytes() as u64,
         ),
         vec![],
     );
@@ -476,7 +476,7 @@ fn identity_input_and_format_validation_happen_before_workflow_polling() {
             execution(10),
             bytes(b"expected"),
             Some(&unsupported),
-            CheckpointLimits::new(1, 1).unwrap()
+            CheckpointLimits::new(1, 1, 1).unwrap()
         ),
         Evaluation::CheckpointRejected(CheckpointError::UnsupportedFormat { .. })
     ));
@@ -538,7 +538,7 @@ fn configured_limits_reject_loaded_checkpoints_before_workflow_polling() {
             execution_id,
             input.clone(),
             Some(&oversized_history),
-            CheckpointLimits::new(1, 1_000_000).unwrap(),
+            CheckpointLimits::new(1, 1_000_000, 1_000_000).unwrap(),
         ),
         Evaluation::CheckpointRejected(CheckpointError::ActivityRecordLimitExceeded {
             actual: 2,
@@ -555,7 +555,7 @@ fn configured_limits_reject_loaded_checkpoints_before_workflow_polling() {
             execution_id,
             input.clone(),
             Some(&empty),
-            CheckpointLimits::new(1, exact_encoded - 1).unwrap(),
+            CheckpointLimits::new(1, exact_encoded - 1, exact_encoded - 1).unwrap(),
         ),
         Evaluation::CheckpointRejected(CheckpointError::EncodedCheckpointLimitExceeded {
             actual,
@@ -569,6 +569,193 @@ fn configured_limits_reject_loaded_checkpoints_before_workflow_polling() {
         Evaluation::Complete { .. }
     ));
     assert_eq!(workflow.polls.get(), 1);
+}
+
+#[test]
+fn active_and_terminal_encoded_limits_are_enforced_independently() {
+    let execution_id = execution(14);
+    let execution = execution_spec(execution_id, bytes(b"independent-limits"));
+    let terminal_limit = 20_000_u64;
+    let mut active_limit = 1_000_000_u64;
+    let active = loop {
+        let payload = CheckpointPayload::active(
+            ExecutionContract::with_encoded_limits(execution.clone(), active_limit, terminal_limit),
+            vec![ActivityRecord::completed(
+                ActivitySequence::new(0),
+                spec("bounded", 1, b"input"),
+                bytes(b"result"),
+            )],
+        );
+        let envelope = CheckpointEnvelope::encode(&payload).unwrap();
+        let encoded = u64::try_from(envelope.encoded_len().unwrap()).unwrap();
+        if encoded == active_limit {
+            break envelope;
+        }
+        active_limit = encoded;
+    };
+    let active_limit = usize::try_from(active_limit).unwrap();
+    let terminal_limit = usize::try_from(terminal_limit).unwrap();
+    assert!(
+        active
+            .decode_and_validate(
+                &execution,
+                CheckpointLimits::new(1, active_limit, terminal_limit).unwrap(),
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        active.decode_and_validate(
+            &execution,
+            CheckpointLimits::new(1, active_limit - 1, terminal_limit).unwrap(),
+        ),
+        Err(CheckpointError::EncodedCheckpointLimitExceeded { actual, maximum })
+            if actual == active_limit && maximum + 1 == active_limit
+    ));
+
+    let mut admitted_terminal = 20_000_u64;
+    let (terminal, terminal_limit) = loop {
+        let contract =
+            ExecutionContract::with_encoded_limits(execution.clone(), 100_000, admitted_terminal);
+        let active = CheckpointPayload::active(contract.clone(), Vec::new());
+        let required = u64::try_from(active.maximum_terminal_encoded_len().unwrap()).unwrap();
+        if required != admitted_terminal {
+            admitted_terminal = required;
+            continue;
+        }
+        let terminals = [
+            CheckpointPayload::terminal(
+                contract.clone(),
+                TerminalOutcome::succeeded(vec![7; MAX_RESULT_BYTES as usize]),
+                u64::MAX,
+            ),
+            CheckpointPayload::terminal(
+                contract,
+                TerminalOutcome::failed(vec![7; MAX_RESULT_BYTES as usize]),
+                u64::MAX,
+            ),
+        ];
+        let terminal = terminals
+            .into_iter()
+            .map(|payload| CheckpointEnvelope::encode(&payload).unwrap())
+            .max_by_key(|envelope| envelope.encoded_len().unwrap())
+            .unwrap();
+        break (terminal, usize::try_from(admitted_terminal).unwrap());
+    };
+    assert_eq!(terminal.encoded_len().unwrap(), terminal_limit);
+    assert!(
+        terminal
+            .decode_and_validate(
+                &execution,
+                CheckpointLimits::new(1, 100_000, terminal_limit).unwrap(),
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        terminal.decode_and_validate(
+            &execution,
+            CheckpointLimits::new(1, 100_000, terminal_limit - 1).unwrap(),
+        ),
+        Err(CheckpointError::TerminalEncodedCheckpointLimitExceeded { actual, maximum })
+            if actual == terminal_limit && maximum + 1 == terminal_limit
+    ));
+}
+
+#[test]
+fn legacy_single_limit_contract_and_versioned_limits_fail_closed_before_polling() {
+    let workflow = PollCountingWorkflow {
+        polls: Cell::new(0),
+    };
+    let execution = execution_spec(execution(15), bytes(b"compatibility"));
+    let legacy_limit = 100_000;
+    let legacy = CheckpointEnvelope::encode(&CheckpointPayload::active(
+        ExecutionContract::new(execution.clone(), legacy_limit),
+        Vec::new(),
+    ))
+    .unwrap();
+    assert!(matches!(
+        evaluate_with_spec(
+            &workflow,
+            &execution,
+            Some(&legacy),
+            CheckpointLimits::new(1, legacy_limit as usize, legacy_limit as usize).unwrap(),
+        ),
+        Evaluation::Complete { .. }
+    ));
+    assert_eq!(workflow.polls.get(), 1);
+
+    let versioned = CheckpointEnvelope::encode(&CheckpointPayload::active(
+        ExecutionContract::with_encoded_limits(execution.clone(), 262_144, 12_288),
+        Vec::new(),
+    ))
+    .unwrap();
+    let versioned_workflow = PollCountingWorkflow {
+        polls: Cell::new(0),
+    };
+    assert!(matches!(
+        evaluate_with_spec(
+            &versioned_workflow,
+            &execution,
+            Some(&versioned),
+            CheckpointLimits::new(1, 262_144, 12_289).unwrap(),
+        ),
+        Evaluation::CheckpointRejected(
+            CheckpointError::TerminalEncodedCheckpointCapacityMismatch {
+                configured: 12_289,
+                admitted: 12_288,
+            }
+        )
+    ));
+    assert_eq!(versioned_workflow.polls.get(), 0);
+
+    let active_limit_changed_workflow = PollCountingWorkflow {
+        polls: Cell::new(0),
+    };
+    assert!(matches!(
+        evaluate_with_spec(
+            &active_limit_changed_workflow,
+            &execution,
+            Some(&versioned),
+            CheckpointLimits::new(1, 262_145, 12_288).unwrap(),
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::ConfiguredCapacityAboveAdmission {
+            configured: 262_145,
+            admitted: 262_144,
+        })
+    ));
+    assert_eq!(active_limit_changed_workflow.polls.get(), 0);
+}
+
+#[test]
+fn production_terminal_ceiling_rejects_a_record_still_below_the_active_ceiling() {
+    let execution = ExecutionSpec::new(execution(16), bytes(b"production-terminal-limit"), 16_384);
+    let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
+        ExecutionContract::with_encoded_limits(execution.clone(), 262_144, 262_144),
+        TerminalOutcome::succeeded(vec![7; 9_000]),
+        16,
+    ))
+    .unwrap();
+    let encoded = terminal.encoded_len().unwrap();
+    assert!(encoded > 12_288);
+    assert!(encoded < 262_144);
+
+    let workflow = PollCountingWorkflow {
+        polls: Cell::new(0),
+    };
+    assert!(matches!(
+        evaluate_with_spec(
+            &workflow,
+            &execution,
+            Some(&terminal),
+            CheckpointLimits::new(16, 262_144, 12_288).unwrap(),
+        ),
+        Evaluation::CheckpointRejected(
+            CheckpointError::TerminalEncodedCheckpointLimitExceeded {
+                actual,
+                maximum: 12_288,
+            }
+        ) if actual == encoded
+    ));
+    assert_eq!(workflow.polls.get(), 0);
 }
 
 #[test]

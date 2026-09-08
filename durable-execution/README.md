@@ -2,8 +2,9 @@
 
 `kuberic-durable-execution` is a focused kernel for deterministic, linear
 workflow replay. It has no dependency on `kuberic-core` or
-`kuberic-operator`; the operator can optionally depend on it for explicitly
-gated pilots. It is not an end-user runtime.
+`kuberic-operator`; the operator uses it for production framework-native
+remove-replica and can also use it for the optional switchover workflow. It is
+not an end-user runtime.
 
 ## Selected authoring surface
 
@@ -76,9 +77,10 @@ mismatch is nondeterminism rather than a new dispatch.
 Format version 3 stores JSON payload bytes in a versioned
 `CheckpointEnvelope`. An immutable `ExecutionSpec` declares execution
 identity, exact workflow input, and the maximum exact-byte terminal payload.
-The persisted execution contract also records the encoded-checkpoint capacity
-under which terminal state was admitted. Every load validates that authority
-and rejects a smaller current limit before workflow polling.
+The persisted execution contract also records the active and terminal
+encoded-checkpoint capacities under which the execution was admitted. Every
+load validates that authority and rejects either changed limit before workflow
+polling.
 
 The payload has exactly one explicit lifecycle state:
 
@@ -101,19 +103,21 @@ logical activity.
 
 ## Checkpoint limits and result reservation
 
-Every `DurableHost` requires `CheckpointLimits` for maximum activity records
-and maximum canonical encoded checkpoint bytes. Exact configured boundaries
-are accepted; loaded or proposed checkpoints beyond either boundary are
-rejected before workflow progress.
+Every `DurableHost` requires `CheckpointLimits` for maximum activity records,
+maximum canonical active-checkpoint bytes, and maximum canonical
+terminal-checkpoint bytes. Exact configured boundaries are accepted; loaded or
+proposed checkpoints beyond the applicable lifecycle boundary are rejected
+before workflow progress or publication.
 
 Before an absent execution is evaluated, the host projects both success and
 failure terminal checkpoints at the execution's declared maximum payload and
 a maximum-width completed activity count. The projection uses checked
 base64/JSON length arithmetic without allocating the declared payload. The
-larger form must fit the configured encoded limit, which is then persisted as
-the execution's immutable admission authority. Capacity failure therefore
-precedes even the first schedule and every possible external-effect permit.
-Later hosts may use an equal or larger limit, but not a smaller one.
+larger form must fit the configured terminal encoded limit. The active and
+terminal capacities are persisted as immutable admission authority. Capacity
+failure therefore precedes even the first schedule and every possible
+external-effect permit. Later hosts must use the same admitted limits; changing either lifecycle limit
+for a versioned operation without a contract-version change is incompatible.
 
 Before committing dispatch exposure, the host projects the completed
 checkpoint containing a result at exactly the activity's declared maximum.
@@ -336,7 +340,11 @@ CARGO_BUILD_JOBS=2 cargo check --workspace
 CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --all-targets -- -D warnings
 ```
 
-Enable the optional provider for deterministic client-surface validation:
+The standalone kernel exposes the Kubernetes provider behind its
+`kubernetes` feature. The production operator enables that feature
+unconditionally because framework-native remove-replica requires ConfigMap
+checkpoints; the explicit feature flag below is only for crate-local provider
+validation:
 
 ```console
 CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint -- --nocapture
@@ -375,22 +383,59 @@ library `[dependencies]` table rather than test-only dependencies and retains a
 negative fixture for a real library runtime dependency. The mechanically
 derived result is **feasible** within this kernel's stated boundary.
 
+## Production operator consumer
+
+Framework-native remove-replica is the production consumer of the shared
+operator runner. Its compact contract version 3 stores immutable admission once
+and records tagged passive observations, exact prepared replica/label/delete
+commands, compact results, and bounded redelivery evidence. Legacy pilot and
+explicit remove records, unsupported versions, and changed lifecycle limits
+are incompatible rather than migrated or restarted.
+
+`status.removeReplicaExecution` owns the immutable execution reference,
+admission authority, and incompatibility marker. The referenced same-namespace
+ConfigMap owns active boundary history and the compact terminal record. Other
+explicit operator workflows continue to use their operation-specific CRD
+status checkpoints.
+
+The no-fault three-member path is exactly three external effects, two passive
+observations, five completed durable boundaries, and six accepted writes. The
+final three-sample run observed active records from 3,373 to 18,693 bytes, a
+4,245-byte terminal record, and a 683-byte terminal payload. These are
+run-specific measurements; the representative active gate is 49,152 bytes.
+The immutable lifecycle limits are 16 records, 4,096-byte inputs, 2,048-byte
+results, 262,144 active encoded bytes, 12,288 terminal encoded bytes, and a
+4,096-byte terminal payload.
+
+The runner reloads terminal state before the remove adapter can hand it to
+topology publication. Same-namespace checkpoint ConfigMaps use a
+non-controlling, non-blocking `KubericSet` owner reference, remain through
+terminal reload, and are deleted with the owner by Kubernetes garbage
+collection. Independently retained orphan cleanup remains a separately
+authorized lifecycle responsibility. No worker, queue, lease, watcher, or
+separate execution service is introduced.
+
 ## Deferred usability roadmap
 
 The crate intentionally stops at the durable-execution kernel.
 Completion-only compaction and an isolated Kubernetes checkpoint-provider spike
-are implemented. A feature-gated operator pilot adopts the kernel without
-moving effect ownership into it; generic active-history compaction and
+are implemented. Production framework-native remove-replica and optional
+switchover adopt the kernel through a shared in-process operator runner without
+moving effect ownership into it. Generic active-history compaction and
 continuation remain excluded. The remaining ordered deferred work is tracked in
 [Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
 
 ## Limitations and exclusions
 
-The kernel result remains experimental. Its opt-in ConfigMap provider and
-real-API spike do not establish production persistence fitness, distributed
-execution ownership, a worker, queue, lease, activity handler, automatic
-observation polling, or passive-observation transport. It does not establish a
-canonical exact-byte representation across versions.
+The kernel remains experimental as a general-purpose orchestration framework.
+The ConfigMap provider is production-required, not opt-in, for
+framework-native remove-replica: `kuberic-operator` enables it unconditionally
+and owns the provider contract described above. The earlier isolated
+real-API evaluation does not establish generic persistence fitness for other
+consumers, distributed execution ownership, a worker, queue, lease, activity
+handler, automatic observation polling, or passive-observation transport. The
+kernel does not establish a canonical exact-byte representation across
+versions.
 
 The classifier is recomputed from the current registry rather than assuming a
 positive result. Provider cases distinguish absence from every portable error
@@ -403,19 +448,7 @@ Generic activity handlers/registries, a second activity-failure lifecycle,
 passive convergence, tracing/inspection, timers, retries, parallelism, generic
 lifecycle APIs, queries, external events, child workflows, workers, queues,
 leases, and distributed runtime ownership are excluded. So are migrations,
-upgrade guarantees, broad rollout, and production diagnostics. The
-feature-gated switchover and remove-replica pilots integrate typed calls and
-operator-owned effect adapters. Both Cargo features are default-off, and both
-workflows retain their explicit implementations as the runtime default. Neither
-changes `ReplicaAgent` or the gRPC protocol.
-
-The second workflow did not demonstrate source-cost amortization. The explicit
-remove baseline is 1,611 executable lines / 213 decision points; the complete
-kernel workflow is 1,632/162; remove-specific operator integration is 1,114/81;
-and shared infrastructure grew by 374/3. The resulting marginal cost is
-3,120/246, or 1.9367 times the explicit lines and 1.1549 times the explicit
-decisions. Shared growth is 30.96%/2.73%, so both dimensions classify as
-negative. The isolated async workflow body is 138/18, but that scope is not
-representative once workflow-specific support and operator integration are
-charged. The full measured result and boundary are recorded in the
-[Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
+upgrade guarantees, broad rollout of other operations, and production
+diagnostics. Framework-native remove-replica integrates typed calls and
+operator-owned effect adapters by default, while switchover remains optional.
+Neither changes `ReplicaAgent` or the gRPC protocol.
