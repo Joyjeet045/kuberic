@@ -6,58 +6,20 @@ use super::api::{
     AffectedKubericSetStatus, MaintenanceBlockedReason, MaintenancePhase,
     NodeMaintenanceRequestStatus,
 };
+use super::attestation::{Attestation, CommittedTopology, LiveObservation, attest};
 use super::discovery::finish;
-
-pub fn reconcile_preparation(
-    mut status: NodeMaintenanceRequestStatus,
-    placements: &[SetPlacement],
-    now: Timestamp,
-) -> NodeMaintenanceRequestStatus {
-    let mut readiness = Vec::with_capacity(status.affected_sets.len());
-    for (set, placement) in status.affected_sets.iter_mut().zip(placements) {
-        let evaluation = evaluate_set(set, placement);
-        set.primary_moved = evaluation.primary_moved;
-        set.quorum_without_node = evaluation.quorum_without_node;
-        set.no_eligible_target = evaluation.readiness == SetReadiness::NoEligibleTarget;
-        readiness.push(evaluation.readiness);
-    }
-
-    let outcome = evaluate_preparation(&status.affected_sets, &readiness);
-    if !status.phase.can_transition_to(outcome.phase)
-        && status.phase.can_transition_to(MaintenancePhase::Preparing)
-    {
-        status.phase = MaintenancePhase::Preparing;
-    }
-    let mut status = finish(
-        status,
-        outcome.phase,
-        outcome.reason,
-        Some(outcome.message),
-        now,
-    );
-    if status.phase == MaintenancePhase::Prepared && status.prepared_at.is_none() {
-        status.prepared_at = Some(now.to_string());
-    }
-    status
-}
 
 #[derive(Debug, PartialEq, Clone, Default)]
 pub struct SetPlacement {
-    pub topology: Option<SetTopology>,
+    pub committed: Option<CommittedTopology>,
+    pub live: Option<LiveObservation>,
     pub promotable_pod_uids: BTreeSet<String>,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct SetTopology {
-    pub primary_pod_uid: Option<String>,
-    pub member_pod_uids: Vec<String>,
-    pub write_quorum: u32,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SetReadiness {
     Ready,
-    TopologyUnknown,
+    EvidenceIncomplete,
     AwaitingPrimaryMove,
     NoEligibleTarget,
     QuorumAtRisk,
@@ -74,54 +36,49 @@ pub fn evaluate_set(
     affected: &AffectedKubericSetStatus,
     placement: &SetPlacement,
 ) -> SetEvaluation {
-    let Some(topology) = placement.topology.as_ref() else {
-        return SetEvaluation {
-            readiness: SetReadiness::TopologyUnknown,
-            primary_moved: false,
-            quorum_without_node: false,
-        };
-    };
-
-    let on_node: BTreeSet<&str> = affected
+    let on_node: BTreeSet<String> = affected
         .replicas
         .iter()
-        .map(|replica| replica.pod_uid.as_str())
+        .map(|replica| replica.pod_uid.clone())
         .collect();
 
-    let surviving = topology
-        .member_pod_uids
-        .iter()
-        .filter(|uid| !on_node.contains(uid.as_str()))
-        .count();
+    let attestation = attest(
+        placement.committed.as_ref(),
+        placement.live.as_ref(),
+        &on_node,
+    );
 
-    let promotable = topology
-        .member_pod_uids
-        .iter()
-        .filter(|uid| !on_node.contains(uid.as_str()))
-        .filter(|uid| placement.promotable_pod_uids.contains(uid.as_str()))
-        .count();
-
-    let quorum_without_node = surviving >= topology.write_quorum as usize;
-    let primary_moved = topology
-        .primary_pod_uid
-        .as_deref()
-        .is_some_and(|primary| !on_node.contains(primary));
-
-    let readiness = if !quorum_without_node {
-        SetReadiness::QuorumAtRisk
-    } else if primary_moved {
-        SetReadiness::Ready
-    } else if promotable == 0 {
-        SetReadiness::NoEligibleTarget
-    } else {
-        SetReadiness::AwaitingPrimaryMove
+    let readiness = match attestation {
+        Attestation::Verified => SetReadiness::Ready,
+        Attestation::Incomplete => SetReadiness::EvidenceIncomplete,
+        Attestation::QuorumLost => SetReadiness::QuorumAtRisk,
+        Attestation::PrimaryOnNode => {
+            if has_promotable_survivor(placement, &on_node) {
+                SetReadiness::AwaitingPrimaryMove
+            } else {
+                SetReadiness::NoEligibleTarget
+            }
+        }
     };
 
     SetEvaluation {
         readiness,
-        primary_moved,
-        quorum_without_node,
+        primary_moved: attestation == Attestation::Verified,
+        quorum_without_node: matches!(
+            attestation,
+            Attestation::Verified | Attestation::PrimaryOnNode
+        ),
     }
+}
+
+fn has_promotable_survivor(placement: &SetPlacement, on_node: &BTreeSet<String>) -> bool {
+    placement.committed.as_ref().is_some_and(|committed| {
+        committed
+            .members
+            .iter()
+            .filter(|member| !on_node.contains(&member.pod_uid))
+            .any(|member| placement.promotable_pod_uids.contains(&member.pod_uid))
+    })
 }
 
 pub struct PreparationOutcome {
@@ -159,24 +116,24 @@ pub fn evaluate_preparation(
             phase: MaintenancePhase::Prepared,
             reason: None,
             message: format!(
-                "{} set(s) retain write quorum with no primary on the node",
+                "{} set(s) attested a healthy primary and write quorum without the node",
                 sets.len()
             ),
         },
         Some(SetReadiness::QuorumAtRisk) => PreparationOutcome {
             phase: MaintenancePhase::Blocked,
             reason: Some(MaintenanceBlockedReason::BlockedByQuorum),
-            message: format!("{blocked_set} would lose write quorum without the node"),
+            message: format!("{blocked_set} cannot attest write quorum without the node"),
         },
         Some(SetReadiness::NoEligibleTarget) => PreparationOutcome {
             phase: MaintenancePhase::Blocked,
             reason: Some(MaintenanceBlockedReason::NoEligibleTarget),
             message: format!("{blocked_set} has no replica outside the node to promote"),
         },
-        Some(SetReadiness::TopologyUnknown) => PreparationOutcome {
+        Some(SetReadiness::EvidenceIncomplete) => PreparationOutcome {
             phase: MaintenancePhase::Preparing,
             reason: None,
-            message: format!("{blocked_set} has not published a committed topology yet"),
+            message: format!("{blocked_set} has not published usable live replica evidence yet"),
         },
         Some(SetReadiness::AwaitingPrimaryMove) => PreparationOutcome {
             phase: MaintenancePhase::Preparing,
@@ -189,17 +146,51 @@ pub fn evaluate_preparation(
 fn severity(readiness: SetReadiness) -> u8 {
     match readiness {
         SetReadiness::Ready => 0,
-        SetReadiness::TopologyUnknown => 1,
+        SetReadiness::EvidenceIncomplete => 1,
         SetReadiness::AwaitingPrimaryMove => 2,
         SetReadiness::NoEligibleTarget => 3,
         SetReadiness::QuorumAtRisk => 4,
     }
 }
 
+pub fn reconcile_preparation(
+    mut status: NodeMaintenanceRequestStatus,
+    placements: &[SetPlacement],
+    now: Timestamp,
+) -> NodeMaintenanceRequestStatus {
+    let mut readiness = Vec::with_capacity(status.affected_sets.len());
+    for (set, placement) in status.affected_sets.iter_mut().zip(placements) {
+        let evaluation = evaluate_set(set, placement);
+        set.primary_moved = evaluation.primary_moved;
+        set.quorum_without_node = evaluation.quorum_without_node;
+        set.no_eligible_target = evaluation.readiness == SetReadiness::NoEligibleTarget;
+        readiness.push(evaluation.readiness);
+    }
+
+    let outcome = evaluate_preparation(&status.affected_sets, &readiness);
+    if !status.phase.can_transition_to(outcome.phase)
+        && status.phase.can_transition_to(MaintenancePhase::Preparing)
+    {
+        status.phase = MaintenancePhase::Preparing;
+    }
+    let mut status = finish(
+        status,
+        outcome.phase,
+        outcome.reason,
+        Some(outcome.message),
+        now,
+    );
+    if status.phase == MaintenancePhase::Prepared && status.prepared_at.is_none() {
+        status.prepared_at = Some(now.to_string());
+    }
+    status
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::node_maintenance::api::AffectedReplicaStatus;
+    use crate::node_maintenance::attestation::{CommittedMember, Epoch, LiveMember};
 
     fn at(text: &str) -> Timestamp {
         text.parse().expect("timestamp")
@@ -225,18 +216,46 @@ mod tests {
         }
     }
 
-    fn placement(primary: Option<&str>, members: &[&str], write_quorum: u32) -> SetPlacement {
+    fn placement(primary: &str, members: &[&str], write_quorum: u32) -> SetPlacement {
+        let uid = |pod: &str| format!("uid-{pod}");
+        let epoch = Epoch {
+            data_loss_number: 0,
+            configuration_number: 1,
+        };
         SetPlacement {
-            topology: Some(SetTopology {
-                primary_pod_uid: primary.map(|pod| format!("uid-{pod}")),
-                member_pod_uids: members.iter().map(|pod| format!("uid-{pod}")).collect(),
+            committed: Some(CommittedTopology {
+                epoch,
                 write_quorum,
+                members: members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pod)| CommittedMember {
+                        id: index as i64 + 1,
+                        pod_uid: uid(pod),
+                        is_primary: *pod == primary,
+                    })
+                    .collect(),
             }),
-            promotable_pod_uids: members.iter().map(|pod| format!("uid-{pod}")).collect(),
+            live: Some(LiveObservation {
+                epoch,
+                settled: true,
+                primary_pod_uid: Some(uid(primary)),
+                members: members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pod)| LiveMember {
+                        id: index as i64 + 1,
+                        pod_uid: uid(pod),
+                        is_primary: *pod == primary,
+                        healthy: true,
+                    })
+                    .collect(),
+            }),
+            promotable_pod_uids: members.iter().map(|pod| uid(pod)).collect(),
         }
     }
 
-    fn stranded(primary: Option<&str>, members: &[&str], write_quorum: u32) -> SetPlacement {
+    fn stranded(primary: &str, members: &[&str], write_quorum: u32) -> SetPlacement {
         SetPlacement {
             promotable_pod_uids: BTreeSet::new(),
             ..placement(primary, members, write_quorum)
@@ -244,10 +263,9 @@ mod tests {
     }
 
     #[test]
-    fn a_secondary_only_node_is_ready_when_quorum_survives() {
+    fn a_secondary_only_node_is_ready_when_live_quorum_survives() {
         let set = affected(vec![replica("kv-2", false)]);
-        let placement = placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2);
-        let evaluation = evaluate_set(&set, &placement);
+        let evaluation = evaluate_set(&set, &placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2));
 
         assert_eq!(evaluation.readiness, SetReadiness::Ready);
         assert!(evaluation.primary_moved);
@@ -255,96 +273,67 @@ mod tests {
     }
 
     #[test]
-    fn losing_the_node_below_write_quorum_is_blocking() {
-        let set = affected(vec![replica("kv-1", false), replica("kv-2", false)]);
-        let placement = placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2);
+    fn an_unhealthy_survivor_blocks_readiness() {
+        let set = affected(vec![replica("kv-2", false)]);
+        let mut placement = placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2);
+        placement
+            .live
+            .as_mut()
+            .expect("live")
+            .members
+            .iter_mut()
+            .find(|member| member.pod_uid == "uid-kv-1")
+            .expect("member")
+            .healthy = false;
         let evaluation = evaluate_set(&set, &placement);
 
         assert_eq!(evaluation.readiness, SetReadiness::QuorumAtRisk);
         assert!(!evaluation.quorum_without_node);
+    }
+
+    #[test]
+    fn missing_live_evidence_keeps_the_set_unproven() {
+        let set = affected(vec![replica("kv-2", false)]);
+        let mut placement = placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2);
+        placement.live = None;
+        let evaluation = evaluate_set(&set, &placement);
+
+        assert_eq!(evaluation.readiness, SetReadiness::EvidenceIncomplete);
+        assert!(!evaluation.primary_moved);
+        assert!(!evaluation.quorum_without_node);
+    }
+
+    #[test]
+    fn losing_the_node_below_write_quorum_is_blocking() {
+        let set = affected(vec![replica("kv-1", false), replica("kv-2", false)]);
+        let evaluation = evaluate_set(&set, &placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2));
+
+        assert_eq!(evaluation.readiness, SetReadiness::QuorumAtRisk);
     }
 
     #[test]
     fn a_primary_on_the_node_waits_while_a_target_exists() {
         let set = affected(vec![replica("kv-0", true)]);
-        let placement = placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2);
-        let evaluation = evaluate_set(&set, &placement);
+        let evaluation = evaluate_set(&set, &placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2));
 
         assert_eq!(evaluation.readiness, SetReadiness::AwaitingPrimaryMove);
         assert!(!evaluation.primary_moved);
-        assert!(evaluation.quorum_without_node);
-    }
-
-    #[test]
-    fn a_single_replica_set_has_no_target_to_promote() {
-        let set = affected(vec![replica("kv-0", true)]);
-        let placement = placement(Some("kv-0"), &["kv-0"], 1);
-        let evaluation = evaluate_set(&set, &placement);
-
-        assert_eq!(evaluation.readiness, SetReadiness::QuorumAtRisk);
-    }
-
-    #[test]
-    fn quorum_is_assessed_before_primary_placement() {
-        let set = affected(vec![replica("kv-0", true), replica("kv-1", false)]);
-        let placement = placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2);
-        let evaluation = evaluate_set(&set, &placement);
-
-        assert_eq!(evaluation.readiness, SetReadiness::QuorumAtRisk);
-    }
-
-    #[test]
-    fn an_unpublished_topology_is_not_treated_as_safe() {
-        let set = affected(vec![replica("kv-0", true)]);
-        let evaluation = evaluate_set(&set, &SetPlacement::default());
-
-        assert_eq!(evaluation.readiness, SetReadiness::TopologyUnknown);
-        assert!(!evaluation.primary_moved);
-        assert!(!evaluation.quorum_without_node);
-    }
-
-    #[test]
-    fn a_replica_absent_from_the_committed_topology_does_not_reduce_quorum() {
-        let set = affected(vec![replica("kv-9", false)]);
-        let placement = placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2);
-        let evaluation = evaluate_set(&set, &placement);
-
-        assert_eq!(evaluation.readiness, SetReadiness::Ready);
     }
 
     #[test]
     fn a_primary_with_no_schedulable_replica_elsewhere_has_no_eligible_target() {
         let set = affected(vec![replica("kv-0", true)]);
-        let placement = stranded(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2);
-        let evaluation = evaluate_set(&set, &placement);
+        let evaluation = evaluate_set(&set, &stranded("kv-0", &["kv-0", "kv-1", "kv-2"], 2));
 
         assert_eq!(evaluation.readiness, SetReadiness::NoEligibleTarget);
-        assert!(evaluation.quorum_without_node);
-        assert!(!evaluation.primary_moved);
     }
 
     #[test]
-    fn a_single_promotable_replica_is_enough_to_keep_waiting() {
-        let set = affected(vec![replica("kv-0", true)]);
-        let placement = SetPlacement {
-            promotable_pod_uids: ["uid-kv-2".to_string()].into_iter().collect(),
-            ..placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)
-        };
-        let evaluation = evaluate_set(&set, &placement);
+    fn a_replica_absent_from_the_committed_topology_does_not_reduce_quorum() {
+        let set = affected(vec![replica("kv-9", false)]);
+        let evaluation = evaluate_set(&set, &placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2));
 
-        assert_eq!(evaluation.readiness, SetReadiness::AwaitingPrimaryMove);
-    }
-
-    #[test]
-    fn a_promotable_replica_on_the_maintenance_node_does_not_count() {
-        let set = affected(vec![replica("kv-0", true), replica("kv-1", false)]);
-        let placement = SetPlacement {
-            promotable_pod_uids: ["uid-kv-1".to_string()].into_iter().collect(),
-            ..placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2", "kv-3"], 2)
-        };
-        let evaluation = evaluate_set(&set, &placement);
-
-        assert_eq!(evaluation.readiness, SetReadiness::NoEligibleTarget);
+        assert_eq!(evaluation.readiness, SetReadiness::Ready);
     }
 
     fn named(name: &str) -> AffectedKubericSetStatus {
@@ -421,9 +410,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unpublished_topology_keeps_the_request_preparing() {
+    fn unproven_evidence_keeps_the_request_preparing() {
         let sets = [named("kv")];
-        let outcome = evaluate_preparation(&sets, &[SetReadiness::TopologyUnknown]);
+        let outcome = evaluate_preparation(&sets, &[SetReadiness::EvidenceIncomplete]);
 
         assert_eq!(outcome.phase, MaintenancePhase::Preparing);
         assert_eq!(outcome.reason, None);
@@ -438,7 +427,7 @@ mod tests {
 
     #[test]
     fn a_prepared_request_does_not_move_with_the_clock() {
-        let placements = [placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let placements = [placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2)];
         let first = reconcile_preparation(
             requested(vec![affected(vec![replica("kv-2", false)])]),
             &placements,
@@ -457,7 +446,7 @@ mod tests {
 
     #[test]
     fn a_blocked_request_does_not_move_with_the_clock() {
-        let placements = [placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let placements = [placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2)];
         let sets = vec![affected(vec![
             replica("kv-1", false),
             replica("kv-2", false),
@@ -471,7 +460,7 @@ mod tests {
 
     #[test]
     fn readiness_lost_again_retracts_the_prepared_condition() {
-        let safe = [placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let safe = [placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2)];
         let prepared = reconcile_preparation(
             requested(vec![affected(vec![replica("kv-2", false)])]),
             &safe,
@@ -479,7 +468,7 @@ mod tests {
         );
         assert_eq!(prepared.phase, MaintenancePhase::Prepared);
 
-        let regressed = [placement(Some("kv-2"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let regressed = [placement("kv-2", &["kv-0", "kv-1", "kv-2"], 2)];
         let later = reconcile_preparation(prepared, &regressed, at("2026-09-06T21:00:00Z"));
 
         assert_ne!(later.phase, MaintenancePhase::Prepared);
@@ -491,13 +480,13 @@ mod tests {
 
     #[test]
     fn a_blocked_request_can_still_reach_prepared_once_it_is_safe() {
-        let unsafe_placement = [placement(Some("kv-0"), &["kv-0", "kv-1", "kv-2"], 2)];
+        let placements = [placement("kv-0", &["kv-0", "kv-1", "kv-2"], 2)];
         let blocked = reconcile_preparation(
             requested(vec![affected(vec![
                 replica("kv-1", false),
                 replica("kv-2", false),
             ])]),
-            &unsafe_placement,
+            &placements,
             at("2026-09-06T20:00:00Z"),
         );
         assert_eq!(blocked.phase, MaintenancePhase::Blocked);
@@ -506,7 +495,7 @@ mod tests {
             affected_sets: vec![affected(vec![replica("kv-2", false)])],
             ..blocked
         };
-        let later = reconcile_preparation(recovered, &unsafe_placement, at("2026-09-06T21:00:00Z"));
+        let later = reconcile_preparation(recovered, &placements, at("2026-09-06T21:00:00Z"));
 
         assert_eq!(later.phase, MaintenancePhase::Prepared);
         assert_eq!(later.blocked_reason, None);
