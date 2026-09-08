@@ -17,10 +17,6 @@ use kuberic_core::types::Lsn;
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct FrameLogMeta {
     pub committed_lsn: Lsn,
-    #[serde(default)]
-    pub confirmed_wal_offset: u64,
-    #[serde(default)]
-    pub confirmed_wal_salt: Option<(u32, u32)>,
 }
 
 /// A single entry in frames.log: one WalFrameSet at one LSN.
@@ -193,6 +189,7 @@ impl FrameLog {
     pub async fn save_meta(data_dir: &Path, meta: &FrameLogMeta) -> io::Result<()> {
         let path = data_dir.join("meta.json");
         let tmp = data_dir.join("meta.json.tmp");
+        let dir = data_dir.to_path_buf();
         let json = serde_json::to_string(meta).map_err(io::Error::other)?;
         let committed_lsn = meta.committed_lsn;
 
@@ -203,7 +200,8 @@ impl FrameLog {
                 file.write_all(json.as_bytes())?;
                 file.sync_all()?;
             }
-            std::fs::rename(&tmp, &path)
+            std::fs::rename(&tmp, &path)?;
+            sync_directory(&dir)
         })
         .await
         .map_err(io::Error::other)??;
@@ -211,4 +209,19 @@ impl FrameLog {
         debug!(committed_lsn, "saved meta.json");
         Ok(())
     }
+}
+
+/// Flush the directory entry so a rename survives power loss.
+///
+/// Syncing the replacement file is not enough on filesystems that journal the
+/// directory separately. Windows has no directory handle to sync, and NTFS
+/// commits the rename with the file, so this is a no-op there.
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }

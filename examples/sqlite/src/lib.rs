@@ -7,6 +7,7 @@
 //! - StateProvider callbacks for copy/catchup/epoch management
 //! - Client-facing gRPC API for Execute/Query/ExecuteBatch
 
+pub mod barrier;
 pub mod demo;
 pub mod framelog;
 pub mod frames;

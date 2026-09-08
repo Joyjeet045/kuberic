@@ -44,6 +44,38 @@ impl WalFrameSet {
 const WAL_HEADER_SIZE: u64 = 32;
 const FRAME_HEADER_SIZE: u64 = 24;
 
+/// Split the raw WAL bytes of one transaction into replicable frames.
+///
+/// `wal_offset` is where `bytes` begins in the WAL file, so frame boundaries
+/// are located against the file rather than the slice.
+pub fn frames_from_wal_bytes(wal_offset: u64, bytes: &[u8], page_size: u32) -> Vec<WalFrame> {
+    if page_size == 0 {
+        return Vec::new();
+    }
+    let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+    let end = wal_offset + bytes.len() as u64;
+    let mut header_at = WAL_HEADER_SIZE;
+    if wal_offset > WAL_HEADER_SIZE {
+        let past = wal_offset - WAL_HEADER_SIZE;
+        let frames_before = past.div_ceil(frame_size);
+        header_at = WAL_HEADER_SIZE + frames_before * frame_size;
+    }
+
+    let mut frames = Vec::new();
+    while header_at + frame_size <= end {
+        let at = (header_at - wal_offset) as usize;
+        let page_number =
+            u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        let data_at = at + FRAME_HEADER_SIZE as usize;
+        frames.push(WalFrame {
+            page_number,
+            data: bytes[data_at..data_at + page_size as usize].to_vec(),
+        });
+        header_at += frame_size;
+    }
+    frames
+}
+
 /// Read the page size from the WAL header.
 /// Returns None if WAL file doesn't exist or is too small.
 pub fn read_wal_page_size(wal_path: &Path) -> io::Result<Option<u32>> {

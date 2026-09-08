@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use kuberic_core::handles::{PartitionHandle, StateReplicatorHandle};
 use kuberic_core::types::{AccessStatus, CancellationToken};
 use tokio::sync::Mutex;
@@ -44,8 +43,8 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
         .map_err(|e| Status::internal(format!("task join error: {e}")))?
         .map_err(|e| Status::internal(format!("SQL error: {e}")))?;
 
-        // Capture WAL frames and replicate
-        let lsn = self.capture_and_replicate().await?;
+        // The commit blocked on durable quorum inside the barrier VFS.
+        let lsn = self.confirm_committed().await?;
 
         debug!(lsn, rows_affected, "execute complete");
         Ok(Response::new(proto::ExecuteResponse {
@@ -107,7 +106,8 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
         .map_err(|e| Status::internal(format!("task join error: {e}")))?
         .map_err(|e| Status::internal(format!("SQL error: {e}")))?;
 
-        let lsn = self.capture_and_replicate().await?;
+        // The commit blocked on durable quorum inside the barrier VFS.
+        let lsn = self.confirm_committed().await?;
 
         debug!(
             lsn,
@@ -147,45 +147,17 @@ impl SqliteServer {
         }
     }
 
-    /// Capture WAL frames from the last write and replicate to secondaries.
-    async fn capture_and_replicate(&self) -> Result<i64, Status> {
-        let state = self.state.clone();
-        let (offset_before, captured) = tokio::task::spawn_blocking(move || {
-            let mut state = state.blocking_lock();
-            let before = state.wal_read_offset();
-            state.capture_wal_frames().map(|c| (before, c))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?
-        .map_err(|e| Status::internal(format!("WAL capture failed: {e}")))?;
-
-        let Some((frame_set, offset_after)) = captured else {
-            let state = self.state.lock().await;
-            return Ok(state.last_applied_lsn);
-        };
-
-        let data = serde_json::to_vec(&frame_set)
-            .map_err(|e| Status::internal(format!("serialization failed: {e}")))?;
-
-        let lsn = match self
-            .replicator
-            .replicate(Bytes::from(data), self.token.clone())
-            .await
-        {
-            Ok(lsn) => lsn,
-            Err(e) => {
-                self.state.lock().await.rewind_capture(offset_before);
-                return Err(Status::unavailable(format!("replication failed: {e}")));
-            }
-        };
-
+    /// The commit itself waits for durable quorum inside the barrier VFS, so a
+    /// returned statement has already been replicated. The LSN is whatever the
+    /// barrier recorded for that commit.
+    async fn confirm_committed(&self) -> Result<i64, Status> {
+        let lsn = crate::barrier::barrier().last_lsn();
         self.state
             .lock()
             .await
-            .mark_confirmed(lsn, offset_after)
+            .mark_confirmed(lsn)
             .await
             .map_err(|e| Status::internal(format!("confirmation record failed: {e}")))?;
-
         Ok(lsn)
     }
 }

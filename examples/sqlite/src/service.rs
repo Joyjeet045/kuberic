@@ -287,7 +287,6 @@ pub async fn run_service_with_data_loss(
                                 &st.data_dir,
                                 &crate::framelog::FrameLogMeta {
                                     committed_lsn: lsn,
-                                    ..Default::default()
                                 },
                             ).await {
                                 warn!(error = %e, "meta save after copy failed");
@@ -338,18 +337,40 @@ pub async fn run_service_with_data_loss(
                                     warn!(error = %e, "applying frames before promotion failed");
                                 }
                             }
+                            // Commits block on the barrier, so it must accept
+                            // replication before SQLite can write anything.
+                            let ready = match (replicator.as_ref(), token.as_ref()) {
+                                (Some(r), Some(t)) => {
+                                    crate::barrier::barrier().install(r.clone(), t.clone());
+                                    true
+                                }
+                                _ => {
+                                    tracing::error!(
+                                        "promotion without a replicator — refusing to serve"
+                                    );
+                                    false
+                                }
+                            };
                             // open_as_primary is blocking (rusqlite) — use spawn_blocking
                             let st = state.clone();
-                            if let Err(e) = tokio::task::spawn_blocking(move || {
-                                let mut st = st.blocking_lock();
-                                st.open_as_primary()
-                            })
-                            .await
-                            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
-                            {
-                                warn!(error = %e, "failed to open as primary");
-                            }
-                            if client_server_handle.is_none() {
+                            let opened = if ready {
+                                tokio::task::spawn_blocking(move || {
+                                    let mut st = st.blocking_lock();
+                                    st.open_as_primary()
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+                            } else {
+                                Err(std::io::Error::other("no replicator"))
+                            };
+                            if let Err(e) = opened {
+                                tracing::error!(
+                                    error = %e,
+                                    "failed to open as primary — not starting the client server"
+                                );
+                                crate::barrier::barrier().uninstall();
+                                state.lock().await.close();
+                            } else if client_server_handle.is_none() {
                                 let srv_state = state.clone();
                                 let p = partition.as_ref().unwrap().clone();
                                 let r = replicator.as_ref().unwrap().clone();
@@ -368,6 +389,7 @@ pub async fn run_service_with_data_loss(
                             }
                         }
                         Role::None => {
+                            crate::barrier::barrier().uninstall();
                             // Permanent removal — stop client server immediately
                             if let Some(shutdown) = client_server_shutdown.take() {
                                 shutdown.cancel();

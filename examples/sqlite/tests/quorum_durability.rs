@@ -1,157 +1,196 @@
-use std::path::{Path, PathBuf};
+//! The commit barrier must make a locally committed transaction impossible
+//! unless it reached durable quorum first.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+use serial_test::serial;
+use sqlite_replicated::barrier::barrier;
 use sqlite_replicated::state::SqliteState;
 
-fn scratch_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join("sqlite-durability")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+struct Sink {
+    accept: Arc<AtomicBool>,
+    lsn: Arc<AtomicI64>,
+    replicated: Arc<AtomicI64>,
 }
 
-fn crash_snapshot(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for name in ["db.sqlite", "db.sqlite-wal", "meta.json"] {
-        let src = from.join(name);
-        if src.exists() {
-            std::fs::copy(&src, to.join(name)).unwrap();
-        }
+fn sink() -> Sink {
+    Sink {
+        accept: Arc::new(AtomicBool::new(true)),
+        lsn: Arc::new(AtomicI64::new(0)),
+        replicated: Arc::new(AtomicI64::new(0)),
     }
 }
 
-fn column(rows: &[Vec<serde_json::Value>]) -> Vec<String> {
-    rows.iter()
-        .map(|row| row[0].as_str().unwrap_or_default().to_string())
-        .collect()
+fn install(sink: &Sink) {
+    let accept = sink.accept.clone();
+    let lsn = sink.lsn.clone();
+    let replicated = sink.replicated.clone();
+    barrier().install_sink(move |payload| {
+        if !accept.load(Ordering::SeqCst) {
+            return Err("quorum unavailable".to_string());
+        }
+        assert!(!payload.is_empty(), "a published commit must carry frames");
+        replicated.fetch_add(1, Ordering::SeqCst);
+        Ok(lsn.fetch_add(1, Ordering::SeqCst) + 1)
+    });
 }
 
-async fn seed_confirmed(dir: &Path) -> SqliteState {
-    let mut state = SqliteState::open(dir.to_path_buf()).await.unwrap();
-    state.open_as_primary().unwrap();
-
-    state
-        .execute_sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
-        .unwrap();
-    let (_, offset) = state
-        .capture_wal_frames()
-        .unwrap()
-        .expect("schema change produces frames");
-    state.mark_confirmed(1, offset).await.unwrap();
-
-    state
-        .execute_sql("INSERT INTO t VALUES (1, 'confirmed')", &[])
-        .unwrap();
-    let (_, offset) = state
-        .capture_wal_frames()
-        .unwrap()
-        .expect("insert produces frames");
-    state.mark_confirmed(2, offset).await.unwrap();
-
+async fn primary(dir: &std::path::Path) -> SqliteState {
+    let mut state = SqliteState::open(dir.to_path_buf()).await.expect("open");
+    state.open_as_primary().expect("open as primary");
     state
 }
 
-#[tokio::test]
-async fn unconfirmed_commit_is_discarded_on_restart() {
-    let dir = scratch_dir("unconfirmed");
-    let state = seed_confirmed(&dir).await;
+fn count(state: &SqliteState) -> i64 {
+    let (_, rows) = state
+        .query_sql("SELECT count(*) FROM t", &[])
+        .expect("query");
+    rows[0][0].as_i64().expect("count")
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_replicated_write_is_visible_and_durable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = sink();
+    install(&sink);
+
+    {
+        let mut state = primary(dir.path()).await;
+        state
+            .execute_batch_sql(&["CREATE TABLE t(v INTEGER)".to_string()])
+            .expect("create");
+        state
+            .execute_sql("INSERT INTO t VALUES (1)", &[])
+            .expect("insert");
+        assert_eq!(count(&state), 1);
+        state.close();
+    }
+
+    assert!(sink.replicated.load(Ordering::SeqCst) >= 2);
+
+    let reopened = primary(dir.path()).await;
+    assert_eq!(count(&reopened), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_write_that_loses_quorum_never_commits_locally() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = sink();
+    install(&sink);
+
+    {
+        let mut state = primary(dir.path()).await;
+        state
+            .execute_batch_sql(&["CREATE TABLE t(v INTEGER)".to_string()])
+            .expect("create");
+
+        sink.accept.store(false, Ordering::SeqCst);
+        let rejected = state.execute_sql("INSERT INTO t VALUES (1)", &[]);
+        assert!(
+            rejected.is_err(),
+            "a write must fail when quorum is unavailable"
+        );
+
+        sink.accept.store(true, Ordering::SeqCst);
+        assert_eq!(
+            count(&state),
+            0,
+            "an unreplicated write must not be visible on the primary"
+        );
+        state.close();
+    }
+
+    let reopened = primary(dir.path()).await;
+    assert_eq!(
+        count(&reopened),
+        0,
+        "an unreplicated write must not survive a restart"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn an_unreplicated_write_cannot_escape_through_a_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = sink();
+    install(&sink);
+
+    let mut state = primary(dir.path()).await;
     state
-        .execute_sql("INSERT INTO t VALUES (2, 'unconfirmed')", &[])
-        .unwrap();
+        .execute_batch_sql(&["CREATE TABLE t(v INTEGER)".to_string()])
+        .expect("create");
 
-    let recovered_dir = scratch_dir("unconfirmed-recovered");
-    crash_snapshot(&dir, &recovered_dir);
+    sink.accept.store(false, Ordering::SeqCst);
+    assert!(state.execute_sql("INSERT INTO t VALUES (1)", &[]).is_err());
+    sink.accept.store(true, Ordering::SeqCst);
 
-    let mut recovered = SqliteState::open(recovered_dir).await.unwrap();
-    recovered.open_as_primary().unwrap();
-    let (_, rows) = recovered
-        .query_sql("SELECT v FROM t ORDER BY id", &[])
-        .unwrap();
+    let snapshot = state.snapshot_db().expect("snapshot");
+    let restored = dir.path().join("restored");
+    tokio::fs::create_dir_all(&restored).await.expect("mkdir");
+    let mut copy = SqliteState::open(restored.clone())
+        .await
+        .expect("open copy");
+    copy.restore_from_snapshot(&snapshot)
+        .await
+        .expect("restore");
+    copy.open_as_primary().expect("open restored");
 
     assert_eq!(
-        column(&rows),
-        vec!["confirmed".to_string()],
-        "a locally committed write that never reached quorum must not survive restart"
+        count(&copy),
+        0,
+        "a snapshot must not carry an unreplicated write to another replica"
     );
-    assert_eq!(recovered.committed_lsn, 2);
 }
 
-#[tokio::test]
-async fn confirmed_commit_survives_restart() {
-    let dir = scratch_dir("confirmed");
-    let mut state = seed_confirmed(&dir).await;
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_primary_without_a_barrier_cannot_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = sink();
+    install(&sink);
 
+    let mut state = primary(dir.path()).await;
     state
-        .execute_sql("INSERT INTO t VALUES (2, 'also confirmed')", &[])
-        .unwrap();
-    let (_, offset) = state
-        .capture_wal_frames()
-        .unwrap()
-        .expect("insert produces frames");
-    state.mark_confirmed(3, offset).await.unwrap();
+        .execute_batch_sql(&["CREATE TABLE t(v INTEGER)".to_string()])
+        .expect("create");
 
-    let recovered_dir = scratch_dir("confirmed-recovered");
-    crash_snapshot(&dir, &recovered_dir);
-
-    let mut recovered = SqliteState::open(recovered_dir).await.unwrap();
-    recovered.open_as_primary().unwrap();
-    let (_, rows) = recovered
-        .query_sql("SELECT v FROM t ORDER BY id", &[])
-        .unwrap();
-
-    assert_eq!(
-        column(&rows),
-        vec!["confirmed".to_string(), "also confirmed".to_string()],
-        "recovery must not discard writes that reached quorum"
-    );
-    assert_eq!(recovered.committed_lsn, 3);
-}
-
-#[tokio::test]
-async fn capture_resumes_after_wal_restart() {
-    let dir = scratch_dir("wal-restart");
-    let mut state = seed_confirmed(&dir).await;
-
-    state.close();
-    state.open_as_primary().unwrap();
-
-    state
-        .execute_sql("INSERT INTO t VALUES (2, 'after restart')", &[])
-        .unwrap();
-
-    let captured = state.capture_wal_frames().unwrap();
+    barrier().uninstall();
     assert!(
-        captured.is_some(),
-        "frames written after a WAL restart must still be captured"
+        state.execute_sql("INSERT INTO t VALUES (1)", &[]).is_err(),
+        "a demoted replica must not commit"
     );
+
+    install(&sink);
+    assert_eq!(count(&state), 0);
 }
 
-#[tokio::test]
-async fn unconfirmed_commit_after_checkpoint_is_discarded() {
-    let dir = scratch_dir("unconfirmed-after-checkpoint");
-    let mut state = seed_confirmed(&dir).await;
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_batch_reaches_quorum_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = sink();
+    install(&sink);
 
-    state.close();
-    state.open_as_primary().unwrap();
+    let mut state = primary(dir.path()).await;
+    state
+        .execute_batch_sql(&["CREATE TABLE t(v INTEGER)".to_string()])
+        .expect("create");
+    let before = sink.replicated.load(Ordering::SeqCst);
 
     state
-        .execute_sql("INSERT INTO t VALUES (2, 'unconfirmed')", &[])
-        .unwrap();
-
-    let recovered_dir = scratch_dir("unconfirmed-after-checkpoint-recovered");
-    crash_snapshot(&dir, &recovered_dir);
-
-    let mut recovered = SqliteState::open(recovered_dir).await.unwrap();
-    recovered.open_as_primary().unwrap();
-    let (_, rows) = recovered
-        .query_sql("SELECT v FROM t ORDER BY id", &[])
-        .unwrap();
+        .execute_batch_sql(&[
+            "INSERT INTO t VALUES (1)".to_string(),
+            "INSERT INTO t VALUES (2)".to_string(),
+        ])
+        .expect("batch");
 
     assert_eq!(
-        column(&rows),
-        vec!["confirmed".to_string()],
-        "an unconfirmed write in a post-checkpoint WAL generation must not survive"
+        sink.replicated.load(Ordering::SeqCst) - before,
+        1,
+        "a batch must replicate as one transaction"
     );
+    assert_eq!(count(&state), 2);
 }
