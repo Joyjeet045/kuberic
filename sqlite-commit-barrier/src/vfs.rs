@@ -143,11 +143,16 @@ unsafe fn write_through(file: *mut ffi::sqlite3_file) -> c_int {
     }
 }
 
+unsafe fn stage_holds_commit(file: *mut ffi::sqlite3_file) -> bool {
+    unsafe { BarrierFile::stage(file).is_some_and(|stage| stage.commit_pages().is_some()) }
+}
+
 unsafe fn flush_stage(file: *mut ffi::sqlite3_file) -> c_int {
     unsafe {
-        match BarrierFile::stage(file) {
-            Some(stage) if stage.commit_pages().is_some() => publish_stage(file),
-            _ => write_through(file),
+        if stage_holds_commit(file) {
+            publish_stage(file)
+        } else {
+            write_through(file)
         }
     }
 }
@@ -156,33 +161,42 @@ unsafe fn flush_stage(file: *mut ffi::sqlite3_file) -> c_int {
 /// syncs the WAL when `synchronous=FULL`.
 unsafe fn publish_if_complete(file: *mut ffi::sqlite3_file) -> c_int {
     unsafe {
-        match BarrierFile::stage(file) {
-            Some(stage) if stage.commit_pages().is_some() => publish_stage(file),
-            _ => ffi::SQLITE_OK,
+        if stage_holds_commit(file) {
+            publish_stage(file)
+        } else {
+            ffi::SQLITE_OK
         }
     }
 }
 
 unsafe fn publish_stage(file: *mut ffi::sqlite3_file) -> c_int {
     unsafe {
-        let Some(stage) = BarrierFile::stage(file) else {
+        let Some((empty, pages)) =
+            BarrierFile::stage(file).map(|stage| (stage.is_empty(), stage.commit_pages()))
+        else {
             return ffi::SQLITE_OK;
         };
-        if stage.is_empty() {
+        if empty {
             return ffi::SQLITE_OK;
         }
-        let Some(pages) = stage.commit_pages() else {
+        let Some(pages) = pages else {
             return write_through(file);
         };
-        let layout = stage.layout();
+
         let barrier = BarrierFile::barrier(file).clone();
-        let transaction = Transaction {
-            wal_offset: stage.start(),
-            frames: stage.bytes(),
-            page_size: layout.map(|layout| layout.page_size).unwrap_or_default(),
-            database_pages: pages,
+        let outcome = {
+            let stage = BarrierFile::stage(file).expect("stage");
+            let layout = stage.layout();
+            let transaction = Transaction {
+                wal_offset: stage.start(),
+                frames: stage.bytes(),
+                page_size: layout.map(|layout| layout.page_size).unwrap_or_default(),
+                database_pages: pages,
+            };
+            barrier.publish(&transaction)
         };
-        match barrier.publish(&transaction) {
+
+        match outcome {
             Ok(()) => {
                 let rc = write_through(file);
                 if rc != ffi::SQLITE_OK {
@@ -197,7 +211,9 @@ unsafe fn publish_stage(file: *mut ffi::sqlite3_file) -> c_int {
             }
             Err(error) => {
                 tracing::warn!(%error, "commit barrier rejected a transaction");
-                stage.take();
+                if let Some(stage) = BarrierFile::stage(file) {
+                    stage.take();
+                }
                 ffi::SQLITE_IOERR_WRITE
             }
         }
