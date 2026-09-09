@@ -16,10 +16,10 @@ async fn test_kvstore_k8s_write_read() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Connect via NodePort
-    let mut client =
-        kvstore::proto::kv_store_client::KvStoreClient::connect("http://127.0.0.1:30090")
-            .await
-            .expect("failed to connect via NodePort 30090");
+    let endpoint = crate::test_utils::isolated_kvstore_endpoint();
+    let mut client = kvstore::proto::kv_store_client::KvStoreClient::connect(endpoint)
+        .await
+        .expect("failed to connect through the dedicated KinD port mapping");
 
     // Put a key
     let put_resp = client
@@ -51,7 +51,7 @@ async fn test_kvstore_k8s_write_read() {
 async fn test_kvstore_k8s_status_healthy() {
     crate::test_utils::ensure_kvstore_deployed().await;
 
-    let client = kube::Client::try_default().await.unwrap();
+    let client = crate::test_utils::isolated_kube_client().await;
     let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
         client,
         "xedio",
@@ -86,7 +86,7 @@ async fn test_kvstore_k8s_status_healthy() {
 #[serial_test::serial]
 async fn test_kvstore_k8s_framework_native_remove_replica() {
     crate::test_utils::ensure_kvstore_deployed().await;
-    let client = kube::Client::try_default().await.unwrap();
+    let client = crate::test_utils::isolated_kube_client().await;
     let sets: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
         client.clone(),
         "xedio",

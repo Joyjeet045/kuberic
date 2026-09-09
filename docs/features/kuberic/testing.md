@@ -367,8 +367,8 @@ both ACK paths through correlated Close actions and bounds new/in-flight
 writes.
 
 **Pattern 5: Failure during switchover compensation** ✅
-`test_durable_switchover_compensates_failed_target_promotion` exercises the
-real correlated path and verifies old-primary restoration.
+`test_framework_native_switchover_publication_compensates_failed_promotion`
+exercises the real correlated path and verifies old-primary restoration.
 
 **Pattern 6: Operator process restart recovery** ✅
 `test_operator_restart_recovers_read_only_then_switches_and_scales` replaces
@@ -378,56 +378,60 @@ verifies continued writes, switchover, and scale-up. Companion tests cover
 recovered unhealthy-primary failover, legacy/mismatched snapshot rejection,
 post-recovery pod logical/incarnation drift, and unordered pod listing.
 
-**Pattern 7: Durable switchover boundary and ambiguity recovery** ✅
-`test_durable_switchover_survives_state_loss_at_every_boundary` discards
-`ReconcilerState` after every checkpoint/activity window. Companion tests
-inject a lost target-promotion reply, force target-promotion compensation,
-reject a stale pod incarnation, and reject a status resource-version conflict
-before mutation. Assertions cover deterministic single dispatch of unsafe role
-changes, terminal stable snapshot recovery, and unsupported checkpoint
-versions with no mutating RPC.
+**Pattern 7: Framework-native durable switchover** ✅
+`test_framework_native_switchover_*` drives the only production path through
+the format-3 checkpoint kernel. The matrix covers every-turn operator restart,
+unknown outcomes with and without apply, checkpoint conflict, terminal CAS
+conflict, failed status publication followed by terminal reload without Pods,
+stale target incarnation, target-promotion compensation, and lost replies for
+every replica mutation. It asserts the ordered mutation sequence, one admitted
+unsafe effect per correlation identity, terminal-before-status recovery, and
+fail-closed missing-reference and unsupported current-native state.
 
-**Pattern 7a: Feature-gated durable-execution switchover pilot** ✅
-`test_durable_execution_switchover_pilot_*` keeps the explicit path as the
-default and drives the opt-in path through the format-3 checkpoint kernel.
-The matrix covers every-turn operator restart, schedule unknown outcomes with
-and without apply, fused terminal CAS conflict, failed status publication
-followed by terminal reload without Pods, stale target incarnation, failed
-target-promotion compensation, and lost replies for every replica mutation. It
-asserts the ordered mutation sequence, one admitted unsafe effect per
-correlation identity, and terminal-before-status recovery. Operator unit tests
-separately prove unknown UID-fenced label exposure remains quarantined,
-ordinary activity payloads exclude full operation snapshots, and activity
-count plus deterministic transition fuel are independently bounded.
-
-Run only the targeted pilot matrix:
+Run the targeted matrix:
 
 ```console
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
-  --test reconciler test_durable_execution_switchover_pilot_ -- --nocapture
+  --test reconciler test_framework_native_switchover_ -- --nocapture
 ```
 
 The authoritative happy-path gate expects exactly nine external effects plus
 three passive observations, giving 12 completed durable boundaries and 13
 accepted checkpoint writes including terminal persistence. Seven former
 preparation-only records are now part of their corresponding effect exposure.
-Six repeated remediation runs observed maximum active checkpoints from 31,597
-to 31,605 bytes and terminal checkpoints from 4,077 to 4,081 bytes. These are
+The graduation sample observed 31,785 maximum active-checkpoint bytes, 4,169
+terminal-checkpoint bytes, and a 1,041-byte terminal payload. These are
 run-specific snapshots because runtime-generated values affect serialized
-length; no exact byte value is a compatibility contract. The stable admission
-contracts are the configured 770,048-byte (752 KiB) encoded-checkpoint ceiling
-and 4,096-byte terminal-payload ceiling, and the executable gate checks its
-authoritative measurements against those ceilings.
+length; no exact byte value is a compatibility contract.
+
+The product-wide replica range is 1–9 and is enforced by both the CRD schema
+and reconciliation. A four-member end-to-end switchover test covers the former
+three-replica ceiling, while schema and admission tests cover exactly nine and
+reject ten. Generated-schema tests assert the exact current native property
+set and required fields. A dedicated isolated KinD API-server check with
+strict field validation accepts the valid native shape and rejects missing
+input, removed variants, and unknown top-level or nested input fields.
+
+The independent contract limits are 33 activity records, 4,096 workflow-input
+bytes, 8,192 activity-input bytes, 4,096 result bytes, 770,048 active encoded
+bytes, 16,384 terminal encoded bytes, 4,096 terminal-payload bytes, 512 error
+bytes, 64 workflow transitions, and 32 runner outcomes per reconcile. Maximum
+fixtures measure 736,181 active bytes and 15,093 terminal bytes. The
+19-record success-with-redelivery projection is 427,133 bytes; the 21-record
+rollback-with-redelivery projection is 471,285 bytes for three members. At the
+nine-member product maximum, the corresponding projections are 31 records /
+692,029 bytes and 33 records / 736,181 bytes.
 
 The terminal payload carries the external-effect and passive-observation
 counts, so a fresh measurement store can recover the classification without
-prior active-checkpoint cache state. A successful full pilot requires exactly
-three passive observations and `9 + r` external boundaries, where `r` is the
-number of proven-no-admission redeliveries and is limited to the seven
-projected ReplicaAgent-effect slots; UID-fenced label effects have no
-redelivery path. The no-redelivery target remains 9/3, 12
-boundaries, and 13 accepted writes; fault paths may consume additional
-boundaries and writes. Compensated completion is validated against the exact
+prior active-checkpoint cache state. A successful `N`-member switchover
+requires exactly three passive observations and `N + 6 + r` external
+boundaries, where `r` is the number of proven-no-admission redeliveries and is
+limited to the `N + 4` projected ReplicaAgent-effect slots; UID-fenced label
+effects have no redelivery path. For the canonical three-member path, the
+no-redelivery target remains 9/3, 12 boundaries, and 13 accepted writes, with
+at most seven redeliveries. Fault paths may consume additional boundaries and
+writes. Compensated completion is validated against the exact
 reachable pairs for its restore or failed-promotion compensation transcript,
 including only redelivery slots belonging to effects that were actually
 exposed.
@@ -446,14 +450,16 @@ Run the exact operational measurement and projection gates with:
 
 ```console
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  --features durable-switchover-pilot success_and_rollback_transcripts_fit_with_redelivery_headroom
+  success_and_rollback_transcripts_fit_with_redelivery_headroom -- --nocapture
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  --features durable-switchover-pilot maximum_projected_history_fits_both_budgets
+  maximum_projected_history_fits_both_budgets -- --nocapture
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  --features durable-switchover-pilot measurements_ -- --nocapture
+  framework_native_switchover_rejects_every_independent_one_over_bound
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
+  measurements_ -- --nocapture
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
   -p kvstore --test reconciler \
-  test_durable_execution_switchover_pilot_happy_path -- --nocapture
+  test_framework_native_switchover_happy_path -- --nocapture
 ```
 
 The ambiguity matrix distinguishes exposure conflicts, definite storage
@@ -467,12 +473,12 @@ kernel's 45-scenario conformance matrix also covers fused schedule/exposure,
 observation/next exposure, observation/terminal, exact permit/attempt identity,
 and capacity reservation.
 
-Pilot/operator tests run with a 4 MiB test-thread stack in CI-constrained
+Switchover/operator tests run with a 4 MiB test-thread stack in CI-constrained
 environments:
 
 ```console
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
-  -p kvstore --test reconciler test_durable_execution_switchover_pilot_
+  -p kvstore --test reconciler test_framework_native_switchover_
 ```
 
 The real Kubernetes checkpoint test also creates an owner-bound terminal
@@ -542,22 +548,38 @@ live-cluster tests in the committed source tree. The six operation-adapter
 responsibilities have dedicated `framework_native_remove_replica_fr019_*`
 tests.
 
-For isolated live validation, use only the dedicated Kuberic Kind kubeconfig:
+For isolated live validation, create a new workflow-specific Kind cluster and
+use only its dedicated kubeconfig. Never reuse or inspect unrelated clusters:
 
 ```console
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" kubectl \
-  --kubeconfig "$HOME/.kube/kuberic-kind-config" cluster-info
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" just images
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test \
+export KIND_CLUSTER_NAME="kuberic-<workflow>-$(date +%s)"
+export KUBECONFIG="$HOME/.kube/${KIND_CLUSTER_NAME}.config"
+export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+export KIND_CONFIG="deploy/kind-isolated-config.yaml"
+just create-kind-cluster
+test "$(kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
+  config current-context)" = "$KUBE_CONTEXT"
+kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" cluster-info
+just images
+cargo test \
   -p kuberic-durable-execution --features kubernetes \
   --test kubernetes_checkpoint_real -- --nocapture
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests \
+cargo test -p kuberic-tests \
   test_kvstore_k8s_status_healthy -- --nocapture
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests \
+cargo test -p kuberic-tests \
   test_kvstore_k8s_write_read -- --nocapture
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests \
+cargo test -p kuberic-tests \
   test_kvstore_k8s_framework_native_remove_replica -- --nocapture
+just delete-kind-cluster
 ```
+
+The exported `KUBECONFIG` points every kube client and real-API test at the
+dedicated cluster. The `just` recipes also require `KIND_CLUSTER_NAME`, verify
+the exact `kind-<name>` context before Kubernetes mutations, and delete only
+that named cluster and kubeconfig after validating a workflow-created ownership
+receipt. The isolated config uses a dynamically allocated host port; the
+kvstore test resolves it from only the exact
+`<KIND_CLUSTER_NAME>-control-plane` container.
 
 The live removal test verifies selector-free admission, the owner-bound
 terminal checkpoint, exact removal of one pod, preservation of the two

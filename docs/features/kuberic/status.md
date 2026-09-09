@@ -28,7 +28,7 @@ Implementation status, known gaps, and open questions.
 | gRPC failure tracking | ❌ Not implemented — K8s adaptation of SF federation heartbeats |
 | Stable Healthy operator restart recovery | ✅ Implemented — authoritative status snapshot + read-only `PartitionDriver::recover()` |
 | Durable initial partition creation | ✅ Implemented — explicit no-previous-topology checkpoint, partial committed bootstrap snapshots, gated routing |
-| Durable switchover restart recovery | ✅ Implemented — compact CRD operation checkpoint, correlated activities, compensation |
+| Durable switchover restart recovery | ✅ Implemented — native `status.switchoverExecution` admission plus owner-bound ConfigMap checkpoints, exact correlated actions, quarantine, compensation, and terminal reload |
 | Durable scale-up and stale-secondary rejoin | ✅ Implemented — one coarse primary-agent intent, target peer stages, tracked copy/quorum, commit-aware compensation |
 | Durable scale-down and stale/dead-secondary eviction | ✅ Implemented — native `status.removeReplicaExecution` admission plus owner-bound ConfigMap checkpoints, one coarse primary-agent intent, config-first commit, lifecycle-peer retirement, exact connection cleanup, UID-fenced deletion |
 | Pod-local RA-lite boundary | ✅ Implemented — control v3, one versioned correlated mutation path with generation/version fencing and bounded replay |
@@ -91,6 +91,14 @@ third records evidence erased by a complete same-Pod primary process restart.
 They are durable ConfigMap terminal decisions, unlike the volatile coordinator
 ledger.
 
+During switchover, `status.switchoverExecution` stores immutable admission and
+checkpoint identity. Its ConfigMap checkpoint stores exact prepared commands,
+observations, bounded redelivery evidence, and terminal outcome. A
+`Switchover` phase without the current native reference fails closed.
+The local sequence remains individually correlated rather than hidden behind
+a coarse agent intent because it spans the old primary, target, retained
+members, and Kubernetes routing effects.
+
 ---
 
 ## Known Gaps vs SF
@@ -142,6 +150,10 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 **Minimum recommended:** `replicas >= 3`. Pod anti-affinity across nodes
 (ensures failure independence for quorum model).
 
+**Maximum supported:** `replicas <= 9`. The CRD and reconciler enforce this
+product-wide bound. It keeps the largest framework-native switchover
+compensation history within the admitted ConfigMap checkpoint budget.
+
 ---
 
 ## Open Questions
@@ -162,11 +174,6 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
    The self-fencing liveness probe (K8s-specific addition) needs an HTTP
    health endpoint. This is not an SF pattern — it compensates for K8s
    lacking SF's federation-level failure detection.
-6. **Agent-owned switchover** — add/build and removal now delegate their local
-   reconfiguration sequence through one coarse primary intent. Switchover is
-   the next candidate; it still persists and dispatches its revoke, catch-up,
-   demotion, promotion, epoch, configuration, and compensation activities from
-   the operator checkpoint.
 
 ---
 
@@ -207,6 +214,7 @@ kuberic-operator/
 │   ├── main.rs                      # Binary entry point (kube controller)
 │   ├── crd.rs                       # KubericSet CRD with spec/status/enums
 │   ├── cluster_api.rs               # ClusterApi trait + KubeClusterApi impl
+│   ├── durable/switchover_execution.rs # Native switchover contract, adapter, bounds, recovery
 │   ├── durable/remove_replica.rs     # Coarse intent freeze/redrive, commit, cleanup, dispositions
 │   ├── reconciler.rs                # Reconcile loop and Kubernetes-owned cleanup/publication
 │   └── tests.rs                     # Mock reconciler tests

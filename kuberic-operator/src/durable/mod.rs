@@ -13,12 +13,11 @@ mod create_partition;
 pub mod effects;
 mod failover;
 pub mod failover_election;
-#[cfg(feature = "durable-switchover-pilot")]
-pub mod pilot;
 mod remove_replica;
 pub mod remove_replica_execution;
 pub mod runner;
 mod switchover;
+pub mod switchover_execution;
 pub mod workflow_host;
 
 pub(crate) use add_replica::final_attestation as attest_add_replica;

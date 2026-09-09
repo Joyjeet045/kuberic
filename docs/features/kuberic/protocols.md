@@ -117,8 +117,8 @@ fail closed and never restore the failed primary.
 
 ## Protocol: Switchover
 
-Planned primary change uses a versioned compact checkpoint in
-`status.operation`.
+Planned primary change uses the versioned `status.switchoverExecution`
+admission reference and an owner-bound ConfigMap checkpoint.
 
 ```
 persist revoke intent → revoke writes
@@ -131,12 +131,12 @@ converge routing labels
 publish stable snapshot
 ```
 
-Every external activity has a deterministic action ID and is persisted before
-dispatch. A resumed reconcile observes first: a matching postcondition
+Every external activity has a deterministic action ID and exact prepared
+command persisted before dispatch. A resumed reconcile observes first: a matching postcondition
 advances, a matching precondition permits dispatch/retry, and any impossible
-observation fails closed. The controller performs one status transition or one
-activity dispatch per reconcile and uses Kubernetes `resourceVersion` to
-exclude stale advancement.
+observation fails closed. The shared runner uses fused checkpoint
+compare-and-swap, one-use dispatch permits, bounded in-process fuel, and
+authoritative reload before any later effect.
 
 If target promotion cannot be confirmed after old-primary demotion, the same
 checkpoint durably restores the old primary at the new epoch, converges member
@@ -149,14 +149,13 @@ observations. These fields are the only local correlation ledger. The bounded
 records correlate a lost reply within one agent generation without becoming
 distributed workflow history or an exactly-once claim.
 
-### Feature-gated durable replay path
+### Framework-native durable replay
 
-With both the operator build feature and per-resource `durablePilot` mode, the
-same protocol decisions are recorded as linear format-3 workflow activities.
+The protocol decisions are recorded as linear format-3 workflow activities.
 The ordering above does not change:
 
 ```
-persist pilot reference
+persist native execution reference
   → schedule activity → expose dispatch → persist agent fence
   → schedule activity → expose dispatch → correlated ReplicaAgent call
   → observe agent ledger/runtime postcondition
@@ -170,6 +169,15 @@ plus exact precondition can prove that the old request was not admitted and
 allows one bounded redelivery of the same action identity. All other exposed
 ambiguity remains quarantined. ConfigMap conflicts and unknown write outcomes
 reload before any later permit.
+
+A resource already in the `Switchover` phase must contain the current native
+execution reference. If it does not, reconciliation fails closed and does not
+authorize a replacement execution.
+
+Switchover deliberately retains individually correlated local mutations. A
+coarse primary-agent intent would require a new coordinator across multiple
+replicas plus Kubernetes routing effects; the existing exact per-command
+fences already preserve the required recovery boundary.
 
 ---
 
@@ -727,8 +735,9 @@ Step 3: update_current_configuration(new_config)
 ```
 
 For add and removal, the primary-agent coordinator issues these runtime
-effects behind one coarse operator action. Failover and switchover still issue
-their ordered correlated activities from the operator checkpoint.
+effects behind one coarse operator action. Failover uses its explicit
+operation checkpoint, while switchover issues its ordered correlated
+activities from the framework-native ConfigMap checkpoint.
 
 ### QuorumTracker Internals
 

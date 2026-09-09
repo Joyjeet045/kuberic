@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use kube::Client;
 use kube_lease_manager::LeaseManagerBuilder;
 
 const TEST_NAMESPACE: &str = "xedio-test-ns";
@@ -13,7 +12,7 @@ const TEST_NAMESPACE: &str = "xedio-test-ns";
 async fn ensure_test_namespace() {
     static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     INIT.get_or_init(|| async {
-        let client = Client::try_default().await.unwrap();
+        let client = crate::test_utils::isolated_kube_client().await;
         let namespaces: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
         let ns = k8s_openapi::api::core::v1::Namespace {
             metadata: kube::api::ObjectMeta {
@@ -41,7 +40,7 @@ async fn ensure_test_namespace() {
 async fn test_lease_leader_election() {
     ensure_test_namespace().await;
 
-    let client = Client::try_default().await.unwrap();
+    let client = crate::test_utils::isolated_kube_client().await;
     let lease_name = "test-watch-lease";
 
     // Simulate 5 competing instances
@@ -146,7 +145,7 @@ impl LeaderElection {
         use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
         use rand::{RngExt, distr::Alphanumeric};
 
-        let client = Client::try_default().await.unwrap();
+        let client = crate::test_utils::isolated_kube_client().await;
         let random: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(7)

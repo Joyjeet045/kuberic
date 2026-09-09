@@ -3,7 +3,7 @@
 This document tracks deferred work for the
 `kuberic-durable-execution` crate. The crate is a replay and persistence safety
 kernel, not an end-user orchestration runtime. Production remove-replica and
-optional switchover consume it through an in-process operator runner. Items
+switchover consume it through an in-process operator runner. Items
 below are ordered possibilities, not commitments.
 
 The ordering is informed by the broader user and provider surfaces in
@@ -44,7 +44,7 @@ The implemented kernel provides:
 - real-API spike measurements for checkpoint/object size, accepted writes,
   canonical typed watch-event bytes, and unknown-outcome recovery;
 - a shared bounded operator runner used by production framework-native
-  remove-replica and the optional switchover workflow while preserving the
+  remove-replica and switchover workflows while preserving the
   `ReplicaAgent` mutation boundary;
 - direct kube-controller integration through Send workflow/store futures,
   without another executor or scheduler;
@@ -177,14 +177,44 @@ preparation, effect/quarantine handling, deadlines, terminal validation, and
 publication. The Kubernetes reconciler remains the scheduler; no worker,
 queue, lease, watcher, distributed owner, or retry scheduler was added.
 
-Switchover remains optional and retains its existing public selection model.
-Its representative no-redelivery path remains nine external effects, three
-passive observations, 12 boundaries, and 13 accepted writes. Its byte
-measurements and lifecycle limits remain operation-specific.
+Switchover is now a production framework-native consumer with no public
+selection model or optional build feature. Its representative no-redelivery
+path remains nine external effects, three passive observations, 12 boundaries,
+and 13 accepted writes. Its byte measurements and lifecycle limits remain
+operation-specific.
+
+### Graduated: Framework-Native Switchover
+
+`status.switchoverExecution` owns immutable admission and checkpoint identity.
+A resource in the `Switchover` phase without a current native reference fails
+closed; removed historical formats are neither migrated nor converted.
+
+The operation reuses the shared runner and ConfigMap provider while retaining
+the existing deterministic switchover reducer and individually correlated
+ReplicaAgent and exact-UID label commands. A coarse agent-owned switchover
+intent was not introduced: unlike add and remove, the sequence spans multiple
+replicas and Kubernetes routing objects, and the existing per-command fences
+already supply authoritative ambiguity recovery.
+
+The product supports 1–9 replicas. The upper bound is enforced by the CRD and
+reconciler because the nine-member maximum-fault rollback consumes all 33
+admitted activity records while remaining within the ConfigMap budget.
+The status schema has one native execution-reference shape with required
+immutable input; no switchover incompatibility variant remains. Missing fields
+fail schema admission, while strict Kubernetes field validation rejects
+removed or unknown fields before persistence.
+
+The independent limits are 33 activity records, 4,096 workflow-input bytes,
+8,192 activity-input bytes, 4,096 result bytes, 770,048 active bytes, 16,384
+terminal bytes, 4,096 terminal-payload bytes, 512 error bytes, 64 workflow
+transitions, and 32 runner outcomes per reconcile. Maximum fixtures measure
+736,181 active bytes and 15,093 terminal bytes. The measured no-fault sample
+was 31,785 active bytes, 4,169 terminal bytes, and a 1,041-byte terminal
+payload.
 
 ### Graduated: Framework-Native Remove Replica
 
-Remove-replica is the first production framework-native consumer. It has one
+Remove-replica is a production framework-native consumer. It has one
 default execution path and no build or resource mode selector. Legacy pilot
 and explicit remove records are converted to durable incompatibility markers;
 they are never resumed, migrated, cleared as absent, or used to admit a new

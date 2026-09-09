@@ -14,20 +14,28 @@ use kuberic_core::types::{
     ReplicaInstanceId, ReplicaStatusInfo, Role,
 };
 use kuberic_durable_execution::{
-    CasOutcome, CheckpointEnvelope, CheckpointPayload, CheckpointStore, ExactBytes,
-    ExecutionContract, InMemoryCheckpointStore, TerminalOutcome,
+    ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome, CheckpointEnvelope,
+    CheckpointPayload, CheckpointStore, ExactBytes, ExecutionContract, InMemoryCheckpointStore,
+    InMemoryFault, StoreErrorKind, TerminalOutcome,
 };
 
 use super::*;
 use crate::crd::{
     EpochStatus, MemberStatus, PvcRetentionPolicy, RemoveReplicaCleanupStatus,
     RemoveReplicaCommitEvidenceStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
-    TargetRetirementObservationStatus,
+    SwitchoverExecutionStatus, TargetRetirementObservationStatus,
 };
 use crate::durable::remove_replica_execution::{
     REMOVE_REPLICA_MAX_ACTIVE_ENCODED_BYTES, REMOVE_REPLICA_MAX_TERMINAL_ENCODED_BYTES,
     RemoveReplicaActivityAccounting, RemoveReplicaExecution, RemoveReplicaTerminal,
     checkpoint_limits, execution_spec, new_execution, reconstruct_initial_operation,
+};
+use crate::durable::switchover_execution::{
+    SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES, SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
+    SwitchoverActivityAccounting, SwitchoverTerminal,
+    checkpoint_limits as switchover_checkpoint_limits,
+    encode_terminal as encode_switchover_terminal, native_execution_spec, native_initial_operation,
+    new_switchover_execution,
 };
 
 #[derive(Default)]
@@ -37,6 +45,7 @@ struct RoutingApi {
     fail_status_patch: StdMutex<bool>,
     replica_statuses: StdArc<StdMutex<BTreeMap<ReplicaId, ReplicaStatusInfo>>>,
     status_failures: StdArc<StdMutex<BTreeMap<ReplicaId, StatusFailure>>>,
+    reject_dispatch_as_busy: StdArc<StdMutex<bool>>,
 }
 
 impl RoutingApi {
@@ -62,6 +71,10 @@ impl RoutingApi {
             .unwrap()
             .insert(replica_id, failure);
     }
+
+    fn reject_dispatch_as_busy(&self) {
+        *self.reject_dispatch_as_busy.lock().unwrap() = true;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +87,7 @@ struct RoutingHandle {
     replica_id: ReplicaId,
     statuses: StdArc<StdMutex<BTreeMap<ReplicaId, ReplicaStatusInfo>>>,
     failures: StdArc<StdMutex<BTreeMap<ReplicaId, StatusFailure>>>,
+    reject_dispatch_as_busy: StdArc<StdMutex<bool>>,
 }
 
 #[async_trait]
@@ -132,6 +146,9 @@ impl ReplicaHandle for RoutingHandle {
         &self,
         _: CorrelatedControlActionRequest,
     ) -> kuberic_core::Result<CorrelatedControlActionAcknowledgement> {
+        if *self.reject_dispatch_as_busy.lock().unwrap() {
+            return Err(KubericError::AgentBusy);
+        }
         panic!("authority-gap tests must not dispatch effects")
     }
 }
@@ -193,6 +210,7 @@ impl ClusterApi for RoutingApi {
             replica_id,
             statuses: self.replica_statuses.clone(),
             failures: self.status_failures.clone(),
+            reject_dispatch_as_busy: self.reject_dispatch_as_busy.clone(),
         }))
     }
 
@@ -390,7 +408,6 @@ fn set(reference: RemoveReplicaExecution) -> KubericSet {
             image: "test:latest".to_string(),
             failover_delay: 0,
             switchover_delay: 30,
-            switchover_execution_mode: Default::default(),
             port: 8080,
             control_port: 9090,
             data_port: 9091,
@@ -640,6 +657,568 @@ async fn framework_native_remove_replica_route_isolates_malformed_agent_status()
                     && condition
                         .message
                         .contains("unsupported or malformed control status")
+            })
+    );
+}
+
+fn switchover_set(reference: SwitchoverExecutionStatus) -> KubericSet {
+    KubericSet {
+        metadata: ObjectMeta {
+            name: Some("set".to_string()),
+            namespace: Some("default".to_string()),
+            uid: Some("set-uid".to_string()),
+            resource_version: Some("1".to_string()),
+            ..Default::default()
+        },
+        spec: KubericSetSpec {
+            replicas: 3,
+            min_replicas: 2,
+            image: "test:latest".to_string(),
+            failover_delay: 0,
+            switchover_delay: 30,
+            port: 8080,
+            control_port: 9090,
+            data_port: 9091,
+            storage: "256Mi".to_string(),
+            pvc_retention_policy: PvcRetentionPolicy::Delete,
+        },
+        status: Some(KubericSetStatus {
+            phase: Phase::Switchover,
+            replicas: 3,
+            ready_replicas: 3,
+            current_primary: Some("set-0".to_string()),
+            target_primary: Some("set-1".to_string()),
+            epoch: EpochStatus {
+                data_loss_number: 1,
+                configuration_number: 7,
+            },
+            members: vec![
+                member(1, "one", "primary"),
+                member(2, "two", "secondary"),
+                member(3, "three", "secondary"),
+            ],
+            stable_snapshot: Some(snapshot()),
+            switchover_execution: Some(reference),
+            ..Default::default()
+        }),
+    }
+}
+
+async fn store_switchover_terminal(
+    store: &InMemoryCheckpointStore,
+    reference: &SwitchoverExecutionStatus,
+) {
+    let initial = native_initial_operation(reference).unwrap();
+    let mut completed = initial.clone();
+    completed.phase = DurableOperationPhase::Completed;
+    let terminal = SwitchoverTerminal::Complete {
+        operation: completed.clone(),
+        snapshot: completed.target_snapshot.clone(),
+        compensated: false,
+        accounting: SwitchoverActivityAccounting::new(9, 3),
+    };
+    store_switchover_terminal_outcome(
+        store,
+        reference,
+        TerminalOutcome::succeeded(encode_switchover_terminal(&terminal).unwrap()),
+        12,
+    )
+    .await;
+}
+
+async fn store_switchover_terminal_outcome(
+    store: &InMemoryCheckpointStore,
+    reference: &SwitchoverExecutionStatus,
+    outcome: TerminalOutcome,
+    completed_activity_count: u64,
+) {
+    let execution = native_execution_spec(reference).unwrap();
+    let envelope = CheckpointEnvelope::encode_with_limits(
+        &CheckpointPayload::terminal(
+            ExecutionContract::with_encoded_limits(
+                execution.clone(),
+                SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES as u64,
+                SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
+            ),
+            outcome,
+            completed_activity_count,
+        ),
+        switchover_checkpoint_limits(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .compare_and_swap(execution.execution_id(), None, envelope)
+            .await
+            .unwrap(),
+        CasOutcome::Accepted(_)
+    ));
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_publishes_reloaded_terminal() {
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let store = InMemoryCheckpointStore::new();
+    store_switchover_terminal(&store, &reference).await;
+    let state = ReconcilerState::with_switchover_store(store);
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    let current_pods = api.pods.lock().unwrap().clone();
+
+    reconcile_framework_native_switchover(
+        &switchover_set(reference.clone()),
+        &api,
+        &state,
+        &current_pods,
+    )
+    .await
+    .unwrap();
+
+    let published = api.last_status().unwrap();
+    assert_eq!(published.phase, Phase::Healthy);
+    assert_eq!(published.current_primary.as_deref(), Some("set-1"));
+    assert_eq!(published.stable_snapshot.as_ref().unwrap().primary_id, 2);
+    assert_eq!(
+        published
+            .switchover_execution
+            .as_ref()
+            .unwrap()
+            .execution_id,
+        reference.execution_id
+    );
+    assert!(published.conditions.iter().any(|condition| {
+        condition.type_ == "FrameworkNativeSwitchover"
+            && condition.reason == "Completed"
+            && condition.status == "False"
+    }));
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_records_invalid_reference_condition() {
+    let mut reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    reference.contract_version += 1;
+    let state = ReconcilerState::with_switchover_store(InMemoryCheckpointStore::new());
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    let current_pods = api.pods.lock().unwrap().clone();
+
+    reconcile_framework_native_switchover(&switchover_set(reference), &api, &state, &current_pods)
+        .await
+        .unwrap();
+
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == "Blocked"
+                    && condition.message.contains("unsupported")
+            })
+    );
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_blocks_invalid_admission_authority_without_dispatch() {
+    let valid = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let mut invalid_references = Vec::new();
+    let mut foreign_authority = valid.clone();
+    foreign_authority.input.operation_authority = "other-uid".to_string();
+    invalid_references.push(foreign_authority);
+    let mut invalid_time = valid;
+    invalid_time.input.accepted_unix_seconds = i64::MAX;
+    invalid_references.push(invalid_time);
+
+    for reference in invalid_references {
+        let state = ReconcilerState::with_switchover_store(InMemoryCheckpointStore::new());
+        let api = RoutingApi::new(vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ]);
+        let current_pods = api.pods.lock().unwrap().clone();
+
+        reconcile_framework_native_switchover(
+            &switchover_set(reference),
+            &api,
+            &state,
+            &current_pods,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            api.last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| {
+                    condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "Blocked"
+                })
+        );
+    }
+}
+
+#[tokio::test]
+async fn switchover_phase_without_native_reference_fails_closed_without_dispatch() {
+    let mut set = switchover_set(new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap());
+    let status = set.status.as_mut().unwrap();
+    status.switchover_execution = None;
+    status.legacy_status_fields.insert(
+        "removedSwitchoverField".to_string(),
+        serde_json::json!({"ignored": true}),
+    );
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+
+    let error = match reconcile_set(&set, &api, &ReconcilerState::default()).await {
+        Ok(_) => panic!("missing native switchover reference unexpectedly reconciled"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        "switchover phase has no production execution reference"
+    );
+    assert!(api.statuses.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn framework_native_switchover_publication_retry_cleans_native_host() {
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let store = InMemoryCheckpointStore::new();
+    store_switchover_terminal(&store, &reference).await;
+    let state = ReconcilerState::with_switchover_store(store);
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    api.fail_next_status_patch();
+    let set = switchover_set(reference);
+    let current_pods = api.pods.lock().unwrap().clone();
+
+    reconcile_framework_native_switchover(&set, &api, &state, &current_pods)
+        .await
+        .unwrap();
+    assert_eq!(state.framework_native_switchover.host_count().await, 1);
+
+    reconcile_set(&set, &api, &state).await.unwrap();
+    assert_eq!(state.framework_native_switchover.host_count().await, 0);
+}
+
+async fn assert_native_switchover_condition_for_store(
+    reference: SwitchoverExecutionStatus,
+    store: InMemoryCheckpointStore,
+    expected_reason: &str,
+    pods: Vec<Pod>,
+) {
+    let state = ReconcilerState::with_switchover_store(store);
+    let api = RoutingApi::new(pods);
+    let current_pods = api.pods.lock().unwrap().clone();
+    reconcile_framework_native_switchover(&switchover_set(reference), &api, &state, &current_pods)
+        .await
+        .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == expected_reason
+            }),
+        "missing native switchover condition {expected_reason}"
+    );
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_records_checkpoint_dispositions() {
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let execution = native_execution_spec(&reference).unwrap();
+    let incompatible = InMemoryCheckpointStore::new();
+    assert!(matches!(
+        incompatible
+            .compare_and_swap(
+                execution.execution_id(),
+                None,
+                CheckpointEnvelope::new(99, ExactBytes::new(b"{}".to_vec())),
+            )
+            .await
+            .unwrap(),
+        CasOutcome::Accepted(_)
+    ));
+    assert_native_switchover_condition_for_store(
+        reference.clone(),
+        incompatible,
+        "Incompatible",
+        vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ],
+    )
+    .await;
+
+    let rejected = InMemoryCheckpointStore::new();
+    assert!(matches!(
+        rejected
+            .compare_and_swap(
+                execution.execution_id(),
+                None,
+                CheckpointEnvelope::new(
+                    kuberic_durable_execution::CHECKPOINT_FORMAT_VERSION,
+                    ExactBytes::new(b"not-json".to_vec()),
+                ),
+            )
+            .await
+            .unwrap(),
+        CasOutcome::Accepted(_)
+    ));
+    assert_native_switchover_condition_for_store(
+        reference,
+        rejected,
+        "Rejected",
+        vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ],
+    )
+    .await;
+
+    assert_native_switchover_condition_for_store(
+        new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap(),
+        InMemoryCheckpointStore::new(),
+        "Isolated",
+        vec![pod(1, "one", "primary"), pod(2, "two", "secondary")],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_records_reload_and_persistence_failures() {
+    let reload = InMemoryCheckpointStore::new();
+    reload.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
+    assert_native_switchover_condition_for_store(
+        new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap(),
+        reload,
+        "ReloadRequired",
+        vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ],
+    )
+    .await;
+
+    let failed = InMemoryCheckpointStore::new();
+    failed.fail_next_compare_and_swap(InMemoryFault::FailBeforeRequest(
+        StoreErrorKind::Unavailable,
+    ));
+    assert_native_switchover_condition_for_store(
+        new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap(),
+        failed,
+        "StorageUnavailable",
+        vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_records_adapter_wait_and_fuel_exhaustion() {
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, unix_seconds()).unwrap();
+    let state = ReconcilerState::with_switchover_store(InMemoryCheckpointStore::new());
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    api.fail_status(1, StatusFailure::Unavailable);
+    let current_pods = api.pods.lock().unwrap().clone();
+    reconcile_framework_native_switchover(&switchover_set(reference), &api, &state, &current_pods)
+        .await
+        .unwrap();
+    let waiting = api.last_status().unwrap();
+    assert!(
+        waiting.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeSwitchover"
+                && condition.reason == "AwaitingEffectPreparation"
+        }),
+        "{:?}",
+        waiting.conditions
+    );
+
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, unix_seconds()).unwrap();
+    let state = ReconcilerState::with_switchover_store(InMemoryCheckpointStore::new());
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    api.reject_dispatch_as_busy();
+    let current_pods = api.pods.lock().unwrap().clone();
+    reconcile_framework_native_switchover_with_fuel(
+        &switchover_set(reference),
+        &api,
+        &state,
+        &current_pods,
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == "FuelExhausted"
+            })
+    );
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_records_nondeterminism() {
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let execution = native_execution_spec(&reference).unwrap();
+    let store = InMemoryCheckpointStore::new();
+    let wrong = ActivitySpec::new(
+        ActivityName::new("kuberic.switchover.wrong-boundary", 1).unwrap(),
+        ExactBytes::new(b"{}".to_vec()),
+        1,
+    );
+    let envelope = CheckpointEnvelope::encode_with_limits(
+        &CheckpointPayload::active(
+            ExecutionContract::with_encoded_limits(
+                execution.clone(),
+                SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES as u64,
+                SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
+            ),
+            vec![ActivityRecord::scheduled(ActivitySequence::new(0), wrong)],
+        ),
+        switchover_checkpoint_limits(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .compare_and_swap(execution.execution_id(), None, envelope)
+            .await
+            .unwrap(),
+        CasOutcome::Accepted(_)
+    ));
+    assert_native_switchover_condition_for_store(
+        reference,
+        store,
+        "Nondeterministic",
+        vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_publishes_compensation_and_quarantine() {
+    let compensation_reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let initial = native_initial_operation(&compensation_reference).unwrap();
+    let mut failed = initial.clone();
+    failed.phase = DurableOperationPhase::Failed;
+    failed.frozen_lsn = Some(42);
+    failed.next_secondary_index = 2;
+    let terminal = SwitchoverTerminal::Complete {
+        operation: failed,
+        snapshot: initial.previous_snapshot.cloned().unwrap(),
+        compensated: true,
+        accounting: SwitchoverActivityAccounting::new(8, 5),
+    };
+    let store = InMemoryCheckpointStore::new();
+    store_switchover_terminal_outcome(
+        &store,
+        &compensation_reference,
+        TerminalOutcome::succeeded(encode_switchover_terminal(&terminal).unwrap()),
+        13,
+    )
+    .await;
+    let state = ReconcilerState::with_switchover_store(store);
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    let current_pods = api.pods.lock().unwrap().clone();
+    reconcile_framework_native_switchover(
+        &switchover_set(compensation_reference),
+        &api,
+        &state,
+        &current_pods,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == "CompensatedOrSafeFailure"
+                    && condition.status == "False"
+            })
+    );
+
+    let quarantine_reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let initial = native_initial_operation(&quarantine_reference).unwrap();
+    let terminal = SwitchoverTerminal::Stopped {
+        operation: Some(initial),
+        message: "unknown exposed effect".to_string(),
+    };
+    let store = InMemoryCheckpointStore::new();
+    store_switchover_terminal_outcome(
+        &store,
+        &quarantine_reference,
+        TerminalOutcome::failed(encode_switchover_terminal(&terminal).unwrap()),
+        0,
+    )
+    .await;
+    let state = ReconcilerState::with_switchover_store(store);
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    let current_pods = api.pods.lock().unwrap().clone();
+    reconcile_framework_native_switchover(
+        &switchover_set(quarantine_reference),
+        &api,
+        &state,
+        &current_pods,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "Quarantined"
             })
     );
 }

@@ -11,6 +11,10 @@ env:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    env:
+      KIND_CLUSTER_NAME: kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBECONFIG: /tmp/kuberic-kind-kubeconfig-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBE_CONTEXT: kind-kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       matrix:
         os: [ ubuntu-latest ]
@@ -53,10 +57,11 @@ jobs:
       env:
         RUST_MIN_STACK: 4194304
       run: |
-        cargo test -p kuberic-operator --features durable-switchover-pilot success_and_rollback_transcripts_fit_with_redelivery_headroom
-        cargo test -p kuberic-operator --features durable-switchover-pilot maximum_projected_history_fits_both_budgets
-        cargo test -p kuberic-operator --features durable-switchover-pilot measurements_ -- --nocapture
-        cargo test -p kvstore --test reconciler test_durable_execution_switchover_pilot_happy_path -- --nocapture
+        cargo test -p kuberic-operator success_and_rollback_transcripts_fit_with_redelivery_headroom -- --nocapture
+        cargo test -p kuberic-operator maximum_projected_history_fits_both_budgets -- --nocapture
+        cargo test -p kuberic-operator framework_native_switchover_rejects_every_independent_one_over_bound
+        cargo test -p kuberic-operator measurements_ -- --nocapture
+        cargo test -p kvstore --test reconciler test_framework_native_switchover_happy_path -- --nocapture
 
     - name: Run framework-native remove-replica gates
       env:
@@ -77,8 +82,28 @@ jobs:
       id: kind
       uses: helm/kind-action@v1
       with:
-        cluster_name: kind
-        config: deploy/kind-config.yaml
+        cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+        config: deploy/kind-isolated-config.yaml
+        kubeconfig: ${{ env.KUBECONFIG }}
+        registry: true
+        registry_name: kuberic-registry-${{ github.run_id }}-${{ github.run_attempt }}
+
+    - name: Record isolated KinD ownership
+      run: |
+        printf '%s\n' \
+          "cluster=${KIND_CLUSTER_NAME}" \
+          "context=${KUBE_CONTEXT}" \
+          "kubeconfig=${KUBECONFIG}" \
+          | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
+
+    - name: Verify isolated KinD context
+      run: just verify-kind-context
+
+    - name: Resolve isolated kvstore endpoint
+      run: |
+        port="$(docker port "${KIND_CLUSTER_NAME}-control-plane" 30090/tcp | sed -n 's/.*://p')"
+        test -n "$port"
+        echo "KUBERIC_KVSTORE_ENDPOINT=http://127.0.0.1:${port}" >> "$GITHUB_ENV"
 
     - name: Build and load Docker images
       run: just images

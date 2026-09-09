@@ -122,9 +122,9 @@ authoritative `stableSnapshot`, current pod logical/incarnation identities,
 and runtime `GetStatus`. It does not trust live state to invent a topology and
 does not issue mutating RPCs during reconstruction.
 
-Mid-switchover and mid-failover recovery use the persisted
-`status.operation` checkpoint; they are not inferred from whichever live role
-happens to be visible.
+Mid-switchover recovery uses `status.switchoverExecution` and its referenced
+ConfigMap checkpoint. Mid-failover recovery uses `status.operation`. Neither is
+inferred from whichever live role happens to be visible.
 
 ---
 
@@ -1062,8 +1062,9 @@ Replica add/build and removal share one deliberately narrow
 reverse-observes exact parent/sender authority and local
 identity/generation/epoch before typed Prepare/Activate/Cleanup/Retire effects.
 Shared peer primitives do not merge the workflows and do not create a general
-RA-to-RA reconfiguration framework. Switchover remains the next
-operator-sequenced local reconfiguration candidate.
+RA-to-RA reconfiguration framework. Framework-native switchover deliberately
+retains individually correlated operator-sequenced local mutations because its
+authority spans multiple replicas and Kubernetes routing effects.
 
 ### E9. PostgreSQL correlated topology integration
 
