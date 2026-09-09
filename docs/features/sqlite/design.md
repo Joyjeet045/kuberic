@@ -407,8 +407,8 @@ checkpoint integration is exercised by the durable KV reconciler suite.
 
 ## Known Problems
 
-These are inherent limitations that cannot be fully resolved in this
-design. They are documented for awareness and future mitigation.
+Constraints the design has to work around, and how it does so. Each entry
+states what remains after the mitigation.
 
 ### KP-1: Commit ordering
 

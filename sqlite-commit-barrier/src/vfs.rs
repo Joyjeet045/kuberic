@@ -222,11 +222,11 @@ unsafe fn publish_stage(file: *mut ffi::sqlite3_file) -> c_int {
 
 unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
     unsafe {
-        if let Some(stage) = BarrierFile::stage(file) {
-            stage.take();
-            let this = file as *mut BarrierFile;
-            drop(Box::from_raw((*this).stage));
+        let this = file as *mut BarrierFile;
+        if !(*this).stage.is_null() {
+            let stage = (*this).stage;
             (*this).stage = ptr::null_mut();
+            drop(Box::from_raw(stage));
         }
         let parent = BarrierFile::parent(file);
         if !parent.opened() {
@@ -273,26 +273,32 @@ unsafe extern "C" fn x_write(
 ) -> c_int {
     unsafe {
         let data = std::slice::from_raw_parts(buf as *const u8, amount as usize);
-        let Some(stage) = BarrierFile::stage(file) else {
+        if BarrierFile::stage(file).is_none() {
             return BarrierFile::parent(file).write(offset as u64, data);
-        };
-        if stage.layout().is_none()
-            && offset == 0
-            && let Some(layout) = parse_wal_header(data)
-        {
-            stage.set_layout(layout);
         }
-        if stage.accept(offset as u64, data) == StageOutcome::Buffered {
+        let outcome = {
+            let stage = BarrierFile::stage(file).expect("stage");
+            if stage.layout().is_none()
+                && offset == 0
+                && let Some(layout) = parse_wal_header(data)
+            {
+                stage.set_layout(layout);
+            }
+            stage.accept(offset as u64, data)
+        };
+        if outcome == StageOutcome::Buffered {
             return publish_if_complete(file);
         }
         let rc = flush_stage(file);
         if rc != ffi::SQLITE_OK {
             return rc;
         }
-        let Some(stage) = BarrierFile::stage(file) else {
-            return BarrierFile::parent(file).write(offset as u64, data);
-        };
-        stage.accept(offset as u64, data);
+        {
+            let Some(stage) = BarrierFile::stage(file) else {
+                return BarrierFile::parent(file).write(offset as u64, data);
+            };
+            stage.accept(offset as u64, data);
+        }
         publish_if_complete(file)
     }
 }
