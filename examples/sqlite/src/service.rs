@@ -76,6 +76,15 @@ async fn handle_state_provider_event(
             mut copy_context,
             reply,
         } => {
+            if crate::barrier::barrier().is_fenced() {
+                warn!("refusing to build copy state on a replica awaiting rebuild");
+                let _ = reply.send(Err(kuberic_core::KubericError::Internal(Box::new(
+                    std::io::Error::other(
+                        "replica lost a replicated transaction locally and must be rebuilt",
+                    ),
+                ))));
+                return;
+            }
             let peer_lsn = if let Some(op) = copy_context.get_operation().await {
                 String::from_utf8_lossy(&op.data)
                     .parse::<i64>()
@@ -246,6 +255,8 @@ pub async fn run_service_with_data_loss(
             Some(event) = lifecycle_rx.recv() => match event {
                 LifecycleEvent::Open { ctx, reply } => {
                     info!("service opened — creating replicator");
+                    let data_dir = state.lock().await.data_dir.clone();
+                    crate::barrier::barrier().arm(data_dir, ctx.fault_tx.clone());
                     let (sp_tx, sp_rx) = mpsc::unbounded_channel();
                     match WalReplicator::create(
                         ctx.replica_id,
@@ -339,16 +350,23 @@ pub async fn run_service_with_data_loss(
                             }
                             // Commits block on the barrier, so it must accept
                             // replication before SQLite can write anything.
-                            let ready = match (replicator.as_ref(), token.as_ref()) {
-                                (Some(r), Some(t)) => {
-                                    crate::barrier::barrier().install(r.clone(), t.clone());
-                                    true
-                                }
-                                _ => {
-                                    tracing::error!(
-                                        "promotion without a replicator — refusing to serve"
-                                    );
-                                    false
+                            let ready = if crate::barrier::barrier().is_fenced() {
+                                tracing::error!(
+                                    "refusing to promote a replica that must be rebuilt"
+                                );
+                                false
+                            } else {
+                                match (replicator.as_ref(), token.as_ref()) {
+                                    (Some(r), Some(t)) => {
+                                        crate::barrier::barrier().install(r.clone(), t.clone());
+                                        true
+                                    }
+                                    _ => {
+                                        tracing::error!(
+                                            "promotion without a replicator — refusing to serve"
+                                        );
+                                        false
+                                    }
                                 }
                             };
                             // open_as_primary is blocking (rusqlite) — use spawn_blocking

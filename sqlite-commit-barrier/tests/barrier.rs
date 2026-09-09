@@ -58,6 +58,43 @@ fn row_count(connection: &Connection) -> i64 {
         .expect("count")
 }
 
+/// The barrier must not depend on SQLite choosing to sync, because a client can
+/// lower `synchronous` at any time.
+#[test]
+fn lowering_synchronous_does_not_bypass_the_barrier() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sync.sqlite");
+    let barrier = RecordingBarrier::accepting();
+    register("barrier-synchronous", barrier.clone()).expect("register");
+
+    let connection = open(&path, "barrier-synchronous");
+    connection
+        .execute_batch("CREATE TABLE t(v INTEGER)")
+        .expect("create");
+
+    for level in ["OFF", "NORMAL"] {
+        connection
+            .pragma_update(None, "synchronous", level)
+            .expect("synchronous");
+        let before = barrier.published.load(Ordering::SeqCst);
+        connection
+            .execute("INSERT INTO t VALUES (1)", [])
+            .expect("insert");
+        assert_eq!(
+            barrier.published.load(Ordering::SeqCst) - before,
+            1,
+            "a commit must reach the barrier with synchronous={level}"
+        );
+    }
+
+    barrier.accept.store(false, Ordering::SeqCst);
+    assert!(
+        connection.execute("INSERT INTO t VALUES (99)", []).is_err(),
+        "a rejected commit must fail even without a sync"
+    );
+    assert_eq!(row_count(&connection), 2);
+}
+
 #[test]
 fn an_accepted_transaction_is_visible_and_survives_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");

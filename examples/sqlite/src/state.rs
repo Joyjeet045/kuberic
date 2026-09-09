@@ -60,8 +60,13 @@ impl SqliteState {
     /// Opened against the commit-barrier VFS, so a transaction only becomes
     /// visible once it has reached durable quorum. `locking_mode=EXCLUSIVE`
     /// keeps the wal-index in heap memory instead of a shared-memory file, and
-    /// `synchronous=FULL` guarantees the sync in which the barrier runs.
+    /// `synchronous=FULL` keeps the published commit durable on this replica.
     pub fn open_as_primary(&mut self) -> io::Result<()> {
+        if crate::barrier::is_fenced_on_disk(&self.data_dir) {
+            return Err(io::Error::other(
+                "replica lost a replicated transaction locally and must be rebuilt",
+            ));
+        }
         let conn = Connection::open_with_flags_and_vfs(
             &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -287,6 +292,8 @@ impl SqliteState {
         let shm = self.data_dir.join("db.sqlite-shm");
         let _ = tokio::fs::remove_file(&wal).await;
         let _ = tokio::fs::remove_file(&shm).await;
+
+        crate::barrier::barrier().clear_fence_after_rebuild(&self.data_dir);
 
         info!(size = data.len(), "restored DB from snapshot");
         Ok(())

@@ -4,9 +4,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+use kuberic_core::handles::{PartitionHandle, PartitionState};
+use kuberic_core::types::{AccessStatus, FaultType};
 use serial_test::serial;
+use sqlite_commit_barrier::CommitBarrier;
 use sqlite_replicated::barrier::barrier;
+use sqlite_replicated::server::SqliteServer;
 use sqlite_replicated::state::SqliteState;
+use tokio::sync::mpsc;
 
 struct Sink {
     accept: Arc<AtomicBool>,
@@ -42,6 +47,12 @@ async fn primary(dir: &std::path::Path) -> SqliteState {
     state
 }
 
+/// The barrier is process-global, so each test rebinds it to its own directory.
+fn fresh(dir: &std::path::Path) {
+    barrier().arm(dir.to_path_buf(), mpsc::channel(1).0);
+    barrier().clear_fence_after_rebuild(dir);
+}
+
 fn count(state: &SqliteState) -> i64 {
     let (_, rows) = state
         .query_sql("SELECT count(*) FROM t", &[])
@@ -59,6 +70,7 @@ async fn a_crash_while_awaiting_quorum_leaves_nothing_behind() {
     let dir = tempfile::tempdir().expect("tempdir");
     let salvage = dir.path().join("salvage");
     std::fs::create_dir_all(&salvage).expect("mkdir");
+    fresh(dir.path());
 
     let sink = sink();
     let captured = Arc::new(AtomicBool::new(false));
@@ -115,6 +127,7 @@ async fn a_crash_while_awaiting_quorum_leaves_nothing_behind() {
 #[serial]
 async fn a_replicated_write_is_visible_and_durable() {
     let dir = tempfile::tempdir().expect("tempdir");
+    fresh(dir.path());
     let sink = sink();
     install(&sink);
 
@@ -140,6 +153,7 @@ async fn a_replicated_write_is_visible_and_durable() {
 #[serial]
 async fn a_write_that_loses_quorum_never_commits_locally() {
     let dir = tempfile::tempdir().expect("tempdir");
+    fresh(dir.path());
     let sink = sink();
     install(&sink);
 
@@ -177,6 +191,7 @@ async fn a_write_that_loses_quorum_never_commits_locally() {
 #[serial]
 async fn an_unreplicated_write_cannot_escape_through_a_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
+    fresh(dir.path());
     let sink = sink();
     install(&sink);
 
@@ -211,6 +226,7 @@ async fn an_unreplicated_write_cannot_escape_through_a_snapshot() {
 #[serial]
 async fn a_primary_without_a_barrier_cannot_write() {
     let dir = tempfile::tempdir().expect("tempdir");
+    fresh(dir.path());
     let sink = sink();
     install(&sink);
 
@@ -233,6 +249,7 @@ async fn a_primary_without_a_barrier_cannot_write() {
 #[serial]
 async fn a_batch_reaches_quorum_once() {
     let dir = tempfile::tempdir().expect("tempdir");
+    fresh(dir.path());
     let sink = sink();
     install(&sink);
 
@@ -255,4 +272,86 @@ async fn a_batch_reaches_quorum_once() {
         "a batch must replicate as one transaction"
     );
     assert_eq!(count(&state), 2);
+}
+
+/// A replica missing a transaction the cluster kept must stop serving entirely.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_replica_that_loses_a_committed_transaction_is_fenced_until_rebuild() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fresh(dir.path());
+    let (fault_tx, mut fault_rx) = mpsc::channel(4);
+    barrier().arm(dir.path().to_path_buf(), fault_tx);
+    let sink = sink();
+    install(&sink);
+
+    let mut state = primary(dir.path()).await;
+    state
+        .execute_batch_sql(&["CREATE TABLE t(v INTEGER)".to_string()])
+        .expect("create");
+    state
+        .execute_sql("INSERT INTO t VALUES (1)", &[])
+        .expect("insert");
+    let snapshot = state.snapshot_db().expect("snapshot");
+    state.close();
+
+    CommitBarrier::abandon(&**barrier(), "write failed after quorum");
+
+    assert!(barrier().is_fenced(), "the barrier must fence the replica");
+    assert!(
+        sqlite_replicated::barrier::is_fenced_on_disk(dir.path()),
+        "the fence must survive a restart"
+    );
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), fault_rx.recv())
+            .await
+            .expect("a permanent fault must be reported"),
+        Some(FaultType::Permanent)
+    );
+
+    let granted = Arc::new(PartitionState::new());
+    granted.set_read_status(AccessStatus::Granted);
+    granted.set_write_status(AccessStatus::Granted);
+    let partition = Arc::new(PartitionHandle::new(granted, mpsc::channel(1).0));
+    let server = SqliteServer::new(
+        Arc::new(tokio::sync::Mutex::new(
+            SqliteState::open(dir.path().to_path_buf())
+                .await
+                .expect("open"),
+        )),
+        partition,
+    );
+    assert!(
+        server.check_read_access().is_err(),
+        "a fenced replica must not serve reads even while access is granted"
+    );
+    assert!(
+        server.check_write_access().is_err(),
+        "a fenced replica must not serve writes even while access is granted"
+    );
+
+    let mut reopened = SqliteState::open(dir.path().to_path_buf())
+        .await
+        .expect("open");
+    assert!(
+        reopened.open_as_primary().is_err(),
+        "a fenced replica must not be reusable as primary"
+    );
+
+    reopened
+        .restore_from_snapshot(&snapshot)
+        .await
+        .expect("rebuild");
+
+    assert!(!barrier().is_fenced(), "a rebuild must clear the fence");
+    assert!(!sqlite_replicated::barrier::is_fenced_on_disk(dir.path()));
+
+    install(&sink);
+    reopened
+        .open_as_primary()
+        .expect("a rebuilt replica must serve again");
+    reopened
+        .execute_sql("INSERT INTO t VALUES (2)", &[])
+        .expect("write after rebuild");
+    assert_eq!(count(&reopened), 2);
 }

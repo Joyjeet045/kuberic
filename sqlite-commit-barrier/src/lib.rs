@@ -11,8 +11,11 @@
 //! them only once [`CommitBarrier::publish`] has accepted the transaction. Reads
 //! are served from the buffer while it is held, so SQLite observes a file that
 //! behaves normally. If the barrier rejects the transaction the buffer is
-//! dropped and the sync fails, so SQLite rolls the transaction back and nothing
+//! dropped and the write fails, so SQLite rolls the transaction back and nothing
 //! recoverable is left behind.
+//!
+//! The barrier runs as soon as the commit frame is complete rather than waiting
+//! for a sync, because SQLite only syncs the WAL when `synchronous=FULL`.
 //!
 //! [`CommitBarrier::publish`] runs on the thread driving SQLite and is expected
 //! to block until the transaction is durable elsewhere.
@@ -72,6 +75,7 @@ pub enum Error {
     InvalidName,
     AlreadyRegistered,
     NoDefaultVfs,
+    UnknownParent(String),
     Register(i32),
 }
 
@@ -81,6 +85,7 @@ impl fmt::Display for Error {
             Self::InvalidName => formatter.write_str("vfs name contains an interior nul byte"),
             Self::AlreadyRegistered => formatter.write_str("vfs name is already registered"),
             Self::NoDefaultVfs => formatter.write_str("sqlite has no default vfs"),
+            Self::UnknownParent(name) => write!(formatter, "no vfs named {name} is registered"),
             Self::Register(code) => {
                 write!(
                     formatter,
@@ -97,7 +102,16 @@ impl std::error::Error for Error {}
 /// Registers a VFS under `name`. The registration and the barrier live for the
 /// remainder of the process, because SQLite keeps a pointer to both.
 pub fn register(name: &str, barrier: Arc<dyn CommitBarrier>) -> Result<(), Error> {
-    vfs::register(name, barrier)
+    vfs::register(name, None, barrier)
+}
+
+/// Registers a VFS that delegates to `parent` rather than to the default VFS.
+pub fn register_with_parent(
+    name: &str,
+    parent: &str,
+    barrier: Arc<dyn CommitBarrier>,
+) -> Result<(), Error> {
+    vfs::register(name, Some(parent), barrier)
 }
 
 pub fn is_registered(name: &str) -> bool {

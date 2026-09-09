@@ -1,9 +1,11 @@
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 use kuberic_core::handles::StateReplicatorHandle;
-use kuberic_core::types::{CancellationToken, Lsn};
+use kuberic_core::types::{CancellationToken, FaultType, Lsn};
 use sqlite_commit_barrier::{BarrierError, CommitBarrier, Transaction};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -11,6 +13,26 @@ use tracing::warn;
 use crate::frames::{WalFrameSet, frames_from_wal_bytes};
 
 pub const VFS_NAME: &str = "kuberic-quorum";
+
+const FENCE_FILE: &str = "rebuild-required";
+
+/// Marker proving this replica lost a transaction the cluster kept.
+pub fn fence_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(FENCE_FILE)
+}
+
+pub fn is_fenced_on_disk(data_dir: &Path) -> bool {
+    fence_path(data_dir).exists()
+}
+
+fn write_fence_marker(data_dir: &Path, reason: &str) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(fence_path(data_dir))?;
+    file.write_all(reason.as_bytes())?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    std::fs::File::open(data_dir)?.sync_all()?;
+    Ok(())
+}
 
 struct Request {
     payload: Vec<u8>,
@@ -26,12 +48,31 @@ struct Request {
 pub struct ReplicationBarrier {
     sender: Mutex<Option<mpsc::UnboundedSender<Request>>>,
     last_lsn: AtomicI64,
-    abandoned: AtomicBool,
+    fenced: AtomicBool,
+    fault: Mutex<Option<mpsc::Sender<FaultType>>>,
+    data_dir: Mutex<Option<PathBuf>>,
 }
 
 impl ReplicationBarrier {
+    /// Binds the barrier to this replica's data directory and fault channel.
+    pub fn arm(&self, data_dir: PathBuf, fault: mpsc::Sender<FaultType>) {
+        if is_fenced_on_disk(&data_dir) {
+            self.fenced.store(true, Ordering::SeqCst);
+        }
+        *self.data_dir.lock().expect("barrier data dir") = Some(data_dir);
+        *self.fault.lock().expect("barrier fault") = Some(fault);
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
+    }
+
     /// Starts replicating commits. Writes fail until this is called.
     pub fn install(&self, replicator: StateReplicatorHandle, token: CancellationToken) {
+        if self.is_fenced() {
+            warn!("refusing to accept commits on a replica awaiting rebuild");
+            return;
+        }
         let (sender, mut receiver) = mpsc::unbounded_channel::<Request>();
         tokio::spawn(async move {
             while let Some(request) = receiver.recv().await {
@@ -49,6 +90,29 @@ impl ReplicationBarrier {
     /// unreplicated.
     pub fn uninstall(&self) {
         *self.sender.lock().expect("barrier sender") = None;
+    }
+
+    /// Clears the fence once the database has been replaced from quorum state.
+    pub fn clear_fence_after_rebuild(&self, data_dir: &Path) {
+        let _ = std::fs::remove_file(fence_path(data_dir));
+        self.fenced.store(false, Ordering::SeqCst);
+    }
+
+    fn report_permanent_fault(&self) {
+        let fault = self.fault.lock().expect("barrier fault").clone();
+        let Some(fault) = fault else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = fault.send(FaultType::Permanent).await;
+                });
+            }
+            Err(_) => {
+                let _ = fault.try_send(FaultType::Permanent);
+            }
+        }
     }
 
     /// Replaces quorum replication with `sink`, so the commit path can be
@@ -75,7 +139,7 @@ impl ReplicationBarrier {
 
 impl CommitBarrier for ReplicationBarrier {
     fn publish(&self, transaction: &Transaction<'_>) -> Result<(), BarrierError> {
-        if self.abandoned.load(Ordering::SeqCst) {
+        if self.is_fenced() {
             return Err(BarrierError::new(
                 "replica is behind the cluster and must be rebuilt",
             ));
@@ -120,8 +184,15 @@ impl CommitBarrier for ReplicationBarrier {
     }
 
     fn abandon(&self, error: &str) {
-        self.abandoned.store(true, Ordering::SeqCst);
+        self.fenced.store(true, Ordering::SeqCst);
         self.uninstall();
+        let data_dir = self.data_dir.lock().expect("barrier data dir").clone();
+        if let Some(dir) = data_dir
+            && let Err(write_error) = write_fence_marker(&dir, error)
+        {
+            tracing::error!(error = %write_error, "could not record the rebuild marker");
+        }
+        self.report_permanent_fault();
         tracing::error!(error, "replica lost a replicated transaction locally");
     }
 }

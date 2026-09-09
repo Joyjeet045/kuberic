@@ -21,8 +21,8 @@ durable copy of the database but do not serve client queries.
 
 - Multi-writer / multi-primary (single primary, same as kvstore)
 - Sharding across partitions (single partition = single SQLite DB)
-- Custom VFS implementation (use standard SQLite WAL mode, intercept
-  at the application layer)
+- Multi-process or multi-connection access to one database (the primary
+  holds an exclusive lock so the wal-index stays in heap memory)
 - Sub-millisecond replication latency (WAL frames are shipped per-commit)
 
 ---
@@ -39,8 +39,10 @@ durable copy of the database but do not serve client queries.
 ### Our Approach: WAL Frame Shipping via Kuberic Quorum
 
 We take the **LiteFS page-level concept** but use kuberic's existing
-quorum replication instead of HTTP, and intercept at the **application
-layer** (WAL file reads after commit) instead of FUSE.
+quorum replication instead of HTTP, and intercept in a **commit-barrier
+VFS** instead of FUSE. The VFS wraps the default VFS and only takes over
+the WAL file, so it stages a transaction rather than reimplementing
+storage.
 
 | Aspect | Our Design |
 |--------|------------|
@@ -99,7 +101,7 @@ Client ──SQL write──► SqliteServer
                     │            │
                     ▼            ▼
             write the WAL   drop the buffer,
-            bytes, sync,    fail the sync,
+            bytes locally,  fail the write,
             commit stands   SQLite rolls back
                     │            │
                     ▼            ▼
@@ -164,16 +166,15 @@ content: which pages changed and what their new content is.
 ### Primary: Capturing WAL Frames
 
 The primary opens SQLite against a commit-barrier VFS. The VFS buffers the
-WAL bytes of the transaction in progress, and when SQLite syncs the commit
-the barrier packages them as a `WalFrameSet` with a CRC32 checksum and calls
-`replicator.replicate()`, which blocks until quorum ACK. Only then are the
-bytes written to the WAL file. Auto-checkpoint is disabled
+WAL bytes of the transaction in progress, and as soon as the commit frame is
+complete the barrier packages them as a `WalFrameSet` with a CRC32 checksum
+and calls `replicator.replicate()`, which blocks until quorum ACK. Only then
+are the bytes written to the WAL file. Auto-checkpoint is disabled
 (`wal_autocheckpoint=0`); single connection enforced.
 
 **Timing:** frames reach quorum before the commit is visible. The barrier
-runs inside the sync that publishes the commit frame, so SQLite never
-considers a transaction committed that the cluster has not accepted. See
-Known Problems (KP-1).
+runs in the write that completes the commit frame, not in a later sync, so
+lowering `PRAGMA synchronous` cannot bypass it. See Known Problems (KP-1).
 
 ### Secondary: Persist-then-ACK, Deferred Apply
 
@@ -223,15 +224,25 @@ See `proto/sqlitestore.proto` for full message definitions.
 
 ### Durability contract
 
-- **Success** means the transaction reached durable quorum. It is committed on
-  this replica and on enough secondaries to survive the loss of this one.
-- **An error** means the transaction did not commit. The commit barrier failed
-  the sync, SQLite rolled the transaction back, and no commit frame was written,
-  so nothing is visible to queries, checkpoints, copy snapshots or recovery.
-- **A timeout, or an error raised after the commit returned**, leaves the
-  outcome unknown. Quorum may have completed while the response or the local
-  confirmation record did not. Retrying is only safe for a statement that is
-  itself idempotent; the API has no request-level idempotency key.
+The barrier returning successfully is the durability boundary. Errors on
+either side of it mean different things, so they carry different gRPC codes.
+
+| Outcome | gRPC code | Meaning |
+|---------|-----------|---------|
+| Success | `OK` | Committed here and on enough secondaries to survive losing this replica |
+| Failure before the commit | `INTERNAL` | Definitely not committed |
+| Failure after the commit | `UNKNOWN` | Reached quorum, but the response could not be completed |
+| Replica awaiting rebuild | `FAILED_PRECONDITION` | This replica lost a committed transaction and serves nothing until rebuilt |
+
+- **Failure before the commit** covers a rejected barrier: the write failed,
+  SQLite rolled the transaction back and no commit frame was written, so
+  nothing is visible to queries, checkpoints, copy snapshots or recovery.
+- **Failure after the commit** covers a lost response, a cancelled request,
+  or a `meta.json` confirmation write that failed. The transaction did commit
+  and did reach quorum. An error here does **not** prove a rollback.
+- **Retries** are only safe for a statement that is itself idempotent. The
+  API has no request-level idempotency key, so a retried `INSERT` after an
+  `UNKNOWN` result can produce a second row.
 - **Reads** observe only quorum-confirmed state. A transaction that has not
   reached quorum is not visible on the primary, so no client can read a value
   the cluster has not agreed on.
@@ -261,9 +272,15 @@ Same two-channel pattern as kvstore (`LifecycleEvent` + `StateProviderEvent`).
 - **WAL frame shipping (not statement replication):** Eliminates
   determinism requirement. `random()`, `datetime('now')`, triggers all
   work — we ship the result of execution, not the instructions.
-- **Application-layer interception (not VFS):** WAL file read after
-  commit gives us the same data as a custom VFS with ~100 lines vs
-  ~2000. Uses a commit-barrier VFS to gate each transaction.
+- **Commit-barrier VFS (not a post-commit hook):** `sqlite3_wal_hook`
+  runs after the local transaction is already committed and recoverable,
+  which is the wrong side of the durability boundary. A VFS that stages
+  the WAL bytes can hold the commit frame until quorum confirms, so a
+  transaction never exists locally without existing in the cluster.
+- **Stage the whole transaction (not stream frames):** Releasing the
+  buffer in one write keeps the barrier out of SQLite's wal-index
+  ordering, and the commit frame is inside the buffer rather than
+  already recoverable on disk.
 - **Logical page content (not raw WAL bytes):** WAL files contain
   file-specific salts and checksums. We extract `(page_number, data)`
   pairs — simpler and portable across WAL file instances.
@@ -303,19 +320,26 @@ examples/sqlite/
 ├── proto/sqlitestore.proto
 ├── src/
 │   ├── lib.rs, main.rs, demo.rs
-│   ├── state.rs         # SqliteState: WAL capture (primary), page apply (secondary)
+│   ├── state.rs         # SqliteState: primary connection, page apply (secondary)
+│   ├── barrier.rs       # ReplicationBarrier: quorum gate + rebuild fence
 │   ├── server.rs        # Client gRPC server (Execute/Query/ExecuteBatch)
 │   ├── service.rs       # Lifecycle + StateProvider event loop
-│   ├── frames.rs        # WalFrameSet/WalFrame types, WAL file parser
+│   ├── frames.rs        # WalFrameSet/WalFrame types, staged-frame decoding
 │   ├── framelog.rs      # frames.log + meta.json persistence
 │   └── testing.rs       # SqlitePod helper (feature = "testing")
 └── tests/
     ├── durable_data_loss.rs        # Correlated typed data-loss completion
+    ├── quorum_durability.rs        # Commit barrier, crash injection, fencing
     └── correlated_replication.rs   # WAL shipping, schema, switchover, failover
+
+sqlite-commit-barrier/
+├── src/wal.rs           # WAL framing, commit detection, staging buffer
+├── src/vfs.rs           # VFS shim over the default VFS
+└── tests/               # Real-SQLite and raw-VFS staging tests
 ```
 
-Key dependency: `rusqlite = { features = ["bundled", "hooks"] }` —
-statically links SQLite. `sqlite-commit-barrier` registers the VFS. Also
+Key dependency: `rusqlite = { features = ["bundled"] }` — statically
+links SQLite. `sqlite-commit-barrier` registers the VFS. Also
 `crc32fast` for checksums.
 
 ---
@@ -371,12 +395,13 @@ checkpoint integration is exercised by the durable KV reconciler suite.
 1. **Large transactions:** A transaction modifying 10,000 pages creates
    a ~40MB `WalFrameSet`. Tonic's default gRPC limit is 4MB. May need
    `max_encoding_message_size` / `max_decoding_message_size` config.
+   The commit barrier also stages the whole transaction in memory, so
+   the same transactions are the ones worth bounding.
 
-2. **Fault reporting on promotion failure:** If `open_as_primary` fails
-   (disk full, permissions), the service currently logs a warning but
-   continues — the client gRPC server starts with no connection and all
-   queries panic. Should report fault via `fault_tx` to trigger operator
-   failover/rebuild. Same applies to `apply_committed_frames` failure.
+2. **Group commit:** Every commit costs one quorum round trip, which
+   bounds write throughput at roughly the inverse of quorum latency.
+   Batching several transactions into one round trip is the main
+   remaining throughput lever.
 
 ---
 
@@ -403,7 +428,7 @@ normally.
 
 **Result:** replication happens before the commit is visible, matching the
 kvstore's replicate-then-apply ordering. A transaction that cannot reach
-quorum fails its sync, SQLite rolls it back, and no commit frame is left
+quorum fails its write, SQLite rolls it back, and no commit frame is left
 behind, so the transaction is invisible to queries, to checkpoints, to
 copy snapshots and to recovery after a crash.
 
@@ -413,54 +438,30 @@ Group commit would amortise the round trip and is not implemented.
 
 **Requirements:** the primary opens with `locking_mode=EXCLUSIVE`, which
 keeps the wal-index in heap memory rather than a shared-memory file, and
-`synchronous=FULL`, which guarantees the sync the barrier runs in.
+`synchronous=FULL`, which keeps a published commit durable locally. The
+barrier itself does not depend on `synchronous`: it runs in the write that
+completes the commit frame, so a client lowering the pragma weakens local
+durability but cannot commit without quorum.
 
 Covered by `sqlite-commit-barrier/tests/barrier.rs` and
 `examples/sqlite/tests/quorum_durability.rs`.
 
-**Residual limitation — graceful shutdown.** Recovery works by truncating
-the WAL, so it can only discard frames that are still *in* the WAL. SQLite
-checkpoints the WAL whenever the last connection closes, and that happens
-regardless of `wal_autocheckpoint=0` or whether the application issues
-`PRAGMA wal_checkpoint` itself — `SQLITE_FCNTL_PERSIST_WAL` suppresses only
-the deletion, not the checkpoint. A write that committed locally, failed to
-reach quorum, and is then followed by a graceful shutdown is therefore
-folded into the database file where truncation can no longer reach it.
-
-Exposure is limited because a restarted pod reports a mismatched epoch and
-the reconciler rebuilds it by copy, discarding the local database. It
-matters where a replica is re-promoted without a rebuild, notably
-`replicas=1`. Closing it properly means reporting a fault when replication
-fails, so the replica is rebuilt rather than resumed — an operator-contract
-change, not a local fix.
-
-**Residual limitation — copy snapshots.** `snapshot_db()` checkpoints before
-reading the database file and does not take the write gate, so an in-flight
-unconfirmed write can be folded into a snapshot shipped to a new secondary.
-The window requires the snapshot to be taken while a write is in flight and
-that write to never reach quorum.
-
-**Residual limitation:** while the primary is *running*, a locally
-committed but unconfirmed transaction is still visible to reads on that
-primary, because SQLite makes a commit visible and durable at the same
-instant. Only a VFS interception approach closes that. If the primary
-survives, the write is retried or the replica is rebuilt; if it crashes,
-recovery discards the transaction.
+**Residual limitation — a commit the cluster keeps but this replica loses.**
+Once the barrier confirms quorum the transaction is durable on the cluster,
+so the local write that follows is the last step that can still fail. If it
+does, this replica is missing a transaction the cluster has and cannot be
+trusted to serve or to be promoted. The barrier then fences the replica: it
+stops accepting commits, refuses reads, refuses copy snapshots, refuses
+promotion, writes a `rebuild-required` marker so the fence survives a
+restart, and reports `FaultType::Permanent` so the operator rebuilds it.
+The fence is cleared only by `restore_from_snapshot`, which replaces the
+local database with quorum-confirmed state.
 
 **Client retry semantics:** retrying a timed-out write is **not**
 automatically safe. Page-level *frame replay* is idempotent, but the
 client's *SQL* is not — a retried `INSERT` after a commit that did land
 produces a second row. Clients that retry need request-level
 idempotency (a deduplicating key), not page-level idempotency.
-
-**VFS alternative:** A custom VFS could eliminate the window entirely by
-intercepting `xWrite()` calls to the WAL file and shipping pages to the
-replicator *before* letting SQLite flush locally (replicate-then-commit).
-However, implementing a WAL-mode VFS requires ~2000 lines (vs ~100 for WAL
-file reads), including `xShmMap`/`xShmLock`/`xShmBarrier` for shared
-memory, and VFS bugs can silently corrupt the database. The current
-approach is the right trade-off for an example app; a production system
-would consider VFS or a purpose-built replication engine (e.g., dqlite).
 
 ### KP-2: Per-Commit Synchronous Replication Throughput
 
@@ -511,4 +512,4 @@ skips `build_replica`).
 - [dqlite Replication](https://canonical.com/dqlite/docs/explanation/replication)
 - [Litestream How It Works](https://litestream.io/how-it-works/)
 - [mvSQLite Design](https://su3.io/posts/mvsqlite)
-- [rusqlite WAL Hook](https://docs.rs/rusqlite/latest/rusqlite/hooks/struct.Wal.html)
+- [SQLite VFS](https://www.sqlite.org/vfs.html)
