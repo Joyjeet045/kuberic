@@ -184,10 +184,14 @@ impl WalReplicatorActor {
                                 "updating epoch"
                             );
                             // Update local epoch first
+                            let prev_lsn = if new_epoch.data_loss_number == epoch.data_loss_number {
+                                state.current_progress().max(state.committed_lsn())
+                            } else {
+                                state.committed_lsn()
+                            };
                             epoch = new_epoch;
 
                             // Forward to state provider (inline — must complete before next event)
-                            let prev_lsn = state.committed_lsn();
                             let (sp_tx, sp_rx) = tokio::sync::oneshot::channel();
                             if state_provider_tx.send(StateProviderEvent::UpdateEpoch {
                                 epoch: new_epoch,
@@ -715,6 +719,33 @@ mod tests {
         assert_eq!(harness.state.current_progress(), 7);
         assert_eq!(harness.state.catch_up_capability(), 7);
         assert_eq!(harness.state.committed_lsn(), 7);
+    }
+
+    #[tokio::test]
+    async fn configuration_epoch_preserves_accepted_suffix_but_data_loss_can_roll_back() {
+        let mut harness = ActorHarness::start(Duration::from_secs(5)).await;
+        harness.state.set_current_progress(5);
+        harness.state.set_committed_lsn(4);
+        for (epoch, expected_lsn) in [(Epoch::new(1, 2), 5), (Epoch::new(2, 3), 4)] {
+            let (reply, receiver) = oneshot::channel();
+            harness
+                .control_tx
+                .send(ReplicatorControlEvent::UpdateEpoch { epoch, reply })
+                .await
+                .unwrap();
+            match harness.state_provider_rx.recv().await.unwrap() {
+                StateProviderEvent::UpdateEpoch {
+                    previous_epoch_last_lsn,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(previous_epoch_last_lsn, expected_lsn);
+                    reply.send(Ok(())).unwrap();
+                }
+                _ => panic!("epoch update was not forwarded"),
+            }
+            receiver.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]

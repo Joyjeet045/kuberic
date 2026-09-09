@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn wait_for_signal(shutdown: CancellationToken) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
@@ -110,6 +111,13 @@ async fn wait_for_signal(shutdown: CancellationToken) {
         _ = sigterm.recv() => info!("received SIGTERM"),
         _ = sigint.recv() => info!("received SIGINT"),
     }
+    info!("initiating graceful shutdown");
+    shutdown.cancel();
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal(shutdown: CancellationToken) {
+    tokio::signal::ctrl_c().await.expect("Ctrl+C handler");
     info!("initiating graceful shutdown");
     shutdown.cancel();
 }

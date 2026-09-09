@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::server::run_client_server;
-use crate::state::{KvOp, SharedState, drain_stream};
+use crate::state::{CopyChunk, SharedState, drain_copy_stream, drain_stream};
 
 #[derive(Debug, Clone, Default)]
 pub enum DataLossBehavior {
@@ -37,19 +37,20 @@ async fn handle_state_provider_event(
             ..
         } => {
             // A6: Rollback uncommitted ops on epoch change.
-            let current_lsn = state.read().await.last_applied_lsn;
-            if previous_epoch_last_lsn > 0 && previous_epoch_last_lsn < current_lsn {
+            let mut state = state.write().await;
+            state.generation += 1;
+            let current_lsn = state.last_applied_lsn;
+            if previous_epoch_last_lsn < current_lsn {
                 info!(
                     previous_epoch_last_lsn,
                     current_lsn, "epoch updated — rolling back uncommitted ops"
                 );
-                if let Err(e) = state
-                    .write()
-                    .await
-                    .rollback_to(previous_epoch_last_lsn)
-                    .await
-                {
+                if let Err(e) = state.rollback_to(previous_epoch_last_lsn).await {
                     tracing::warn!(error = %e, "rollback failed");
+                    let _ = reply.send(Err(kuberic_core::KubericError::Internal(
+                        e.to_string().into(),
+                    )));
+                    return;
                 }
             } else {
                 info!(previous_epoch_last_lsn, current_lsn, "epoch updated");
@@ -89,29 +90,46 @@ async fn handle_state_provider_event(
 
                 info!(peer_lsn, up_to_lsn, "producing copy state");
 
-                let (snapshot, current_lsn): (Vec<(String, String)>, i64) = {
-                    let guard = st.read().await;
-                    let lsn = guard.last_applied_lsn;
-                    if peer_lsn < lsn {
-                        let data: Vec<_> = guard
-                            .data
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        (data, lsn)
-                    } else {
-                        (Vec::new(), lsn)
+                let applied = st.read().await.applied.clone();
+                let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let notified = applied.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        let guard = st.read().await;
+                        if guard.last_applied_lsn >= up_to_lsn {
+                            break guard.snapshot_at(up_to_lsn).await;
+                        }
+                        drop(guard);
+                        notified.await;
+                    }
+                })
+                .await;
+                let snapshot = match snapshot {
+                    Ok(Ok(snapshot)) => snapshot,
+                    result => {
+                        let _ = reply.send(Err(kuberic_core::KubericError::Internal(
+                            format!("cannot produce copy at LSN {up_to_lsn}: {result:?}").into(),
+                        )));
+                        return;
                     }
                 };
 
-                let (tx, stream) = OperationStream::channel(64);
+                let (tx, stream) = OperationStream::channel(1);
                 let _ = reply.send(Ok(stream));
 
-                for (k, v) in snapshot {
-                    let op = KvOp::Put { key: k, value: v };
-                    let data = Bytes::from(serde_json::to_vec(&op).unwrap());
+                let data = serde_json::to_vec(&snapshot).unwrap();
+                let chunks = data.chunks(256 * 1024);
+                let count = chunks.len();
+                for (index, data) in chunks.enumerate() {
+                    let chunk = CopyChunk {
+                        index,
+                        data: data.to_vec(),
+                        last: index + 1 == count,
+                    };
+                    let data = Bytes::from(serde_json::to_vec(&chunk).unwrap());
                     if tx
-                        .send(Operation::new(current_lsn, data, None))
+                        .send(Operation::new(up_to_lsn, data, None))
                         .await
                         .is_err()
                     {
@@ -199,7 +217,7 @@ pub async fn run_service_with_options_and_data_loss(
     let mut copy_stream: Option<OperationStream> = None;
     let mut replication_stream: Option<OperationStream> = None;
     let mut token: Option<CancellationToken> = None;
-    let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut bg_handles: Vec<tokio::task::JoinHandle<std::io::Result<()>>> = Vec::new();
     let mut bg_token: Option<CancellationToken> = None;
     let mut client_server_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut client_server_shutdown: Option<CancellationToken> = None;
@@ -241,11 +259,23 @@ pub async fn run_service_with_options_and_data_loss(
                 }
                 LifecycleEvent::ChangeRole { new_role, reply } => {
                     info!(?new_role, "role changed");
+                    if new_role != last_role {
+                        state.write().await.generation += 1;
+                    }
 
                     if new_role == Role::ActiveSecondary {
                         // IdleSecondary → ActiveSecondary: let copy drain finish
+                        let mut copy_error = None;
                         for h in bg_handles.drain(..) {
-                            let _ = h.await;
+                            match h.await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => copy_error = Some(error.to_string()),
+                                Err(error) => copy_error = Some(error.to_string()),
+                            }
+                        }
+                        if let Some(error) = copy_error {
+                            let _ = reply.send(Err(kuberic_core::KubericError::Internal(error.into())));
+                            continue;
                         }
                         // Checkpoint after copy completes
                         {
@@ -253,6 +283,8 @@ pub async fn run_service_with_options_and_data_loss(
                             guard.committed_lsn = guard.last_applied_lsn;
                             if let Err(e) = guard.checkpoint().await {
                                 tracing::warn!(error = %e, "checkpoint after copy failed");
+                                let _ = reply.send(Err(kuberic_core::KubericError::Internal(e.to_string().into())));
+                                continue;
                             }
                         }
                     } else {
@@ -272,7 +304,7 @@ pub async fn run_service_with_options_and_data_loss(
                             if let Some(cs) = copy_stream.take() {
                                 let st = state.clone();
                                 bg_handles.push(tokio::spawn(
-                                    drain_stream(st, cs, t.clone(), "copy"),
+                                    drain_copy_stream(st, cs, t.clone()),
                                 ));
                             }
                         }

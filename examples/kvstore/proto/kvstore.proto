@@ -6,6 +6,13 @@ service KvStore {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);
+  rpc TransactionGet(TransactionGetRequest) returns (GetResponse);
+  rpc TransactionPut(TransactionPutRequest) returns (TransactionResponse);
+  rpc TransactionDelete(TransactionDeleteRequest) returns (TransactionResponse);
+  rpc CommitTransaction(TransactionRequest) returns (CommitTransactionResponse);
+  rpc AbortTransaction(TransactionRequest) returns (TransactionResponse);
+  rpc ExecuteTransaction(ExecuteTransactionRequest) returns (CommitTransactionResponse);
 }
 
 message GetRequest {
@@ -33,4 +40,50 @@ message DeleteRequest {
 message DeleteResponse {
   bool existed = 1;
   int64 lsn = 2;
+}
+
+message BeginTransactionRequest {
+  uint64 timeout_ms = 1;
+}
+
+message BeginTransactionResponse {
+  string transaction_id = 1;
+}
+
+message TransactionRequest {
+  string transaction_id = 1;
+}
+
+message TransactionGetRequest {
+  string transaction_id = 1;
+  string key = 2;
+}
+
+message TransactionPutRequest {
+  string transaction_id = 1;
+  string key = 2;
+  string value = 3;
+}
+
+message TransactionDeleteRequest {
+  string transaction_id = 1;
+  string key = 2;
+}
+
+message TransactionResponse {}
+
+message CommitTransactionResponse {
+  int64 lsn = 1;
+}
+
+message TransactionMutation {
+  oneof mutation {
+    PutRequest put = 1;
+    DeleteRequest delete = 2;
+  }
+}
+
+message ExecuteTransactionRequest {
+  string transaction_id = 1;
+  repeated TransactionMutation mutations = 2;
 }

@@ -183,20 +183,6 @@ impl ReplicatorData for SecondaryReceiver {
                             Ok(()) => {
                                 debug!(lsn, "accepted replication item");
 
-                                // Propagate committed_lsn to PartitionState (B5 fix).
-                                // This makes committed_lsn visible to PodRuntime's
-                                // handle_update_epoch for correct rollback boundaries.
-                                if let Some(ref ps) = partition_state {
-                                    if item.committed_lsn > ps.committed_lsn() {
-                                        ps.set_committed_lsn(item.committed_lsn);
-                                    }
-                                    // Update current_progress so GetStatus reports
-                                    // secondary replication progress (E2 catchup fix).
-                                    if lsn > ps.current_progress() {
-                                        ps.set_current_progress(lsn);
-                                    }
-                                }
-
                                 if let Some(ref op_tx) = operation_tx {
                                     // Persisted mode: forward to user, defer ACK
                                     let (user_ack_tx, user_ack_rx) =
@@ -210,17 +196,18 @@ impl ReplicatorData for SecondaryReceiver {
                                         warn!(lsn, "operation stream closed");
                                         break;
                                     }
-                                    let ack_tx = ack_tx.clone();
-                                    tokio::spawn(async move {
-                                        if user_ack_rx.await.is_ok() {
-                                            let _ = ack_tx.send(Ok(ReplicationAck { lsn })).await;
-                                        }
-                                    });
-                                } else {
-                                    // Volatile mode: auto-ACK
-                                    if ack_tx.send(Ok(ReplicationAck { lsn })).await.is_err() {
+                                    if user_ack_rx.await.is_err() {
                                         break;
                                     }
+                                }
+                                if let Some(ref ps) = partition_state {
+                                    ps.advance_committed_lsn(item.committed_lsn);
+                                    if lsn > ps.current_progress() {
+                                        ps.set_current_progress(lsn);
+                                    }
+                                }
+                                if ack_tx.send(Ok(ReplicationAck { lsn })).await.is_err() {
+                                    break;
                                 }
                             }
                             Err(status) => {
@@ -327,5 +314,75 @@ impl ReplicatorData for SecondaryReceiver {
         Ok(Response::new(CopyStreamResponse {
             items_received: count,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handles::PartitionState;
+    use crate::proto::replicator_data_client::ReplicatorDataClient;
+    use crate::proto::replicator_data_server::ReplicatorDataServer;
+
+    #[tokio::test]
+    async fn persisted_progress_is_published_only_after_application_ack() {
+        let state = Arc::new(PartitionState::new());
+        let (operation_tx, mut operations) = mpsc::channel(2);
+        let (copy_tx, _copy_rx) = mpsc::channel(1);
+        let (provider_tx, _provider_rx) = mpsc::unbounded_channel();
+        let receiver = SecondaryReceiver::with_streams(
+            Arc::new(SecondaryState::new()),
+            state.clone(),
+            operation_tx,
+            copy_tx,
+            provider_tx,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = crate::types::CancellationToken::new();
+        let stopping = shutdown.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(ReplicatorDataServer::new(receiver))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    stopping.cancelled(),
+                )
+                .await
+                .unwrap();
+        });
+        let mut client = ReplicatorDataClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let mut acknowledgements = client
+            .replication_stream(tokio_stream::iter([
+                ReplicationItem {
+                    lsn: 1,
+                    committed_lsn: 1,
+                    ..Default::default()
+                },
+                ReplicationItem {
+                    lsn: 2,
+                    committed_lsn: 2,
+                    ..Default::default()
+                },
+            ]))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = operations.recv().await.unwrap();
+        assert_eq!(state.current_progress(), 0);
+        assert_eq!(state.committed_lsn(), 0);
+        first.acknowledge();
+        assert_eq!(acknowledgements.message().await.unwrap().unwrap().lsn, 1);
+        let second = operations.recv().await.unwrap();
+        assert_eq!(state.current_progress(), 1);
+        assert_eq!(state.committed_lsn(), 1);
+        drop(second);
+        assert!(acknowledgements.message().await.unwrap().is_none());
+        assert_eq!(state.current_progress(), 1);
+        assert_eq!(state.committed_lsn(), 1);
+        shutdown.cancel();
+        server.await.unwrap();
     }
 }
