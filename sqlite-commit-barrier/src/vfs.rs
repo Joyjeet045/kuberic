@@ -111,40 +111,64 @@ impl BarrierFile {
         }
     }
 
-    unsafe fn stage<'a>(file: *mut ffi::sqlite3_file) -> Option<&'a mut WalStage> {
+    /// The only way to reach the stage. Scoping the borrow to `act` keeps two
+    /// of them from existing at once, which raw access made easy to get wrong.
+    unsafe fn with_stage<R>(
+        file: *mut ffi::sqlite3_file,
+        act: impl FnOnce(&mut WalStage) -> R,
+    ) -> Option<R> {
         unsafe {
             let this = file as *mut BarrierFile;
             if (*this).stage.is_null() {
-                None
-            } else {
-                Some(&mut *(*this).stage)
+                return None;
             }
+            Some(act(&mut *(*this).stage))
         }
     }
 
-    unsafe fn barrier<'a>(file: *mut ffi::sqlite3_file) -> &'a Arc<dyn CommitBarrier> {
+    unsafe fn take_stage(file: *mut ffi::sqlite3_file) -> Option<Box<WalStage>> {
         unsafe {
             let this = file as *mut BarrierFile;
-            &*((*this).barrier as *const Arc<dyn CommitBarrier>)
+            if (*this).stage.is_null() {
+                return None;
+            }
+            let stage = (*this).stage;
+            (*this).stage = ptr::null_mut();
+            Some(Box::from_raw(stage))
+        }
+    }
+
+    unsafe fn barrier(file: *mut ffi::sqlite3_file) -> Arc<dyn CommitBarrier> {
+        unsafe {
+            let this = file as *mut BarrierFile;
+            (*((*this).barrier as *const Arc<dyn CommitBarrier>)).clone()
         }
     }
 }
 
+enum Staged {
+    Empty,
+    Incomplete,
+    Accepted,
+    Rejected,
+}
+
 unsafe fn write_through(file: *mut ffi::sqlite3_file) -> c_int {
     unsafe {
-        let Some(stage) = BarrierFile::stage(file) else {
+        let taken =
+            BarrierFile::with_stage(file, |stage| (!stage.is_empty()).then(|| stage.take()))
+                .flatten();
+        let Some((start, bytes)) = taken else {
             return ffi::SQLITE_OK;
         };
-        if stage.is_empty() {
-            return ffi::SQLITE_OK;
-        }
-        let (start, bytes) = stage.take();
         BarrierFile::parent(file).write(start, &bytes)
     }
 }
 
 unsafe fn stage_holds_commit(file: *mut ffi::sqlite3_file) -> bool {
-    unsafe { BarrierFile::stage(file).is_some_and(|stage| stage.commit_pages().is_some()) }
+    unsafe {
+        BarrierFile::with_stage(file, |stage| stage.commit_pages().is_some()).unwrap_or(false)
+    }
 }
 
 unsafe fn flush_stage(file: *mut ffi::sqlite3_file) -> c_int {
@@ -171,33 +195,38 @@ unsafe fn publish_if_complete(file: *mut ffi::sqlite3_file) -> c_int {
 
 unsafe fn publish_stage(file: *mut ffi::sqlite3_file) -> c_int {
     unsafe {
-        let Some((empty, pages)) =
-            BarrierFile::stage(file).map(|stage| (stage.is_empty(), stage.commit_pages()))
-        else {
-            return ffi::SQLITE_OK;
-        };
-        if empty {
-            return ffi::SQLITE_OK;
-        }
-        let Some(pages) = pages else {
-            return write_through(file);
-        };
-
-        let barrier = BarrierFile::barrier(file).clone();
-        let outcome = {
-            let stage = BarrierFile::stage(file).expect("stage");
-            let layout = stage.layout();
-            let transaction = Transaction {
-                wal_offset: stage.start(),
-                frames: stage.bytes(),
-                page_size: layout.map(|layout| layout.page_size).unwrap_or_default(),
-                database_pages: pages,
+        let barrier = BarrierFile::barrier(file);
+        let staged = BarrierFile::with_stage(file, |stage| {
+            if stage.is_empty() {
+                return Staged::Empty;
+            }
+            let Some(pages) = stage.commit_pages() else {
+                return Staged::Incomplete;
             };
-            barrier.publish(&transaction)
-        };
+            let published = {
+                let transaction = Transaction {
+                    wal_offset: stage.start(),
+                    frames: stage.bytes(),
+                    page_size: stage.layout().map(|l| l.page_size).unwrap_or_default(),
+                    database_pages: pages,
+                };
+                barrier.publish(&transaction)
+            };
+            match published {
+                Ok(()) => Staged::Accepted,
+                Err(error) => {
+                    tracing::warn!(%error, "commit barrier rejected a transaction");
+                    stage.take();
+                    Staged::Rejected
+                }
+            }
+        });
 
-        match outcome {
-            Ok(()) => {
+        match staged {
+            None | Some(Staged::Empty) => ffi::SQLITE_OK,
+            Some(Staged::Incomplete) => write_through(file),
+            Some(Staged::Rejected) => ffi::SQLITE_IOERR_WRITE,
+            Some(Staged::Accepted) => {
                 let rc = write_through(file);
                 if rc != ffi::SQLITE_OK {
                     let message = format!(
@@ -209,25 +238,13 @@ unsafe fn publish_stage(file: *mut ffi::sqlite3_file) -> c_int {
                 }
                 rc
             }
-            Err(error) => {
-                tracing::warn!(%error, "commit barrier rejected a transaction");
-                if let Some(stage) = BarrierFile::stage(file) {
-                    stage.take();
-                }
-                ffi::SQLITE_IOERR_WRITE
-            }
         }
     }
 }
 
 unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
     unsafe {
-        let this = file as *mut BarrierFile;
-        if !(*this).stage.is_null() {
-            let stage = (*this).stage;
-            (*this).stage = ptr::null_mut();
-            drop(Box::from_raw(stage));
-        }
+        drop(BarrierFile::take_stage(file));
         let parent = BarrierFile::parent(file);
         if !parent.opened() {
             return ffi::SQLITE_OK;
@@ -245,21 +262,22 @@ unsafe extern "C" fn x_read(
     unsafe {
         let parent = BarrierFile::parent(file);
         let out = std::slice::from_raw_parts_mut(buf as *mut u8, amount as usize);
-        let Some(stage) = BarrierFile::stage(file) else {
-            return parent.read(out, offset as u64);
-        };
-        if stage.is_empty() {
-            return parent.read(out, offset as u64);
-        }
-        if stage.read_overlay(offset as u64, out) {
+        let offset = offset as u64;
+
+        let fully_staged = BarrierFile::with_stage(file, |stage| {
+            !stage.is_empty() && stage.read_overlay(offset, out)
+        })
+        .unwrap_or(false);
+        if fully_staged {
             return ffi::SQLITE_OK;
         }
+
         let mut backing = vec![0u8; amount as usize];
-        let rc = parent.read(&mut backing, offset as u64);
+        let rc = parent.read(&mut backing, offset);
         if rc != ffi::SQLITE_OK && rc != ffi::SQLITE_IOERR_SHORT_READ {
             return rc;
         }
-        stage.read_overlay(offset as u64, &mut backing);
+        BarrierFile::with_stage(file, |stage| stage.read_overlay(offset, &mut backing));
         out.copy_from_slice(&backing);
         rc
     }
@@ -273,18 +291,18 @@ unsafe extern "C" fn x_write(
 ) -> c_int {
     unsafe {
         let data = std::slice::from_raw_parts(buf as *const u8, amount as usize);
-        if BarrierFile::stage(file).is_none() {
-            return BarrierFile::parent(file).write(offset as u64, data);
-        }
-        let outcome = {
-            let stage = BarrierFile::stage(file).expect("stage");
+        let offset = offset as u64;
+
+        let Some(outcome) = BarrierFile::with_stage(file, |stage| {
             if stage.layout().is_none()
                 && offset == 0
                 && let Some(layout) = parse_wal_header(data)
             {
                 stage.set_layout(layout);
             }
-            stage.accept(offset as u64, data)
+            stage.accept(offset, data)
+        }) else {
+            return BarrierFile::parent(file).write(offset, data);
         };
         if outcome == StageOutcome::Buffered {
             return publish_if_complete(file);
@@ -293,11 +311,8 @@ unsafe extern "C" fn x_write(
         if rc != ffi::SQLITE_OK {
             return rc;
         }
-        {
-            let Some(stage) = BarrierFile::stage(file) else {
-                return BarrierFile::parent(file).write(offset as u64, data);
-            };
-            stage.accept(offset as u64, data);
+        if BarrierFile::with_stage(file, |stage| stage.accept(offset, data)).is_none() {
+            return BarrierFile::parent(file).write(offset, data);
         }
         publish_if_complete(file)
     }
@@ -305,9 +320,7 @@ unsafe extern "C" fn x_write(
 
 unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int {
     unsafe {
-        if let Some(stage) = BarrierFile::stage(file) {
-            stage.discard_from(size as u64);
-        }
+        BarrierFile::with_stage(file, |stage| stage.discard_from(size as u64));
         BarrierFile::parent(file).truncate(size)
     }
 }
@@ -328,10 +341,11 @@ unsafe extern "C" fn x_file_size(file: *mut ffi::sqlite3_file, size: *mut i64) -
         if rc != ffi::SQLITE_OK {
             return rc;
         }
-        if let Some(stage) = BarrierFile::stage(file)
-            && !stage.is_empty()
-        {
-            *size = (*size).max(stage.end() as i64);
+        let staged_end =
+            BarrierFile::with_stage(file, |stage| (!stage.is_empty()).then(|| stage.end()))
+                .flatten();
+        if let Some(end) = staged_end {
+            *size = (*size).max(end as i64);
         }
         ffi::SQLITE_OK
     }
