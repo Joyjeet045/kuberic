@@ -1401,6 +1401,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

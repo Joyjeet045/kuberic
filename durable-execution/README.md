@@ -63,6 +63,16 @@ completed-result lifecycle as success. The low-level
 advanced and compatibility uses. No explicit poll/replay authoring surface is
 exported.
 
+For direct-style workflows, each meaningful operation boundary can be a
+separate `DurableActivity` and the ordinary async workflow body can express
+ordering, loops, waits, terminal choices, and compensation directly. An
+effect-specific `PreparedActivityResolver` may replace a logical typed input
+with an exact prepared command before exposure, while preserving the declared
+name, version, and result bound. The kernel still owns only deterministic
+replay and persistence safety; the caller's adapter owns domain observations,
+command preparation, dispatch, quarantine interpretation, deadlines, and
+terminal validation.
+
 ## Replay and checkpoint semantics
 
 Typed calls first canonicalize JSON object-key order, then compare the encoded
@@ -360,12 +370,11 @@ CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes
 ```
 
 The repository's existing [CI workflow](../.github/workflows/CI.yml) enables
-all crate features on its workspace-wide test command after the existing
-`helm/kind-action` step has provisioned the shared one-control-plane KinD
-environment. There is no separate provider test step, second cluster, or
-second cleanup owner. Cluster lifecycle remains owned by the existing KinD
-action. Ordinary local and default Cargo test runs without the Kubernetes
-feature do not select this test.
+all crate features on its workspace-wide test command after
+`helm/kind-action` has provisioned a uniquely named, one-control-plane KinD
+environment with a dedicated kubeconfig/context, dynamic loopback port, and
+ownership receipt. There is no second provider cluster or cleanup owner.
+Ordinary local and default Cargo test runs without the Kubernetes feature do not select this test.
 
 The test reports a failed endpoint or authorization precondition rather than
 claiming real-API coverage. Its apply-then-unknown and no-apply-unknown cases
@@ -382,14 +391,20 @@ library `[dependencies]` table rather than test-only dependencies and retains a
 negative fixture for a real library runtime dependency. The mechanically
 derived result is **feasible** within this kernel's stated boundary.
 
-## Production operator consumer
+## Production operator consumers
 
-Framework-native remove-replica is the production consumer of the shared
-operator runner. Its compact contract version 3 stores immutable admission once
-and records tagged passive observations, exact prepared replica/label/delete
-commands, compact results, and bounded redelivery evidence. Legacy pilot and
-explicit remove records, unsupported versions, and changed lifecycle limits
-are incompatible rather than migrated or restarted.
+Framework-native remove-replica and direct-style switchover are production
+consumers of the shared operator runner. Both use the same load/reload,
+single-use permit, fused progression, quarantine, terminal compaction, and
+ConfigMap provider mechanisms, but each adapter retains its own contract,
+activity/result shapes, limits, observations, effects, deadlines, terminal
+validation, and publication rules.
+
+Remove-replica's compact contract version 3 stores immutable admission once
+and records tagged passive observations, exact prepared
+replica/label/delete commands, compact results, and bounded redelivery
+evidence. Legacy pilot and explicit remove records, unsupported versions, and
+changed lifecycle limits are incompatible rather than migrated or restarted.
 
 `status.removeReplicaExecution` owns the immutable execution reference,
 admission authority, and incompatibility marker. The referenced same-namespace
@@ -414,6 +429,23 @@ collection. Independently retained orphan cleanup remains a separately
 authorized lifecycle responsibility. No worker, queue, lease, watcher, or
 separate execution service is introduced.
 
+Direct-style switchover uses 20 operation-specific version-1 typed activities.
+Its workflow source, rather than the kernel or host adapter, visibly owns the
+normal and compensating sequence. The adapter resolves logical calls to exact
+prepared `ReplicaAgent` or UID-fenced label commands before exposure and
+supplies authoritative observations afterward. This demonstrates the reusable
+direct authoring pattern without adding an activity registry, generic
+compensation engine, or distributed runtime.
+
+Those activity payloads remain operation-local; the adapter does not persist a
+cross-operation kind/request union behind the typed names. Once an effect is
+exposed, its deadline is not evidence of failure: replica quarantine resolves
+only from a matching terminal ledger record, the exact live postcondition, or
+generation-change proof of non-admission, while labels resolve only from the
+exact UID-fenced label postcondition. The workflow applies one checked
+transition budget across normal calls, compensation, attestation, and
+redelivery.
+
 ## Deferred usability roadmap
 
 The crate intentionally stops at the durable-execution kernel.
@@ -428,10 +460,10 @@ continuation remain excluded. The remaining ordered deferred work is tracked in
 
 The kernel remains experimental as a general-purpose orchestration framework.
 The ConfigMap provider is production-required, not opt-in, for
-framework-native remove-replica: `kuberic-operator` enables it unconditionally
-and owns the provider contract described above. The earlier isolated
-real-API evaluation does not establish generic persistence fitness for other
-consumers, distributed execution ownership, a worker, queue, lease, activity
+framework-native remove-replica and switchover: `kuberic-operator` enables it unconditionally
+and owns the provider contract described above. The earlier isolated real-API
+evaluation does not establish generic persistence fitness for other consumers,
+distributed execution ownership, a worker, queue, lease, activity
 handler, automatic observation polling, or passive-observation transport. The
 kernel does not establish a canonical exact-byte representation across
 versions.
@@ -449,5 +481,6 @@ lifecycle APIs, queries, external events, child workflows, workers, queues,
 leases, and distributed runtime ownership are excluded. So are migrations,
 upgrade guarantees, broad rollout of other operations, and production
 diagnostics. Framework-native remove-replica integrates typed calls and
-operator-owned effect adapters by default for both remove-replica and
-switchover. Neither changes `ReplicaAgent` or the gRPC protocol.
+operator-owned effect adapters through its existing compact workflow;
+switchover is the direct-style named-activity reference. Neither changes
+`ReplicaAgent` or the gRPC protocol.

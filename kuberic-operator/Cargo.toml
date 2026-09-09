@@ -32,3 +32,4 @@ rand.workspace = true
 
 [dev-dependencies]
 kuberic-core = { path = "../kuberic-core", features = ["testing"] }
+serde_yaml_ng = "=0.10.0"

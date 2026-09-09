@@ -17,15 +17,8 @@ use kuberic_core::types::{
 use serde::{Deserialize, Serialize};
 
 use crate::cluster_api::ClusterApi;
-use crate::crd::DurableOperationPhase;
 use crate::crd::{DurableOperationStatus, EpochStatus, PendingActionStatus};
 
-use super::switchover_execution::{
-    DurableSwitchoverState, DurableSwitchoverStepResult, SwitchoverActivityKind,
-    SwitchoverAdapterDecision, SwitchoverPermitGuard,
-};
-use super::workflow_host::DurablePermitGuard;
-use super::{Decision, switchover::is_switchover_postcondition_transition};
 use super::{
     OperationObservations, correlated_action_observation, fail_closed, record_activity_error,
 };
@@ -319,28 +312,6 @@ fn prepare_replica_effect_command_with_lifecycle_support(
         return Err(DurableEffectPreparationError::InvalidCommand);
     }
     Ok((planned, command))
-}
-
-pub fn validate_switchover_replica_action_kind(
-    kind: crate::crd::DurableActionKind,
-    action: &DurableReplicaAction,
-) -> bool {
-    use crate::crd::DurableActionKind as Kind;
-    matches!(
-        kind,
-        Kind::RevokeWrite
-            | Kind::DemoteOldPrimary
-            | Kind::PromoteTarget
-            | Kind::CompensatePromoteOldPrimary
-            | Kind::UpdateSecondaryEpoch
-            | Kind::CompensateUpdateSecondaryEpoch
-            | Kind::UpdateCatchUpConfiguration
-            | Kind::CompensateCatchUpConfiguration
-            | Kind::WaitForCatchUpQuorum
-            | Kind::UpdateCurrentConfiguration
-            | Kind::RestorePreviousConfiguration
-            | Kind::CompensateCurrentConfiguration
-    ) && replica_action_matches_kind(kind, action)
 }
 
 pub fn replica_action_matches_kind(
@@ -778,8 +749,20 @@ pub(crate) fn generation_change_proves_no_admission(
     let Some(observed) = observations.get(&target_id) else {
         return false;
     };
-    observed.status.agent.generation.as_str() != dispatched_generation
-        && correlated_action_observation(&observed.status, &pending.action_id).is_none()
+    command_generation_change_proves_no_admission(
+        dispatched_generation,
+        &pending.action_id,
+        &observed.status,
+    )
+}
+
+pub(crate) fn command_generation_change_proves_no_admission(
+    dispatched_generation: &str,
+    action_id: &str,
+    observed: &ReplicaStatusInfo,
+) -> bool {
+    observed.agent.generation.as_str() != dispatched_generation
+        && correlated_action_observation(observed, action_id).is_none()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -934,250 +917,6 @@ pub async fn execute_delete_command(
         .await;
 }
 
-pub type SwitchoverEffectBridgeOutcome =
-    DurableEffectBridgeOutcome<Box<DurableSwitchoverStepResult>>;
-
-#[allow(clippy::too_many_arguments)]
-pub async fn bridge_switchover_permitted_step(
-    guard: &mut SwitchoverPermitGuard,
-    operation: &DurableOperationStatus,
-    prepared: &super::switchover_execution::SwitchoverActivityKind,
-    accepted_activity: &kuberic_durable_execution::LogicalActivityId,
-    accepted_attempt: kuberic_durable_execution::AttemptId,
-    observations: &OperationObservations,
-    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
-    api: &dyn ClusterApi,
-    namespace: &str,
-) -> Result<SwitchoverEffectBridgeOutcome, String> {
-    let _permit = guard.consume_for(operation, prepared, accepted_activity, accepted_attempt)?;
-    bridge_preconsumed_switchover_step(operation, prepared, observations, handles, api, namespace)
-        .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn bridge_switchover_runner_step(
-    guard: &mut DurablePermitGuard,
-    operation: &DurableOperationStatus,
-    prepared: &super::switchover_execution::SwitchoverActivityKind,
-    accepted_activity: &kuberic_durable_execution::LogicalActivityId,
-    accepted_attempt: kuberic_durable_execution::AttemptId,
-    observations: &OperationObservations,
-    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
-    api: &dyn ClusterApi,
-    namespace: &str,
-) -> Result<SwitchoverEffectBridgeOutcome, String> {
-    let expected = super::switchover_execution::prepared_activity_spec(operation, prepared)?;
-    let _permit = guard.consume(&expected, accepted_activity, accepted_attempt, "switchover")?;
-    bridge_preconsumed_switchover_step(operation, prepared, observations, handles, api, namespace)
-        .await
-}
-
-async fn bridge_preconsumed_switchover_step(
-    operation: &DurableOperationStatus,
-    prepared: &super::switchover_execution::SwitchoverActivityKind,
-    observations: &OperationObservations,
-    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
-    api: &dyn ClusterApi,
-    namespace: &str,
-) -> Result<SwitchoverEffectBridgeOutcome, String> {
-    match prepared {
-        super::switchover_execution::SwitchoverActivityKind::PassiveObservation => {
-            Err("passive switchover observation unexpectedly reached the effect bridge".to_string())
-        }
-        super::switchover_execution::SwitchoverActivityKind::PreparedReplica { command } => {
-            let Some(handle) = handles.get(&command.target_id) else {
-                return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
-            };
-            if handle.instance_id().as_str() != command.target_instance_id {
-                return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
-            }
-            match execute_replica_command(handle.as_ref(), command).await {
-                Ok(()) => Ok(SwitchoverEffectBridgeOutcome::Exposed),
-                Err(error) => match switchover_result_after_dispatch_error(
-                    operation,
-                    command.action_id.clone(),
-                    &error,
-                ) {
-                    Some(result) if dispatch_rejection_requires_refresh(&error) => Ok(
-                        SwitchoverEffectBridgeOutcome::ObserveAfterFenceRefresh(Box::new(result)),
-                    ),
-                    Some(result) => Ok(SwitchoverEffectBridgeOutcome::Observe(Box::new(result))),
-                    None => Ok(SwitchoverEffectBridgeOutcome::Exposed),
-                },
-            }
-        }
-        super::switchover_execution::SwitchoverActivityKind::PreparedLabel { command } => {
-            if observations
-                .get(&command.target_id)
-                .is_some_and(|observed| {
-                    observed.status.instance_id.as_str() != command.expected_uid
-                        || observed.pod_name != command.pod_name
-                })
-            {
-                return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
-            }
-            execute_label_command(api, namespace, command).await;
-            Ok(SwitchoverEffectBridgeOutcome::Exposed)
-        }
-    }
-}
-
-fn switchover_result_after_dispatch_error(
-    operation: &DurableOperationStatus,
-    action_id: String,
-    error: &KubericError,
-) -> Option<DurableSwitchoverStepResult> {
-    if classify_dispatch_failure(error) == DispatchFailureDisposition::ProvenNoAdmission {
-        return Some(DurableSwitchoverStepResult::ProvenNoAdmission {
-            operation: DurableSwitchoverState::from_operation(&operation_after_dispatch_error(
-                operation, error,
-            )),
-            action_id,
-            redelivery: 1,
-        });
-    }
-    matches!(error, KubericError::RemoteAgentConflict(_)).then(|| {
-        DurableSwitchoverStepResult::Stopped {
-            operation: DurableSwitchoverState::from_operation(&fail_closed(
-                operation,
-                &error.to_string(),
-            )),
-            message: error.to_string(),
-        }
-    })
-}
-
-pub fn resolve_switchover_quarantine(
-    operation: &DurableOperationStatus,
-    prepared: &SwitchoverActivityKind,
-    decision: SwitchoverAdapterDecision,
-    observations: &OperationObservations,
-) -> Result<SwitchoverEffectBridgeOutcome, String> {
-    if matches!(
-        (&prepared, &decision),
-        (
-            SwitchoverActivityKind::PassiveObservation,
-            SwitchoverAdapterDecision::AwaitEvidence
-        )
-    ) && operation.pending_action.is_some()
-    {
-        return Err(
-            "quarantined pending external switchover effect was misclassified as a passive observation"
-                .to_string(),
-        );
-    }
-    if let SwitchoverAdapterDecision::Observe(result) = decision {
-        let authoritative = matches!(prepared, SwitchoverActivityKind::PassiveObservation)
-            || quarantine_result_is_authoritative(operation, &result, observations);
-        return Ok(resolve_quarantined_observation(result, authoritative));
-    }
-    let (
-        SwitchoverActivityKind::PreparedReplica { command },
-        SwitchoverAdapterDecision::External(decision),
-    ) = (prepared, decision)
-    else {
-        return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
-    };
-    let Decision::Execute {
-        target_id,
-        action_id,
-        action,
-    } = *decision
-    else {
-        return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
-    };
-    resolve_quarantined_replica_effect(
-        operation,
-        command,
-        QuarantinedReplicaDecision {
-            target_id,
-            action_id,
-            action,
-        },
-        observations,
-        |next, action_id| {
-            Box::new(DurableSwitchoverStepResult::ProvenNoAdmission {
-                operation: DurableSwitchoverState::from_operation(&next),
-                action_id,
-                redelivery: 1,
-            })
-        },
-    )
-}
-
-fn quarantine_result_is_authoritative(
-    operation: &DurableOperationStatus,
-    result: &DurableSwitchoverStepResult,
-    observations: &OperationObservations,
-) -> bool {
-    match result {
-        DurableSwitchoverStepResult::Complete { .. } => operation.pending_action.is_none(),
-        DurableSwitchoverStepResult::Stopped { .. } => operation.pending_action.is_none(),
-        DurableSwitchoverStepResult::ProvenNoAdmission { .. } => true,
-        DurableSwitchoverStepResult::Advance {
-            operation: next_state,
-        } => {
-            let Ok(next) = next_state.apply_to(operation) else {
-                return false;
-            };
-            if next.phase == DurableOperationPhase::Poisoned {
-                return false;
-            }
-            let Some(pending) = operation.pending_action.as_ref() else {
-                return true;
-            };
-            if let Some(observed) = observations.get(&pending.target_id)
-                && let Some(action) =
-                    correlated_action_observation(&observed.status, &pending.action_id)
-            {
-                return matches!(
-                    action.state,
-                    DurableActionState::Completed | DurableActionState::Failed
-                ) && next.pending_action.is_none();
-            }
-            is_switchover_postcondition_transition(operation, &next, pending)
-        }
-    }
-}
-
-pub(crate) fn exact_label_command(
-    operation: &DurableOperationStatus,
-    target_id: ReplicaId,
-    role: &str,
-    observations: &OperationObservations,
-) -> Result<LabelEffectCommand, String> {
-    let expected_uid = operation
-        .previous_snapshot
-        .members
-        .iter()
-        .find(|member| member.id == target_id)
-        .or_else(|| {
-            operation
-                .target_snapshot
-                .members
-                .iter()
-                .find(|member| member.id == target_id)
-        })
-        .map(|member| member.instance_id.clone())
-        .ok_or_else(|| {
-            format!("switchover label target {target_id} is not in the operation snapshot")
-        })?;
-    let observed = observations
-        .get(&target_id)
-        .ok_or_else(|| format!("switchover label target {target_id} is unavailable"))?;
-    if observed.status.instance_id.as_str() != expected_uid {
-        return Err(format!(
-            "switchover label target {target_id} incarnation changed before patch"
-        ));
-    }
-    Ok(LabelEffectCommand::new(
-        target_id,
-        observed.pod_name.clone(),
-        expected_uid,
-        role.to_string(),
-    ))
-}
-
 fn bounded(value: &str) -> String {
     value.chars().take(MAX_EFFECT_DIAGNOSTIC_BYTES).collect()
 }
@@ -1326,22 +1065,6 @@ mod tests {
             classify_dispatch_failure(&KubericError::Closed),
             DispatchFailureDisposition::Unknown
         );
-    }
-
-    #[test]
-    fn workflow_neutral_action_matching_is_separate_from_switchover_allow_list() {
-        let action = DurableReplicaAction::RemoveReplica {
-            replica_id: 3,
-            instance_id: ReplicaInstanceId::new("replica-3-uid"),
-        };
-        assert!(replica_action_matches_kind(
-            crate::crd::DurableActionKind::CreateCompensateRemoveCandidate,
-            &action,
-        ));
-        assert!(!validate_switchover_replica_action_kind(
-            crate::crd::DurableActionKind::CreateCompensateRemoveCandidate,
-            &action,
-        ));
     }
 
     #[tokio::test]

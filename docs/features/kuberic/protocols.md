@@ -118,31 +118,105 @@ fail closed and never restore the failed primary.
 ## Protocol: Switchover
 
 Planned primary change uses the versioned `status.switchoverExecution`
-admission reference and an owner-bound ConfigMap checkpoint.
+admission reference and an owner-bound ConfigMap checkpoint. Contract version
+4 is the only accepted switchover execution shape; prior contract versions and
+histories are not migrated or resumed.
 
+### Direct activity catalog
+
+The production checkpoint history contains these 20 operation-specific names,
+all at version 1:
+
+| Activity | Role |
+|---|---|
+| `kuberic.switchover.revoke-writes` | Revoke old-primary writes |
+| `kuberic.switchover.capture-frozen-lsn` | Observe the frozen old-primary LSN |
+| `kuberic.switchover.wait-target-caught-up` | Observe target catch-up through the frozen LSN |
+| `kuberic.switchover.demote-old-primary` | Demote the old primary |
+| `kuberic.switchover.promote-target` | Promote the selected target |
+| `kuberic.switchover.distribute-replica-epoch` | Advance one retained replica to the target epoch |
+| `kuberic.switchover.install-target-catch-up-configuration` | Install target dual-configuration catch-up |
+| `kuberic.switchover.wait-target-write-quorum` | Observe target write-quorum catch-up |
+| `kuberic.switchover.install-target-current-configuration` | Commit the target current configuration |
+| `kuberic.switchover.publish-target-primary-label` | Publish target primary routing |
+| `kuberic.switchover.publish-old-primary-secondary-label` | Publish old-primary secondary routing |
+| `kuberic.switchover.attest-target-topology` | Attest the completed target topology |
+| `kuberic.switchover.restore-previous-current-configuration` | Restore the pre-promotion current configuration |
+| `kuberic.switchover.compensate-promote-old-primary` | Re-promote the old primary at the advanced epoch |
+| `kuberic.switchover.compensate-distribute-replica-epoch` | Advance one retained replica to the compensation epoch |
+| `kuberic.switchover.install-compensation-catch-up-configuration` | Install compensation dual-configuration catch-up |
+| `kuberic.switchover.install-compensation-current-configuration` | Commit the compensation current configuration |
+| `kuberic.switchover.restore-old-primary-label` | Restore old-primary routing |
+| `kuberic.switchover.restore-target-secondary-label` | Restore target secondary routing |
+| `kuberic.switchover.attest-compensated-topology` | Attest the safe compensated topology |
+
+The direct async workflow visibly owns the following normal sequence:
+
+```text
+kuberic.switchover.revoke-writes@v1
+→ kuberic.switchover.capture-frozen-lsn@v1
+→ kuberic.switchover.wait-target-caught-up@v1
+→ kuberic.switchover.demote-old-primary@v1
+→ kuberic.switchover.promote-target@v1
+→ kuberic.switchover.distribute-replica-epoch@v1
+    for each sorted retained member except the old primary and target
+→ kuberic.switchover.install-target-catch-up-configuration@v1
+→ kuberic.switchover.wait-target-write-quorum@v1
+→ kuberic.switchover.install-target-current-configuration@v1
+→ kuberic.switchover.publish-target-primary-label@v1
+→ kuberic.switchover.publish-old-primary-secondary-label@v1
+→ kuberic.switchover.attest-target-topology@v1
+→ terminal checkpoint reload
+→ stable snapshot publication
 ```
-persist revoke intent → revoke writes
-observe frozen LSN → wait for target catch-up
-persist demote intent → demote old primary
-persist promote intent → promote target
-converge retained member epochs
-install catch-up config → wait write quorum → install current config
-converge routing labels
-publish stable snapshot
+
+Before target promotion, a catch-up or demotion failure restores the previous
+configuration and attests it:
+
+```text
+normal prefix through the failed pre-promotion boundary
+→ kuberic.switchover.restore-previous-current-configuration@v1
+→ kuberic.switchover.attest-compensated-topology@v1
 ```
 
-Every external activity has a deterministic action ID and exact prepared
-command persisted before dispatch. A resumed reconcile observes first: a matching postcondition
-advances, a matching precondition permits dispatch/retry, and any impossible
-observation fails closed. The shared runner uses fused checkpoint
-compare-and-swap, one-use dispatch permits, bounded in-process fuel, and
-authoritative reload before any later effect.
+A revoke failure can attest the still-safe previous topology directly. If
+target promotion fails after old-primary demotion, compensation instead uses
+the target epoch:
 
-If target promotion cannot be confirmed after old-primary demotion, the same
-checkpoint durably restores the old primary at the new epoch, converges member
-epochs/configuration and labels, then publishes the compensated stable
-snapshot. Unverifiable post-promotion convergence becomes `poisoned`; it never
-publishes a snapshot containing an old-epoch retained member.
+```text
+normal prefix through kuberic.switchover.promote-target@v1 failure
+→ kuberic.switchover.compensate-promote-old-primary@v1
+→ kuberic.switchover.compensate-distribute-replica-epoch@v1
+    for every sorted retained member except the restored old primary
+→ kuberic.switchover.install-compensation-catch-up-configuration@v1
+→ kuberic.switchover.install-compensation-current-configuration@v1
+→ kuberic.switchover.restore-old-primary-label@v1
+→ kuberic.switchover.restore-target-secondary-label@v1
+→ kuberic.switchover.attest-compensated-topology@v1
+→ terminal checkpoint reload
+→ compensated stable snapshot publication
+```
+
+Every dispatched activity has a deterministic action ID and exact prepared
+command persisted before dispatch. Before exposure, a matching precondition
+can dispatch and ordinary deadline policy can select a domain failure. After
+exposure, prepared-command rules are stricter: only a matching terminal
+agent-ledger record, the exact live postcondition, or generation-change proof
+of non-admission can resolve a replica command. A precondition, unavailable
+replica, or scheduled/in-progress ledger record remains quarantined even after
+the activity deadline. Replica actions receive at most one same-identity
+redelivery, and only after generation change proves that the previous request
+was not admitted. UID-fenced label actions are never redelivered and remain
+quarantined until the exact UID-bound label postcondition is observed.
+Evidence-only effects have no prepared command; after restart they are
+re-evaluated with dispatch disabled, accepting deterministic observations and
+waiting whenever a command would otherwise be required.
+
+The shared runner uses fused checkpoint compare-and-swap, one-use dispatch
+permits, one end-to-end 64-transition workflow budget, and authoritative
+reload before any later effect. The budget includes normal, compensation,
+attestation, and redelivery calls. ConfigMap conflicts and unknown write
+outcomes reload before a later permit.
 
 The pod-local agent records the active action and 16 most recent terminal
 observations. These fields are the only local correlation ledger. The bounded
@@ -151,16 +225,19 @@ distributed workflow history or an exactly-once claim.
 
 ### Framework-native durable replay
 
-The protocol decisions are recorded as linear format-3 workflow activities.
-The ordering above does not change:
+The protocol decisions are recorded as the named linear format-3 history
+above:
 
 ```
 persist native execution reference
-  → schedule activity → expose dispatch → persist agent fence
-  → schedule activity → expose dispatch → correlated ReplicaAgent call
-  → observe agent ledger/runtime postcondition
-  → repeat existing switchover or compensation decision
-  → persist terminal checkpoint → publish stable topology/status
+  → direct workflow requests one named typed activity
+  → adapter validates authority and prepares the exact command
+  → host persists DispatchExposed and grants one-use permit
+  → adapter calls ReplicaAgent or applies an exact-UID label patch
+  → adapter supplies authoritative observation
+  → host persists observation plus next exposure or terminal
+  → runner reloads and validates terminal
+  → reconciler publishes stable topology/status
 ```
 
 A dispatch permit is not an exactly-once claim. A lost reply is resolved from
@@ -178,6 +255,11 @@ Switchover deliberately retains individually correlated local mutations. A
 coarse primary-agent intent would require a new coordinator across multiple
 replicas plus Kubernetes routing effects; the existing exact per-command
 fences already preserve the required recovery boundary.
+
+The product-wide replica range remains 1–9. A one-replica set has no distinct
+switchover target; direct switchover accepts valid stable topologies with 2–9
+members. Creation, add/build/rejoin, failover, and remove-replica keep their
+existing protocol and execution models.
 
 ---
 

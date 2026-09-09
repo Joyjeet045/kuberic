@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    CasOutcome, CheckpointEnvelope, CheckpointPayload, CheckpointState, CheckpointStore,
-    ExactBytes, ExecutionId, HostOutcome, InMemoryCheckpointStore, KubernetesCheckpointStore,
+    ActivitySpec, CasOutcome, CheckpointEnvelope, CheckpointPayload, CheckpointState,
+    CheckpointStore, ExecutionId, HostOutcome, InMemoryCheckpointStore, KubernetesCheckpointStore,
     PersistenceBoundary, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
     TerminalOutcome,
 };
@@ -71,14 +71,14 @@ pub struct DurableActivityAccounting {
 #[derive(Clone, Copy)]
 pub struct CheckpointMeasurementDecoder {
     workflow_name: &'static str,
-    activity: fn(&ExactBytes) -> Option<DurableActivityClass>,
+    activity: fn(&ActivitySpec) -> Option<DurableActivityClass>,
     terminal: fn(&TerminalOutcome, u64) -> Option<DurableActivityAccounting>,
 }
 
 impl CheckpointMeasurementDecoder {
     pub const fn new(
         workflow_name: &'static str,
-        activity: fn(&ExactBytes) -> Option<DurableActivityClass>,
+        activity: fn(&ActivitySpec) -> Option<DurableActivityClass>,
         terminal: fn(&TerminalOutcome, u64) -> Option<DurableActivityAccounting>,
     ) -> Self {
         Self {
@@ -92,8 +92,8 @@ impl CheckpointMeasurementDecoder {
         self.workflow_name
     }
 
-    fn activity(self, input: &ExactBytes) -> Option<DurableActivityClass> {
-        (self.activity)(input)
+    fn activity(self, activity: &ActivitySpec) -> Option<DurableActivityClass> {
+        (self.activity)(activity)
     }
 
     fn terminal(
@@ -349,7 +349,7 @@ impl MeasuredDurableCheckpointStore {
                 let mut external_effects = 0_u64;
                 let mut passive_observations = 0_u64;
                 for activity in activities {
-                    match self.decoder.activity(activity.input()) {
+                    match self.decoder.activity(activity.spec()) {
                         Some(DurableActivityClass::PassiveObservation) => {
                             passive_observations = passive_observations.saturating_add(1);
                         }
@@ -552,8 +552,8 @@ mod checkpoint_store_tests {
         CheckpointEnvelope::new(3, ExactBytes::new(value))
     }
 
-    fn fixture_activity_decoder(input: &ExactBytes) -> Option<DurableActivityClass> {
-        match input.as_slice() {
+    fn fixture_activity_decoder(activity: &ActivitySpec) -> Option<DurableActivityClass> {
+        match activity.input().as_slice() {
             b"effect" => Some(DurableActivityClass::ExternalEffect),
             b"observation" => Some(DurableActivityClass::PassiveObservation),
             _ => None,
@@ -579,15 +579,22 @@ mod checkpoint_store_tests {
             fixture_activity_decoder,
             fixture_terminal_decoder,
         );
+        let spec = |input: &'static [u8]| {
+            ActivitySpec::new(
+                ActivityName::new("fixture.activity", 1).unwrap(),
+                ExactBytes::new(input),
+                32,
+            )
+        };
         assert_eq!(
-            decoder.activity(&ExactBytes::new(b"effect")),
+            decoder.activity(&spec(b"effect")),
             Some(DurableActivityClass::ExternalEffect)
         );
         assert_eq!(
-            decoder.activity(&ExactBytes::new(b"observation")),
+            decoder.activity(&spec(b"observation")),
             Some(DurableActivityClass::PassiveObservation)
         );
-        assert_eq!(decoder.activity(&ExactBytes::new(b"unknown")), None);
+        assert_eq!(decoder.activity(&spec(b"unknown")), None);
         assert_eq!(
             decoder.terminal(&TerminalOutcome::succeeded(ExactBytes::new(b"fixture")), 3),
             Some(DurableActivityAccounting {
@@ -798,50 +805,42 @@ mod checkpoint_store_tests {
     }
 
     fn terminal_accounting_payload(
+        member_count: usize,
         compensated: bool,
-        phase: &str,
-        frozen_lsn: Option<i64>,
-        next_secondary_index: u32,
-        last_error: Option<&str>,
         external_effect_count: u64,
         passive_observation_count: u64,
     ) -> Vec<u8> {
+        let members = (1..=member_count)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "instanceId": format!("pod-{id}-uid"),
+                    "role": if id == 2 { "primary" } else { "activeSecondary" },
+                })
+            })
+            .collect::<Vec<_>>();
         serde_json::to_vec(&serde_json::json!({
             "status": "complete",
-            "state": {
-                "phase": phase,
-                "frozenLsn": frozen_lsn,
-                "nextSecondaryIndex": next_secondary_index,
-                "phaseDeadlineUnixSeconds": 100,
-                "pendingAction": null,
-                "lastError": last_error,
-            },
             "snapshot": {
                 "epoch": {
                     "dataLossNumber": 4,
                     "configurationNumber": 9,
                 },
                 "primaryId": 2,
-                "members": [
-                    {
-                        "id": 1,
-                        "instanceId": "pod-1-uid",
-                        "role": "activeSecondary",
-                    },
-                    {
-                        "id": 2,
-                        "instanceId": "pod-2-uid",
-                        "role": "primary",
-                    },
-                    {
-                        "id": 3,
-                        "instanceId": "pod-3-uid",
-                        "role": "activeSecondary",
-                    },
-                ],
-                "writeQuorum": 2,
+                "members": members,
+                "writeQuorum": member_count / 2 + 1,
             },
             "compensated": compensated,
+            "branch": if compensated {
+                "post_promotion_compensated"
+            } else {
+                "target_success"
+            },
+            "reason": if compensated {
+                Some("compensated test terminal")
+            } else {
+                None
+            },
             "accounting": {
                 "externalEffectCount": external_effect_count,
                 "passiveObservationCount": passive_observation_count,
@@ -853,14 +852,6 @@ mod checkpoint_store_tests {
     fn two_member_terminal_accounting_payload() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "status": "complete",
-            "state": {
-                "phase": "completed",
-                "frozenLsn": 42,
-                "nextSecondaryIndex": 0,
-                "phaseDeadlineUnixSeconds": 100,
-                "pendingAction": null,
-                "lastError": null,
-            },
             "snapshot": {
                 "epoch": {
                     "dataLossNumber": 4,
@@ -882,6 +873,8 @@ mod checkpoint_store_tests {
                 "writeQuorum": 2,
             },
             "compensated": false,
+            "branch": "target_success",
+            "reason": null,
             "accounting": {
                 "externalEffectCount": 8,
                 "passiveObservationCount": 3,
@@ -1107,16 +1100,15 @@ mod checkpoint_store_tests {
     }
 
     #[tokio::test]
-    async fn switchover_terminal_accounting_rejects_inconsistent_claims() {
-        let wrong_split_payload =
-            terminal_accounting_payload(false, "completed", Some(42), 1, None, 10, 2);
-        let wrong_split = terminal_accounting_measurements(12, &wrong_split_payload, 12).await;
-        assert_eq!(wrong_split.completed_activity_count, Some(12));
-        assert_eq!(wrong_split.completed_external_effect_count, None);
-        assert_eq!(wrong_split.completed_passive_observation_count, None);
+    async fn switchover_terminal_accounting_uses_the_direct_terminal_contract() {
+        let mismatched_total_payload = terminal_accounting_payload(3, false, 10, 2);
+        let mismatched_total =
+            terminal_accounting_measurements(12, &mismatched_total_payload, 13).await;
+        assert_eq!(mismatched_total.completed_activity_count, Some(13));
+        assert_eq!(mismatched_total.completed_external_effect_count, None);
+        assert_eq!(mismatched_total.completed_passive_observation_count, None);
 
-        let successful_redelivery_payload =
-            terminal_accounting_payload(false, "completed", Some(42), 1, None, 10, 3);
+        let successful_redelivery_payload = terminal_accounting_payload(3, false, 10, 3);
         let successful_redelivery =
             terminal_accounting_measurements(13, &successful_redelivery_payload, 13).await;
         assert_eq!(
@@ -1133,62 +1125,21 @@ mod checkpoint_store_tests {
         assert_eq!(two_member.completed_external_effect_count, Some(8));
         assert_eq!(two_member.completed_passive_observation_count, Some(3));
 
-        let compensation_payload =
-            terminal_accounting_payload(true, "failed", Some(42), 2, None, 8, 5);
+        let compensation_payload = terminal_accounting_payload(3, true, 8, 5);
         let compensation = terminal_accounting_measurements(15, &compensation_payload, 13).await;
         assert_eq!(compensation.completed_activity_count, Some(13));
         assert_eq!(compensation.completed_external_effect_count, Some(8));
         assert_eq!(compensation.completed_passive_observation_count, Some(5));
 
-        let compensation_redelivery_payload =
-            terminal_accounting_payload(true, "failed", Some(42), 2, None, 16, 5);
-        let compensation_redelivery =
-            terminal_accounting_measurements(16, &compensation_redelivery_payload, 21).await;
-        assert_eq!(
-            compensation_redelivery.completed_external_effect_count,
-            Some(16)
-        );
-        assert_eq!(
-            compensation_redelivery.completed_passive_observation_count,
-            Some(5)
-        );
+        let exact_maximum_payload = terminal_accounting_payload(9, true, 28, 5);
+        let exact_maximum = terminal_accounting_measurements(16, &exact_maximum_payload, 33).await;
+        assert_eq!(exact_maximum.completed_external_effect_count, Some(28));
+        assert_eq!(exact_maximum.completed_passive_observation_count, Some(5));
 
-        let impossible_compensation_payload =
-            terminal_accounting_payload(true, "failed", Some(42), 2, None, 21, 3);
-        let impossible_compensation =
-            terminal_accounting_measurements(17, &impossible_compensation_payload, 24).await;
-        assert_eq!(
-            impossible_compensation.completed_external_effect_count,
-            None
-        );
-        assert_eq!(
-            impossible_compensation.completed_passive_observation_count,
-            None
-        );
-
-        let impossible_split_payload =
-            terminal_accounting_payload(true, "failed", Some(42), 2, None, 1, 1);
-        let impossible_split =
-            terminal_accounting_measurements(18, &impossible_split_payload, 2).await;
-        assert_eq!(impossible_split.completed_external_effect_count, None);
-        assert_eq!(impossible_split.completed_passive_observation_count, None);
-
-        let phase_inconsistent_payload =
-            terminal_accounting_payload(true, "failed", Some(42), 0, None, 8, 5);
-        let phase_inconsistent =
-            terminal_accounting_measurements(19, &phase_inconsistent_payload, 13).await;
-        assert_eq!(phase_inconsistent.completed_external_effect_count, None);
-        assert_eq!(phase_inconsistent.completed_passive_observation_count, None);
-
-        let uncompensated_failure_payload =
-            terminal_accounting_payload(true, "failed", None, 0, Some("revoke failed"), 1, 1);
-        let uncompensated_failure =
-            terminal_accounting_measurements(20, &uncompensated_failure_payload, 2).await;
-        assert_eq!(uncompensated_failure.completed_external_effect_count, None);
-        assert_eq!(
-            uncompensated_failure.completed_passive_observation_count,
-            None
-        );
+        let one_over_payload = terminal_accounting_payload(9, true, 29, 5);
+        let one_over = terminal_accounting_measurements(17, &one_over_payload, 34).await;
+        assert_eq!(one_over.completed_external_effect_count, None);
+        assert_eq!(one_over.completed_passive_observation_count, None);
     }
 
     #[tokio::test]

@@ -144,6 +144,14 @@ pub trait DurableOperationAdapter: Send {
         attempt_id: AttemptId,
     ) -> DurableAdapterBoundary;
 
+    fn interrupt_after_accepted_exposure(
+        &mut self,
+        _activity: &LogicalActivityId,
+        _attempt_id: AttemptId,
+    ) -> Option<DurableAdapterWait> {
+        None
+    }
+
     /// Operation deadline used only to bound the reconcile requeue.
     fn deadline_unix_seconds(&self) -> i64;
 
@@ -316,6 +324,23 @@ impl DurableRunner {
                 HostOutcome::DispatchPermitted { permit, .. } => {
                     let activity = permit.activity().clone();
                     let attempt_id = permit.attempt_id();
+                    if let Some(wait) =
+                        adapter.interrupt_after_accepted_exposure(&activity, attempt_id)
+                    {
+                        return DurableRunnerOutcome::Active {
+                            reason: DurableActiveReason::Adapter,
+                            condition_reason: wait.reason,
+                            detail: wait.detail,
+                            requeue_after_seconds: wait.requeue_after_seconds.unwrap_or_else(
+                                || {
+                                    deadline_requeue_seconds(
+                                        now_unix_seconds,
+                                        adapter.deadline_unix_seconds(),
+                                    )
+                                },
+                            ),
+                        };
+                    }
                     let mut guard = DurablePermitGuard::new(permit);
                     let boundary = adapter
                         .observe_or_dispatch(&activity, attempt_id, &mut guard)

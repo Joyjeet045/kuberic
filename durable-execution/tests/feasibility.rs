@@ -628,12 +628,18 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
         .find("uses: helm/kind-action@v1")
         .expect("existing KinD action");
     let checkpoint_step = workflow
-        .find("name: Run cargo test")
-        .expect("existing workspace test step");
+        .find("name: Run isolated provider owner-GC and full workspace suite")
+        .expect("isolated provider and workspace test step");
     assert!(kind_step < checkpoint_step);
     assert_eq!(workflow.matches("uses: helm/kind-action@v1").count(), 1);
     assert!(!workflow.contains("name: Run real Kubernetes checkpoint test"));
-    assert!(workflow.contains("cargo test --all --all-features"));
+    assert!(
+        workflow.contains("cargo test -p kuberic-durable-execution --all-features -- --nocapture")
+    );
+    assert!(
+        workflow
+            .contains("cargo test --workspace --all-features --exclude kuberic-durable-execution")
+    );
     assert!(!workflow.contains("kubernetes_checkpoint_real -- --nocapture"));
     assert!(!real_test.contains("#[ignore"));
 }

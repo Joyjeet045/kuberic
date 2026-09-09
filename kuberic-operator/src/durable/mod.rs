@@ -16,7 +16,6 @@ pub mod failover_election;
 mod remove_replica;
 pub mod remove_replica_execution;
 pub mod runner;
-mod switchover;
 pub mod switchover_execution;
 pub mod workflow_host;
 
@@ -30,7 +29,6 @@ pub use failover::{
     pending_label as failover_pending_label, record_observation, start_failover,
 };
 pub use remove_replica::{RemoveReplicaTarget, decide_remove_replica, start_remove_replica};
-pub use switchover::{decide, start_switchover};
 
 // Includes authorization, dispatch-fence persistence, activity, and
 // observation-first retry reconciles.

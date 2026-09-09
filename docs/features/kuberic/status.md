@@ -28,7 +28,7 @@ Implementation status, known gaps, and open questions.
 | gRPC failure tracking | ❌ Not implemented — K8s adaptation of SF federation heartbeats |
 | Stable Healthy operator restart recovery | ✅ Implemented — authoritative status snapshot + read-only `PartitionDriver::recover()` |
 | Durable initial partition creation | ✅ Implemented — explicit no-previous-topology checkpoint, partial committed bootstrap snapshots, gated routing |
-| Durable switchover restart recovery | ✅ Implemented — native `status.switchoverExecution` admission plus owner-bound ConfigMap checkpoints, exact correlated actions, quarantine, compensation, and terminal reload |
+| Durable switchover restart recovery | ✅ Implemented — contract-v4 `status.switchoverExecution`, 20 named v1 activities, owner-bound ConfigMap checkpoints, exact correlated actions, quarantine, compensation, and terminal reload |
 | Durable scale-up and stale-secondary rejoin | ✅ Implemented — one coarse primary-agent intent, target peer stages, tracked copy/quorum, commit-aware compensation |
 | Durable scale-down and stale/dead-secondary eviction | ✅ Implemented — native `status.removeReplicaExecution` admission plus owner-bound ConfigMap checkpoints, one coarse primary-agent intent, config-first commit, lifecycle-peer retirement, exact connection cleanup, UID-fenced deletion |
 | Pod-local RA-lite boundary | ✅ Implemented — control v3, one versioned correlated mutation path with generation/version fencing and bounded replay |
@@ -95,9 +95,37 @@ During switchover, `status.switchoverExecution` stores immutable admission and
 checkpoint identity. Its ConfigMap checkpoint stores exact prepared commands,
 observations, bounded redelivery evidence, and terminal outcome. A
 `Switchover` phase without the current native reference fails closed.
-The local sequence remains individually correlated rather than hidden behind
-a coarse agent intent because it spans the old primary, target, retained
-members, and Kubernetes routing effects.
+Contract version 4 is the only current shape; previous versions and histories
+are incompatible and are neither migrated nor restarted. Required input pins
+the `KubericSet` UID authority, previous stable snapshot, distinct target, and
+acceptance time.
+
+The history uses 20 operation-specific version-1 names. The direct workflow
+source visibly owns normal ordering and both compensation paths; the host
+adapter only prepares and dispatches exact commands or supplies authoritative
+observations. The local sequence remains individually correlated rather than
+hidden behind a coarse agent intent because it spans the old primary, target,
+retained members, and Kubernetes routing effects.
+
+Compact terminal payloads carry an immutable branch discriminator for target
+success, revoke-safe failure, previous-configuration restore, or
+post-promotion compensation. Reload rejects a terminal whose topology,
+external/passive activity split, member-count-specific base sequence, or
+redelivery count is unreachable for that branch. Replica and label slots both
+admit evidence-only classifications when their production evaluator can
+persist them, while only replica slots admit one bounded redelivery. Terminal
+`reason`/`message` and persisted activity errors are limited to 512 UTF-8
+bytes.
+
+`FrameworkNativeSwitchover=True` exposes active and blocked states such as
+`Accepted`, `Blocked`, `AwaitingEffectPreparation`, `EffectExposed`,
+`ExposureInterrupted` when the explicit integration fault hook is armed,
+`Quarantined`, `ReloadRequired`, `StorageUnavailable`, `Incompatible`,
+`Rejected`, `Isolated`, `Nondeterministic`, and `FuelExhausted`. A validated
+terminal is reloaded before publication. Normal completion sets reason
+`Completed`; verified rollback sets `CompensatedOrSafeFailure`; both set the
+condition to `False` and return the resource to `Healthy`. A stopped terminal
+remains `Quarantined` and does not publish a new stable snapshot.
 
 ---
 
@@ -142,7 +170,8 @@ CNPG patterns we **rejected** (conflict with SF model):
 ## Degenerate Configurations
 
 **replicas=1:** No replication, no failover. Pod restart = resume as primary.
-Development/testing only.
+Development/testing only. Switchover is unavailable because no distinct target
+exists.
 
 **replicas=2:** Write quorum=2 (both must ACK). Zero write fault tolerance.
 Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
@@ -151,8 +180,10 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 (ensures failure independence for quorum model).
 
 **Maximum supported:** `replicas <= 9`. The CRD and reconciler enforce this
-product-wide bound. It keeps the largest framework-native switchover
-compensation history within the admitted ConfigMap checkpoint budget.
+product-wide bound. Direct switchover accepts valid stable topologies with
+2–9 members and a distinct target. Its nine-member maximum-fault compensation
+history consumes all 33 admitted records while remaining within the
+524,288-byte active and 16,384-byte terminal checkpoint limits.
 
 ---
 
@@ -214,7 +245,8 @@ kuberic-operator/
 │   ├── main.rs                      # Binary entry point (kube controller)
 │   ├── crd.rs                       # KubericSet CRD with spec/status/enums
 │   ├── cluster_api.rs               # ClusterApi trait + KubeClusterApi impl
-│   ├── durable/switchover_execution.rs # Native switchover contract, adapter, bounds, recovery
+│   ├── durable/switchover_execution.rs # Direct switchover admission, runtime, bounds
+│   ├── durable/switchover_execution/   # Named activities, workflow, adapter, preparation, quarantine
 │   ├── durable/remove_replica.rs     # Coarse intent freeze/redrive, commit, cleanup, dispositions
 │   ├── reconciler.rs                # Reconcile loop and Kubernetes-owned cleanup/publication
 │   └── tests.rs                     # Mock reconciler tests
