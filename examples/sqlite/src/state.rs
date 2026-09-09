@@ -25,8 +25,6 @@ pub struct SqliteState {
     pub data_dir: PathBuf,
     /// SQLite page size (typically 4096).
     pub page_size: u32,
-    /// Current offset in WAL file for frame reading (primary).
-    wal_read_offset: u64,
     /// Last LSN applied to the database.
     pub last_applied_lsn: Lsn,
     /// Last committed LSN (confirmed by quorum).
@@ -51,7 +49,6 @@ impl SqliteState {
             db_path,
             data_dir,
             page_size: 4096,
-            wal_read_offset: 0,
             last_applied_lsn: meta.committed_lsn,
             committed_lsn: meta.committed_lsn,
             frame_log: None,
@@ -59,18 +56,35 @@ impl SqliteState {
     }
 
     /// Open SQLite as primary: WAL mode, single connection, no auto-checkpoint.
+    ///
+    /// Opened against the commit-barrier VFS, so a transaction only becomes
+    /// visible once it has reached durable quorum. `locking_mode=EXCLUSIVE`
+    /// keeps the wal-index in heap memory instead of a shared-memory file, and
+    /// `synchronous=FULL` keeps the published commit durable on this replica.
     pub fn open_as_primary(&mut self) -> io::Result<()> {
-        let conn = Connection::open_with_flags(
+        if crate::barrier::is_fenced_on_disk(&self.data_dir) {
+            return Err(io::Error::other(
+                "replica lost a replicated transaction locally and must be rebuilt",
+            ));
+        }
+        let conn = Connection::open_with_flags_and_vfs(
             &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            crate::barrier::VFS_NAME,
         )
         .map_err(|e| io::Error::other(format!("failed to open SQLite: {e}")))?;
+
+        conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .map_err(|e| io::Error::other(format!("failed to set locking mode: {e}")))?;
 
         // Enable WAL mode
         conn.pragma_update(None, "journal_mode", "wal")
             .map_err(|e| io::Error::other(format!("failed to set WAL mode: {e}")))?;
+
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(|e| io::Error::other(format!("failed to set synchronous mode: {e}")))?;
 
         // Disable auto-checkpoint — we control checkpointing
         conn.pragma_update(None, "wal_autocheckpoint", 0)
@@ -81,9 +95,6 @@ impl SqliteState {
             .pragma_query_value(None, "page_size", |row| row.get(0))
             .map_err(|e| io::Error::other(format!("failed to read page_size: {e}")))?;
         self.page_size = page_size;
-
-        // Reset WAL read offset (read from beginning of new WAL)
-        self.wal_read_offset = 0;
 
         info!(
             db = %self.db_path.display(),
@@ -157,45 +168,14 @@ impl SqliteState {
         Ok((columns, rows))
     }
 
-    /// Capture new WAL frames after a write operation (primary only).
-    /// Returns None if no new frames were written.
-    pub fn capture_wal_frames(&mut self) -> io::Result<Option<WalFrameSet>> {
-        let wal_path = self.wal_path();
-
-        // Check page size from WAL if needed
-        if self.wal_read_offset == 0
-            && let Some(ps) = crate::frames::read_wal_page_size(&wal_path)?
-            && ps != self.page_size
-        {
-            warn!(
-                wal_page_size = ps,
-                db_page_size = self.page_size,
-                "page size mismatch"
-            );
+    pub async fn mark_confirmed(&mut self, lsn: Lsn) -> io::Result<()> {
+        if lsn <= self.committed_lsn {
+            return Ok(());
         }
+        self.last_applied_lsn = lsn;
+        self.committed_lsn = lsn;
 
-        let (frames, db_size_pages, new_offset) =
-            crate::frames::read_wal_frames(&wal_path, self.page_size, self.wal_read_offset)?;
-
-        if frames.is_empty() {
-            return Ok(None);
-        }
-
-        self.wal_read_offset = new_offset;
-
-        let checksum = WalFrameSet::compute_checksum(&frames);
-        let frame_set = WalFrameSet {
-            frames,
-            db_size_pages,
-            checksum,
-        };
-
-        debug!(
-            num_frames = frame_set.frames.len(),
-            db_size_pages, "captured WAL frames"
-        );
-
-        Ok(Some(frame_set))
+        FrameLog::save_meta(&self.data_dir, &FrameLogMeta { committed_lsn: lsn }).await
     }
 
     /// Apply a WalFrameSet to the database file (secondary).
@@ -313,6 +293,8 @@ impl SqliteState {
         let _ = tokio::fs::remove_file(&wal).await;
         let _ = tokio::fs::remove_file(&shm).await;
 
+        crate::barrier::barrier().clear_fence_after_rebuild(&self.data_dir);
+
         info!(size = data.len(), "restored DB from snapshot");
         Ok(())
     }
@@ -324,13 +306,6 @@ impl SqliteState {
             drop(conn);
             info!("SQLite connection closed");
         }
-    }
-
-    fn wal_path(&self) -> PathBuf {
-        let mut wal = self.db_path.clone();
-        let name = wal.file_name().unwrap().to_str().unwrap().to_string();
-        wal.set_file_name(format!("{}-wal", name));
-        wal
     }
 }
 

@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
-use kuberic_core::handles::{PartitionHandle, StateReplicatorHandle};
+use kuberic_core::handles::PartitionHandle;
 use kuberic_core::types::{AccessStatus, CancellationToken};
+use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
@@ -14,8 +14,7 @@ use crate::state::SharedState;
 pub struct SqliteServer {
     pub state: SharedState,
     pub partition: Arc<PartitionHandle>,
-    pub replicator: StateReplicatorHandle,
-    pub token: CancellationToken,
+    write_gate: Arc<Semaphore>,
 }
 
 #[tonic::async_trait]
@@ -26,22 +25,29 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
     ) -> Result<Response<proto::ExecuteResponse>, Status> {
         self.check_write_access()?;
 
+        let _write = self.write_gate.acquire().await.expect("write gate");
+        self.check_write_access()?;
+
         let req = request.into_inner();
         let params = convert_params(&req.params);
         let sql = req.sql;
 
         // Execute SQL on blocking thread (rusqlite is synchronous)
         let state = self.state.clone();
-        let (rows_affected, last_insert_rowid) = tokio::task::spawn_blocking(move || {
+        let executed = tokio::task::spawn_blocking(move || {
             let state = state.blocking_lock();
             state.execute_sql(&sql, &params)
         })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?
-        .map_err(|e| Status::internal(format!("SQL error: {e}")))?;
+        .await;
 
-        // Capture WAL frames and replicate
-        let lsn = self.capture_and_replicate().await?;
+        let (rows_affected, last_insert_rowid) = match executed {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return Err(Status::internal(format!("SQL error: {e}"))),
+            Err(e) => return Err(unknown_outcome(format!("execution task failed: {e}"))),
+        };
+
+        // The commit blocked on durable quorum inside the barrier VFS.
+        let lsn = self.confirm_committed().await?;
 
         debug!(lsn, rows_affected, "execute complete");
         Ok(Response::new(proto::ExecuteResponse {
@@ -89,19 +95,27 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
     ) -> Result<Response<proto::ExecuteBatchResponse>, Status> {
         self.check_write_access()?;
 
+        let _write = self.write_gate.acquire().await.expect("write gate");
+        self.check_write_access()?;
+
         let req = request.into_inner();
         let statements = req.statements;
 
         let state = self.state.clone();
-        let rows_affected = tokio::task::spawn_blocking(move || {
+        let executed = tokio::task::spawn_blocking(move || {
             let mut state = state.blocking_lock();
             state.execute_batch_sql(&statements)
         })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?
-        .map_err(|e| Status::internal(format!("SQL error: {e}")))?;
+        .await;
 
-        let lsn = self.capture_and_replicate().await?;
+        let rows_affected = match executed {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return Err(Status::internal(format!("SQL error: {e}"))),
+            Err(e) => return Err(unknown_outcome(format!("execution task failed: {e}"))),
+        };
+
+        // The commit blocked on durable quorum inside the barrier VFS.
+        let lsn = self.confirm_committed().await?;
 
         debug!(
             lsn,
@@ -116,8 +130,17 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
 }
 
 impl SqliteServer {
-    fn check_write_access(&self) -> Result<(), Status> {
-        match self.partition.read_status() {
+    pub fn new(state: SharedState, partition: Arc<PartitionHandle>) -> Self {
+        Self {
+            state,
+            partition,
+            write_gate: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    pub fn check_write_access(&self) -> Result<(), Status> {
+        rebuild_fence()?;
+        match self.partition.write_status() {
             AccessStatus::Granted => Ok(()),
             AccessStatus::NotPrimary => {
                 Err(Status::unavailable("not primary — redirect to primary"))
@@ -129,7 +152,8 @@ impl SqliteServer {
         }
     }
 
-    fn check_read_access(&self) -> Result<(), Status> {
+    pub fn check_read_access(&self) -> Result<(), Status> {
+        rebuild_fence()?;
         match self.partition.read_status() {
             AccessStatus::Granted | AccessStatus::NoWriteQuorum => Ok(()),
             AccessStatus::NotPrimary => {
@@ -141,41 +165,35 @@ impl SqliteServer {
         }
     }
 
-    /// Capture WAL frames from the last write and replicate to secondaries.
-    async fn capture_and_replicate(&self) -> Result<i64, Status> {
-        let state = self.state.clone();
-        let frame_set = tokio::task::spawn_blocking(move || {
-            let mut state = state.blocking_lock();
-            state.capture_wal_frames()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?
-        .map_err(|e| Status::internal(format!("WAL capture failed: {e}")))?;
-
-        if let Some(fs) = frame_set {
-            let data = serde_json::to_vec(&fs)
-                .map_err(|e| Status::internal(format!("serialization failed: {e}")))?;
-
-            let lsn = self
-                .replicator
-                .replicate(Bytes::from(data), self.token.clone())
-                .await
-                .map_err(|e| Status::unavailable(format!("replication failed: {e}")))?;
-
-            // Update state LSN
-            {
-                let mut state = self.state.lock().await;
-                state.last_applied_lsn = lsn;
-                state.committed_lsn = lsn;
-            }
-
-            Ok(lsn)
-        } else {
-            // No WAL frames (no-op write like empty transaction)
-            let state = self.state.lock().await;
-            Ok(state.last_applied_lsn)
-        }
+    /// The commit itself waits for durable quorum inside the barrier VFS, so a
+    /// returned statement has already been replicated. The LSN is whatever the
+    /// barrier recorded for that commit.
+    async fn confirm_committed(&self) -> Result<i64, Status> {
+        let lsn = crate::barrier::barrier().last_lsn();
+        self.state
+            .lock()
+            .await
+            .mark_confirmed(lsn)
+            .await
+            .map_err(|e| unknown_outcome(format!("confirmation record failed: {e}")))?;
+        Ok(lsn)
     }
+}
+
+/// The transaction may have committed and reached quorum, so this is not a rollback.
+fn unknown_outcome(detail: String) -> Status {
+    Status::unknown(format!(
+        "outcome unknown: the transaction may have reached durable quorum and committed, but the request could not be completed ({detail}); retry only if the statement is idempotent"
+    ))
+}
+
+fn rebuild_fence() -> Result<(), Status> {
+    if crate::barrier::barrier().is_fenced() {
+        return Err(Status::failed_precondition(
+            "replica lost a replicated transaction locally and must be rebuilt",
+        ));
+    }
+    Ok(())
 }
 
 /// Start the client-facing SQL gRPC server.
@@ -183,8 +201,6 @@ pub async fn run_client_server(
     bind: String,
     state: SharedState,
     partition: Arc<PartitionHandle>,
-    replicator: StateReplicatorHandle,
-    token: CancellationToken,
     shutdown: CancellationToken,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind).await {
@@ -197,12 +213,7 @@ pub async fn run_client_server(
     let addr = listener.local_addr().unwrap();
     info!(%addr, "client SQL gRPC server started");
 
-    let server = SqliteServer {
-        state,
-        partition,
-        replicator,
-        token,
-    };
+    let server = SqliteServer::new(state, partition);
 
     let _ = tonic::transport::Server::builder()
         .add_service(proto::sqlite_store_server::SqliteStoreServer::new(server))

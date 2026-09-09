@@ -76,6 +76,15 @@ async fn handle_state_provider_event(
             mut copy_context,
             reply,
         } => {
+            if crate::barrier::barrier().is_fenced() {
+                warn!("refusing to build copy state on a replica awaiting rebuild");
+                let _ = reply.send(Err(kuberic_core::KubericError::Internal(Box::new(
+                    std::io::Error::other(
+                        "replica lost a replicated transaction locally and must be rebuilt",
+                    ),
+                ))));
+                return;
+            }
             let peer_lsn = if let Some(op) = copy_context.get_operation().await {
                 String::from_utf8_lossy(&op.data)
                     .parse::<i64>()
@@ -246,6 +255,8 @@ pub async fn run_service_with_data_loss(
             Some(event) = lifecycle_rx.recv() => match event {
                 LifecycleEvent::Open { ctx, reply } => {
                     info!("service opened — creating replicator");
+                    let data_dir = state.lock().await.data_dir.clone();
+                    crate::barrier::barrier().arm(data_dir, ctx.fault_tx.clone());
                     let (sp_tx, sp_rx) = mpsc::unbounded_channel();
                     match WalReplicator::create(
                         ctx.replica_id,
@@ -285,7 +296,9 @@ pub async fn run_service_with_data_loss(
                             st.committed_lsn = lsn;
                             if let Err(e) = crate::framelog::FrameLog::save_meta(
                                 &st.data_dir,
-                                &crate::framelog::FrameLogMeta { committed_lsn: lsn },
+                                &crate::framelog::FrameLogMeta {
+                                    committed_lsn: lsn,
+                                },
                             ).await {
                                 warn!(error = %e, "meta save after copy failed");
                             }
@@ -335,22 +348,49 @@ pub async fn run_service_with_data_loss(
                                     warn!(error = %e, "applying frames before promotion failed");
                                 }
                             }
+                            // Commits block on the barrier, so it must accept
+                            // replication before SQLite can write anything.
+                            let ready = if crate::barrier::barrier().is_fenced() {
+                                tracing::error!(
+                                    "refusing to promote a replica that must be rebuilt"
+                                );
+                                false
+                            } else {
+                                match (replicator.as_ref(), token.as_ref()) {
+                                    (Some(r), Some(t)) => {
+                                        crate::barrier::barrier().install(r.clone(), t.clone());
+                                        true
+                                    }
+                                    _ => {
+                                        tracing::error!(
+                                            "promotion without a replicator — refusing to serve"
+                                        );
+                                        false
+                                    }
+                                }
+                            };
                             // open_as_primary is blocking (rusqlite) — use spawn_blocking
                             let st = state.clone();
-                            if let Err(e) = tokio::task::spawn_blocking(move || {
-                                let mut st = st.blocking_lock();
-                                st.open_as_primary()
-                            })
-                            .await
-                            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
-                            {
-                                warn!(error = %e, "failed to open as primary");
-                            }
-                            if client_server_handle.is_none() {
+                            let opened = if ready {
+                                tokio::task::spawn_blocking(move || {
+                                    let mut st = st.blocking_lock();
+                                    st.open_as_primary()
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+                            } else {
+                                Err(std::io::Error::other("no replicator"))
+                            };
+                            if let Err(e) = opened {
+                                tracing::error!(
+                                    error = %e,
+                                    "failed to open as primary — not starting the client server"
+                                );
+                                crate::barrier::barrier().uninstall();
+                                state.lock().await.close();
+                            } else if client_server_handle.is_none() {
                                 let srv_state = state.clone();
                                 let p = partition.as_ref().unwrap().clone();
-                                let r = replicator.as_ref().unwrap().clone();
-                                let srv_token = token.as_ref().unwrap().clone();
                                 let shutdown = CancellationToken::new();
                                 let shutdown_cp = shutdown.clone();
                                 let bind = client_bind.clone();
@@ -358,13 +398,13 @@ pub async fn run_service_with_data_loss(
                                 client_server_shutdown = Some(shutdown);
                                 client_server_handle = Some(tokio::spawn(async move {
                                     run_client_server(
-                                        bind, srv_state, p, r,
-                                        srv_token, shutdown_cp,
+                                        bind, srv_state, p, shutdown_cp,
                                     ).await;
                                 }));
                             }
                         }
                         Role::None => {
+                            crate::barrier::barrier().uninstall();
                             // Permanent removal — stop client server immediately
                             if let Some(shutdown) = client_server_shutdown.take() {
                                 shutdown.cancel();
