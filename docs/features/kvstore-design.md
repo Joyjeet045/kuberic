@@ -59,9 +59,10 @@ service KvStore {
 - **Delete**: Primary only. Serializes `KvOp::Delete{key}` → `replicate()` →
   flushes WAL, then applies to local HashMap → returns LSN.
 - **Get**: Reads from local HashMap. Checks `read_status()` — returns
-  `UNAVAILABLE` if not `Granted`.
+  `UNAVAILABLE` while not primary or reconfiguring. Primary reads remain
+  available without a write quorum.
 
-  ### Transactions
+### Transactions
 
   `BeginTransaction` returns a server-generated transaction ID. Pass that ID to
   the transactional get/put/delete RPCs, then commit or abort. Staging never
@@ -70,11 +71,11 @@ service KvStore {
 
   The Rust wrapper exposes the same protocol:
 
-  ```rust,no_run
-  use kvstore::client::KvTransaction;
-  use kvstore::proto::kv_store_client::KvStoreClient;
+```rust,no_run
+use kvstore::client::KvTransaction;
+use kvstore::proto::kv_store_client::KvStoreClient;
 
-  async fn example() -> Result<(), Box<dyn std::error::Error>> {
+async fn example() -> Result<(), Box<dyn std::error::Error>> {
     let client = KvStoreClient::connect("http://127.0.0.1:50051").await?;
     let mut transaction = KvTransaction::begin(client).await?;
     transaction.put("account-a", "90").await?;
@@ -84,8 +85,8 @@ service KvStore {
     let lsn = transaction.commit().await?;
     assert_eq!(transaction.commit().await?, lsn);
     Ok(())
-  }
-  ```
+}
+```
 
   After reconnecting to a new primary, `KvTransaction::from_id(client, id)` can
   retry a committed transaction. The wrapper does not send asynchronous work on
@@ -97,7 +98,7 @@ service KvStore {
   validation, serialization, replication, and deduplication path as interactive
   commit. It does not provide interactive reads or conditional mutations.
 
-  ### Isolation and Errors
+### Isolation and Errors
 
   Transactions use optimistic serializable isolation for point-key operations:
 
@@ -133,14 +134,15 @@ service KvStore {
   keys/values and staged mutation payload. JSON-encoded commits are additionally
   limited to 3 MiB to fit the replication transport.
 
-  ### Commit Retries and Durability
+### Commit Retries and Durability
 
   A transaction ID identifies its first retained successful commit. Concurrent
   or lost-response retries return that commit's original LSN without replicating
   or applying again, even if the retried batch contains different mutations.
   Commit execution continues if its RPC caller disconnects. An uncertain write
-  blocks further writes in that epoch and reports a transient replica fault;
-  the client must not assume an unavailable response means the write aborted.
+  blocks further writes until the replica is restarted/recovered and reports
+  a transient replica fault. An epoch change alone does not clear that block.
+  The client must not assume an unavailable response means the write aborted.
 
   Each replica retains the latest 1,024 transaction IDs, ordered by commit LSN.
   These records are part of WAL recovery, checkpoints, and copy snapshots.
@@ -154,22 +156,27 @@ service KvStore {
   Copy transfers a snapshot at the replicator's requested LSN in bounded chunks.
   The receiver stages the chunks and persists/installs one snapshot only when it
   is complete; incomplete copies never expose partial data. WAL replay likewise
-  stops before a truncated transaction record. WAL failures never publish any
-  of that operation's mutations and prevent later operations from passing it.
+  stops before a truncated transaction record, including torn UTF-8 values.
+  Actual WAL I/O errors fail recovery rather than truncating valid history.
+  WAL failures never publish any of that operation's mutations and prevent
+  later operations from passing it. Copy failures remain failed when promotion
+  is retried; a failed completion cannot be mistaken for a completed copy.
 
   Configuration-only epoch changes preserve accepted progress: the final quorum
   ACK can precede propagation of the primary's commit watermark. Truncating to
   that lagging watermark would lose a successful transaction during immediate
   failover. Secondary election progress is published only after the application
-  acknowledges WAL persistence, not on network receipt. Data-loss epoch changes may still request rollback to the known
-  commit boundary. As with ordinary operations, a commit with an unknown outcome
-  may be retained by the elected primary.
+  acknowledges WAL persistence, not on network receipt. Data-loss epoch changes
+  may still request rollback to the known commit boundary. Failed epoch updates
+  retain the previous epoch so a retry uses the same rollback boundary. As with
+  ordinary operations, a commit with an unknown outcome may be retained by the
+  elected primary.
 
   Existing Get/Put/Delete messages and old WAL/snapshot files remain readable.
   Transaction records and chunked copy require all participating KVStore replicas
   to run the new code; mixed-version replication is not supported.
 
-  ### Service Fabric Comparison
+### Service Fabric Comparison
 
   The handle lifecycle follows Reliable Collections and `KeyValueStoreReplica`:
   create a transaction, perform reads and mutations, commit atomically, or abort.
@@ -195,8 +202,8 @@ use protobuf or a binary format):
 enum KvOp {
     Put { key: String, value: String },
     Delete { key: String },
-  Transaction { transaction_id: String, mutations: Vec<KvMutation> },
-  Snapshot(SnapshotData),
+    Transaction { transaction_id: String, mutations: Vec<KvMutation> },
+    Snapshot(SnapshotData),
 }
 ```
 
@@ -246,7 +253,7 @@ Wrapped in `Arc<RwLock<KvState>>` and shared between:
 | Event | Action |
 |-------|--------|
 | **Open** | `KvState::open(data_dir)` — load snapshot + replay WAL |
-| **ChangeRole(IdleSecondary)** | Spawn `drain_stream` for `copy_stream` — applies ops via `apply_op()` (WAL + in-memory) |
+| **ChangeRole(IdleSecondary)** | Spawn `drain_copy_stream` — stage chunks and install the complete snapshot through `apply_op()` |
 | **ChangeRole(ActiveSecondary)** | Wait for copy drain to finish naturally, checkpoint, then spawn `drain_stream` for `replication_stream` |
 | **ChangeRole(Primary)** | Start client gRPC server |
 | **Close** | Cancel drains, stop client server, checkpoint for fast recovery |
@@ -284,9 +291,11 @@ OperationStream → `drain_stream` → `apply_op()` (WAL flush, then memory) →
 examples/kvstore/
 ├── Cargo.toml
 ├── build.rs
-├── proto/kvstore.proto           # Client API: Get/Put/Delete
+├── proto/kvstore.proto           # Client API: Get/Put/Delete and transactions
 ├── src/
 │   ├── lib.rs                    # Module declarations
+│   ├── client.rs                 # Rust KvTransaction wrapper
+│   ├── transactions.rs           # Optimistic staging, validation and expiry
 │   ├── main.rs                   # Binary entry point + CLI args (--data-dir)
 │   ├── state.rs                  # KvOp, KvState, SharedState, drain_stream
 │   ├── persistence.rs            # WAL/snapshot helpers: load, replay, checkpoint, rollback
@@ -295,6 +304,7 @@ examples/kvstore/
 │   ├── testing.rs                # KvPod helper (feature = "testing")
 │   └── demo.rs                   # Operator/client simulators for --demo mode
 └── tests/
+  ├── transactions.rs           # Transaction API and recovery coverage
     ├── reconciler.rs             # Durable workflow integration tests
     │                              # Includes build-buffer + quorum-loss E2E
     └── durable_data_loss.rs      # Correlated data-loss/replay tests
@@ -381,6 +391,11 @@ When `UpdateEpoch(previous_epoch_last_lsn)` arrives, the service:
 Rollback fires when the supplied boundary precedes local applied state.
 Transactions are indivisible at that boundary. A boundary older than the
 checkpoint is rejected instead of silently retaining incorrect state.
+The recovered state is built privately and must reach the requested LSN.
+Only after the WAL replacement succeeds are data, key versions, and commit
+results installed together. Failed replacement leaves live state untouched
+and blocks writes until recovery; missing history fails instead of producing
+an earlier snapshot under the requested LSN.
 Replication drains share the same state lock, so they cannot apply midway
 through rollback. Configuration-only failover preserves the accepted suffix
 as described above, rather than treating a lagging commit watermark as a

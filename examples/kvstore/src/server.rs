@@ -18,7 +18,7 @@ pub struct KvServer {
     pub replicator: StateReplicatorHandle,
     pub token: CancellationToken,
     transactions: Arc<Mutex<Transactions>>,
-    commit_gate: Arc<Mutex<Option<u64>>>,
+    commit_gate: Arc<Mutex<bool>>,
 }
 
 enum Write {
@@ -41,7 +41,7 @@ impl KvServer {
             replicator,
             token,
             transactions: Arc::new(Mutex::new(Transactions::default())),
-            commit_gate: Arc::new(Mutex::new(None)),
+            commit_gate: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -60,12 +60,12 @@ impl KvServer {
     }
 
     async fn commit(&self, write: Write) -> Result<(i64, bool), Status> {
-        let mut failed_generation = self.commit_gate.lock().await;
+        let mut requires_recovery = self.commit_gate.lock().await;
         self.check_write_access()?;
         let mut transactions = self.transactions.lock().await;
         let state = self.state.read().await;
         let generation = state.generation;
-        if *failed_generation == Some(generation) {
+        if *requires_recovery {
             return Err(Status::unavailable(
                 "an uncertain write requires replica recovery",
             ));
@@ -139,7 +139,7 @@ impl KvServer {
         {
             Ok(lsn) => lsn,
             Err(error) => {
-                *failed_generation = Some(generation);
+                *requires_recovery = true;
                 self.partition
                     .report_fault(kuberic_core::types::FaultType::Transient);
                 return Err(Status::unavailable(error.to_string()));
@@ -147,12 +147,15 @@ impl KvServer {
         };
         let mut state = self.state.write().await;
         if state.generation != generation {
+            *requires_recovery = true;
+            self.partition
+                .report_fault(kuberic_core::types::FaultType::Transient);
             return Err(Status::unavailable(
                 "primary epoch changed during commit; retry the ID on the primary",
             ));
         }
         if let Err(error) = state.apply_op(lsn, &operation).await {
-            *failed_generation = Some(generation);
+            *requires_recovery = true;
             self.partition
                 .report_fault(kuberic_core::types::FaultType::Transient);
             return Err(Status::unavailable(format!(
@@ -369,6 +372,80 @@ mod tests {
     use crate::state::KvState;
     use kuberic_core::handles::PartitionState;
     use tokio::sync::{RwLock, mpsc};
+
+    #[tokio::test]
+    async fn uncertain_commit_remains_fenced_across_epoch_changes() {
+        for quorum_succeeded in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("kv-uncertain-{:032x}", rand::random::<u128>()));
+            let state = Arc::new(RwLock::new(KvState::open(directory.clone()).await.unwrap()));
+            let partition_state = Arc::new(PartitionState::new());
+            partition_state.set_write_status(AccessStatus::Granted);
+            let (fault_tx, mut faults) = mpsc::channel(1);
+            let partition = Arc::new(PartitionHandle::new(partition_state.clone(), fault_tx));
+            let (request_tx, mut requests) = mpsc::channel(1);
+            let server = KvServer::new(
+                state.clone(),
+                partition,
+                StateReplicatorHandle::new(request_tx, partition_state),
+                CancellationToken::new(),
+            );
+            let transaction_id = server
+                .begin_transaction(Request::new(proto::BeginTransactionRequest::default()))
+                .await
+                .unwrap()
+                .into_inner()
+                .transaction_id;
+            server
+                .transaction_put(Request::new(proto::TransactionPutRequest {
+                    transaction_id: transaction_id.clone(),
+                    key: "pending".into(),
+                    value: "value".into(),
+                }))
+                .await
+                .unwrap();
+            let committing = server.clone();
+            let commit = tokio::spawn(async move {
+                committing
+                    .commit_transaction(Request::new(proto::TransactionRequest { transaction_id }))
+                    .await
+            });
+            let operation = requests.recv().await.unwrap();
+            if quorum_succeeded {
+                state.write().await.generation += 1;
+                operation.reply.send(Ok(1)).unwrap();
+            } else {
+                operation
+                    .reply
+                    .send(Err(kuberic_core::KubericError::NoWriteQuorum))
+                    .unwrap();
+            }
+            assert_eq!(
+                commit.await.unwrap().unwrap_err().code(),
+                tonic::Code::Unavailable
+            );
+            assert_eq!(
+                faults.try_recv().unwrap(),
+                kuberic_core::types::FaultType::Transient
+            );
+            state.write().await.generation += 1;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                server.put(Request::new(proto::PutRequest {
+                    key: "later".into(),
+                    value: "must-not-pass".into(),
+                })),
+            )
+            .await
+            .expect("fenced write must not reach replication");
+            assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+            assert!(requests.try_recv().is_err());
+            assert!(state.read().await.data.is_empty());
+            drop(server);
+            drop(state);
+            tokio::fs::remove_dir_all(directory).await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_commit_finishes_once_and_serializes_ordinary_writes() {

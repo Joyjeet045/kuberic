@@ -21,6 +21,23 @@ pub enum DataLossBehavior {
     },
 }
 
+async fn complete_copy(
+    handles: &mut Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    failure: &mut Option<String>,
+) -> kuberic_core::Result<()> {
+    for handle in handles.drain(..) {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => *failure = Some(error.to_string()),
+            Err(error) => *failure = Some(error.to_string()),
+        }
+    }
+    match failure {
+        Some(error) => Err(kuberic_core::KubericError::Internal(error.clone().into())),
+        None => Ok(()),
+    }
+}
+
 /// Handle a single state provider event.
 ///
 /// This is the KV service's "state provider" — the replicator calls these
@@ -218,6 +235,7 @@ pub async fn run_service_with_options_and_data_loss(
     let mut replication_stream: Option<OperationStream> = None;
     let mut token: Option<CancellationToken> = None;
     let mut bg_handles: Vec<tokio::task::JoinHandle<std::io::Result<()>>> = Vec::new();
+    let mut copy_failure: Option<String> = None;
     let mut bg_token: Option<CancellationToken> = None;
     let mut client_server_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut client_server_shutdown: Option<CancellationToken> = None;
@@ -259,22 +277,22 @@ pub async fn run_service_with_options_and_data_loss(
                 }
                 LifecycleEvent::ChangeRole { new_role, reply } => {
                     info!(?new_role, "role changed");
-                    if new_role != last_role {
-                        state.write().await.generation += 1;
+                    if new_role == last_role {
+                        let _ = reply.send(Ok(String::new()));
+                        continue;
                     }
+                    if matches!(new_role, Role::ActiveSecondary | Role::Primary)
+                        && let Some(error) = &copy_failure
+                    {
+                        let _ = reply.send(Err(kuberic_core::KubericError::Internal(error.clone().into())));
+                        continue;
+                    }
+                    state.write().await.generation += 1;
 
-                    if new_role == Role::ActiveSecondary {
+                    if new_role == Role::ActiveSecondary && last_role == Role::IdleSecondary {
                         // IdleSecondary → ActiveSecondary: let copy drain finish
-                        let mut copy_error = None;
-                        for h in bg_handles.drain(..) {
-                            match h.await {
-                                Ok(Ok(())) => {}
-                                Ok(Err(error)) => copy_error = Some(error.to_string()),
-                                Err(error) => copy_error = Some(error.to_string()),
-                            }
-                        }
-                        if let Some(error) = copy_error {
-                            let _ = reply.send(Err(kuberic_core::KubericError::Internal(error.into())));
+                        if let Err(error) = complete_copy(&mut bg_handles, &mut copy_failure).await {
+                            let _ = reply.send(Err(error));
                             continue;
                         }
                         // Checkpoint after copy completes
@@ -404,4 +422,34 @@ pub async fn run_service_with_options_and_data_loss(
         }
     }
     info!("kv service exited");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_copy_cannot_succeed_when_completion_is_retried() {
+        let directory =
+            std::env::temp_dir().join(format!("kv-copy-failure-{:032x}", rand::random::<u128>()));
+        let state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::KvState::open(directory.clone())
+                .await
+                .unwrap(),
+        ));
+        let (sender, stream) = OperationStream::channel(1);
+        drop(sender);
+        let mut handles = vec![tokio::spawn(drain_copy_stream(
+            state.clone(),
+            stream,
+            CancellationToken::new(),
+        ))];
+        let mut failure = None;
+        assert!(complete_copy(&mut handles, &mut failure).await.is_err());
+        assert!(handles.is_empty());
+        assert!(complete_copy(&mut handles, &mut failure).await.is_err());
+        assert_eq!(state.read().await.last_applied_lsn, 0);
+        drop(state);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
 }

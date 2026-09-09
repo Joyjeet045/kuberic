@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use kuberic_core::types::{CancellationToken, Lsn, OperationStream};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -211,6 +211,11 @@ impl KvState {
         }
         let mut recovered = Self::from_snapshot(snapshot, self.data_dir.clone()).await?;
         persistence::replay_wal_up_to(&mut recovered, &self.data_dir, lsn).await?;
+        if recovered.last_applied_lsn != lsn {
+            return Err(std::io::Error::other(
+                "copy LSN is missing from retained history",
+            ));
+        }
         Ok(recovered.snapshot())
     }
 
@@ -246,33 +251,12 @@ impl KvState {
     }
 
     /// Rollback state to target_lsn by reloading snapshot + partial WAL replay.
-    /// Call AFTER cancelling drain tasks to avoid races.
+    /// The caller holds the shared state write lock throughout recovery.
     pub async fn rollback_to(&mut self, target_lsn: Lsn) -> std::io::Result<()> {
-        let dir = self.data_dir.clone();
-
-        // Reload from snapshot (always at committed_lsn)
-        let snapshot = persistence::load_snapshot(&dir).await?;
-        if snapshot.last_applied_lsn > target_lsn {
-            return Err(std::io::Error::other("rollback precedes checkpoint"));
-        }
+        let snapshot = self.snapshot_at(target_lsn).await?;
+        self.wal_failed = true;
+        self.wal_writer = persistence::rewrite_wal_up_to(&self.data_dir, target_lsn).await?;
         self.install_snapshot(&snapshot);
-
-        // Replay WAL only up to target_lsn
-        let wal_path = dir.join("wal.log");
-        if let Ok(file) = tokio::fs::File::open(&wal_path).await {
-            let mut lines = tokio::io::BufReader::new(file).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(entry) = serde_json::from_str::<persistence::WalEntry>(&line) else {
-                    break;
-                };
-                if entry.lsn > self.last_applied_lsn && entry.lsn <= target_lsn {
-                    self.apply_op_in_memory(entry.lsn, &entry.op);
-                }
-            }
-        }
-
-        // Rewrite WAL with only entries up to target_lsn
-        self.wal_writer = persistence::rewrite_wal_up_to(&dir, target_lsn).await?;
         self.committed_lsn = self.committed_lsn.min(self.last_applied_lsn);
         self.wal_failed = false;
 
@@ -379,6 +363,83 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn missing_wal_history_cannot_be_published_as_a_rollback_snapshot() {
+        let directory = std::env::temp_dir().join(format!(
+            "kv-missing-history-{:032x}",
+            rand::random::<u128>()
+        ));
+        let mut state = KvState::open(directory.clone()).await.unwrap();
+        for lsn in 1..=2 {
+            state
+                .apply_op(
+                    lsn,
+                    &KvOp::Transaction {
+                        transaction_id: format!("transaction-{lsn}"),
+                        mutations: vec![KvMutation::Put {
+                            key: "value".into(),
+                            value: lsn.to_string(),
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(directory.join("wal.log"), b"")
+            .await
+            .unwrap();
+        assert!(state.snapshot_at(1).await.is_err());
+        assert!(state.rollback_to(1).await.is_err());
+        assert_eq!(state.last_applied_lsn, 2);
+        assert_eq!(state.data["value"], "2");
+        assert_eq!(state.transaction_lsn("transaction-2"), Some(2));
+        drop(state);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_rollback_preserves_live_transaction_and_retry_result() {
+        let directory = std::env::temp_dir().join(format!(
+            "kv-rollback-failure-{:032x}",
+            rand::random::<u128>()
+        ));
+        let mut state = KvState::open(directory.clone()).await.unwrap();
+        let operation = KvOp::Transaction {
+            transaction_id: "retained".into(),
+            mutations: vec![
+                KvMutation::Put {
+                    key: "left".into(),
+                    value: "committed".into(),
+                },
+                KvMutation::Put {
+                    key: "right".into(),
+                    value: "committed".into(),
+                },
+            ],
+        };
+        state.apply_op(1, &operation).await.unwrap();
+        tokio::fs::create_dir(directory.join("wal.log.tmp"))
+            .await
+            .unwrap();
+        assert!(state.rollback_to(0).await.is_err());
+        assert_eq!(state.last_applied_lsn, 1);
+        assert_eq!(state.data["left"], "committed");
+        assert_eq!(state.data["right"], "committed");
+        assert_eq!(state.transaction_lsn("retained"), Some(1));
+        tokio::fs::remove_dir(directory.join("wal.log.tmp"))
+            .await
+            .unwrap();
+        state.rollback_to(0).await.unwrap();
+        assert!(state.data.is_empty());
+        assert_eq!(state.transaction_lsn("retained"), None);
+        drop(state);
+        let recovered = KvState::open(directory.clone()).await.unwrap();
+        assert!(recovered.data.is_empty());
+        assert_eq!(recovered.transaction_lsn("retained"), None);
+        drop(recovered);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn transaction_wal_failure_and_recovery_are_atomic() {
         let dir = std::env::temp_dir().join(format!(
             "kvstore-transaction-wal-{}-{}",
@@ -450,15 +511,16 @@ mod tests {
                     KvMutation::Delete { key: "old".into() },
                     KvMutation::Put {
                         key: "new".into(),
-                        value: "hidden".into(),
+                        value: "hidden\u{1f600}".into(),
                     },
                 ],
             },
         };
         let encoded = serde_json::to_vec(&entry).unwrap();
+        let torn_utf8 = encoded.iter().position(|byte| !byte.is_ascii()).unwrap() + 1;
         state
             .wal_writer
-            .write_all(&encoded[..encoded.len() - 3])
+            .write_all(&encoded[..torn_utf8])
             .await
             .unwrap();
         state.wal_writer.flush().await.unwrap();
@@ -496,7 +558,7 @@ mod tests {
         let recovered = KvState::open(directory.clone()).await.unwrap();
         assert_eq!(recovered.last_applied_lsn, 2);
         assert_eq!(recovered.data.len(), 1);
-        assert_eq!(recovered.data["new"], "hidden");
+        assert_eq!(recovered.data["new"], "hidden\u{1f600}");
         drop(recovered);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
