@@ -77,13 +77,15 @@ pub use store::{
     CasOutcome, CheckpointStore, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
 };
 pub use typed::{
-    ActivityCallError, ActivityInvocationError, DurableActivity, IdentityActivityResolver,
+    ACTIVITY_VERSION, ActivityCallError, ActivityInvocationError, DurableActivity,
+    IdentityActivityResolver, MAX_ACTIVITY_INPUT_BYTES, MAX_ACTIVITY_RESULT_BYTES,
     PreparedActivityError, PreparedActivityResolver, decode_activity_input, decode_activity_result,
     encode_activity_input, encode_activity_result,
 };
-pub use workflow::{
-    Orchestration, OrchestrationContext, TerminalOutcome, WorkflowCodecError,
-    decode_orchestration_result, decode_workflow_result, encode_workflow_input,
-};
 #[doc(hidden)]
-pub use workflow::{Workflow, WorkflowContext};
+pub use workflow::{Orchestration, Workflow, WorkflowContext, decode_orchestration_result};
+pub use workflow::{
+    OrchestrationContext, OrchestrationFuture, OrchestrationRegistry, OrchestrationRegistryBuilder,
+    OrchestrationRegistryError, TerminalOutcome, WorkflowCodecError, decode_workflow_result,
+    encode_workflow_input,
+};

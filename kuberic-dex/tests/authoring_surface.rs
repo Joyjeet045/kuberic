@@ -1,85 +1,48 @@
 mod support;
 
-use async_trait::async_trait;
 use futures::executor::block_on;
 use kuberic_dex::{
-    CheckpointLimits, DurableActivity, DurableHost, Evaluation, ExecutionId, ExecutionSpec,
-    HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome, InMemoryCheckpointStore, Orchestration,
-    OrchestrationContext, WorkflowCodecError, decode_orchestration_result, evaluate,
+    CheckpointLimits, DurableHost, Evaluation, ExecutionId, ExecutionSpec, HOST_OUTCOME_VARIANTS,
+    HostEpoch, HostOutcome, InMemoryCheckpointStore, OrchestrationContext, OrchestrationRegistry,
+    OrchestrationRegistryError, WorkflowCodecError, decode_workflow_result, evaluate,
 };
 use serde::{Deserialize, Serialize};
 use support::scenarios::{ScenarioId, run_conformance_matrix};
-
-struct OrdinaryAsyncOrchestration;
-
-struct ImmediateSuccess;
-struct ImmediateFailure;
 
 #[derive(Deserialize, Serialize)]
 struct GreetingInput {
     message: String,
 }
 
-struct OrdinaryAsyncActivity;
-
-impl DurableActivity for OrdinaryAsyncActivity {
-    type Input = GreetingInput;
-    type Output = Vec<u8>;
-
-    const NAME: &'static str = "ordinary-async";
-    const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 1024;
-    const MAX_RESULT_BYTES: u64 = 1024;
-}
-
-#[async_trait]
-impl Orchestration for OrdinaryAsyncOrchestration {
-    type Input = GreetingInput;
-    type Output = Vec<u8>;
-    type Error = kuberic_dex::ActivityInvocationError;
-
-    async fn run(
-        &self,
-        context: &mut OrchestrationContext<'_>,
-        input: GreetingInput,
-    ) -> Result<Vec<u8>, kuberic_dex::ActivityInvocationError> {
-        // FR012_WORKFLOW_START
-        let result = context
-            .schedule_activity::<OrdinaryAsyncActivity>(&input)
-            .await?;
-        Ok(result)
-        // FR012_WORKFLOW_END
-    }
-}
-
-#[async_trait]
-impl Orchestration for ImmediateSuccess {
-    type Input = GreetingInput;
-    type Output = String;
-    type Error = String;
-
-    async fn run(
-        &self,
-        _context: &mut OrchestrationContext<'_>,
-        input: GreetingInput,
-    ) -> Result<String, String> {
-        Ok(input.message)
-    }
-}
-
-#[async_trait]
-impl Orchestration for ImmediateFailure {
-    type Input = GreetingInput;
-    type Output = String;
-    type Error = String;
-
-    async fn run(
-        &self,
-        _context: &mut OrchestrationContext<'_>,
-        input: GreetingInput,
-    ) -> Result<String, String> {
-        Err(format!("cannot greet {}", input.message))
-    }
+fn orchestrations() -> OrchestrationRegistry {
+    OrchestrationRegistry::builder()
+        .register_typed::<GreetingInput, Vec<u8>, kuberic_dex::ActivityInvocationError, _>(
+            "OrdinaryAsync",
+            |context: &mut OrchestrationContext<'_>, input| {
+                Box::pin(async move {
+                    // FR012_WORKFLOW_START
+                    let result = context
+                        .schedule_activity_typed::<GreetingInput, Vec<u8>>("ordinary-async", &input)
+                        .await?;
+                    Ok(result)
+                    // FR012_WORKFLOW_END
+                })
+            },
+        )
+        .register_typed::<GreetingInput, String, String, _>(
+            "ImmediateSuccess",
+            |_context: &mut OrchestrationContext<'_>, input| {
+                Box::pin(async move { Ok(input.message) })
+            },
+        )
+        .register_typed::<GreetingInput, String, String, _>(
+            "ImmediateFailure",
+            |_context: &mut OrchestrationContext<'_>, input| {
+                Box::pin(async move { Err(format!("cannot greet {}", input.message)) })
+            },
+        )
+        .build()
+        .unwrap()
 }
 
 #[test]
@@ -92,7 +55,7 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
         .split_once("// FR012_WORKFLOW_END")
         .unwrap()
         .0;
-    let framework_operation_count = body.matches(".schedule_activity::<").count();
+    let framework_operation_count = body.matches(".schedule_activity_typed::<").count();
     let authored_poll = body.contains(concat!("fn po", "ll("))
         || body.contains(concat!("impl Future", " for"))
         || body.contains(concat!("state_", "machine"));
@@ -108,6 +71,8 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
     .any(|symbol| body.contains(symbol));
 
     let store = InMemoryCheckpointStore::new();
+    let orchestrations = orchestrations();
+    let workflow = orchestrations.get("OrdinaryAsync").unwrap();
     let mut host = DurableHost::new(
         store,
         HostEpoch::from_bytes([1; 16]),
@@ -115,8 +80,8 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
     );
     let first_turn = block_on(
         host.turn(
-            &OrdinaryAsyncOrchestration,
-            ExecutionSpec::for_orchestration::<OrdinaryAsyncOrchestration>(
+            workflow,
+            ExecutionSpec::typed(
                 ExecutionId::from_bytes([1; 16]),
                 &GreetingInput {
                     message: "hello".to_owned(),
@@ -136,9 +101,10 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
     }
 
     let library_exports = include_str!("../src/lib.rs");
-    let async_surface_exported = library_exports.contains("Orchestration, OrchestrationContext");
-    let low_level_surface_hidden =
-        library_exports.contains("#[doc(hidden)]\npub use workflow::{Workflow, WorkflowContext};");
+    let async_surface_exported =
+        library_exports.contains("OrchestrationContext, OrchestrationFuture");
+    let low_level_surface_hidden = library_exports
+        .contains("#[doc(hidden)]\npub use workflow::{Orchestration, Workflow, WorkflowContext");
 
     let predicates = [
         (
@@ -165,7 +131,7 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
         ),
     ];
 
-    println!("selected surface: typed async Orchestration::run");
+    println!("selected surface: typed async orchestration registry");
     println!("workflow-body framework operations: {framework_operation_count}");
     let outcome_count = HOST_OUTCOME_VARIANTS.len();
     println!("public HostOutcome variants: {outcome_count}");
@@ -179,6 +145,9 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
 #[test]
 fn typed_orchestration_boundary_round_trips_results_and_reports_bad_input() {
     let limits = CheckpointLimits::new(16, 100_000, 100_000).unwrap();
+    let orchestrations = orchestrations();
+    let immediate_success = orchestrations.get("ImmediateSuccess").unwrap();
+    let immediate_failure = orchestrations.get("ImmediateFailure").unwrap();
     let execution = ExecutionSpec::typed(
         ExecutionId::from_bytes([2; 16]),
         &GreetingInput {
@@ -188,12 +157,12 @@ fn typed_orchestration_boundary_round_trips_results_and_reports_bad_input() {
     )
     .unwrap();
     let Evaluation::Complete { outcome, .. } =
-        evaluate(&ImmediateSuccess, &execution, None, limits)
+        evaluate(immediate_success, &execution, None, limits)
     else {
         panic!("typed orchestration did not complete");
     };
     assert_eq!(
-        decode_orchestration_result::<ImmediateSuccess>(&outcome).unwrap(),
+        decode_workflow_result::<String, String>(&outcome).unwrap(),
         Ok("hello".to_owned())
     );
 
@@ -202,12 +171,12 @@ fn typed_orchestration_boundary_round_trips_results_and_reports_bad_input() {
         b"not-json".to_vec().into(),
         1024,
     );
-    let Evaluation::Complete { outcome, .. } = evaluate(&ImmediateSuccess, &invalid, None, limits)
+    let Evaluation::Complete { outcome, .. } = evaluate(immediate_success, &invalid, None, limits)
     else {
         panic!("invalid typed input did not become a terminal failure");
     };
     assert_eq!(
-        decode_orchestration_result::<ImmediateSuccess>(&outcome),
+        decode_workflow_result::<String, String>(&outcome),
         Err(WorkflowCodecError::InputDecoding)
     );
 
@@ -220,12 +189,50 @@ fn typed_orchestration_boundary_round_trips_results_and_reports_bad_input() {
     )
     .unwrap();
     let Evaluation::Complete { outcome, .. } =
-        evaluate(&ImmediateFailure, &execution, None, limits)
+        evaluate(immediate_failure, &execution, None, limits)
     else {
         panic!("typed orchestration failure did not complete");
     };
     assert_eq!(
-        decode_orchestration_result::<ImmediateFailure>(&outcome).unwrap(),
+        decode_workflow_result::<String, String>(&outcome).unwrap(),
         Err("cannot greet Ada".to_owned())
     );
+}
+
+#[test]
+fn orchestration_registry_rejects_invalid_names_and_duplicates() {
+    let empty = OrchestrationRegistry::builder()
+        .register_typed::<GreetingInput, String, String, _>(
+            "",
+            |_context: &mut OrchestrationContext<'_>, input| {
+                Box::pin(async move { Ok(input.message) })
+            },
+        )
+        .build();
+    assert!(matches!(empty, Err(OrchestrationRegistryError::EmptyName)));
+
+    let duplicate = OrchestrationRegistry::builder()
+        .register_typed::<GreetingInput, String, String, _>(
+            "Greeting",
+            |_context: &mut OrchestrationContext<'_>, input| {
+                Box::pin(async move { Ok(input.message) })
+            },
+        )
+        .register_typed::<GreetingInput, String, String, _>(
+            "Greeting",
+            |_context: &mut OrchestrationContext<'_>, input| {
+                Box::pin(async move { Ok(input.message) })
+            },
+        )
+        .build();
+    assert!(matches!(
+        duplicate,
+        Err(OrchestrationRegistryError::DuplicateRegistration(name)) if name == "Greeting"
+    ));
+
+    let registry = OrchestrationRegistry::builder().build().unwrap();
+    assert!(matches!(
+        registry.get("Missing"),
+        Err(OrchestrationRegistryError::Unregistered(name)) if name == "Missing"
+    ));
 }

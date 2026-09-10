@@ -114,6 +114,7 @@ impl ExecutionSpec {
     }
 
     /// Construct an execution using an orchestration's declared input type.
+    #[doc(hidden)]
     pub fn for_orchestration<O: crate::Orchestration>(
         execution_id: ExecutionId,
         workflow_input: &O::Input,

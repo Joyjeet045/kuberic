@@ -334,7 +334,7 @@ impl<S: CheckpointStore> DurableHost<S> {
     }
 
     /// Evaluate and, when needed, commit exactly one schedule or exposure turn.
-    pub async fn turn<W: Workflow>(
+    pub async fn turn<W: Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: ExecutionSpec,
@@ -498,7 +498,7 @@ impl<S: CheckpointStore> DurableHost<S> {
     /// intermediate accepted schedule checkpoint. The exact command and its
     /// result reservation are part of the single exposed checkpoint, and a
     /// permit is created only after that CAS is accepted.
-    pub async fn turn_and_expose<W: Workflow>(
+    pub async fn turn_and_expose<W: Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: ExecutionSpec,
@@ -510,7 +510,7 @@ impl<S: CheckpointStore> DurableHost<S> {
     /// Evaluate an ordinary activity while enforcing persisted retry
     /// not-before and action-deadline wakeups against a caller-supplied
     /// deterministic clock.
-    pub async fn turn_and_expose_at<W: Workflow>(
+    pub async fn turn_and_expose_at<W: Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: ExecutionSpec,
@@ -527,7 +527,7 @@ impl<S: CheckpointStore> DurableHost<S> {
 
     /// Evaluate and atomically expose an activity resolved to an exact prepared
     /// specification.
-    pub async fn turn_and_expose_with<W: Workflow>(
+    pub async fn turn_and_expose_with<W: Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: ExecutionSpec,
@@ -544,7 +544,7 @@ impl<S: CheckpointStore> DurableHost<S> {
 
     /// Evaluate and atomically expose a typed effect whose exact command is
     /// prepared separately from its logical request.
-    pub async fn turn_and_expose_effects<W: Workflow>(
+    pub async fn turn_and_expose_effects<W: Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: ExecutionSpec,
@@ -559,7 +559,7 @@ impl<S: CheckpointStore> DurableHost<S> {
         .await
     }
 
-    async fn turn_and_expose_resolved<W: Workflow>(
+    async fn turn_and_expose_resolved<W: Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: ExecutionSpec,
@@ -1210,7 +1210,7 @@ impl<S: CheckpointStore> DurableHost<S> {
     /// No intermediate completed checkpoint is accepted. A next-effect permit
     /// is returned only when the CAS containing both the completed result and
     /// exact next exposed command is accepted.
-    pub async fn observe_and_turn<W: Workflow>(
+    pub async fn observe_and_turn<W: Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: &ExecutionSpec,
@@ -1227,7 +1227,7 @@ impl<S: CheckpointStore> DurableHost<S> {
 
     /// Persist an observation and resolve the next activity to an exact
     /// prepared specification in the same accepted checkpoint.
-    pub async fn observe_and_turn_with<W: Workflow>(
+    pub async fn observe_and_turn_with<W: Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: &ExecutionSpec,
@@ -1631,7 +1631,7 @@ mod tests {
             _input: ExactBytes,
         ) -> TerminalOutcome {
             match context
-                .schedule_activity_typed::<EffectActivity<OneEffect>>(
+                .schedule_activity_contract_with_options::<EffectActivity<OneEffect>>(
                     OneEffect::NAME,
                     &UnitRequest,
                     ActivityOptions::default(),

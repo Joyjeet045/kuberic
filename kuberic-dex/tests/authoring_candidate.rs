@@ -1,26 +1,18 @@
 use async_trait::async_trait;
 use kuberic_dex::{
-    CheckpointLimits, DurableActivity, Evaluation, ExactBytes, ExecutionId, ExecutionSpec,
-    TerminalOutcome, Workflow, WorkflowContext, evaluate,
+    CheckpointLimits, Evaluation, ExactBytes, ExecutionId, ExecutionSpec, TerminalOutcome,
+    Workflow, WorkflowContext, evaluate,
 };
 
 struct OneActivityWorkflow;
-struct OneActivity;
-
-impl DurableActivity for OneActivity {
-    type Input = Vec<u8>;
-    type Output = Vec<u8>;
-
-    const NAME: &'static str = "one-activity";
-    const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 1024;
-    const MAX_RESULT_BYTES: u64 = 1024;
-}
 
 #[async_trait]
 impl Workflow for OneActivityWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
-        match context.call::<OneActivity>(input.into_vec()).await {
+        match context
+            .schedule_activity_typed::<Vec<u8>, Vec<u8>>("one-activity", &input.into_vec())
+            .await
+        {
             Ok(result) => TerminalOutcome::succeeded(result),
             Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
         }

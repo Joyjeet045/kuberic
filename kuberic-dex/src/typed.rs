@@ -3,6 +3,13 @@ use thiserror::Error;
 
 use crate::{ActivityName, ActivityOptions, ActivitySpec, ExactBytes};
 
+/// Version assigned to ordinary activities.
+pub const ACTIVITY_VERSION: u32 = 1;
+/// Maximum encoded input size for an ordinary activity.
+pub const MAX_ACTIVITY_INPUT_BYTES: u64 = 8 * 1024;
+/// Maximum encoded result size for an ordinary activity.
+pub const MAX_ACTIVITY_RESULT_BYTES: u64 = 8 * 1024;
+
 /// Deterministic failure while resolving a logical activity into the exact
 /// specification that may be exposed.
 #[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
@@ -63,12 +70,11 @@ impl PreparedActivityResolver for IdentityActivityResolver {
 
 pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = IdentityActivityResolver;
 
-/// A versioned, bounded durable activity contract.
+/// A typed durable activity contract.
 ///
 /// Orchestration bodies invoke an activity with
 /// [`crate::OrchestrationContext::schedule_activity`].
-/// The activity type owns its immutable replay identity and encoded payload
-/// limits.
+/// DEX supplies the activity version and encoded payload limits.
 ///
 /// Domain rejection and failure belong in `Output`; they are durable activity
 /// results rather than a second kernel failure lifecycle.
@@ -85,9 +91,6 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 ///     type Input = NotSerializable;
 ///     type Output = ();
 ///     const NAME: &'static str = "invalid";
-///     const VERSION: u32 = 1;
-///     const MAX_INPUT_BYTES: u64 = 16;
-///     const MAX_RESULT_BYTES: u64 = 16;
 /// }
 /// ```
 ///
@@ -104,9 +107,6 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 ///     type Input = Input;
 ///     type Output = NotSerializable;
 ///     const NAME: &'static str = "invalid-output";
-///     const VERSION: u32 = 1;
-///     const MAX_INPUT_BYTES: u64 = 16;
-///     const MAX_RESULT_BYTES: u64 = 16;
 /// }
 /// ```
 ///
@@ -122,23 +122,33 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 ///     type Input = ExpectedInput;
 ///     type Output = ();
 ///     const NAME: &'static str = "typed-input";
-///     const VERSION: u32 = 1;
-///     const MAX_INPUT_BYTES: u64 = 16;
-///     const MAX_RESULT_BYTES: u64 = 16;
 /// }
 ///
 /// async fn invalid_call(context: &mut OrchestrationContext<'_>) {
 ///     context.schedule_activity::<Activity>(&"wrong input").await;
 /// }
 /// ```
+#[doc(hidden)]
 pub trait DurableActivity {
     type Input: Serialize + DeserializeOwned;
     type Output: Serialize + DeserializeOwned;
 
     const NAME: &'static str;
-    const VERSION: u32;
-    const MAX_INPUT_BYTES: u64;
-    const MAX_RESULT_BYTES: u64;
+
+    #[doc(hidden)]
+    fn version() -> u32 {
+        ACTIVITY_VERSION
+    }
+
+    #[doc(hidden)]
+    fn max_input_bytes() -> u64 {
+        MAX_ACTIVITY_INPUT_BYTES
+    }
+
+    #[doc(hidden)]
+    fn max_result_bytes() -> u64 {
+        MAX_ACTIVITY_RESULT_BYTES
+    }
 
     #[doc(hidden)]
     fn completion_class() -> Option<crate::CompletionClass> {
@@ -200,42 +210,83 @@ pub enum ActivityInvocationError {
 pub fn encode_activity_input<A: DurableActivity>(
     input: &A::Input,
 ) -> Result<ExactBytes, ActivityCallError> {
-    let encoded = canonical_json(input).map_err(|_| ActivityCallError::InputEncoding)?;
-    enforce_bound(encoded.len(), A::MAX_INPUT_BYTES, PayloadKind::Input)?;
-    Ok(ExactBytes::new(encoded))
+    encode_typed_input(input, A::max_input_bytes())
 }
 
 /// Decode a typed activity input received by an activity adapter.
 pub fn decode_activity_input<A: DurableActivity>(
     input: &ExactBytes,
 ) -> Result<A::Input, ActivityCallError> {
-    enforce_bound(
-        input.as_slice().len(),
-        A::MAX_INPUT_BYTES,
-        PayloadKind::Input,
-    )?;
-    serde_json::from_slice(input.as_slice()).map_err(|_| ActivityCallError::InputDecoding)
+    decode_typed_input(input, A::max_input_bytes())
 }
 
 /// Encode and bound a typed activity result for durable observation.
 pub fn encode_activity_result<A: DurableActivity>(
     result: &A::Output,
 ) -> Result<ExactBytes, ActivityCallError> {
-    let encoded = canonical_json(result).map_err(|_| ActivityCallError::ResultEncoding)?;
-    enforce_bound(encoded.len(), A::MAX_RESULT_BYTES, PayloadKind::Result)?;
-    Ok(ExactBytes::new(encoded))
+    encode_typed_result(result, A::max_result_bytes())
 }
 
 /// Decode a bounded typed activity result during workflow replay.
 pub fn decode_activity_result<A: DurableActivity>(
     result: &ExactBytes,
 ) -> Result<A::Output, ActivityCallError> {
-    enforce_bound(
-        result.as_slice().len(),
-        A::MAX_RESULT_BYTES,
-        PayloadKind::Result,
-    )?;
+    decode_typed_result(result, A::max_result_bytes())
+}
+
+pub(crate) fn encode_typed_input<T: Serialize>(
+    input: &T,
+    max_bytes: u64,
+) -> Result<ExactBytes, ActivityCallError> {
+    let encoded = canonical_json(input).map_err(|_| ActivityCallError::InputEncoding)?;
+    enforce_bound(encoded.len(), max_bytes, PayloadKind::Input)?;
+    Ok(ExactBytes::new(encoded))
+}
+
+pub(crate) fn decode_typed_input<T: DeserializeOwned>(
+    input: &ExactBytes,
+    max_bytes: u64,
+) -> Result<T, ActivityCallError> {
+    enforce_bound(input.as_slice().len(), max_bytes, PayloadKind::Input)?;
+    serde_json::from_slice(input.as_slice()).map_err(|_| ActivityCallError::InputDecoding)
+}
+
+pub(crate) fn encode_typed_result<T: Serialize>(
+    result: &T,
+    max_bytes: u64,
+) -> Result<ExactBytes, ActivityCallError> {
+    let encoded = canonical_json(result).map_err(|_| ActivityCallError::ResultEncoding)?;
+    enforce_bound(encoded.len(), max_bytes, PayloadKind::Result)?;
+    Ok(ExactBytes::new(encoded))
+}
+
+pub(crate) fn decode_typed_result<T: DeserializeOwned>(
+    result: &ExactBytes,
+    max_bytes: u64,
+) -> Result<T, ActivityCallError> {
+    enforce_bound(result.as_slice().len(), max_bytes, PayloadKind::Result)?;
     serde_json::from_slice(result.as_slice()).map_err(|_| ActivityCallError::ResultDecoding)
+}
+
+pub(crate) fn typed_activity_spec<T: Serialize>(
+    name: &str,
+    input: &T,
+    options: ActivityOptions,
+) -> Result<ActivitySpec, ActivityCallError> {
+    let name = ActivityName::new(name, ACTIVITY_VERSION).map_err(|error| match error {
+        crate::IdentityError::EmptyActivityName => ActivityCallError::EmptyName,
+        crate::IdentityError::ZeroActivityVersion => ActivityCallError::ZeroVersion,
+        crate::IdentityError::ZeroActivityAttempts | crate::IdentityError::ZeroAttemptCounter => {
+            unreachable!("activity identity construction does not create an attempt")
+        }
+    })?;
+    Ok(ActivitySpec::with_bounds_and_options(
+        name,
+        encode_typed_input(input, MAX_ACTIVITY_INPUT_BYTES)?,
+        MAX_ACTIVITY_INPUT_BYTES,
+        MAX_ACTIVITY_RESULT_BYTES,
+        options,
+    ))
 }
 
 pub(crate) fn activity_spec<A: DurableActivity>(
@@ -256,7 +307,7 @@ pub(crate) fn activity_spec_named<A: DurableActivity>(
         });
     }
 
-    let name = ActivityName::new(name, A::VERSION).map_err(|error| match error {
+    let name = ActivityName::new(name, A::version()).map_err(|error| match error {
         crate::IdentityError::EmptyActivityName => ActivityCallError::EmptyName,
         crate::IdentityError::ZeroActivityVersion => ActivityCallError::ZeroVersion,
         crate::IdentityError::ZeroActivityAttempts | crate::IdentityError::ZeroAttemptCounter => {
@@ -266,8 +317,8 @@ pub(crate) fn activity_spec_named<A: DurableActivity>(
     Ok(ActivitySpec::with_bounds_and_options(
         name,
         encode_activity_input::<A>(input)?,
-        A::MAX_INPUT_BYTES,
-        A::MAX_RESULT_BYTES,
+        A::max_input_bytes(),
+        A::max_result_bytes(),
         options,
     ))
 }

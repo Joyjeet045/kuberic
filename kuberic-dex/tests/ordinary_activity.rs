@@ -13,11 +13,11 @@ use kuberic_dex::{
     ActivityInvocationRuntime, ActivityName, ActivityOptions, ActivityRegistry,
     ActivityRegistryError, ActivityRunner, ActivitySequence, ActivitySpec, ActivityTimeoutRuntime,
     ActivityWakeups, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError, CheckpointLimits,
-    CheckpointStore, DurableActivity, DurableHost, Evaluation, ExactBytes, ExecutionId,
-    ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault,
-    LogicalActivityId, Nondeterminism, ReloadReason, ScopedActivityRegistry, StorageRevision,
-    StoreError, StoredCheckpoint, TerminalCheckpointStatus, TerminalOutcome, Workflow,
-    WorkflowContext, evaluate,
+    CheckpointStore, DurableHost, Evaluation, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch,
+    HostOutcome, InMemoryCheckpointStore, InMemoryFault, LogicalActivityId,
+    MAX_ACTIVITY_INPUT_BYTES, MAX_ACTIVITY_RESULT_BYTES, Nondeterminism, ReloadReason,
+    ScopedActivityRegistry, StorageRevision, StoreError, StoredCheckpoint,
+    TerminalCheckpointStatus, TerminalOutcome, Workflow, WorkflowContext, evaluate,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +25,6 @@ use serde::{Deserialize, Serialize};
 struct EchoInput {
     value: String,
 }
-
-struct Echo;
 
 struct TokioTimeoutRuntime;
 
@@ -46,16 +44,6 @@ impl ActivityTimeoutRuntime for TokioTimeoutRuntime {
     }
 }
 
-impl DurableActivity for Echo {
-    type Input = EchoInput;
-    type Output = String;
-
-    const NAME: &'static str = "Echo";
-    const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 128;
-    const MAX_RESULT_BYTES: u64 = 128;
-}
-
 fn execution() -> ExecutionSpec {
     ExecutionSpec::new(ExecutionId::from_bytes([7; 16]), ExactBytes::default(), 128)
 }
@@ -69,10 +57,10 @@ fn logical(options: ActivityOptions) -> LogicalActivityId {
         execution().execution_id(),
         ActivitySequence::new(0),
         ActivitySpec::with_bounds_and_options(
-            ActivityName::new(Echo::NAME, Echo::VERSION).unwrap(),
+            ActivityName::new("Echo", kuberic_dex::ACTIVITY_VERSION).unwrap(),
             ExactBytes::new(br#"{"value":"hello"}"#),
-            Echo::MAX_INPUT_BYTES,
-            Echo::MAX_RESULT_BYTES,
+            MAX_ACTIVITY_INPUT_BYTES,
+            MAX_ACTIVITY_RESULT_BYTES,
             options,
         ),
     )
@@ -113,7 +101,7 @@ impl CheckpointStore for CountingStore {
 #[tokio::test]
 async fn registry_invokes_an_ordinary_send_handler_with_runtime_identity() {
     let registry = ActivityRegistry::builder()
-        .register_typed::<Echo, _, _>("Echo", |context, input| async move {
+        .register_typed::<EchoInput, String, _, _>("Echo", |context, input| async move {
             assert_eq!(context.activity_instance_id().sequence().get(), 0);
             assert_eq!(context.attempt_ordinal(), 2);
             assert_eq!(context.action_deadline_unix_millis(), Some(9_000));
@@ -150,7 +138,7 @@ async fn scoped_registry_owns_handlers_that_borrow_embedding_state() {
     }
 
     let registry = ScopedActivityRegistry::<State>::builder()
-        .register::<Echo, _>("Echo", |state, context, input| {
+        .register_typed::<EchoInput, String, _>("Echo", |state, context, input| {
             Box::pin(async move {
                 state.calls += 1;
                 Ok(format!(
@@ -193,7 +181,7 @@ async fn scoped_registry_owns_handlers_that_borrow_embedding_state() {
 #[tokio::test]
 async fn shared_invocation_runtime_classifies_scoped_retry_exhaustion() {
     let registry = ScopedActivityRegistry::<Vec<(u32, Option<i64>)>>::builder()
-        .register::<Echo, _>("Echo", |state, context, _| {
+        .register_typed::<EchoInput, String, _>("Echo", |state, context, _| {
             Box::pin(async move {
                 state.push((
                     context.attempt_ordinal(),
@@ -236,7 +224,7 @@ async fn shared_invocation_runtime_classifies_scoped_retry_exhaustion() {
 #[tokio::test]
 async fn shared_invocation_runtime_allows_observation_only_recovery_after_deadline() {
     let registry = ScopedActivityRegistry::<usize>::builder()
-        .register::<Echo, _>("Echo", |calls, context, input| {
+        .register_typed::<EchoInput, String, _>("Echo", |calls, context, input| {
             Box::pin(async move {
                 assert!(!context.dispatch_authorized());
                 *calls += 1;
@@ -273,7 +261,9 @@ async fn shared_invocation_runtime_allows_observation_only_recovery_after_deadli
 #[tokio::test]
 async fn registry_rejects_recorded_contract_bound_mismatches() {
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", |_context, input| async move { Ok(input.value) })
+        .register_typed::<EchoInput, String, _, _>("Echo", |_context, input| async move {
+            Ok(input.value)
+        })
         .build()
         .unwrap();
     let wrong = LogicalActivityId::new(
@@ -282,8 +272,8 @@ async fn registry_rejects_recorded_contract_bound_mismatches() {
         ActivitySpec::with_bounds_and_options(
             ActivityName::new("Echo", 1).unwrap(),
             ExactBytes::new(br#"{"value":"hello"}"#),
-            Echo::MAX_INPUT_BYTES - 1,
-            Echo::MAX_RESULT_BYTES,
+            MAX_ACTIVITY_INPUT_BYTES - 1,
+            MAX_ACTIVITY_RESULT_BYTES,
             ActivityOptions::default(),
         ),
     );
@@ -302,15 +292,14 @@ async fn registry_rejects_recorded_contract_bound_mismatches() {
 }
 
 #[test]
-fn registry_rejects_name_mismatch_and_duplicates() {
-    let mismatch = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Other", |_context, _input| async { Ok(String::new()) })
-        .build();
-    assert!(matches!(mismatch, Err(ActivityRegistryError::Contract(_))));
-
+fn registry_rejects_duplicates() {
     let duplicate = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", |_context, _input| async { Ok(String::new()) })
-        .register::<Echo, _, _>("Echo", |_context, _input| async { Ok(String::new()) })
+        .register_typed::<EchoInput, String, _, _>("Echo", |_context, _input| async {
+            Ok(String::new())
+        })
+        .register_typed::<EchoInput, String, _, _>("Echo", |_context, _input| async {
+            Ok(String::new())
+        })
         .build();
     assert!(matches!(
         duplicate,
@@ -344,7 +333,7 @@ struct TypedWorkflow {
 impl Workflow for TypedWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         match context
-            .schedule_activity_typed::<Echo>(
+            .schedule_activity_typed_with_options::<EchoInput, String>(
                 "Echo",
                 &EchoInput {
                     value: "hello".to_owned(),
@@ -432,7 +421,7 @@ async fn integrated_runner_retries_twice_then_replays_success() {
     let calls = Arc::new(AtomicUsize::new(0));
     let handler_calls = calls.clone();
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", move |_context, input| {
+        .register_typed::<EchoInput, String, _, _>("Echo", move |_context, input| {
             let calls = handler_calls.clone();
             async move {
                 let call = calls.fetch_add(1, Ordering::SeqCst);
@@ -494,7 +483,7 @@ async fn each_attempt_uses_only_exposure_and_result_boundaries() {
     let calls = Arc::new(AtomicUsize::new(0));
     let handler_calls = calls.clone();
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", move |_context, input| {
+        .register_typed::<EchoInput, String, _, _>("Echo", move |_context, input| {
             let call = handler_calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 if call == 0 {
@@ -534,7 +523,7 @@ async fn each_attempt_uses_only_exposure_and_result_boundaries() {
 #[tokio::test]
 async fn exhausted_retry_replays_the_final_application_error() {
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", |_context, _input| async {
+        .register_typed::<EchoInput, String, _, _>("Echo", |_context, _input| async {
             Err(ActivityHandlerError::Retryable(ExactBytes::new(
                 b"final-error",
             )))
@@ -575,7 +564,7 @@ async fn timeout_is_terminal_and_does_not_consume_a_retry() {
     let calls = Arc::new(AtomicUsize::new(0));
     let handler_calls = calls.clone();
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", move |_context, _input| {
+        .register_typed::<EchoInput, String, _, _>("Echo", move |_context, _input| {
             handler_calls.fetch_add(1, Ordering::SeqCst);
             async {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -610,7 +599,7 @@ async fn elapsed_action_deadline_fails_without_invoking_handler() {
     let calls = Arc::new(AtomicUsize::new(0));
     let handler_calls = calls.clone();
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", move |_context, input| {
+        .register_typed::<EchoInput, String, _, _>("Echo", move |_context, input| {
             handler_calls.fetch_add(1, Ordering::SeqCst);
             async move { Ok(input.value) }
         })
@@ -643,7 +632,7 @@ async fn handler_wait_is_persisted_without_consuming_a_retry() {
     let handler_calls = calls.clone();
     let handler_ordinals = ordinals.clone();
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", move |context, input| {
+        .register_typed::<EchoInput, String, _, _>("Echo", move |context, input| {
             let call = handler_calls.fetch_add(1, Ordering::SeqCst);
             handler_ordinals
                 .lock()
@@ -693,7 +682,7 @@ async fn unknown_result_cas_reloads_without_duplicate_after_apply() {
     let calls = Arc::new(AtomicUsize::new(0));
     let handler_calls = calls.clone();
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", move |_context, input| {
+        .register_typed::<EchoInput, String, _, _>("Echo", move |_context, input| {
             handler_calls.fetch_add(1, Ordering::SeqCst);
             async move { Ok(input.value) }
         })
@@ -730,7 +719,7 @@ async fn unknown_retry_cas_after_apply_reloads_persisted_next_attempt() {
     let calls = Arc::new(AtomicUsize::new(0));
     let handler_calls = calls.clone();
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", move |_context, input| {
+        .register_typed::<EchoInput, String, _, _>("Echo", move |_context, input| {
             let call = handler_calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 if call == 0 {
@@ -769,7 +758,7 @@ async fn lost_result_is_retried_with_the_same_logical_identity() {
     let observed_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
     let handler_ids = observed_ids.clone();
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", move |context, input| {
+        .register_typed::<EchoInput, String, _, _>("Echo", move |context, input| {
             let ids = handler_ids.clone();
             async move {
                 ids.lock()
@@ -811,7 +800,9 @@ async fn lost_result_is_retried_with_the_same_logical_identity() {
 #[tokio::test]
 async fn lost_result_at_attempt_limit_becomes_a_replayed_application_failure() {
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", |_context, input| async move { Ok(input.value) })
+        .register_typed::<EchoInput, String, _, _>("Echo", |_context, input| async move {
+            Ok(input.value)
+        })
         .build()
         .unwrap();
     let store = kuberic_dex::InMemoryCheckpointStore::new();

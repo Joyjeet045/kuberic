@@ -36,7 +36,7 @@ impl<S: CheckpointStore> MockReconciler<S> {
         self.now_unix_millis = now_unix_millis;
     }
 
-    pub async fn reconcile<W: Workflow>(
+    pub async fn reconcile<W: Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: ExecutionSpec,

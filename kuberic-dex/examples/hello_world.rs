@@ -1,9 +1,8 @@
-use async_trait::async_trait;
 use kuberic_dex::{
     ActivityContext, ActivityHandlerError, ActivityInvocationError, ActivityRegistry,
-    ActivityRunner, CheckpointLimits, DurableActivity, DurableHost, ExecutionId, ExecutionSpec,
-    HostEpoch, HostOutcome, InMemoryCheckpointStore, Orchestration, OrchestrationContext,
-    decode_orchestration_result,
+    ActivityRunner, CheckpointLimits, DurableHost, ExecutionId, ExecutionSpec, HostEpoch,
+    HostOutcome, InMemoryCheckpointStore, OrchestrationContext, OrchestrationRegistry,
+    decode_workflow_result,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,43 +16,31 @@ struct Greeting {
     message: String,
 }
 
-struct Greet;
-
-impl DurableActivity for Greet {
-    type Input = GreetingInput;
-    type Output = Greeting;
-
-    const NAME: &'static str = "Greet";
-    const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 1024;
-    const MAX_RESULT_BYTES: u64 = 1024;
-}
-
-struct HelloWorld;
-
-#[async_trait]
-impl Orchestration for HelloWorld {
-    type Input = GreetingInput;
-    type Output = Greeting;
-    type Error = ActivityInvocationError;
-
-    async fn run(
-        &self,
-        context: &mut OrchestrationContext<'_>,
-        input: GreetingInput,
-    ) -> Result<Greeting, ActivityInvocationError> {
-        Ok(context.schedule_activity::<Greet>(&input).await?)
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let orchestrations = OrchestrationRegistry::builder()
+        .register_typed::<GreetingInput, Greeting, ActivityInvocationError, _>(
+            "HelloWorld",
+            |context: &mut OrchestrationContext<'_>, input| {
+                Box::pin(async move {
+                    context
+                        .schedule_activity_typed::<GreetingInput, Greeting>("Greet", &input)
+                        .await
+                })
+            },
+        )
+        .build()?;
+    let workflow = orchestrations.get("HelloWorld")?;
+
     let activities = ActivityRegistry::builder()
-        .register_typed::<Greet, _, _>("Greet", |_context: ActivityContext, input| async move {
-            Ok::<_, ActivityHandlerError>(Greeting {
-                message: format!("Hello, {}!", input.name),
-            })
-        })
+        .register_typed::<GreetingInput, Greeting, _, _>(
+            "Greet",
+            |_context: ActivityContext, input| async move {
+                Ok::<_, ActivityHandlerError>(Greeting {
+                    message: format!("Hello, {}!", input.name),
+                })
+            },
+        )
         .build()?;
 
     let host = DurableHost::new(
@@ -62,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CheckpointLimits::new(16, 64 * 1024, 64 * 1024)?,
     );
     let mut runner = ActivityRunner::new(host, activities);
-    let execution = ExecutionSpec::for_orchestration::<HelloWorld>(
+    let execution = ExecutionSpec::typed(
         ExecutionId::from_bytes([2; 16]),
         &GreetingInput {
             name: "DEX".to_owned(),
@@ -72,9 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for turn in 0..4 {
         if let HostOutcome::WorkflowCompleted { outcome, .. } =
-            runner.run_once(&HelloWorld, execution.clone(), turn).await
+            runner.run_once(workflow, execution.clone(), turn).await
         {
-            let greeting = decode_orchestration_result::<HelloWorld>(&outcome)??;
+            let greeting = decode_workflow_result::<Greeting, ActivityInvocationError>(&outcome)??;
             println!("{}", greeting.message);
             return Ok(());
         }

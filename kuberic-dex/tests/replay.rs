@@ -8,9 +8,10 @@ use kuberic_dex::{
     CheckpointPayload, CompletionClass, DurableActivity, DurableEffect, EffectActivity,
     EffectAttempt, EffectAttemptState, EffectMetadata, EffectOutcome, Evaluation, ExactBytes,
     ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
-    Nondeterminism, PreparedActivityError, PreparedActivityResolver, PreparedCommand,
-    PreparedEffectResolver, TerminalOutcome, Workflow, WorkflowContext, encode_activity_input,
-    encode_activity_result, evaluate as evaluate_with_spec, evaluate_effects, evaluate_prepared,
+    MAX_ACTIVITY_INPUT_BYTES, MAX_ACTIVITY_RESULT_BYTES, Nondeterminism, PreparedActivityError,
+    PreparedActivityResolver, PreparedCommand, PreparedEffectResolver, TerminalOutcome, Workflow,
+    WorkflowContext, encode_activity_input, encode_activity_result, evaluate as evaluate_with_spec,
+    evaluate_effects, evaluate_prepared,
 };
 use serde::{Deserialize, Serialize};
 
@@ -815,25 +816,9 @@ impl DurableActivity for TypedEffectV1 {
     type Output = TypedOutcome;
 
     const NAME: &'static str = "typed.effect";
-    const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 32;
-    const MAX_RESULT_BYTES: u64 = 128;
-}
-
-struct TypedEffectV2;
-
-impl DurableActivity for TypedEffectV2 {
-    type Input = String;
-    type Output = TypedOutcome;
-
-    const NAME: &'static str = "typed.effect";
-    const VERSION: u32 = 2;
-    const MAX_INPUT_BYTES: u64 = 32;
-    const MAX_RESULT_BYTES: u64 = 128;
 }
 
 struct TypedWorkflowV1;
-struct TypedWorkflowV2;
 
 async fn run_typed<A: DurableActivity<Input = String, Output = TypedOutcome>>(
     context: &mut WorkflowContext<'_>,
@@ -851,19 +836,12 @@ impl Workflow for TypedWorkflowV1 {
     }
 }
 
-#[async_trait]
-impl Workflow for TypedWorkflowV2 {
-    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
-        run_typed::<TypedEffectV2>(context).await
-    }
-}
-
 fn typed_spec<A: DurableActivity<Input = String>>(input: &str) -> ActivitySpec {
     ActivitySpec::with_bounds_and_options(
-        ActivityName::new(A::NAME, A::VERSION).unwrap(),
+        ActivityName::new(A::NAME, A::version()).unwrap(),
         encode_activity_input::<A>(&input.to_owned()).unwrap(),
-        A::MAX_INPUT_BYTES,
-        A::MAX_RESULT_BYTES,
+        A::max_input_bytes(),
+        A::max_result_bytes(),
         ActivityOptions::default(),
     )
 }
@@ -885,7 +863,7 @@ fn typed_call_schedules_canonical_input_and_immutable_identity() {
         activity.input(),
         &encode_activity_input::<TypedEffectV1>(&"hello".to_owned()).unwrap()
     );
-    assert_eq!(activity.max_result_bytes(), 128);
+    assert_eq!(activity.max_result_bytes(), MAX_ACTIVITY_RESULT_BYTES);
 }
 
 #[test]
@@ -922,7 +900,7 @@ fn typed_domain_failure_is_a_bounded_completed_output() {
 }
 
 #[test]
-fn typed_identity_change_remains_nondeterminism() {
+fn typed_recorded_version_change_remains_nondeterminism() {
     let execution_id = execution(16);
     let workflow_input = bytes(b"workflow");
     let checkpoint = envelope(
@@ -930,7 +908,13 @@ fn typed_identity_change_remains_nondeterminism() {
         workflow_input.clone(),
         vec![ActivityRecord::completed(
             ActivitySequence::new(0),
-            typed_spec::<TypedEffectV1>("hello"),
+            ActivitySpec::with_bounds_and_options(
+                ActivityName::new(TypedEffectV1::NAME, 2).unwrap(),
+                encode_activity_input::<TypedEffectV1>(&"hello".to_owned()).unwrap(),
+                MAX_ACTIVITY_INPUT_BYTES,
+                MAX_ACTIVITY_RESULT_BYTES,
+                ActivityOptions::default(),
+            ),
             encode_activity_result::<TypedEffectV1>(&TypedOutcome::Applied {
                 value: "done".to_owned(),
             })
@@ -940,7 +924,7 @@ fn typed_identity_change_remains_nondeterminism() {
 
     assert!(matches!(
         evaluate(
-            &TypedWorkflowV2,
+            &TypedWorkflowV1,
             execution_id,
             workflow_input,
             Some(&checkpoint),
@@ -991,7 +975,7 @@ impl PreparedEffectResolver for ExactEffectResolver {
 
 async fn effect_body(context: &mut WorkflowContext<'_>) -> Result<String, String> {
     let outcome = context
-        .schedule_activity_typed::<EffectActivity<WorkflowEffect>>(
+        .schedule_activity_contract_with_options::<EffectActivity<WorkflowEffect>>(
             WorkflowEffect::NAME,
             &"hello".to_owned(),
             ActivityOptions::default(),
@@ -1106,9 +1090,6 @@ impl DurableActivity for TinyInput {
     type Output = String;
 
     const NAME: &'static str = "typed.tiny";
-    const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 4;
-    const MAX_RESULT_BYTES: u64 = 4;
 }
 
 struct OversizedTypedInputWorkflow;
@@ -1116,7 +1097,10 @@ struct OversizedTypedInputWorkflow;
 #[async_trait]
 impl Workflow for OversizedTypedInputWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
-        match context.call::<TinyInput>("too large".to_owned()).await {
+        match context
+            .call::<TinyInput>("x".repeat(MAX_ACTIVITY_INPUT_BYTES as usize))
+            .await
+        {
             Ok(_) => TerminalOutcome::succeeded([]),
             Err(error) => TerminalOutcome::failed(serde_json::to_vec(&error).unwrap()),
         }
@@ -1142,14 +1126,17 @@ fn typed_input_and_result_bounds_fail_before_persistence() {
     assert_eq!(completed_activity_count, 0);
     assert!(matches!(
         serde_json::from_slice::<ActivityCallError>(payload.as_slice()).unwrap(),
-        ActivityCallError::InputTooLarge { max_bytes: 4, .. }
+        ActivityCallError::InputTooLarge {
+            max_bytes: MAX_ACTIVITY_INPUT_BYTES,
+            ..
+        }
     ));
 
     assert!(matches!(
-        encode_activity_result::<TinyInput>(&"large".to_owned()),
+        encode_activity_result::<TinyInput>(&"x".repeat(MAX_ACTIVITY_RESULT_BYTES as usize)),
         Err(ActivityCallError::ResultTooLarge {
-            actual_bytes: 7,
-            max_bytes: 4
+            max_bytes: MAX_ACTIVITY_RESULT_BYTES,
+            ..
         })
     ));
 }
@@ -1175,9 +1162,6 @@ impl DurableActivity for MapInputActivity {
     type Output = ();
 
     const NAME: &'static str = "typed.map-input";
-    const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 128;
-    const MAX_RESULT_BYTES: u64 = 4;
 }
 
 #[test]
@@ -1228,7 +1212,7 @@ fn typed_prepared_resolver() -> TypedPreparedResolver {
     TypedPreparedResolver {
         command: b"promote",
         target: b"replica-2:generation-7",
-        result_bound: TypedEffectV1::MAX_RESULT_BYTES,
+        result_bound: MAX_ACTIVITY_RESULT_BYTES,
     }
 }
 
@@ -1312,17 +1296,6 @@ fn typed_prepared_replay_rejects_each_complete_specification_mismatch() {
         ));
     }
 
-    assert!(matches!(
-        evaluate_prepared(
-            &TypedWorkflowV2,
-            &execution_spec(execution_id, workflow_input.clone()),
-            Some(&checkpoint),
-            limits(),
-            &resolver,
-        ),
-        Evaluation::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
-    ));
-
     struct ChangedLogicalInput;
     #[async_trait]
     impl Workflow for ChangedLogicalInput {
@@ -1356,9 +1329,9 @@ fn typed_completed_prepared_activity_replays_its_exact_recorded_result_and_speci
     let workflow_input = bytes(b"workflow");
     let logical = encode_activity_input::<TypedEffectV1>(&"hello".to_owned()).unwrap();
     let requested = ActivitySpec::new(
-        ActivityName::new(TypedEffectV1::NAME, TypedEffectV1::VERSION).unwrap(),
+        ActivityName::new(TypedEffectV1::NAME, kuberic_dex::ACTIVITY_VERSION).unwrap(),
         logical,
-        TypedEffectV1::MAX_RESULT_BYTES,
+        MAX_ACTIVITY_RESULT_BYTES,
     );
     let recorded = resolver.resolve(&requested, None).unwrap();
     let recorded_result = TypedOutcome::Applied {

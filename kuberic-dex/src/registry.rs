@@ -1,11 +1,14 @@
 use std::{collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+use crate::typed::{decode_typed_input, encode_typed_result};
 use crate::{
-    ActivityCallError, ActivityFailure, ActivityName, ActivityObservation, ActivityOptions,
-    AttemptId, CheckpointError, CheckpointStore, DurableActivity, DurableHost, ExactBytes,
-    HostOutcome, LogicalActivityId, decode_activity_input, encode_activity_result,
+    ACTIVITY_VERSION, ActivityCallError, ActivityFailure, ActivityName, ActivityObservation,
+    ActivityOptions, AttemptId, CheckpointError, CheckpointStore, DurableActivity, DurableHost,
+    ExactBytes, HostOutcome, LogicalActivityId, MAX_ACTIVITY_INPUT_BYTES,
+    MAX_ACTIVITY_RESULT_BYTES, decode_activity_input, encode_activity_result,
 };
 
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<ExactBytes, ActivityHandlerError>> + Send>>;
@@ -27,6 +30,44 @@ trait ScopedErasedHandler<S>: Send + Sync {
 struct TypedScopedHandler<A, H> {
     handler: H,
     activity: PhantomData<fn() -> A>,
+}
+
+struct JsonTypedScopedHandler<In, Out, H> {
+    handler: H,
+    types: PhantomData<fn(In) -> Out>,
+}
+
+impl<S, In, Out, H> ScopedErasedHandler<S> for JsonTypedScopedHandler<In, Out, H>
+where
+    In: DeserializeOwned + Send + 'static,
+    Out: Serialize + Send + 'static,
+    H: for<'a> Fn(
+            &'a mut S,
+            ActivityContext,
+            In,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Out, ActivityHandlerError>> + Send + 'a>>
+        + Send
+        + Sync,
+{
+    fn invoke<'a>(
+        &'a self,
+        state: &'a mut S,
+        context: ActivityContext,
+        input: ExactBytes,
+    ) -> ScopedHandlerFuture<'a> {
+        match decode_typed_input(&input, MAX_ACTIVITY_INPUT_BYTES) {
+            Ok(input) => {
+                let future = (self.handler)(state, context, input);
+                Box::pin(async move {
+                    let output = future.await?;
+                    encode_typed_result(&output, MAX_ACTIVITY_RESULT_BYTES)
+                        .map_err(ActivityHandlerError::Codec)
+                })
+            }
+            Err(error) => Box::pin(async move { Err(ActivityHandlerError::Codec(error)) }),
+        }
+    }
 }
 
 impl<S, A, H> ScopedErasedHandler<S> for TypedScopedHandler<A, H>
@@ -342,6 +383,51 @@ impl<S> Default for ScopedActivityRegistryBuilder<S> {
 }
 
 impl<S> ScopedActivityRegistryBuilder<S> {
+    pub fn register_typed<In, Out, H>(mut self, name: &str, handler: H) -> Self
+    where
+        In: DeserializeOwned + Send + 'static,
+        Out: Serialize + Send + 'static,
+        H: for<'a> Fn(
+                &'a mut S,
+                ActivityContext,
+                In,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<Out, ActivityHandlerError>> + Send + 'a>,
+            > + Send
+            + Sync
+            + 'static,
+    {
+        if self.error.is_some() {
+            return self;
+        }
+        let activity_name = match ActivityName::new(name, ACTIVITY_VERSION) {
+            Ok(name) => name,
+            Err(_) => {
+                self.error = Some(ActivityRegistryError::Contract(
+                    ActivityCallError::EmptyName,
+                ));
+                return self;
+            }
+        };
+        if self.handlers.contains_key(&activity_name) {
+            self.error = Some(ActivityRegistryError::DuplicateRegistration(activity_name));
+            return self;
+        }
+        self.handlers.insert(
+            activity_name,
+            ScopedRegistryEntry {
+                handler: Arc::new(JsonTypedScopedHandler::<In, Out, H> {
+                    handler,
+                    types: PhantomData,
+                }),
+                max_input_bytes: MAX_ACTIVITY_INPUT_BYTES,
+                max_result_bytes: MAX_ACTIVITY_RESULT_BYTES,
+            },
+        );
+        self
+    }
+
+    #[doc(hidden)]
     pub fn register<A, H>(mut self, name: &str, handler: H) -> Self
     where
         A: DurableActivity + Send + Sync + 'static,
@@ -369,7 +455,7 @@ impl<S> ScopedActivityRegistryBuilder<S> {
             ));
             return self;
         }
-        let activity_name = match ActivityName::new(name, A::VERSION) {
+        let activity_name = match ActivityName::new(name, A::version()) {
             Ok(name) => name,
             Err(_) => {
                 self.error = Some(ActivityRegistryError::Contract(
@@ -389,8 +475,8 @@ impl<S> ScopedActivityRegistryBuilder<S> {
                     handler,
                     activity: PhantomData,
                 }),
-                max_input_bytes: A::MAX_INPUT_BYTES,
-                max_result_bytes: A::MAX_RESULT_BYTES,
+                max_input_bytes: A::max_input_bytes(),
+                max_result_bytes: A::max_result_bytes(),
             },
         );
         self
@@ -410,18 +496,57 @@ impl ActivityRegistryBuilder {
     /// Register an ordinary typed async activity handler.
     ///
     /// This mirrors Duroxide's `register_typed` shape while retaining DEX's
-    /// versioned activity contract and payload bounds.
-    pub fn register_typed<A, H, F>(self, name: &str, handler: H) -> Self
+    /// replay identity and framework-owned payload bounds.
+    pub fn register_typed<In, Out, H, F>(mut self, name: &str, handler: H) -> Self
     where
-        A: DurableActivity + Send + Sync + 'static,
-        A::Input: Send + 'static,
-        A::Output: Send + 'static,
-        H: Fn(ActivityContext, A::Input) -> F + Send + Sync + 'static,
-        F: Future<Output = Result<A::Output, ActivityHandlerError>> + Send + 'static,
+        In: DeserializeOwned + Send + 'static,
+        Out: Serialize + Send + 'static,
+        H: Fn(ActivityContext, In) -> F + Send + Sync + 'static,
+        F: Future<Output = Result<Out, ActivityHandlerError>> + Send + 'static,
     {
-        self.register::<A, H, F>(name, handler)
+        if self.error.is_some() {
+            return self;
+        }
+        let activity_name = match ActivityName::new(name, ACTIVITY_VERSION) {
+            Ok(name) => name,
+            Err(_) => {
+                self.error = Some(ActivityRegistryError::Contract(
+                    ActivityCallError::EmptyName,
+                ));
+                return self;
+            }
+        };
+        if self.handlers.contains_key(&activity_name) {
+            self.error = Some(ActivityRegistryError::DuplicateRegistration(activity_name));
+            return self;
+        }
+        let erased = move |context: ActivityContext, input: ExactBytes| {
+            let decoded = decode_typed_input(&input, MAX_ACTIVITY_INPUT_BYTES);
+            match decoded {
+                Ok(input) => {
+                    let future = handler(context, input);
+                    Box::pin(async move {
+                        let output = future.await?;
+                        encode_typed_result(&output, MAX_ACTIVITY_RESULT_BYTES)
+                            .map_err(ActivityHandlerError::Codec)
+                    }) as HandlerFuture
+                }
+                Err(error) => Box::pin(async move { Err(ActivityHandlerError::Codec(error)) })
+                    as HandlerFuture,
+            }
+        };
+        self.handlers.insert(
+            activity_name,
+            RegistryEntry {
+                handler: Arc::new(erased),
+                max_input_bytes: MAX_ACTIVITY_INPUT_BYTES,
+                max_result_bytes: MAX_ACTIVITY_RESULT_BYTES,
+            },
+        );
+        self
     }
 
+    #[doc(hidden)]
     pub fn register<A, H, F>(self, name: &str, handler: H) -> Self
     where
         A: DurableActivity + Send + Sync + 'static,
@@ -474,7 +599,7 @@ impl ActivityRegistryBuilder {
             ));
             return self;
         }
-        let activity_name = match ActivityName::new(name, A::VERSION) {
+        let activity_name = match ActivityName::new(name, A::version()) {
             Ok(name) => name,
             Err(_) => {
                 self.error = Some(ActivityRegistryError::Contract(
@@ -491,8 +616,8 @@ impl ActivityRegistryBuilder {
             activity_name,
             RegistryEntry {
                 handler,
-                max_input_bytes: A::MAX_INPUT_BYTES,
-                max_result_bytes: A::MAX_RESULT_BYTES,
+                max_input_bytes: A::max_input_bytes(),
+                max_result_bytes: A::max_result_bytes(),
             },
         );
         self
@@ -681,7 +806,7 @@ impl<S: CheckpointStore> ActivityRunner<S> {
         &self.host
     }
 
-    pub async fn run_once<W: crate::Workflow>(
+    pub async fn run_once<W: crate::Workflow + ?Sized>(
         &mut self,
         workflow: &W,
         execution: crate::ExecutionSpec,

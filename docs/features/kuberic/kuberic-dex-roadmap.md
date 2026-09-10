@@ -16,10 +16,10 @@ compatibility with either project.
 The implemented kernel provides:
 
 - deterministic linear replay;
-- typed orchestration input, output, and errors with ordinary `Result`
-  propagation and canonical boundary encoding;
-- named, typed, versioned ordinary activities with independent bounded inputs
-  and outputs, direct async calls, and immutable registry validation;
+- named typed orchestration registration with ordinary `Result` propagation
+  and canonical input, output, and error boundary encoding;
+- named, typed ordinary activities with framework-owned versioning and payload
+  limits, direct async calls, and immutable registry validation;
 - bounded at-least-once physical attempts under one stable logical identity,
   with persisted retry policy, backoff, deadlines, and timeouts;
 - an optional narrow strict-effect facility with separate bounded logical
@@ -112,9 +112,8 @@ need. Short topology workflows should complete and use terminal compaction.
 ### Kernel Ergonomics
 
 1. **Implemented:** typed activity declarations and direct workflow calls,
-   retaining exact canonical input matching, immutable version identity,
-   independent input/result bounds, persisted options, and portable
-   deterministic failures.
+   retaining exact canonical input matching, framework-owned version identity
+   and payload limits, persisted options, and portable deterministic failures.
 2. **Implemented:** immutable activity registration and typed invocation,
    including scoped handlers that borrow embedding state. Dynamic runtime
    discovery remains deferred.

@@ -68,7 +68,7 @@ pub enum Nondeterminism {
 }
 
 /// Validate a checkpoint, then poll an active workflow exactly once.
-pub fn evaluate<W: Workflow>(
+pub fn evaluate<W: Workflow + ?Sized>(
     workflow: &W,
     execution: &ExecutionSpec,
     checkpoint: Option<&CheckpointEnvelope>,
@@ -85,7 +85,7 @@ pub fn evaluate<W: Workflow>(
 
 /// Validate a checkpoint and evaluate one turn through an opt-in prepared
 /// activity resolver.
-pub fn evaluate_prepared<W: Workflow>(
+pub fn evaluate_prepared<W: Workflow + ?Sized>(
     workflow: &W,
     execution: &ExecutionSpec,
     checkpoint: Option<&CheckpointEnvelope>,
@@ -97,7 +97,7 @@ pub fn evaluate_prepared<W: Workflow>(
 
 /// Validate a checkpoint and evaluate typed durable effects with exact command
 /// preparation and replay validation.
-pub fn evaluate_effects<W: Workflow>(
+pub fn evaluate_effects<W: Workflow + ?Sized>(
     workflow: &W,
     execution: &ExecutionSpec,
     checkpoint: Option<&CheckpointEnvelope>,
@@ -114,7 +114,7 @@ pub fn evaluate_effects<W: Workflow>(
     )
 }
 
-fn evaluate_internal<W: Workflow>(
+fn evaluate_internal<W: Workflow + ?Sized>(
     workflow: &W,
     execution: &ExecutionSpec,
     checkpoint: Option<&CheckpointEnvelope>,

@@ -601,9 +601,18 @@ impl<E: DurableEffect> DurableActivity for EffectActivity<E> {
     type Output = EffectOutcome<E::Output>;
 
     const NAME: &'static str = E::NAME;
-    const VERSION: u32 = E::VERSION;
-    const MAX_INPUT_BYTES: u64 = E::MAX_REQUEST_BYTES;
-    const MAX_RESULT_BYTES: u64 = E::MAX_RESULT_BYTES;
+
+    fn version() -> u32 {
+        E::VERSION
+    }
+
+    fn max_input_bytes() -> u64 {
+        E::MAX_REQUEST_BYTES
+    }
+
+    fn max_result_bytes() -> u64 {
+        E::MAX_RESULT_BYTES
+    }
 
     fn strict_effect_metadata() -> Option<EffectMetadata> {
         Some(EffectMetadata::of::<E>())

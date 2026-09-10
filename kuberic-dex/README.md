@@ -20,46 +20,43 @@ cargo run -p kuberic-dex --example reconciler_mock
 
 ## Typed orchestration and activity authoring
 
-Application workflows implement `Orchestration` with typed input, output, and
-error values. The body is ordinary async Rust and returns `Result`, allowing
-normal `?` propagation without handling `ExactBytes` or constructing
-`TerminalOutcome`.
+Application workflows are typed async closures registered under stable string
+names. The body returns `Result`, allowing normal `?` propagation without
+handling `ExactBytes` or constructing `TerminalOutcome`.
 
 ```rust
-use async_trait::async_trait;
-use kuberic_dex::{ActivityInvocationError, Orchestration, OrchestrationContext};
+use kuberic_dex::{
+    ActivityInvocationError, OrchestrationContext, OrchestrationRegistry,
+};
 
-struct GreetingWorkflow;
-
-#[async_trait]
-impl Orchestration for GreetingWorkflow {
-    type Input = GreetingInput;
-    type Output = GreetingResult;
-    type Error = ActivityInvocationError;
-
-    async fn run(
-        &self,
-        context: &mut OrchestrationContext<'_>,
-        input: GreetingInput,
-    ) -> Result<GreetingResult, ActivityInvocationError> {
-        let result = context.schedule_activity::<SendGreeting>(&input).await?;
-        Ok(result)
-    }
-}
+let orchestrations = OrchestrationRegistry::builder()
+    .register_typed::<GreetingInput, GreetingResult, ActivityInvocationError, _>(
+        "GreetingWorkflow",
+        |context: &mut OrchestrationContext<'_>, input| {
+            Box::pin(async move {
+                context
+                    .schedule_activity_typed::<GreetingInput, GreetingResult>(
+                        "greeting",
+                        &input,
+                    )
+                    .await
+            })
+        },
+    )
+    .build()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`ExecutionSpec::for_orchestration` canonically encodes workflow input, and
-`decode_orchestration_result` decodes a terminal success or error value. The
-exact-byte `Workflow` contract remains the low-level replay-kernel interface;
-application code should normally use `Orchestration`.
+`ExecutionSpec::typed` canonically encodes workflow input, and
+`decode_workflow_result` decodes a terminal success or error value. The
+exact-byte `Workflow` contract remains the hidden replay-kernel interface.
 
-`DurableActivity` combines typed input/output with immutable versioned identity
-and independent encoded bounds. Workflow and store futures are `Send`, so a
-host turn runs directly inside an asynchronous controller without a second
-executor.
+Typed activities use string names with generic input/output types, matching
+Duroxide's authoring shape. DEX supplies the activity version and global
+encoded payload limits. Workflow and store futures are `Send`, so a host turn
+runs directly inside an asynchronous controller without a second executor.
 
 ```rust
-use kuberic_dex::DurableActivity;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
@@ -72,28 +69,17 @@ struct GreetingResult {
     message_id: String,
 }
 
-struct SendGreeting;
-
-impl DurableActivity for SendGreeting {
-    type Input = GreetingInput;
-    type Output = GreetingResult;
-
-    const NAME: &'static str = "greeting";
-    const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 1024;
-    const MAX_RESULT_BYTES: u64 = 4096;
-}
 ```
 
 Handlers use the same typed async closure shape as Duroxide while DEX verifies
-the activity's versioned contract and payload bounds:
+the activity's name and framework-owned payload bounds:
 
 ```rust
 use kuberic_dex::{ActivityContext, ActivityHandlerError, ActivityRegistry};
 
 let activities = ActivityRegistry::builder()
-    .register_typed::<SendGreeting, _, _>(
-        SendGreeting::NAME,
+    .register_typed::<GreetingInput, GreetingResult, _, _>(
+        "greeting",
         |_context: ActivityContext, input: GreetingInput| async move {
             Ok(GreetingResult {
                 message_id: input.recipient,
@@ -104,11 +90,12 @@ let activities = ActivityRegistry::builder()
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Inside `Orchestration::run`, the ordinary direct-style call is:
+Inside an orchestration handler, the ordinary direct-style call is:
 
 ```rust
 let sent = context
-    .schedule_activity::<SendGreeting>(
+    .schedule_activity_typed::<GreetingInput, GreetingResult>(
+        "greeting",
         &GreetingInput {
             recipient: "Ada".to_owned(),
         },
@@ -158,7 +145,7 @@ input exactly on every replay. Low-level `ExactBytes` are compared without
 normalization and encoded as validated base64 JSON strings. Workflow history
 is a contiguous, zero-based sequence with a completed prefix and at most one
 final pending activity. A requested activity must match the recorded sequence,
-immutable positive-versioned name, exact input, and declared result bound; a
+immutable framework-versioned name, exact input, and global result bound; a
 mismatch is nondeterminism rather than a new dispatch.
 
 Format version 4 stores JSON payload bytes in a versioned
@@ -183,7 +170,7 @@ without a dispatch permit. Once terminal, a turn returns the stored outcome
 and observed revision directly without polling workflow code.
 
 Logical activity identity is the complete tuple of execution ID, sequence,
-versioned activity name, exact activity input, declared input/result bounds,
+versioned activity name, exact activity input, framework input/result bounds,
 and scheduling options. Its stable external action rendering contains the
 execution ID, sequence, versioned name, exact input, and result bound without
 hashing or normalization; replay separately authenticates the input bound and
@@ -207,7 +194,7 @@ larger form must fit the configured terminal encoded limit. The active and
 terminal capacities are persisted as immutable admission authority. Capacity
 failure therefore precedes even the first schedule and every possible
 external-effect permit. Later hosts must use the same admitted limits; changing either lifecycle limit
-for a versioned operation without a contract-version change is incompatible.
+for a persisted operation is incompatible.
 
 Before committing dispatch exposure, the host projects the completed
 checkpoint containing a result at exactly the activity's declared maximum.
@@ -370,9 +357,9 @@ effect-specific proof that permits a safe retry. Process-local knowledge that
 a permit or reply was lost cannot override checkpoint state.
 
 This is an internal, opt-in host/evaluation behavior behind an ordinary
-activity call. `DurableActivity`, `OrchestrationContext::schedule_activity`, immutable
+activity call. `OrchestrationContext::schedule_activity_typed`, immutable
 name/version identity, canonical typed input/output encoding, exact replay
-matching, and declared input/result bounds remain the public model.
+matching, and framework-owned input/result bounds remain the public model.
 
 Completion conflict or `OutcomeUnknown` returns `ReloadRequired` and never a
 permit or completion. If an unknown write applied, reload observes terminal

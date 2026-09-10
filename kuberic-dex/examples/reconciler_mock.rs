@@ -6,12 +6,10 @@ use std::{
     },
 };
 
-use async_trait::async_trait;
 use kuberic_dex::{
     ActivityContext, ActivityHandlerError, ActivityInvocationError, ActivityRegistry,
-    CheckpointLimits, DurableActivity, DurableHost, ExactBytes, ExecutionId, ExecutionSpec,
-    HostEpoch, InMemoryCheckpointStore, Orchestration, OrchestrationContext,
-    decode_orchestration_result,
+    CheckpointLimits, DurableHost, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch,
+    InMemoryCheckpointStore, OrchestrationContext, OrchestrationRegistry, decode_workflow_result,
     reconciler_mock::{MockReconcileAction, MockReconciler},
 };
 use serde::{Deserialize, Serialize};
@@ -31,60 +29,51 @@ struct ReconcileResult {
     resource: String,
 }
 
-struct MarkReady;
-
-impl DurableActivity for MarkReady {
-    type Input = ReconcileInput;
-    type Output = ReconcileResult;
-
-    const NAME: &'static str = "MarkReady";
-    const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 1024;
-    const MAX_RESULT_BYTES: u64 = 1024;
-}
-
-struct ReconcileResource;
-
-#[async_trait]
-impl Orchestration for ReconcileResource {
-    type Input = ReconcileInput;
-    type Output = ReconcileResult;
-    type Error = ActivityInvocationError;
-
-    async fn run(
-        &self,
-        context: &mut OrchestrationContext<'_>,
-        input: ReconcileInput,
-    ) -> Result<ReconcileResult, ActivityInvocationError> {
-        Ok(context.schedule_activity::<MarkReady>(&input).await?)
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let orchestrations = OrchestrationRegistry::builder()
+        .register_typed::<ReconcileInput, ReconcileResult, ActivityInvocationError, _>(
+            "ReconcileResource",
+            |context: &mut OrchestrationContext<'_>, input| {
+                Box::pin(async move {
+                    context
+                        .schedule_activity_typed::<ReconcileInput, ReconcileResult>(
+                            "MarkReady",
+                            &input,
+                        )
+                        .await
+                })
+            },
+        )
+        .build()?;
+    let workflow = orchestrations.get("ReconcileResource")?;
+
     let api = Arc::new(Mutex::new(MockKubernetesApi::default()));
     let activity_api = api.clone();
     let attempts = Arc::new(AtomicUsize::new(0));
     let activity_attempts = attempts.clone();
     let activities = ActivityRegistry::builder()
-        .register_typed::<MarkReady, _, _>("MarkReady", move |_context: ActivityContext, input| {
-            let api = activity_api.clone();
-            let attempts = activity_attempts.clone();
-            async move {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return Err(ActivityHandlerError::Retryable(ExactBytes::new(
-                        b"API temporarily unavailable",
-                    )));
+        .register_typed::<ReconcileInput, ReconcileResult, _, _>(
+            "MarkReady",
+            move |_context: ActivityContext, input| {
+                let api = activity_api.clone();
+                let attempts = activity_attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(ActivityHandlerError::Retryable(ExactBytes::new(
+                            b"API temporarily unavailable",
+                        )));
+                    }
+                    api.lock()
+                        .expect("mock API lock")
+                        .annotations
+                        .insert(input.resource.clone(), "ready".to_owned());
+                    Ok::<_, ActivityHandlerError>(ReconcileResult {
+                        resource: input.resource,
+                    })
                 }
-                api.lock()
-                    .expect("mock API lock")
-                    .annotations
-                    .insert(input.resource.clone(), "ready".to_owned());
-                Ok::<_, ActivityHandlerError>(ReconcileResult {
-                    resource: input.resource,
-                })
-            }
-        })
+            },
+        )
         .build()?;
 
     let host = DurableHost::new(
@@ -93,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CheckpointLimits::new(16, 64 * 1024, 64 * 1024)?,
     );
     let mut reconciler = MockReconciler::new(host, activities, 1_000);
-    let execution = ExecutionSpec::for_orchestration::<ReconcileResource>(
+    let execution = ExecutionSpec::typed(
         ExecutionId::from_bytes([2; 16]),
         &ReconcileInput {
             resource: "demo".to_owned(),
@@ -102,10 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     for turn in 1..=4 {
-        match reconciler
-            .reconcile(&ReconcileResource, execution.clone())
-            .await
-        {
+        match reconciler.reconcile(workflow, execution.clone()).await {
             MockReconcileAction::RequeueNow => {
                 println!("reconcile {turn}: result persisted; requeue now");
             }
@@ -115,7 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             MockReconcileAction::AwaitChange => return Err("waiting for a watch event".into()),
             MockReconcileAction::Complete(outcome) => {
-                let result = decode_orchestration_result::<ReconcileResource>(&outcome)??;
+                let result =
+                    decode_workflow_result::<ReconcileResult, ActivityInvocationError>(&outcome)??;
                 let state = api.lock().expect("mock API lock");
                 println!("reconcile {turn}: workflow complete");
                 println!(

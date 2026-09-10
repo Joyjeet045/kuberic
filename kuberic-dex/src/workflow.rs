@@ -1,4 +1,6 @@
-use std::task::Poll;
+use std::{
+    collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc, task::Poll,
+};
 
 use async_trait::async_trait;
 use futures::future::poll_fn;
@@ -12,7 +14,7 @@ use crate::{
     typed::{
         ActivityCallError, ActivityInvocationError, DurableActivity, PreparedActivityError,
         PreparedActivityResolver, activity_spec, activity_spec_named, canonical_json,
-        decode_activity_result,
+        decode_activity_result, decode_typed_result, typed_activity_spec,
     },
 };
 
@@ -69,6 +71,7 @@ pub enum WorkflowCodecError {
 /// activity failures can be propagated with `?`. The replay kernel encodes the
 /// success or error value into the terminal checkpoint.
 #[async_trait]
+#[doc(hidden)]
 pub trait Orchestration: Sync {
     type Input: Serialize + DeserializeOwned + Send;
     type Output: Serialize + DeserializeOwned + Send;
@@ -79,6 +82,127 @@ pub trait Orchestration: Sync {
         context: &mut OrchestrationContext<'_>,
         input: Self::Input,
     ) -> Result<Self::Output, Self::Error>;
+}
+
+/// Boxed future returned by a typed orchestration registry handler.
+pub type OrchestrationFuture<'a, O, E> = Pin<Box<dyn Future<Output = Result<O, E>> + Send + 'a>>;
+
+/// Immutable registry of named orchestration handlers.
+pub struct OrchestrationRegistry {
+    handlers: BTreeMap<String, Arc<dyn Workflow>>,
+}
+
+impl OrchestrationRegistry {
+    pub fn builder() -> OrchestrationRegistryBuilder {
+        OrchestrationRegistryBuilder::default()
+    }
+
+    pub fn get(&self, name: &str) -> Result<&dyn Workflow, OrchestrationRegistryError> {
+        self.handlers
+            .get(name)
+            .map(Arc::as_ref)
+            .ok_or_else(|| OrchestrationRegistryError::Unregistered(name.to_owned()))
+    }
+}
+
+#[derive(Default)]
+pub struct OrchestrationRegistryBuilder {
+    handlers: BTreeMap<String, Arc<dyn Workflow>>,
+    error: Option<OrchestrationRegistryError>,
+}
+
+impl OrchestrationRegistryBuilder {
+    pub fn register_typed<In, Out, E, H>(mut self, name: &str, handler: H) -> Self
+    where
+        In: Serialize + DeserializeOwned + Send + 'static,
+        Out: Serialize + DeserializeOwned + Send + 'static,
+        E: Serialize + DeserializeOwned + Send + 'static,
+        H: for<'a, 'history> Fn(
+                &'a mut OrchestrationContext<'history>,
+                In,
+            ) -> OrchestrationFuture<'a, Out, E>
+            + Send
+            + Sync
+            + 'static,
+    {
+        if self.error.is_some() {
+            return self;
+        }
+        if name.is_empty() {
+            self.error = Some(OrchestrationRegistryError::EmptyName);
+            return self;
+        }
+        if self.handlers.contains_key(name) {
+            self.error = Some(OrchestrationRegistryError::DuplicateRegistration(
+                name.to_owned(),
+            ));
+            return self;
+        }
+        self.handlers.insert(
+            name.to_owned(),
+            Arc::new(TypedOrchestration::<In, Out, E, H> {
+                handler,
+                types: PhantomData,
+            }),
+        );
+        self
+    }
+
+    pub fn build(self) -> Result<OrchestrationRegistry, OrchestrationRegistryError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        Ok(OrchestrationRegistry {
+            handlers: self.handlers,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum OrchestrationRegistryError {
+    #[error("orchestration name must not be empty")]
+    EmptyName,
+    #[error("orchestration {0:?} is registered more than once")]
+    DuplicateRegistration(String),
+    #[error("orchestration {0:?} is not registered")]
+    Unregistered(String),
+}
+
+struct TypedOrchestration<In, Out, E, H> {
+    handler: H,
+    types: PhantomData<fn(In) -> (Out, E)>,
+}
+
+#[async_trait]
+impl<In, Out, E, H> Workflow for TypedOrchestration<In, Out, E, H>
+where
+    In: Serialize + DeserializeOwned + Send + 'static,
+    Out: Serialize + DeserializeOwned + Send + 'static,
+    E: Serialize + DeserializeOwned + Send + 'static,
+    H: for<'a, 'history> Fn(
+            &'a mut OrchestrationContext<'history>,
+            In,
+        ) -> OrchestrationFuture<'a, Out, E>
+        + Send
+        + Sync
+        + 'static,
+{
+    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
+        let input = match serde_json::from_slice::<In>(input.as_slice()) {
+            Ok(input) => input,
+            Err(_) => return codec_failure(WorkflowCodecError::InputDecoding),
+        };
+        match (self.handler)(context, input).await {
+            Ok(output) => match canonical_json(&output) {
+                Ok(output) => TerminalOutcome::succeeded(output),
+                Err(_) => codec_failure(WorkflowCodecError::OutputEncoding),
+            },
+            Err(error) => match canonical_json(&WorkflowFailure::Application(error)) {
+                Ok(error) => TerminalOutcome::failed(error),
+                Err(_) => codec_failure(WorkflowCodecError::ErrorEncoding),
+            },
+        }
+    }
 }
 
 /// Encode typed orchestration input using DEX's canonical JSON codec.
@@ -108,6 +232,7 @@ pub fn decode_workflow_result<O: DeserializeOwned, E: DeserializeOwned>(
 }
 
 /// Decode the terminal result using an orchestration's associated types.
+#[doc(hidden)]
 pub fn decode_orchestration_result<O: Orchestration>(
     outcome: &TerminalOutcome,
 ) -> Result<Result<O::Output, O::Error>, WorkflowCodecError> {
@@ -225,7 +350,41 @@ impl<'history> WorkflowContext<'history> {
         decode_activity_result::<A>(&result)
     }
 
-    /// Schedule a typed activity with its contract name and default options.
+    /// Schedule a named typed activity with default options.
+    pub async fn schedule_activity_typed<In, Out>(
+        &mut self,
+        name: &str,
+        input: &In,
+    ) -> Result<Out, ActivityInvocationError>
+    where
+        In: Serialize,
+        Out: DeserializeOwned,
+    {
+        self.schedule_activity_typed_with_options(name, input, ActivityOptions::default())
+            .await
+    }
+
+    /// Schedule a named typed activity with replay-matched options.
+    pub async fn schedule_activity_typed_with_options<In, Out>(
+        &mut self,
+        name: &str,
+        input: &In,
+        options: ActivityOptions,
+    ) -> Result<Out, ActivityInvocationError>
+    where
+        In: Serialize,
+        Out: DeserializeOwned,
+    {
+        let spec = typed_activity_spec(name, input, options)?;
+        let result = poll_fn(|_| self.poll_activity(&spec, None))
+            .await
+            .map_err(Self::activity_invocation_error)?;
+        decode_typed_result(&result, crate::MAX_ACTIVITY_RESULT_BYTES)
+            .map_err(ActivityInvocationError::Call)
+    }
+
+    /// Schedule a typed activity using an internal activity contract.
+    #[doc(hidden)]
     pub async fn schedule_activity<A: DurableActivity>(
         &mut self,
         input: &A::Input,
@@ -234,19 +393,20 @@ impl<'history> WorkflowContext<'history> {
             .await
     }
 
-    /// Schedule a typed activity with replay-matched options.
+    /// Schedule a typed activity using an internal contract and replay-matched options.
+    #[doc(hidden)]
     pub async fn schedule_activity_with_options<A: DurableActivity>(
         &mut self,
         input: &A::Input,
         options: ActivityOptions,
     ) -> Result<A::Output, ActivityInvocationError> {
-        self.schedule_activity_typed::<A>(A::NAME, input, options)
+        self.schedule_activity_contract_with_options::<A>(A::NAME, input, options)
             .await
     }
 
-    /// Schedule an ordinary named typed activity with replay-matched options.
+    /// Schedule an activity using an internal contract.
     #[doc(hidden)]
-    pub async fn schedule_activity_typed<A: DurableActivity>(
+    pub async fn schedule_activity_contract_with_options<A: DurableActivity>(
         &mut self,
         name: &str,
         input: &A::Input,
@@ -258,14 +418,18 @@ impl<'history> WorkflowContext<'history> {
         } else {
             poll_fn(|_| self.poll_activity(&spec, A::completion_class())).await
         }
-        .map_err(|failure| match failure {
+        .map_err(Self::activity_invocation_error)?;
+        decode_activity_result::<A>(&result).map_err(ActivityInvocationError::Call)
+    }
+
+    fn activity_invocation_error(failure: ActivityFailure) -> ActivityInvocationError {
+        match failure {
             ActivityFailure::Application(error) => ActivityInvocationError::Application(error),
             ActivityFailure::TimedOut => ActivityInvocationError::TimedOut,
             ActivityFailure::ActionDeadlineExceeded => {
                 ActivityInvocationError::ActionDeadlineExceeded
             }
-        })?;
-        decode_activity_result::<A>(&result).map_err(ActivityInvocationError::Call)
+        }
     }
 
     pub(crate) const fn cursor(&self) -> usize {
