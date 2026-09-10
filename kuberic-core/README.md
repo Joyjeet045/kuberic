@@ -37,6 +37,14 @@ default and return `KubericError::NoWriteQuorum` when it expires. Services that
 need a different bound can use `WalReplicator::create_with_options` with
 `WalReplicatorOptions::new().quorum_timeout(duration)`.
 
+Copy streams require an explicit application completion acknowledgement.
+After `get_operation()` returns `None`, verify `copy_lsn()`, finish snapshot
+validation/installation and required checkpoints, then call
+`acknowledge_completion()`. Only that acknowledgement permits the copy RPC to
+succeed and the secondary's `current_progress` and `committed_lsn` to advance.
+Dropping the stream on any failure rejects the copy without publishing progress.
+An interrupted network stream has no completion boundary and cannot be acknowledged.
+
 See [examples/kvstore](../examples/kvstore/) and [examples/sqlite](../examples/sqlite/) for complete implementations.
 
 ## Replication Model

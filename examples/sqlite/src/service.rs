@@ -155,13 +155,13 @@ async fn drain_stream(
     mut stream: OperationStream,
     token: CancellationToken,
     label: &'static str,
-) {
+) -> std::io::Result<()> {
     loop {
         tokio::select! {
             biased;
             _ = token.cancelled() => {
                 info!(label, "stream drain cancelled");
-                break;
+                return Err(std::io::Error::other("stream drain cancelled"));
             }
             item = stream.get_operation() => {
                 let Some(op) = item else { break };
@@ -172,7 +172,7 @@ async fn drain_stream(
                     let mut st = state.lock().await;
                     if let Err(e) = st.restore_from_snapshot(&op.data).await {
                         warn!(error = %e, "failed to restore snapshot");
-                        continue;
+                        return Err(e);
                     }
                     st.last_applied_lsn = lsn;
                     st.committed_lsn = lsn;
@@ -201,7 +201,28 @@ async fn drain_stream(
             }
         }
     }
+    if label == "copy" {
+        let lsn = stream
+            .copy_lsn()
+            .ok_or_else(|| std::io::Error::other("incomplete copy stream"))?;
+        let mut state = state.lock().await;
+        if state.last_applied_lsn != lsn {
+            return Err(std::io::Error::other(
+                "copy boundary does not match installed snapshot",
+            ));
+        }
+        crate::framelog::FrameLog::save_meta(
+            &state.data_dir,
+            &crate::framelog::FrameLogMeta { committed_lsn: lsn },
+        )
+        .await?;
+        state.committed_lsn = lsn;
+        stream
+            .acknowledge_completion()
+            .map_err(std::io::Error::other)?;
+    }
     info!(label, "stream drained");
+    Ok(())
 }
 
 /// Main service event loop.
@@ -231,7 +252,8 @@ pub async fn run_service_with_data_loss(
     let mut copy_stream: Option<OperationStream> = None;
     let mut replication_stream: Option<OperationStream> = None;
     let mut token: Option<CancellationToken> = None;
-    let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut bg_handles: Vec<tokio::task::JoinHandle<std::io::Result<()>>> = Vec::new();
+    let mut copy_failure: Option<String> = None;
     let mut bg_token: Option<CancellationToken> = None;
     let mut client_server_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut client_server_shutdown: Option<CancellationToken> = None;
@@ -270,25 +292,31 @@ pub async fn run_service_with_data_loss(
                 }
                 LifecycleEvent::ChangeRole { new_role, reply } => {
                     info!(?new_role, "role changed");
+                    if new_role == last_role {
+                        let _ = reply.send(Ok(String::new()));
+                        continue;
+                    }
+                    if matches!(new_role, Role::ActiveSecondary | Role::Primary)
+                        && let Some(error) = &copy_failure
+                    {
+                        let _ = reply.send(Err(kuberic_core::KubericError::Internal(error.clone().into())));
+                        continue;
+                    }
 
-                    if new_role == Role::ActiveSecondary {
+                    if matches!(new_role, Role::ActiveSecondary | Role::Primary)
+                        && last_role == Role::IdleSecondary
+                    {
                         // Let copy drain finish
                         for h in bg_handles.drain(..) {
-                            let _ = h.await;
-                        }
-                        // Apply committed frames after copy
-                        {
-                            let st = state.lock().await;
-                            let lsn = st.last_applied_lsn;
-                            drop(st);
-                            let mut st = state.lock().await;
-                            st.committed_lsn = lsn;
-                            if let Err(e) = crate::framelog::FrameLog::save_meta(
-                                &st.data_dir,
-                                &crate::framelog::FrameLogMeta { committed_lsn: lsn },
-                            ).await {
-                                warn!(error = %e, "meta save after copy failed");
+                            match h.await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => copy_failure = Some(error.to_string()),
+                                Err(error) => copy_failure = Some(error.to_string()),
                             }
+                        }
+                        if let Some(error) = &copy_failure {
+                            let _ = reply.send(Err(kuberic_core::KubericError::Internal(error.clone().into())));
+                            continue;
                         }
                     } else {
                         if let Some(t) = bg_token.take() {

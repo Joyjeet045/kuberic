@@ -282,13 +282,19 @@ pub async fn drain_copy_stream(
     let mut contents = Vec::new();
     let mut expected_index = 0;
     let mut snapshot_lsn = None;
+    let mut snapshot = None;
     loop {
         let operation = tokio::select! {
             biased;
             _ = token.cancelled() => return Err(std::io::Error::other("copy cancelled")),
             operation = stream.get_operation() => operation,
+        };
+        let Some(operation) = operation else { break };
+        if snapshot.is_some() {
+            return Err(std::io::Error::other(
+                "copy data after final snapshot chunk",
+            ));
         }
-        .ok_or_else(|| std::io::Error::other("incomplete copy snapshot"))?;
         let chunk: CopyChunk =
             serde_json::from_slice(&operation.data).map_err(std::io::Error::other)?;
         let lsn = *snapshot_lsn.get_or_insert(operation.lsn);
@@ -298,21 +304,28 @@ pub async fn drain_copy_stream(
         contents.extend_from_slice(&chunk.data);
         expected_index += 1;
         if chunk.last {
-            let snapshot: persistence::SnapshotData =
+            let completed: persistence::SnapshotData =
                 serde_json::from_slice(&contents).map_err(std::io::Error::other)?;
-            if snapshot.last_applied_lsn != lsn {
+            if completed.last_applied_lsn != lsn {
                 return Err(std::io::Error::other("copy snapshot LSN mismatch"));
             }
-            state
-                .write()
-                .await
-                .apply_op(lsn, &KvOp::Snapshot(snapshot))
-                .await?;
-            operation.acknowledge();
-            return Ok(());
+            snapshot = Some(completed);
         }
         operation.acknowledge();
     }
+    let snapshot = snapshot.ok_or_else(|| std::io::Error::other("incomplete copy snapshot"))?;
+    if stream.copy_lsn() != Some(snapshot.last_applied_lsn) {
+        return Err(std::io::Error::other("copy completion boundary mismatch"));
+    }
+    let mut state = state.write().await;
+    state
+        .apply_op(snapshot.last_applied_lsn, &KvOp::Snapshot(snapshot))
+        .await?;
+    state.committed_lsn = state.last_applied_lsn;
+    state.checkpoint().await?;
+    stream
+        .acknowledge_completion()
+        .map_err(std::io::Error::other)
 }
 
 /// Drain a copy or replication stream, applying each operation to shared state.
@@ -361,6 +374,141 @@ pub async fn drain_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuberic_core::driver::ReplicaHandle;
+    use kuberic_core::types::{
+        AccessStatus, CorrelatedControlActionAcknowledgement, CorrelatedControlActionRequest,
+        DurableActionState, DurableReplicaAction, Epoch, OpenMode, Role,
+    };
+
+    async fn copy_test_action(
+        handle: &impl ReplicaHandle,
+        action_id: &str,
+        action: DurableReplicaAction,
+    ) -> kuberic_core::Result<CorrelatedControlActionAcknowledgement> {
+        let status = handle.get_status().await?;
+        handle
+            .execute_correlated_control_action(CorrelatedControlActionRequest {
+                protocol_version: kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                action_id: action_id.into(),
+                input_signature: action.signature(),
+                target_replica_id: handle.id(),
+                target_instance_id: status.instance_id,
+                expected_agent_generation: status.agent.generation,
+                expected_control_version: status.agent.control_version,
+                observed_runtime_epoch: status.epoch,
+                action,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn copy_validation_wal_and_checkpoint_failures_block_progress_and_promotion() {
+        for failure in ["validation", "wal", "checkpoint"] {
+            let pod = crate::testing::KvPod::start(1).await;
+            let handle = pod.replica_handle(1).await;
+            let epoch = Epoch::new(0, 1);
+            for (action_id, action) in [
+                (
+                    "open",
+                    DurableReplicaAction::Open {
+                        mode: OpenMode::New,
+                    },
+                ),
+                (
+                    "idle",
+                    DurableReplicaAction::ChangeRole {
+                        epoch,
+                        role: Role::IdleSecondary,
+                    },
+                ),
+            ] {
+                let result = copy_test_action(&handle, action_id, action).await.unwrap();
+                assert_eq!(
+                    result.observation.action.state,
+                    DurableActionState::Completed
+                );
+            }
+            if failure == "wal" {
+                pod.state.write().await.wal_writer = BufWriter::new(
+                    tokio::fs::File::open(pod.data_dir.join("wal.log"))
+                        .await
+                        .unwrap(),
+                );
+            } else if failure == "checkpoint" {
+                tokio::fs::create_dir(pod.data_dir.join("state.json.tmp"))
+                    .await
+                    .unwrap();
+            }
+            let snapshot = persistence::SnapshotData {
+                last_applied_lsn: 7,
+                data: HashMap::from([("copied".into(), "value".into())]),
+                ..Default::default()
+            };
+            let data = if failure == "validation" {
+                b"{".to_vec()
+            } else {
+                serde_json::to_vec(&snapshot).unwrap()
+            };
+            let chunk = CopyChunk {
+                index: 0,
+                data,
+                last: true,
+            };
+            let mut client =
+                kuberic_core::proto::replicator_data_client::ReplicatorDataClient::connect(
+                    pod.data_address.clone(),
+                )
+                .await
+                .unwrap();
+            let copy = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.copy_stream(tokio_stream::iter([
+                    kuberic_core::proto::CopyItem {
+                        lsn: 7,
+                        data: serde_json::to_vec(&chunk).unwrap(),
+                        is_boundary: false,
+                    },
+                    kuberic_core::proto::CopyItem {
+                        lsn: 7,
+                        data: Vec::new(),
+                        is_boundary: true,
+                    },
+                ])),
+            )
+            .await
+            .expect("failed copy must complete its RPC");
+            assert!(copy.is_err(), "{failure} must fail copy");
+            for (attempt, role) in [Role::Primary, Role::ActiveSecondary, Role::Primary]
+                .into_iter()
+                .enumerate()
+            {
+                let result = copy_test_action(
+                    &handle,
+                    &format!("promotion-{attempt}"),
+                    DurableReplicaAction::ChangeRole { epoch, role },
+                )
+                .await;
+                if let Ok(result) = result {
+                    assert_eq!(
+                        result.observation.action.state,
+                        DurableActionState::Failed,
+                        "{failure}"
+                    );
+                }
+                let status = handle.get_status().await.unwrap();
+                assert_eq!(status.current_progress, 0, "{failure}");
+                assert_eq!(status.committed_lsn, 0, "{failure}");
+                assert_eq!(status.role, Role::IdleSecondary, "{failure}");
+                assert_ne!(status.write_status, AccessStatus::Granted, "{failure}");
+            }
+            if failure == "checkpoint" {
+                assert_eq!(pod.state.read().await.last_applied_lsn, 7);
+            } else {
+                assert!(pod.state.read().await.data.is_empty());
+            }
+            pod.crash().await;
+        }
+    }
 
     #[tokio::test]
     async fn missing_wal_history_cannot_be_published_as_a_rollback_snapshot() {

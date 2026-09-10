@@ -289,21 +289,13 @@ pub async fn run_service_with_options_and_data_loss(
                     }
                     state.write().await.generation += 1;
 
-                    if new_role == Role::ActiveSecondary && last_role == Role::IdleSecondary {
+                    if matches!(new_role, Role::ActiveSecondary | Role::Primary)
+                        && last_role == Role::IdleSecondary
+                    {
                         // IdleSecondary → ActiveSecondary: let copy drain finish
                         if let Err(error) = complete_copy(&mut bg_handles, &mut copy_failure).await {
                             let _ = reply.send(Err(error));
                             continue;
-                        }
-                        // Checkpoint after copy completes
-                        {
-                            let mut guard = state.write().await;
-                            guard.committed_lsn = guard.last_applied_lsn;
-                            if let Err(e) = guard.checkpoint().await {
-                                tracing::warn!(error = %e, "checkpoint after copy failed");
-                                let _ = reply.send(Err(kuberic_core::KubericError::Internal(e.to_string().into())));
-                                continue;
-                            }
                         }
                     } else {
                         if let Some(t) = bg_token.take() {

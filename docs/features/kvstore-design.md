@@ -155,7 +155,13 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 
   Copy transfers a snapshot at the replicator's requested LSN in bounded chunks.
   The receiver stages the chunks and persists/installs one snapshot only when it
-  is complete; incomplete copies never expose partial data. WAL replay likewise
+  is complete. After validating the stream's completion boundary, the copy drain
+  installs and checkpoints the snapshot before calling
+  `OperationStream::acknowledge_completion()`. The copy RPC and advertised
+  `current_progress`/`committed_lsn` wait for that acknowledgement, not network
+  EOF. Final validation, WAL, or checkpoint failure leaves advertised progress
+  unchanged and prevents promotion, including direct promotion and retries.
+  Incomplete copies never expose partial data. WAL replay likewise
   stops before a truncated transaction record, including torn UTF-8 values.
   Actual WAL I/O errors fail recovery rather than truncating valid history.
   WAL failures never publish any of that operation's mutations and prevent
@@ -253,9 +259,9 @@ Wrapped in `Arc<RwLock<KvState>>` and shared between:
 | Event | Action |
 |-------|--------|
 | **Open** | `KvState::open(data_dir)` — load snapshot + replay WAL |
-| **ChangeRole(IdleSecondary)** | Spawn `drain_copy_stream` — stage chunks and install the complete snapshot through `apply_op()` |
-| **ChangeRole(ActiveSecondary)** | Wait for copy drain to finish naturally, checkpoint, then spawn `drain_stream` for `replication_stream` |
-| **ChangeRole(Primary)** | Start client gRPC server |
+| **ChangeRole(IdleSecondary)** | Spawn `drain_copy_stream` — validate, install and checkpoint the snapshot, then acknowledge copy completion |
+| **ChangeRole(ActiveSecondary)** | Wait for successful copy completion, then spawn `drain_stream` for `replication_stream` |
+| **ChangeRole(Primary)** | Require successful copy completion when promoting from idle, then start client gRPC server |
 | **Close** | Cancel drains, stop client server, checkpoint for fast recovery |
 | **Abort** | Cancel drains, stop client server (no checkpoint) |
 
@@ -378,7 +384,7 @@ KvState::open(data_dir):
 
 Snapshots only when `committed_lsn == last_applied_lsn` (no uncommitted
 ops). Triggered on:
-- Copy stream completion (IdleSecondary → ActiveSecondary)
+- Copy drain completion, before application acknowledgement and progress publication
 - Graceful Close
 
 ### UpdateEpoch Rollback
@@ -415,6 +421,8 @@ read-only and blind-write conflicts, absent-key ABA, disjoint commits,
 ordinary-write serialization, abort/expiry/resource limits, concurrent and
 lost-response retries, WAL failure/truncation, checkpoint retention, rollback,
 large atomic copies, catch-up, secondary visibility, and immediate failover.
+Copy regressions inject final validation, WAL-write, and checkpoint failures
+through real gRPC replicas and verify unchanged progress and rejected promotion.
 
 ### Remaining Work
 
