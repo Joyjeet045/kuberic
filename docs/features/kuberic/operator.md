@@ -296,7 +296,7 @@ already present in the committed bootstrap snapshot.
 ## Durable Switchover
 
 The production workflow is a deterministic ordinary-async function that calls
-20 operation-specific version-1 typed activities. Its source visibly owns the
+20 operation-specific version-1 typed effects. Its source visibly owns the
 normal sequence, sorted replica loops, catch-up waits, pre-promotion restore,
 post-promotion compensation, label ordering, topology attestation, and terminal
 choice. Production history therefore contains semantic names such as
@@ -333,15 +333,16 @@ checkpoint load/reload, bounded-fuel progression, terminal short-circuit, and
 persistence outcome classification. Neither the adapter nor runner selects
 the next switchover step.
 
-Each named activity also has its own persisted input and output shape. Fixed
+Each named effect also has its own logical request, exact prepared command, and
+typed output shape. Fixed
 old-primary, target-primary, distribution, configuration, and label contracts
 contain only fields meaningful to that operation; production does not erase
 them into a cross-operation replica/label kind or request superset.
 
-Fused host progression persists a prepared activity directly as
-`DispatchExposed`, returning a private permit only after the exact checkpoint
-CAS is accepted. An authoritative observation can be persisted together with
-the next exposure or terminal state. Replica dispatch freezes exact agent
+The host persists the logical request separately from its exact prepared
+command and marks it `DispatchExposed`, returning a private permit only after
+the exact checkpoint CAS is accepted. An authoritative observation can advance
+the same logical record. Replica dispatch freezes exact agent
 generation, control version, runtime epoch, correlated action identity, and
 payload. Routing-label activities freeze the Pod UID.
 
@@ -362,11 +363,10 @@ The terminal checkpoint is accepted and then reloaded before topology/status
 publication. Terminal reload is status-only and does not poll replicas or
 dispatch effects. Its immutable branch discriminator distinguishes target
 success, revoke-safe failure, previous-configuration restore, and
-post-promotion compensation. The adapter accepts only the exact topology and
-member-count-specific reachable external/passive accounting pairs for that
-branch. Every effect slot admits the passive classification that its
-production evaluator can persist; only replica slots admit one bounded
-redelivery, and labels never do. `Completed` and
+post-promotion compensation. Kernel-authenticated completion metadata supplies
+exact logical, external-effect, and passive-observation counts from immutable
+registered effect metadata. The adapter accepts only the exact legal topology
+for the branch. `Completed` and
 `CompensatedOrSafeFailure` clear the active
 `FrameworkNativeSwitchover` condition and return the resource to `Healthy`;
 stopped, incompatible, rejected, isolated, nondeterministic, reload, and
@@ -384,8 +384,8 @@ reference to the exact `KubericSet`. The operator has ConfigMap `get`,
 `create`, and `update` only. Active and terminal checkpoints live with the
 owner and rely on Kubernetes garbage collection after owner deletion.
 
-The contract independently bounds 4,096 workflow-input bytes, 8,192 activity
-input bytes, 8,192 activity-result bytes, 33 activity records, 524,288
+The contract independently bounds 4,096 workflow-input bytes, 8,192 effect
+request bytes, 8,192 effect-result bytes, 19 logical activity records, 524,288
 active-checkpoint bytes, 16,384 terminal-checkpoint bytes, 4,096
 terminal-payload bytes, and 512 error bytes. Replay is separately bounded at
 64 workflow transitions and each reconcile at 32 runner outcomes. One checked
@@ -393,10 +393,10 @@ transition budget covers the normal path, both compensation families,
 attestation, and proof-backed redelivery. Externally sourced errors are
 UTF-8-truncated before activity persistence, while oversized replayed activity
 or terminal errors are rejected.
-The declared-maximum fixtures measure 444,601 active bytes and 15,077 terminal
-bytes. The nine-member maximum-fault production run measures 64,061 active
-bytes and 4,921 terminal bytes while consuming all 33 records. These limits
-are switchover-specific and are not copied from remove-replica.
+The nine-member maximum-fault production run completes 19 logical records,
+including 16 external effects and three passive observations, with 67 accepted
+writes. These limits are switchover-specific and are not copied from
+remove-replica.
 
 The local mutation boundary remains individually correlated ReplicaAgent
 actions. A coarse switchover intent was not introduced because the operation

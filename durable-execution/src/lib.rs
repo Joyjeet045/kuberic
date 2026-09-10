@@ -15,6 +15,7 @@
 
 mod assessment;
 mod checkpoint;
+mod effect;
 mod host;
 mod identity;
 mod in_memory;
@@ -30,9 +31,19 @@ pub use checkpoint::{
     ActivityRecord, ActivityState, CHECKPOINT_FORMAT_VERSION, CheckpointEnvelope, CheckpointError,
     CheckpointLimits, CheckpointPayload, CheckpointState, ExecutionContract,
 };
+pub use effect::{
+    BoundedEffectError, CompletionClass, CompletionMetadata, DispatchEffect, DurableEffect,
+    DurableEffectSet, EffectActivity, EffectAttempt, EffectAttemptState, EffectCallError,
+    EffectContractError, EffectErrorKind, EffectHostStep, EffectMetadata,
+    EffectObservationDisposition, EffectOutcome, EffectQuarantineContext, EffectRegistration,
+    EffectRoutingError, HostedEffectSet, ObserveEffect, ObserveQuarantinedEffect, PrepareEffect,
+    PreparedCommand, PreparedEffectResolver, PreparedEffectSet, RegisteredEffectResolver,
+    StaticEffectResolver, decode_effect_command, decode_effect_request, encode_effect_command,
+    encode_effect_request, validate_effect_attempts, validate_effect_registrations,
+};
 pub use host::{
-    ActivityObservation, DispatchPermit, DurableHost, HOST_OUTCOME_VARIANTS, HostOutcome,
-    ObservationRejection, PersistenceBoundary, ReloadReason, StoreOperation,
+    ActivityObservation, DispatchPermit, DurableHost, EffectObservation, HOST_OUTCOME_VARIANTS,
+    HostOutcome, ObservationRejection, PersistenceBoundary, ReloadReason, StoreOperation,
     TerminalCheckpointStatus,
 };
 pub use identity::{
@@ -46,7 +57,7 @@ pub use kubernetes::{
     KubernetesCheckpointMetricsSnapshot, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
     KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, MAX_CONFIG_MAP_DATA_BUDGET_BYTES,
 };
-pub use replay::{Evaluation, Nondeterminism, evaluate, evaluate_prepared};
+pub use replay::{Evaluation, Nondeterminism, evaluate, evaluate_effects, evaluate_prepared};
 pub use store::{
     CasOutcome, CheckpointStore, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
 };

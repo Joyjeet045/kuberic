@@ -6,8 +6,8 @@ use kuberic_core::types::{
     ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, Role,
 };
 use kuberic_durable_execution::{
-    ActivityName, ActivitySpec, DurableActivity, ExactBytes, PreparedActivityError,
-    decode_activity_input, encode_activity_input, encode_activity_result,
+    BoundedEffectError, DurableEffect, EffectActivity, EffectErrorKind, EffectOutcome, ExactBytes,
+    PreparedActivityError, decode_activity_result, encode_activity_result,
 };
 
 use crate::crd::{
@@ -31,48 +31,24 @@ use super::{
         CompensateDistributeReplicaEpochInput, CompensatePromoteOldPrimaryActivity,
         CompensatePromoteOldPrimaryInput, DIRECT_SWITCHOVER_CONTRACT_VERSION,
         DemoteOldPrimaryActivity, DemoteOldPrimaryInput, DistributeReplicaEpochActivity,
-        DistributeReplicaEpochInput, EffectObservation,
+        DistributeReplicaEpochInput, EffectApplied,
         InstallCompensationCatchUpConfigurationActivity,
         InstallCompensationCatchUpConfigurationInput,
         InstallCompensationCurrentConfigurationActivity,
         InstallCompensationCurrentConfigurationInput, InstallTargetCatchUpConfigurationActivity,
         InstallTargetCatchUpConfigurationInput, InstallTargetCurrentConfigurationActivity,
-        InstallTargetCurrentConfigurationInput, LabelDirectActivity, PromoteTargetActivity,
-        PromoteTargetInput, PublishOldPrimarySecondaryLabelActivity,
+        InstallTargetCurrentConfigurationInput, LabelEffectFamily, PassiveEffectFamily,
+        PromoteTargetActivity, PromoteTargetInput, PublishOldPrimarySecondaryLabelActivity,
         PublishOldPrimarySecondaryLabelInput, PublishTargetPrimaryLabelActivity,
-        PublishTargetPrimaryLabelInput, ReplicaDirectActivity, RestoreOldPrimaryLabelActivity,
+        PublishTargetPrimaryLabelInput, ReplicaEffectFamily, RestoreOldPrimaryLabelActivity,
         RestoreOldPrimaryLabelInput, RestorePreviousCurrentConfigurationActivity,
         RestorePreviousCurrentConfigurationInput, RestoreTargetSecondaryLabelActivity,
         RestoreTargetSecondaryLabelInput, RevokeWritesActivity, RevokeWritesInput,
-        WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput, WaitTargetCaughtUpOutput,
-        WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
+        SwitchoverEffect, WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput,
+        WaitTargetCaughtUpOutput, WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
     },
     model::DirectSwitchoverDefinition,
 };
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum DirectActivity {
-    RevokeWrites(RevokeWritesInput),
-    DemoteOldPrimary(DemoteOldPrimaryInput),
-    PromoteTarget(PromoteTargetInput),
-    DistributeReplicaEpoch(DistributeReplicaEpochInput),
-    InstallTargetCatchUpConfiguration(InstallTargetCatchUpConfigurationInput),
-    WaitTargetWriteQuorum(WaitTargetWriteQuorumInput),
-    InstallTargetCurrentConfiguration(InstallTargetCurrentConfigurationInput),
-    RestorePreviousCurrentConfiguration(RestorePreviousCurrentConfigurationInput),
-    CompensatePromoteOldPrimary(CompensatePromoteOldPrimaryInput),
-    CompensateDistributeReplicaEpoch(CompensateDistributeReplicaEpochInput),
-    InstallCompensationCatchUpConfiguration(InstallCompensationCatchUpConfigurationInput),
-    InstallCompensationCurrentConfiguration(InstallCompensationCurrentConfigurationInput),
-    PublishTargetPrimaryLabel(PublishTargetPrimaryLabelInput),
-    PublishOldPrimarySecondaryLabel(PublishOldPrimarySecondaryLabelInput),
-    RestoreOldPrimaryLabel(RestoreOldPrimaryLabelInput),
-    RestoreTargetSecondaryLabel(RestoreTargetSecondaryLabelInput),
-    CaptureFrozenLsn(CaptureFrozenLsnInput),
-    WaitTargetCaughtUp(WaitTargetCaughtUpInput),
-    AttestTargetTopology(AttestTargetTopologyInput),
-    AttestCompensatedTopology(AttestCompensatedTopologyInput),
-}
 
 pub enum DirectEvaluation {
     Observe(ExactBytes),
@@ -84,917 +60,49 @@ pub enum DirectEvaluation {
     DispatchLabel,
 }
 
-impl DirectActivity {
-    pub fn decode(spec: &ActivitySpec) -> Result<Self, String> {
-        let name = spec.name().name();
-        Ok(match name {
-            RevokeWritesActivity::NAME => Self::RevokeWrites(decode::<RevokeWritesActivity>(spec)?),
-            DemoteOldPrimaryActivity::NAME => {
-                Self::DemoteOldPrimary(decode::<DemoteOldPrimaryActivity>(spec)?)
-            }
-            PromoteTargetActivity::NAME => {
-                Self::PromoteTarget(decode::<PromoteTargetActivity>(spec)?)
-            }
-            DistributeReplicaEpochActivity::NAME => {
-                Self::DistributeReplicaEpoch(decode::<DistributeReplicaEpochActivity>(spec)?)
-            }
-            InstallTargetCatchUpConfigurationActivity::NAME => {
-                Self::InstallTargetCatchUpConfiguration(decode::<
-                    InstallTargetCatchUpConfigurationActivity,
-                >(spec)?)
-            }
-            WaitTargetWriteQuorumActivity::NAME => {
-                Self::WaitTargetWriteQuorum(decode::<WaitTargetWriteQuorumActivity>(spec)?)
-            }
-            InstallTargetCurrentConfigurationActivity::NAME => {
-                Self::InstallTargetCurrentConfiguration(decode::<
-                    InstallTargetCurrentConfigurationActivity,
-                >(spec)?)
-            }
-            RestorePreviousCurrentConfigurationActivity::NAME => {
-                Self::RestorePreviousCurrentConfiguration(decode::<
-                    RestorePreviousCurrentConfigurationActivity,
-                >(spec)?)
-            }
-            CompensatePromoteOldPrimaryActivity::NAME => Self::CompensatePromoteOldPrimary(
-                decode::<CompensatePromoteOldPrimaryActivity>(spec)?,
-            ),
-            CompensateDistributeReplicaEpochActivity::NAME => {
-                Self::CompensateDistributeReplicaEpoch(decode::<
-                    CompensateDistributeReplicaEpochActivity,
-                >(spec)?)
-            }
-            InstallCompensationCatchUpConfigurationActivity::NAME => {
-                Self::InstallCompensationCatchUpConfiguration(decode::<
-                    InstallCompensationCatchUpConfigurationActivity,
-                >(spec)?)
-            }
-            InstallCompensationCurrentConfigurationActivity::NAME => {
-                Self::InstallCompensationCurrentConfiguration(decode::<
-                    InstallCompensationCurrentConfigurationActivity,
-                >(spec)?)
-            }
-            PublishTargetPrimaryLabelActivity::NAME => {
-                Self::PublishTargetPrimaryLabel(decode::<PublishTargetPrimaryLabelActivity>(spec)?)
-            }
-            PublishOldPrimarySecondaryLabelActivity::NAME => {
-                Self::PublishOldPrimarySecondaryLabel(decode::<
-                    PublishOldPrimarySecondaryLabelActivity,
-                >(spec)?)
-            }
-            RestoreOldPrimaryLabelActivity::NAME => {
-                Self::RestoreOldPrimaryLabel(decode::<RestoreOldPrimaryLabelActivity>(spec)?)
-            }
-            RestoreTargetSecondaryLabelActivity::NAME => Self::RestoreTargetSecondaryLabel(
-                decode::<RestoreTargetSecondaryLabelActivity>(spec)?,
-            ),
-            CaptureFrozenLsnActivity::NAME => {
-                Self::CaptureFrozenLsn(decode::<CaptureFrozenLsnActivity>(spec)?)
-            }
-            WaitTargetCaughtUpActivity::NAME => {
-                Self::WaitTargetCaughtUp(decode::<WaitTargetCaughtUpActivity>(spec)?)
-            }
-            AttestTargetTopologyActivity::NAME => {
-                Self::AttestTargetTopology(decode::<AttestTargetTopologyActivity>(spec)?)
-            }
-            AttestCompensatedTopologyActivity::NAME => {
-                Self::AttestCompensatedTopology(decode::<AttestCompensatedTopologyActivity>(spec)?)
-            }
-            _ => return Err(format!("unknown direct switchover activity {name}")),
-        })
-    }
+pub(crate) enum SwitchoverDispatch<'a> {
+    Replica(&'a ReplicaEffectCommand),
+    Label(&'a LabelEffectCommand),
+    ObservationOnly,
+}
 
-    pub fn spec(&self) -> Result<ActivitySpec, String> {
-        match self {
-            Self::RevokeWrites(input) => spec::<RevokeWritesActivity>(input),
-            Self::DemoteOldPrimary(input) => spec::<DemoteOldPrimaryActivity>(input),
-            Self::PromoteTarget(input) => spec::<PromoteTargetActivity>(input),
-            Self::DistributeReplicaEpoch(input) => spec::<DistributeReplicaEpochActivity>(input),
-            Self::InstallTargetCatchUpConfiguration(input) => {
-                spec::<InstallTargetCatchUpConfigurationActivity>(input)
-            }
-            Self::WaitTargetWriteQuorum(input) => spec::<WaitTargetWriteQuorumActivity>(input),
-            Self::InstallTargetCurrentConfiguration(input) => {
-                spec::<InstallTargetCurrentConfigurationActivity>(input)
-            }
-            Self::RestorePreviousCurrentConfiguration(input) => {
-                spec::<RestorePreviousCurrentConfigurationActivity>(input)
-            }
-            Self::CompensatePromoteOldPrimary(input) => {
-                spec::<CompensatePromoteOldPrimaryActivity>(input)
-            }
-            Self::CompensateDistributeReplicaEpoch(input) => {
-                spec::<CompensateDistributeReplicaEpochActivity>(input)
-            }
-            Self::InstallCompensationCatchUpConfiguration(input) => {
-                spec::<InstallCompensationCatchUpConfigurationActivity>(input)
-            }
-            Self::InstallCompensationCurrentConfiguration(input) => {
-                spec::<InstallCompensationCurrentConfigurationActivity>(input)
-            }
-            Self::PublishTargetPrimaryLabel(input) => {
-                spec::<PublishTargetPrimaryLabelActivity>(input)
-            }
-            Self::PublishOldPrimarySecondaryLabel(input) => {
-                spec::<PublishOldPrimarySecondaryLabelActivity>(input)
-            }
-            Self::RestoreOldPrimaryLabel(input) => spec::<RestoreOldPrimaryLabelActivity>(input),
-            Self::RestoreTargetSecondaryLabel(input) => {
-                spec::<RestoreTargetSecondaryLabelActivity>(input)
-            }
-            Self::CaptureFrozenLsn(input) => spec::<CaptureFrozenLsnActivity>(input),
-            Self::WaitTargetCaughtUp(input) => spec::<WaitTargetCaughtUpActivity>(input),
-            Self::AttestTargetTopology(input) => spec::<AttestTargetTopologyActivity>(input),
-            Self::AttestCompensatedTopology(input) => {
-                spec::<AttestCompensatedTopologyActivity>(input)
-            }
-        }
-    }
-
-    pub fn deadline_unix_seconds(&self) -> i64 {
-        match self {
-            Self::RevokeWrites(input) => input.deadline_unix_seconds,
-            Self::DemoteOldPrimary(input) => input.deadline_unix_seconds,
-            Self::PromoteTarget(input) => input.deadline_unix_seconds,
-            Self::DistributeReplicaEpoch(input) => input.deadline_unix_seconds,
-            Self::InstallTargetCatchUpConfiguration(input) => input.deadline_unix_seconds,
-            Self::WaitTargetWriteQuorum(input) => input.deadline_unix_seconds,
-            Self::InstallTargetCurrentConfiguration(input) => input.deadline_unix_seconds,
-            Self::RestorePreviousCurrentConfiguration(input) => input.deadline_unix_seconds,
-            Self::CompensatePromoteOldPrimary(input) => input.deadline_unix_seconds,
-            Self::CompensateDistributeReplicaEpoch(input) => input.deadline_unix_seconds,
-            Self::InstallCompensationCatchUpConfiguration(input) => input.deadline_unix_seconds,
-            Self::InstallCompensationCurrentConfiguration(input) => input.deadline_unix_seconds,
-            Self::PublishTargetPrimaryLabel(input) => input.deadline_unix_seconds,
-            Self::PublishOldPrimarySecondaryLabel(input) => input.deadline_unix_seconds,
-            Self::RestoreOldPrimaryLabel(input) => input.deadline_unix_seconds,
-            Self::RestoreTargetSecondaryLabel(input) => input.deadline_unix_seconds,
-            Self::CaptureFrozenLsn(input) => input.deadline_unix_seconds,
-            Self::WaitTargetCaughtUp(input) => input.deadline_unix_seconds,
-            Self::AttestTargetTopology(input) => input.deadline_unix_seconds,
-            Self::AttestCompensatedTopology(input) => input.deadline_unix_seconds,
-        }
-    }
-
-    pub fn logical_predecessor(&self) -> Self {
-        let mut predecessor = self.clone();
-        predecessor.clear_prepared_command();
-        predecessor
-    }
-
-    pub fn is_logical(&self) -> bool {
-        match self {
-            Self::RevokeWrites(_)
-            | Self::DemoteOldPrimary(_)
-            | Self::PromoteTarget(_)
-            | Self::DistributeReplicaEpoch(_)
-            | Self::InstallTargetCatchUpConfiguration(_)
-            | Self::WaitTargetWriteQuorum(_)
-            | Self::InstallTargetCurrentConfiguration(_)
-            | Self::RestorePreviousCurrentConfiguration(_)
-            | Self::CompensatePromoteOldPrimary(_)
-            | Self::CompensateDistributeReplicaEpoch(_)
-            | Self::InstallCompensationCatchUpConfiguration(_)
-            | Self::InstallCompensationCurrentConfiguration(_) => {
-                self.prepared_replica_command().is_none()
-            }
-            Self::PublishTargetPrimaryLabel(_)
-            | Self::PublishOldPrimarySecondaryLabel(_)
-            | Self::RestoreOldPrimaryLabel(_)
-            | Self::RestoreTargetSecondaryLabel(_) => self.prepared_label_command().is_none(),
-            Self::CaptureFrozenLsn(_)
-            | Self::WaitTargetCaughtUp(_)
-            | Self::AttestTargetTopology(_)
-            | Self::AttestCompensatedTopology(_) => true,
-        }
-    }
-
-    pub fn validate(&self, definition: &DirectSwitchoverDefinition) -> Result<(), String> {
-        match self {
-            Self::RevokeWrites(input) => {
-                validate_replica::<RevokeWritesActivity>(input, definition)
-            }
-            Self::DemoteOldPrimary(input) => {
-                validate_replica::<DemoteOldPrimaryActivity>(input, definition)
-            }
-            Self::PromoteTarget(input) => {
-                validate_replica::<PromoteTargetActivity>(input, definition)
-            }
-            Self::DistributeReplicaEpoch(input) => {
-                validate_replica::<DistributeReplicaEpochActivity>(input, definition)
-            }
-            Self::InstallTargetCatchUpConfiguration(input) => {
-                validate_replica::<InstallTargetCatchUpConfigurationActivity>(input, definition)
-            }
-            Self::WaitTargetWriteQuorum(input) => {
-                validate_replica::<WaitTargetWriteQuorumActivity>(input, definition)
-            }
-            Self::InstallTargetCurrentConfiguration(input) => {
-                validate_replica::<InstallTargetCurrentConfigurationActivity>(input, definition)
-            }
-            Self::RestorePreviousCurrentConfiguration(input) => {
-                validate_replica::<RestorePreviousCurrentConfigurationActivity>(input, definition)
-            }
-            Self::CompensatePromoteOldPrimary(input) => {
-                validate_replica::<CompensatePromoteOldPrimaryActivity>(input, definition)
-            }
-            Self::CompensateDistributeReplicaEpoch(input) => {
-                validate_replica::<CompensateDistributeReplicaEpochActivity>(input, definition)
-            }
-            Self::InstallCompensationCatchUpConfiguration(input) => validate_replica::<
-                InstallCompensationCatchUpConfigurationActivity,
-            >(input, definition),
-            Self::InstallCompensationCurrentConfiguration(input) => validate_replica::<
-                InstallCompensationCurrentConfigurationActivity,
-            >(input, definition),
-            Self::PublishTargetPrimaryLabel(input) => {
-                validate_label::<PublishTargetPrimaryLabelActivity>(input, definition)
-            }
-            Self::PublishOldPrimarySecondaryLabel(input) => {
-                validate_label::<PublishOldPrimarySecondaryLabelActivity>(input, definition)
-            }
-            Self::RestoreOldPrimaryLabel(input) => {
-                validate_label::<RestoreOldPrimaryLabelActivity>(input, definition)
-            }
-            Self::RestoreTargetSecondaryLabel(input) => {
-                validate_label::<RestoreTargetSecondaryLabelActivity>(input, definition)
-            }
-            Self::CaptureFrozenLsn(input) => {
-                validate_common(
-                    input.contract_version,
-                    &input.execution_id,
-                    input.deadline_unix_seconds,
-                    definition,
-                )?;
-                let old = definition.member(definition.old_primary_id)?;
-                if input.old_primary_id != definition.old_primary_id
-                    || input.old_primary_instance_id != old.instance_id
-                    || input.expected_epoch != definition.previous_snapshot.epoch
-                {
-                    return Err("capture-frozen-lsn input conflicts with admission".to_string());
-                }
-                Ok(())
-            }
-            Self::WaitTargetCaughtUp(input) => {
-                validate_common(
-                    input.contract_version,
-                    &input.execution_id,
-                    input.deadline_unix_seconds,
-                    definition,
-                )?;
-                let target = definition.member(definition.target_primary_id)?;
-                if input.target_id != definition.target_primary_id
-                    || input.target_instance_id != target.instance_id
-                    || input.expected_epoch != definition.previous_snapshot.epoch
-                    || input.frozen_lsn < 0
-                {
-                    return Err("wait-target-caught-up input conflicts with admission".to_string());
-                }
-                Ok(())
-            }
-            Self::AttestTargetTopology(input) => {
-                validate_common(
-                    input.contract_version,
-                    &input.execution_id,
-                    input.deadline_unix_seconds,
-                    definition,
-                )?;
-                if input.expected_snapshot != definition.target_snapshot {
-                    return Err("target attestation snapshot conflicts with admission".to_string());
-                }
-                Ok(())
-            }
-            Self::AttestCompensatedTopology(input) => {
-                validate_common(
-                    input.contract_version,
-                    &input.execution_id,
-                    input.deadline_unix_seconds,
-                    definition,
-                )?;
-                let compensation = definition.compensation_snapshot();
-                if input.expected_snapshot != definition.previous_snapshot
-                    && input.expected_snapshot != compensation
-                {
-                    return Err(
-                        "compensated attestation snapshot conflicts with admission".to_string()
-                    );
-                }
-                Ok(())
-            }
-        }
-    }
-
-    pub fn evaluate(
-        &self,
+pub(crate) trait SwitchoverEffectFamily<E: DurableEffect> {
+    fn deadline_unix_seconds(
+        request: &E::Request,
         definition: &DirectSwitchoverDefinition,
-        observations: &OperationObservations,
-        now: i64,
-    ) -> Result<DirectEvaluation, String> {
-        self.validate(definition)?;
-        match self {
-            Self::RevokeWrites(input) => {
-                evaluate_replica::<RevokeWritesActivity>(input, definition, observations, now)
-            }
-            Self::DemoteOldPrimary(input) => {
-                evaluate_replica::<DemoteOldPrimaryActivity>(input, definition, observations, now)
-            }
-            Self::PromoteTarget(input) => {
-                evaluate_replica::<PromoteTargetActivity>(input, definition, observations, now)
-            }
-            Self::DistributeReplicaEpoch(input) => {
-                evaluate_replica::<DistributeReplicaEpochActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::InstallTargetCatchUpConfiguration(input) => {
-                evaluate_replica::<InstallTargetCatchUpConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::WaitTargetWriteQuorum(input) => {
-                evaluate_replica::<WaitTargetWriteQuorumActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::InstallTargetCurrentConfiguration(input) => {
-                evaluate_replica::<InstallTargetCurrentConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::RestorePreviousCurrentConfiguration(input) => {
-                evaluate_replica::<RestorePreviousCurrentConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::CompensatePromoteOldPrimary(input) => evaluate_replica::<
-                CompensatePromoteOldPrimaryActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::CompensateDistributeReplicaEpoch(input) => evaluate_replica::<
-                CompensateDistributeReplicaEpochActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::InstallCompensationCatchUpConfiguration(input) => {
-                evaluate_replica::<InstallCompensationCatchUpConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::InstallCompensationCurrentConfiguration(input) => {
-                evaluate_replica::<InstallCompensationCurrentConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::PublishTargetPrimaryLabel(input) => evaluate_label::<
-                PublishTargetPrimaryLabelActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::PublishOldPrimarySecondaryLabel(input) => evaluate_label::<
-                PublishOldPrimarySecondaryLabelActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::RestoreOldPrimaryLabel(input) => {
-                evaluate_label::<RestoreOldPrimaryLabelActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::RestoreTargetSecondaryLabel(input) => evaluate_label::<
-                RestoreTargetSecondaryLabelActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::CaptureFrozenLsn(input) => evaluate_capture(input, observations, now),
-            Self::WaitTargetCaughtUp(input) => evaluate_target_catch_up(input, observations, now),
-            Self::AttestTargetTopology(input) => {
-                evaluate_attestation::<AttestTargetTopologyActivity, _, _, _>(
-                    &input.expected_snapshot,
-                    input.deadline_unix_seconds,
-                    observations,
-                    now,
-                    |observed_at, snapshot| AttestTargetTopologyOutput::Attested {
-                        observed_at_unix_seconds: observed_at,
-                        snapshot,
-                        accounting: None,
-                    },
-                    |observed_at, message| AttestTargetTopologyOutput::DeadlineExceeded {
-                        observed_at_unix_seconds: observed_at,
-                        message,
-                    },
-                    |observed_at, message| AttestTargetTopologyOutput::Conflicting {
-                        observed_at_unix_seconds: observed_at,
-                        message,
-                    },
-                )
-            }
-            Self::AttestCompensatedTopology(input) => {
-                evaluate_attestation::<AttestCompensatedTopologyActivity, _, _, _>(
-                    &input.expected_snapshot,
-                    input.deadline_unix_seconds,
-                    observations,
-                    now,
-                    |observed_at, snapshot| AttestCompensatedTopologyOutput::Attested {
-                        observed_at_unix_seconds: observed_at,
-                        snapshot,
-                        accounting: None,
-                    },
-                    |observed_at, message| AttestCompensatedTopologyOutput::DeadlineExceeded {
-                        observed_at_unix_seconds: observed_at,
-                        message,
-                    },
-                    |observed_at, message| AttestCompensatedTopologyOutput::Conflicting {
-                        observed_at_unix_seconds: observed_at,
-                        message,
-                    },
-                )
-            }
-        }
-    }
+    ) -> Result<i64, PreparedActivityError>;
 
-    pub fn evaluate_quarantine(
-        &self,
-        definition: &DirectSwitchoverDefinition,
-        observations: &OperationObservations,
-        now: i64,
-    ) -> Result<DirectEvaluation, String> {
-        self.validate(definition)?;
-        match self {
-            Self::RevokeWrites(input) => evaluate_quarantined_replica::<RevokeWritesActivity>(
-                input,
-                definition,
-                observations,
-                now,
-            ),
-            Self::DemoteOldPrimary(input) => {
-                evaluate_quarantined_replica::<DemoteOldPrimaryActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::PromoteTarget(input) => evaluate_quarantined_replica::<PromoteTargetActivity>(
-                input,
-                definition,
-                observations,
-                now,
-            ),
-            Self::DistributeReplicaEpoch(input) => evaluate_quarantined_replica::<
-                DistributeReplicaEpochActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::InstallTargetCatchUpConfiguration(input) => {
-                evaluate_quarantined_replica::<InstallTargetCatchUpConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::WaitTargetWriteQuorum(input) => evaluate_quarantined_replica::<
-                WaitTargetWriteQuorumActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::InstallTargetCurrentConfiguration(input) => {
-                evaluate_quarantined_replica::<InstallTargetCurrentConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::RestorePreviousCurrentConfiguration(input) => {
-                evaluate_quarantined_replica::<RestorePreviousCurrentConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::CompensatePromoteOldPrimary(input) => evaluate_quarantined_replica::<
-                CompensatePromoteOldPrimaryActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::CompensateDistributeReplicaEpoch(input) => evaluate_quarantined_replica::<
-                CompensateDistributeReplicaEpochActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::InstallCompensationCatchUpConfiguration(input) => {
-                evaluate_quarantined_replica::<InstallCompensationCatchUpConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::InstallCompensationCurrentConfiguration(input) => {
-                evaluate_quarantined_replica::<InstallCompensationCurrentConfigurationActivity>(
-                    input,
-                    definition,
-                    observations,
-                    now,
-                )
-            }
-            Self::PublishTargetPrimaryLabel(input) => evaluate_quarantined_label::<
-                PublishTargetPrimaryLabelActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::PublishOldPrimarySecondaryLabel(input) => evaluate_quarantined_label::<
-                PublishOldPrimarySecondaryLabelActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::RestoreOldPrimaryLabel(input) => evaluate_quarantined_label::<
-                RestoreOldPrimaryLabelActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::RestoreTargetSecondaryLabel(input) => evaluate_quarantined_label::<
-                RestoreTargetSecondaryLabelActivity,
-            >(
-                input, definition, observations, now
-            ),
-            Self::CaptureFrozenLsn(_)
-            | Self::WaitTargetCaughtUp(_)
-            | Self::AttestTargetTopology(_)
-            | Self::AttestCompensatedTopology(_) => self.evaluate(definition, observations, now),
-        }
-    }
-
-    pub fn prepare(
-        &self,
+    fn prepare_command(
+        request: &E::Request,
         definition: &DirectSwitchoverDefinition,
         observations: &OperationObservations,
         addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
         now: i64,
-    ) -> Result<Self, PreparedActivityError> {
-        if !self.is_logical() {
-            return Err(PreparedActivityError::Validation);
-        }
-        match self
-            .evaluate(definition, observations, now)
-            .map_err(|_| PreparedActivityError::Validation)?
-        {
-            DirectEvaluation::Observe(_) => Ok(self.clone()),
-            DirectEvaluation::AwaitEvidence => {
-                if self.is_effect() {
-                    Err(PreparedActivityError::Derivation)
-                } else {
-                    Ok(self.clone())
-                }
-            }
-            DirectEvaluation::DispatchReplica { action, pending } => {
-                let observed = observations
-                    .get(&pending.target_id)
-                    .ok_or(PreparedActivityError::Derivation)?;
-                let addressed = addressed_instances
-                    .get(&pending.target_id)
-                    .ok_or(PreparedActivityError::Derivation)?;
-                let (_, command) =
-                    prepare_replica_effect_command(&pending, &observed.status, addressed, &action)
-                        .map_err(preparation_error)?;
-                let mut prepared = self.clone();
-                prepared
-                    .set_prepared_replica_command(command)
-                    .map_err(|_| PreparedActivityError::Validation)?;
-                prepared
-                    .validate(definition)
-                    .map_err(|_| PreparedActivityError::Validation)?;
-                Ok(prepared)
-            }
-            DirectEvaluation::DispatchLabel => {
-                let request = self
-                    .label_request(definition)
-                    .map_err(|_| PreparedActivityError::Validation)?;
-                let observed = observations
-                    .get(&request.target_id)
-                    .ok_or(PreparedActivityError::Derivation)?;
-                if observed.status.instance_id.as_str() != request.target_instance_id {
-                    return Err(PreparedActivityError::Validation);
-                }
-                let command = LabelEffectCommand::new(
-                    request.target_id,
-                    observed.pod_name.clone(),
-                    request.target_instance_id.to_string(),
-                    request.desired_role.to_string(),
-                );
-                let mut prepared = self.clone();
-                prepared
-                    .set_prepared_label_command(command)
-                    .map_err(|_| PreparedActivityError::Validation)?;
-                prepared
-                    .validate(definition)
-                    .map_err(|_| PreparedActivityError::Validation)?;
-                Ok(prepared)
-            }
-        }
-    }
+    ) -> Result<E::Command, PreparedActivityError>;
 
-    pub fn encode_effect_observation(
-        &self,
-        observation: EffectObservation,
-    ) -> Result<ExactBytes, String> {
-        let observation = observation.bounded();
-        match self {
-            Self::RevokeWrites(_) => {
-                encode_replica_observation::<RevokeWritesActivity>(observation)
-            }
-            Self::DemoteOldPrimary(_) => {
-                encode_replica_observation::<DemoteOldPrimaryActivity>(observation)
-            }
-            Self::PromoteTarget(_) => {
-                encode_replica_observation::<PromoteTargetActivity>(observation)
-            }
-            Self::DistributeReplicaEpoch(_) => {
-                encode_replica_observation::<DistributeReplicaEpochActivity>(observation)
-            }
-            Self::InstallTargetCatchUpConfiguration(_) => {
-                encode_replica_observation::<InstallTargetCatchUpConfigurationActivity>(observation)
-            }
-            Self::WaitTargetWriteQuorum(_) => {
-                encode_replica_observation::<WaitTargetWriteQuorumActivity>(observation)
-            }
-            Self::InstallTargetCurrentConfiguration(_) => {
-                encode_replica_observation::<InstallTargetCurrentConfigurationActivity>(observation)
-            }
-            Self::RestorePreviousCurrentConfiguration(_) => encode_replica_observation::<
-                RestorePreviousCurrentConfigurationActivity,
-            >(observation),
-            Self::CompensatePromoteOldPrimary(_) => {
-                encode_replica_observation::<CompensatePromoteOldPrimaryActivity>(observation)
-            }
-            Self::CompensateDistributeReplicaEpoch(_) => {
-                encode_replica_observation::<CompensateDistributeReplicaEpochActivity>(observation)
-            }
-            Self::InstallCompensationCatchUpConfiguration(_) => encode_replica_observation::<
-                InstallCompensationCatchUpConfigurationActivity,
-            >(observation),
-            Self::InstallCompensationCurrentConfiguration(_) => encode_replica_observation::<
-                InstallCompensationCurrentConfigurationActivity,
-            >(observation),
-            Self::PublishTargetPrimaryLabel(_) => {
-                encode_label_observation::<PublishTargetPrimaryLabelActivity>(observation)
-            }
-            Self::PublishOldPrimarySecondaryLabel(_) => {
-                encode_label_observation::<PublishOldPrimarySecondaryLabelActivity>(observation)
-            }
-            Self::RestoreOldPrimaryLabel(_) => {
-                encode_label_observation::<RestoreOldPrimaryLabelActivity>(observation)
-            }
-            Self::RestoreTargetSecondaryLabel(_) => {
-                encode_label_observation::<RestoreTargetSecondaryLabelActivity>(observation)
-            }
-            Self::CaptureFrozenLsn(_)
-            | Self::WaitTargetCaughtUp(_)
-            | Self::AttestTargetTopology(_)
-            | Self::AttestCompensatedTopology(_) => {
-                Err("passive direct activity cannot encode an effect observation".to_string())
-            }
-        }
-    }
-
-    pub fn prepared_replica_command(&self) -> Option<&ReplicaEffectCommand> {
-        match self {
-            Self::RevokeWrites(input) => RevokeWritesActivity::prepared_command(input),
-            Self::DemoteOldPrimary(input) => DemoteOldPrimaryActivity::prepared_command(input),
-            Self::PromoteTarget(input) => PromoteTargetActivity::prepared_command(input),
-            Self::DistributeReplicaEpoch(input) => {
-                DistributeReplicaEpochActivity::prepared_command(input)
-            }
-            Self::InstallTargetCatchUpConfiguration(input) => {
-                InstallTargetCatchUpConfigurationActivity::prepared_command(input)
-            }
-            Self::WaitTargetWriteQuorum(input) => {
-                WaitTargetWriteQuorumActivity::prepared_command(input)
-            }
-            Self::InstallTargetCurrentConfiguration(input) => {
-                InstallTargetCurrentConfigurationActivity::prepared_command(input)
-            }
-            Self::RestorePreviousCurrentConfiguration(input) => {
-                RestorePreviousCurrentConfigurationActivity::prepared_command(input)
-            }
-            Self::CompensatePromoteOldPrimary(input) => {
-                CompensatePromoteOldPrimaryActivity::prepared_command(input)
-            }
-            Self::CompensateDistributeReplicaEpoch(input) => {
-                CompensateDistributeReplicaEpochActivity::prepared_command(input)
-            }
-            Self::InstallCompensationCatchUpConfiguration(input) => {
-                InstallCompensationCatchUpConfigurationActivity::prepared_command(input)
-            }
-            Self::InstallCompensationCurrentConfiguration(input) => {
-                InstallCompensationCurrentConfigurationActivity::prepared_command(input)
-            }
-            _ => None,
-        }
-    }
-
-    pub fn prepared_label_command(&self) -> Option<&LabelEffectCommand> {
-        match self {
-            Self::PublishTargetPrimaryLabel(input) => {
-                PublishTargetPrimaryLabelActivity::prepared_command(input)
-            }
-            Self::PublishOldPrimarySecondaryLabel(input) => {
-                PublishOldPrimarySecondaryLabelActivity::prepared_command(input)
-            }
-            Self::RestoreOldPrimaryLabel(input) => {
-                RestoreOldPrimaryLabelActivity::prepared_command(input)
-            }
-            Self::RestoreTargetSecondaryLabel(input) => {
-                RestoreTargetSecondaryLabelActivity::prepared_command(input)
-            }
-            _ => None,
-        }
-    }
-
-    fn is_effect(&self) -> bool {
-        !matches!(
-            self,
-            Self::CaptureFrozenLsn(_)
-                | Self::WaitTargetCaughtUp(_)
-                | Self::AttestTargetTopology(_)
-                | Self::AttestCompensatedTopology(_)
-        )
-    }
-
-    fn clear_prepared_command(&mut self) {
-        match self {
-            Self::RevokeWrites(input) => *RevokeWritesActivity::prepared_command_mut(input) = None,
-            Self::DemoteOldPrimary(input) => {
-                *DemoteOldPrimaryActivity::prepared_command_mut(input) = None
-            }
-            Self::PromoteTarget(input) => {
-                *PromoteTargetActivity::prepared_command_mut(input) = None
-            }
-            Self::DistributeReplicaEpoch(input) => {
-                *DistributeReplicaEpochActivity::prepared_command_mut(input) = None
-            }
-            Self::InstallTargetCatchUpConfiguration(input) => {
-                *InstallTargetCatchUpConfigurationActivity::prepared_command_mut(input) = None
-            }
-            Self::WaitTargetWriteQuorum(input) => {
-                *WaitTargetWriteQuorumActivity::prepared_command_mut(input) = None
-            }
-            Self::InstallTargetCurrentConfiguration(input) => {
-                *InstallTargetCurrentConfigurationActivity::prepared_command_mut(input) = None
-            }
-            Self::RestorePreviousCurrentConfiguration(input) => {
-                *RestorePreviousCurrentConfigurationActivity::prepared_command_mut(input) = None
-            }
-            Self::CompensatePromoteOldPrimary(input) => {
-                *CompensatePromoteOldPrimaryActivity::prepared_command_mut(input) = None
-            }
-            Self::CompensateDistributeReplicaEpoch(input) => {
-                *CompensateDistributeReplicaEpochActivity::prepared_command_mut(input) = None
-            }
-            Self::InstallCompensationCatchUpConfiguration(input) => {
-                *InstallCompensationCatchUpConfigurationActivity::prepared_command_mut(input) = None
-            }
-            Self::InstallCompensationCurrentConfiguration(input) => {
-                *InstallCompensationCurrentConfigurationActivity::prepared_command_mut(input) = None
-            }
-            Self::PublishTargetPrimaryLabel(input) => {
-                *PublishTargetPrimaryLabelActivity::prepared_command_mut(input) = None
-            }
-            Self::PublishOldPrimarySecondaryLabel(input) => {
-                *PublishOldPrimarySecondaryLabelActivity::prepared_command_mut(input) = None
-            }
-            Self::RestoreOldPrimaryLabel(input) => {
-                *RestoreOldPrimaryLabelActivity::prepared_command_mut(input) = None
-            }
-            Self::RestoreTargetSecondaryLabel(input) => {
-                *RestoreTargetSecondaryLabelActivity::prepared_command_mut(input) = None
-            }
-            Self::CaptureFrozenLsn(_)
-            | Self::WaitTargetCaughtUp(_)
-            | Self::AttestTargetTopology(_)
-            | Self::AttestCompensatedTopology(_) => {}
-        }
-    }
-
-    fn set_prepared_replica_command(
-        &mut self,
-        command: ReplicaEffectCommand,
-    ) -> Result<(), String> {
-        match self {
-            Self::RevokeWrites(input) => {
-                *RevokeWritesActivity::prepared_command_mut(input) = Some(command)
-            }
-            Self::DemoteOldPrimary(input) => {
-                *DemoteOldPrimaryActivity::prepared_command_mut(input) = Some(command)
-            }
-            Self::PromoteTarget(input) => {
-                *PromoteTargetActivity::prepared_command_mut(input) = Some(command)
-            }
-            Self::DistributeReplicaEpoch(input) => {
-                *DistributeReplicaEpochActivity::prepared_command_mut(input) = Some(command)
-            }
-            Self::InstallTargetCatchUpConfiguration(input) => {
-                *InstallTargetCatchUpConfigurationActivity::prepared_command_mut(input) =
-                    Some(command)
-            }
-            Self::WaitTargetWriteQuorum(input) => {
-                *WaitTargetWriteQuorumActivity::prepared_command_mut(input) = Some(command)
-            }
-            Self::InstallTargetCurrentConfiguration(input) => {
-                *InstallTargetCurrentConfigurationActivity::prepared_command_mut(input) =
-                    Some(command)
-            }
-            Self::RestorePreviousCurrentConfiguration(input) => {
-                *RestorePreviousCurrentConfigurationActivity::prepared_command_mut(input) =
-                    Some(command)
-            }
-            Self::CompensatePromoteOldPrimary(input) => {
-                *CompensatePromoteOldPrimaryActivity::prepared_command_mut(input) = Some(command)
-            }
-            Self::CompensateDistributeReplicaEpoch(input) => {
-                *CompensateDistributeReplicaEpochActivity::prepared_command_mut(input) =
-                    Some(command)
-            }
-            Self::InstallCompensationCatchUpConfiguration(input) => {
-                *InstallCompensationCatchUpConfigurationActivity::prepared_command_mut(input) =
-                    Some(command)
-            }
-            Self::InstallCompensationCurrentConfiguration(input) => {
-                *InstallCompensationCurrentConfigurationActivity::prepared_command_mut(input) =
-                    Some(command)
-            }
-            _ => return Err("direct activity is not a replica effect".to_string()),
-        }
-        Ok(())
-    }
-
-    fn set_prepared_label_command(&mut self, command: LabelEffectCommand) -> Result<(), String> {
-        match self {
-            Self::PublishTargetPrimaryLabel(input) => {
-                *PublishTargetPrimaryLabelActivity::prepared_command_mut(input) = Some(command)
-            }
-            Self::PublishOldPrimarySecondaryLabel(input) => {
-                *PublishOldPrimarySecondaryLabelActivity::prepared_command_mut(input) =
-                    Some(command)
-            }
-            Self::RestoreOldPrimaryLabel(input) => {
-                *RestoreOldPrimaryLabelActivity::prepared_command_mut(input) = Some(command)
-            }
-            Self::RestoreTargetSecondaryLabel(input) => {
-                *RestoreTargetSecondaryLabelActivity::prepared_command_mut(input) = Some(command)
-            }
-            _ => return Err("direct activity is not a label effect".to_string()),
-        }
-        Ok(())
-    }
-
-    fn label_request<'a>(
-        &'a self,
+    fn validate_recorded_command(
+        request: &E::Request,
+        command: &E::Command,
         definition: &DirectSwitchoverDefinition,
-    ) -> Result<LabelRequest<'a>, String> {
-        match self {
-            Self::PublishTargetPrimaryLabel(input) => {
-                PublishTargetPrimaryLabelActivity::request(input, definition)
-            }
-            Self::PublishOldPrimarySecondaryLabel(input) => {
-                PublishOldPrimarySecondaryLabelActivity::request(input, definition)
-            }
-            Self::RestoreOldPrimaryLabel(input) => {
-                RestoreOldPrimaryLabelActivity::request(input, definition)
-            }
-            Self::RestoreTargetSecondaryLabel(input) => {
-                RestoreTargetSecondaryLabelActivity::request(input, definition)
-            }
-            _ => Err("direct activity is not a label effect".to_string()),
-        }
-    }
+    ) -> Result<(), PreparedActivityError>;
+
+    fn observe(
+        request: &E::Request,
+        command: &E::Command,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<Option<EffectOutcome<E::Output>>, String>;
+
+    fn observe_quarantined(
+        request: &E::Request,
+        command: &E::Command,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<Option<EffectOutcome<E::Output>>, String>;
+
+    fn dispatch(command: &E::Command) -> SwitchoverDispatch<'_>;
 }
 
 struct ReplicaRequest<'a> {
@@ -1006,13 +114,13 @@ struct ReplicaRequest<'a> {
     expected_epoch: EpochStatus,
     desired_snapshot: StablePartitionSnapshotStatus,
     deadline_unix_seconds: i64,
-    redelivery: u8,
-    prepared_command: Option<&'a ReplicaEffectCommand>,
 }
 
-trait ReplicaOperation: ReplicaDirectActivity {
+trait ReplicaOperation:
+    DurableEffect<Command = Option<ReplicaEffectCommand>, Output = EffectApplied>
+{
     fn request<'a>(
-        input: &'a Self::Input,
+        input: &'a Self::Request,
         definition: &DirectSwitchoverDefinition,
     ) -> Result<ReplicaRequest<'a>, String>;
 
@@ -1049,8 +157,6 @@ fn fixed_replica_request<'a>(
     expected_epoch: EpochStatus,
     desired_snapshot: StablePartitionSnapshotStatus,
     deadline_unix_seconds: i64,
-    redelivery: u8,
-    prepared_command: Option<&'a ReplicaEffectCommand>,
 ) -> ReplicaRequest<'a> {
     ReplicaRequest {
         contract_version,
@@ -1061,8 +167,6 @@ fn fixed_replica_request<'a>(
         expected_epoch,
         desired_snapshot,
         deadline_unix_seconds,
-        redelivery,
-        prepared_command,
     }
 }
 
@@ -1099,8 +203,6 @@ impl ReplicaOperation for RevokeWritesActivity {
             definition.previous_snapshot.epoch.clone(),
             definition.previous_snapshot.clone(),
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
         ))
     }
 
@@ -1170,8 +272,6 @@ impl ReplicaOperation for DemoteOldPrimaryActivity {
             definition.target_snapshot.epoch.clone(),
             definition.target_snapshot.clone(),
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
         ))
     }
 
@@ -1251,8 +351,6 @@ impl ReplicaOperation for PromoteTargetActivity {
             definition.previous_snapshot.epoch.clone(),
             definition.target_snapshot.clone(),
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
         ))
     }
 
@@ -1335,8 +433,6 @@ impl ReplicaOperation for DistributeReplicaEpochActivity {
             definition.target_snapshot.epoch.clone(),
             definition.target_snapshot.clone(),
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
         ))
     }
 
@@ -1394,8 +490,6 @@ impl ReplicaOperation for InstallTargetCatchUpConfigurationActivity {
             input.target_primary_id,
             &input.target_primary_instance_id,
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
             definition,
         )
     }
@@ -1459,8 +553,6 @@ impl ReplicaOperation for WaitTargetWriteQuorumActivity {
             input.target_primary_id,
             &input.target_primary_instance_id,
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
             definition,
         )
     }
@@ -1522,8 +614,6 @@ impl ReplicaOperation for InstallTargetCurrentConfigurationActivity {
             input.target_primary_id,
             &input.target_primary_instance_id,
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
             definition,
         )
     }
@@ -1589,8 +679,6 @@ impl ReplicaOperation for RestorePreviousCurrentConfigurationActivity {
             definition.previous_snapshot.epoch.clone(),
             definition.previous_snapshot.clone(),
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
             definition,
         )
     }
@@ -1668,8 +756,6 @@ impl ReplicaOperation for CompensatePromoteOldPrimaryActivity {
             definition.target_snapshot.epoch.clone(),
             definition.compensation_snapshot(),
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
             definition,
         )
     }
@@ -1755,8 +841,6 @@ impl ReplicaOperation for CompensateDistributeReplicaEpochActivity {
             definition.target_snapshot.epoch.clone(),
             definition.compensation_snapshot(),
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
         ))
     }
 
@@ -1816,8 +900,6 @@ impl ReplicaOperation for InstallCompensationCatchUpConfigurationActivity {
             definition.target_snapshot.epoch.clone(),
             definition.compensation_snapshot(),
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
             definition,
         )
     }
@@ -1887,8 +969,6 @@ impl ReplicaOperation for InstallCompensationCurrentConfigurationActivity {
             definition.target_snapshot.epoch.clone(),
             definition.compensation_snapshot(),
             input.deadline_unix_seconds,
-            input.redelivery,
-            input.prepared_command.as_ref(),
             definition,
         )
     }
@@ -1948,8 +1028,6 @@ fn target_replica_request<'a>(
     target_primary_id: i64,
     target_primary_instance_id: &'a str,
     deadline_unix_seconds: i64,
-    redelivery: u8,
-    prepared_command: Option<&'a ReplicaEffectCommand>,
     definition: &DirectSwitchoverDefinition,
 ) -> Result<ReplicaRequest<'a>, String> {
     validate_target(
@@ -1967,8 +1045,6 @@ fn target_replica_request<'a>(
         definition.target_snapshot.epoch.clone(),
         definition.target_snapshot.clone(),
         deadline_unix_seconds,
-        redelivery,
-        prepared_command,
     ))
 }
 
@@ -1982,8 +1058,6 @@ fn old_primary_replica_request<'a>(
     expected_epoch: EpochStatus,
     desired_snapshot: StablePartitionSnapshotStatus,
     deadline_unix_seconds: i64,
-    redelivery: u8,
-    prepared_command: Option<&'a ReplicaEffectCommand>,
     definition: &DirectSwitchoverDefinition,
 ) -> Result<ReplicaRequest<'a>, String> {
     validate_target(
@@ -2001,8 +1075,6 @@ fn old_primary_replica_request<'a>(
         expected_epoch,
         desired_snapshot,
         deadline_unix_seconds,
-        redelivery,
-        prepared_command,
     ))
 }
 
@@ -2014,92 +1086,117 @@ struct LabelRequest<'a> {
     target_instance_id: &'a str,
     desired_role: &'static str,
     deadline_unix_seconds: i64,
-    prepared_command: Option<&'a LabelEffectCommand>,
 }
 
-trait LabelOperation: LabelDirectActivity {
+trait LabelOperation:
+    DurableEffect<Command = Option<LabelEffectCommand>, Output = EffectApplied>
+{
     fn request<'a>(
-        input: &'a Self::Input,
+        input: &'a Self::Request,
         definition: &DirectSwitchoverDefinition,
     ) -> Result<LabelRequest<'a>, String>;
 }
 
-macro_rules! impl_label_operation {
-    (
-        $activity:ty,
-        $input:ty,
-        $id_field:ident,
-        $instance_field:ident,
-        $expected_id:expr,
-        $sequence:expr,
-        $role:literal
-    ) => {
-        impl LabelOperation for $activity {
-            fn request<'a>(
-                input: &'a $input,
-                definition: &DirectSwitchoverDefinition,
-            ) -> Result<LabelRequest<'a>, String> {
-                let expected_id = $expected_id(definition);
-                validate_target(
-                    input.$id_field,
-                    &input.$instance_field,
-                    expected_id,
-                    definition,
-                )?;
-                Ok(LabelRequest {
-                    contract_version: input.contract_version,
-                    execution_id: &input.execution_id,
-                    sequence: $sequence,
-                    target_id: input.$id_field,
-                    target_instance_id: &input.$instance_field,
-                    desired_role: $role,
-                    deadline_unix_seconds: input.deadline_unix_seconds,
-                    prepared_command: input.prepared_command.as_ref(),
-                })
-            }
-        }
-    };
+fn validate_label_request<'a>(
+    request: LabelRequest<'a>,
+    expected_id: i64,
+    definition: &DirectSwitchoverDefinition,
+) -> Result<LabelRequest<'a>, String> {
+    validate_target(
+        request.target_id,
+        request.target_instance_id,
+        expected_id,
+        definition,
+    )?;
+    Ok(request)
 }
 
-impl_label_operation!(
-    PublishTargetPrimaryLabelActivity,
-    PublishTargetPrimaryLabelInput,
-    target_primary_id,
-    target_primary_instance_id,
-    |definition: &DirectSwitchoverDefinition| definition.target_primary_id,
-    1003,
-    "primary"
-);
-impl_label_operation!(
-    PublishOldPrimarySecondaryLabelActivity,
-    PublishOldPrimarySecondaryLabelInput,
-    old_primary_id,
-    old_primary_instance_id,
-    |definition: &DirectSwitchoverDefinition| definition.old_primary_id,
-    1004,
-    "secondary"
-);
-impl_label_operation!(
-    RestoreOldPrimaryLabelActivity,
-    RestoreOldPrimaryLabelInput,
-    old_primary_id,
-    old_primary_instance_id,
-    |definition: &DirectSwitchoverDefinition| definition.old_primary_id,
-    2003,
-    "primary"
-);
-impl_label_operation!(
-    RestoreTargetSecondaryLabelActivity,
-    RestoreTargetSecondaryLabelInput,
-    target_primary_id,
-    target_primary_instance_id,
-    |definition: &DirectSwitchoverDefinition| definition.target_primary_id,
-    2004,
-    "secondary"
-);
+impl LabelOperation for PublishTargetPrimaryLabelActivity {
+    fn request<'a>(
+        input: &'a PublishTargetPrimaryLabelInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<LabelRequest<'a>, String> {
+        validate_label_request(
+            LabelRequest {
+                contract_version: input.contract_version,
+                execution_id: &input.execution_id,
+                sequence: 1003,
+                target_id: input.target_primary_id,
+                target_instance_id: &input.target_primary_instance_id,
+                desired_role: "primary",
+                deadline_unix_seconds: input.deadline_unix_seconds,
+            },
+            definition.target_primary_id,
+            definition,
+        )
+    }
+}
+
+impl LabelOperation for PublishOldPrimarySecondaryLabelActivity {
+    fn request<'a>(
+        input: &'a PublishOldPrimarySecondaryLabelInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<LabelRequest<'a>, String> {
+        validate_label_request(
+            LabelRequest {
+                contract_version: input.contract_version,
+                execution_id: &input.execution_id,
+                sequence: 1004,
+                target_id: input.old_primary_id,
+                target_instance_id: &input.old_primary_instance_id,
+                desired_role: "secondary",
+                deadline_unix_seconds: input.deadline_unix_seconds,
+            },
+            definition.old_primary_id,
+            definition,
+        )
+    }
+}
+
+impl LabelOperation for RestoreOldPrimaryLabelActivity {
+    fn request<'a>(
+        input: &'a RestoreOldPrimaryLabelInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<LabelRequest<'a>, String> {
+        validate_label_request(
+            LabelRequest {
+                contract_version: input.contract_version,
+                execution_id: &input.execution_id,
+                sequence: 2003,
+                target_id: input.old_primary_id,
+                target_instance_id: &input.old_primary_instance_id,
+                desired_role: "primary",
+                deadline_unix_seconds: input.deadline_unix_seconds,
+            },
+            definition.old_primary_id,
+            definition,
+        )
+    }
+}
+
+impl LabelOperation for RestoreTargetSecondaryLabelActivity {
+    fn request<'a>(
+        input: &'a RestoreTargetSecondaryLabelInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<LabelRequest<'a>, String> {
+        validate_label_request(
+            LabelRequest {
+                contract_version: input.contract_version,
+                execution_id: &input.execution_id,
+                sequence: 2004,
+                target_id: input.target_primary_id,
+                target_instance_id: &input.target_primary_instance_id,
+                desired_role: "secondary",
+                deadline_unix_seconds: input.deadline_unix_seconds,
+            },
+            definition.target_primary_id,
+            definition,
+        )
+    }
+}
 
 fn validate_replica<A: ReplicaOperation>(
-    input: &A::Input,
+    input: &A::Request,
     definition: &DirectSwitchoverDefinition,
 ) -> Result<(), String> {
     let request = A::request(input, definition)?;
@@ -2108,14 +1205,17 @@ fn validate_replica<A: ReplicaOperation>(
         request.execution_id,
         request.deadline_unix_seconds,
         definition,
-    )?;
-    if request.redelivery > 1 {
-        return Err("direct replica request has invalid redelivery".to_string());
-    }
-    let Some(command) = request.prepared_command else {
-        return Ok(());
-    };
-    let pending = pending::<A>(&request);
+    )
+}
+
+fn validate_replica_command<A: ReplicaOperation>(
+    input: &A::Request,
+    command: &ReplicaEffectCommand,
+    definition: &DirectSwitchoverDefinition,
+) -> Result<(), String> {
+    validate_replica::<A>(input, definition)?;
+    let request = A::request(input, definition)?;
+    let pending = pending::<A>(&request, Some(command));
     if ReplicaEffectCommand::from_pending(&pending)? != *command
         || command.action_id != action_id(definition, request.sequence)
         || command.target_id != request.target_id
@@ -2141,7 +1241,7 @@ fn validate_replica<A: ReplicaOperation>(
 }
 
 fn evaluate_replica<A: ReplicaOperation>(
-    input: &A::Input,
+    input: &A::Request,
     definition: &DirectSwitchoverDefinition,
     observations: &OperationObservations,
     now: i64,
@@ -2149,23 +1249,25 @@ fn evaluate_replica<A: ReplicaOperation>(
     let request = A::request(input, definition)?;
     let Some(observed) = observations.get(&request.target_id) else {
         return deadline_or_wait(request.deadline_unix_seconds, now, || {
-            encode_replica_observation::<A>(EffectObservation::UnavailableAtDeadline {
-                observed_at_unix_seconds: now,
-                message: format!(
+            encode_effect_error::<A>(
+                EffectErrorKind::UnavailableAtDeadline,
+                now,
+                format!(
                     "direct switchover replica {} is unavailable at deadline",
                     request.target_id
                 ),
-            })
+            )
         });
     };
     if observed.status.instance_id.as_str() != request.target_instance_id {
-        return encode_replica_observation::<A>(EffectObservation::Conflicting {
-            observed_at_unix_seconds: now,
-            message: format!(
+        return encode_effect_error::<A>(
+            EffectErrorKind::ConflictingEvidence,
+            now,
+            format!(
                 "direct switchover replica {} incarnation changed",
                 request.target_id
             ),
-        })
+        )
         .map(DirectEvaluation::Observe);
     }
     if let Some(recorded) =
@@ -2175,62 +1277,55 @@ fn evaluate_replica<A: ReplicaOperation>(
             Ok(action) => action,
             Err(error) => {
                 return deadline_or_wait(request.deadline_unix_seconds, now, || {
-                    encode_replica_observation::<A>(EffectObservation::DeadlineExceeded {
-                        observed_at_unix_seconds: now,
-                        message: error,
-                    })
+                    encode_effect_error::<A>(EffectErrorKind::DeadlineExceeded, now, error)
                 });
             }
         };
         if recorded.signature != action.signature() {
-            return encode_replica_observation::<A>(EffectObservation::Conflicting {
-                observed_at_unix_seconds: now,
-                message: "correlated action signature conflicts with direct request".to_string(),
-            })
+            return encode_effect_error::<A>(
+                EffectErrorKind::ConflictingEvidence,
+                now,
+                "correlated action signature conflicts with direct request".to_string(),
+            )
             .map(DirectEvaluation::Observe);
         }
         return match recorded.state {
             DurableActionState::Completed => {
-                encode_replica_observation::<A>(EffectObservation::Applied {
-                    observed_at_unix_seconds: now,
-                })
-                .map(DirectEvaluation::Observe)
+                encode_effect_applied::<A>(now).map(DirectEvaluation::Observe)
             }
-            DurableActionState::Failed => {
-                encode_replica_observation::<A>(EffectObservation::Failed {
-                    observed_at_unix_seconds: now,
-                    message: recorded.error.clone().unwrap_or_else(|| {
-                        "correlated direct switchover action failed".to_string()
-                    }),
-                })
-                .map(DirectEvaluation::Observe)
-            }
+            DurableActionState::Failed => encode_effect_error::<A>(
+                EffectErrorKind::DomainFailure,
+                now,
+                recorded
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "correlated direct switchover action failed".to_string()),
+            )
+            .map(DirectEvaluation::Observe),
             DurableActionState::Scheduled | DurableActionState::InProgress => {
                 deadline_or_wait(request.deadline_unix_seconds, now, || {
-                    encode_replica_observation::<A>(EffectObservation::DeadlineExceeded {
-                        observed_at_unix_seconds: now,
-                        message: "correlated direct switchover action reached its deadline"
-                            .to_string(),
-                    })
+                    encode_effect_error::<A>(
+                        EffectErrorKind::DeadlineExceeded,
+                        now,
+                        "correlated direct switchover action reached its deadline".to_string(),
+                    )
                 })
             }
         };
     }
     match A::status_relation(&request, definition, &observed.status) {
         StatusRelation::Postcondition => {
-            encode_replica_observation::<A>(EffectObservation::Applied {
-                observed_at_unix_seconds: now,
-            })
-            .map(DirectEvaluation::Observe)
+            encode_effect_applied::<A>(now).map(DirectEvaluation::Observe)
         }
         StatusRelation::Precondition if now >= request.deadline_unix_seconds => {
-            encode_replica_observation::<A>(EffectObservation::DeadlineExceeded {
-                observed_at_unix_seconds: now,
-                message: format!(
+            encode_effect_error::<A>(
+                EffectErrorKind::DeadlineExceeded,
+                now,
+                format!(
                     "direct switchover action {:?} reached its deadline",
                     A::action_kind()
                 ),
-            })
+            )
             .map(DirectEvaluation::Observe)
         }
         StatusRelation::Precondition => {
@@ -2240,27 +1335,25 @@ fn evaluate_replica<A: ReplicaOperation>(
             };
             Ok(DirectEvaluation::DispatchReplica {
                 action,
-                pending: Box::new(pending::<A>(&request)),
+                pending: Box::new(pending::<A>(&request, None)),
             })
         }
         StatusRelation::Conflicting(message) => {
-            encode_replica_observation::<A>(EffectObservation::Conflicting {
-                observed_at_unix_seconds: now,
-                message,
-            })
-            .map(DirectEvaluation::Observe)
+            encode_effect_error::<A>(EffectErrorKind::ConflictingEvidence, now, message)
+                .map(DirectEvaluation::Observe)
         }
     }
 }
 
 fn evaluate_quarantined_replica<A: ReplicaOperation>(
-    input: &A::Input,
+    input: &A::Request,
+    command: &Option<ReplicaEffectCommand>,
     definition: &DirectSwitchoverDefinition,
     observations: &OperationObservations,
     now: i64,
 ) -> Result<DirectEvaluation, String> {
     let request = A::request(input, definition)?;
-    let Some(command) = request.prepared_command else {
+    let Some(command) = command.as_ref() else {
         return match evaluate_replica::<A>(input, definition, observations, now)? {
             observation @ DirectEvaluation::Observe(_) => Ok(observation),
             DirectEvaluation::AwaitEvidence
@@ -2278,18 +1371,16 @@ fn evaluate_quarantined_replica<A: ReplicaOperation>(
         if recorded.signature == command.action_signature {
             match recorded.state {
                 DurableActionState::Completed => {
-                    return encode_replica_observation::<A>(EffectObservation::Applied {
-                        observed_at_unix_seconds: now,
-                    })
-                    .map(DirectEvaluation::Observe);
+                    return encode_effect_applied::<A>(now).map(DirectEvaluation::Observe);
                 }
                 DurableActionState::Failed => {
-                    return encode_replica_observation::<A>(EffectObservation::Failed {
-                        observed_at_unix_seconds: now,
-                        message: recorded.error.clone().unwrap_or_else(|| {
+                    return encode_effect_error::<A>(
+                        EffectErrorKind::DomainFailure,
+                        now,
+                        recorded.error.clone().unwrap_or_else(|| {
                             "correlated direct switchover action failed".to_string()
                         }),
-                    })
+                    )
                     .map(DirectEvaluation::Observe);
                 }
                 DurableActionState::Scheduled | DurableActionState::InProgress => {}
@@ -2300,25 +1391,23 @@ fn evaluate_quarantined_replica<A: ReplicaOperation>(
         A::status_relation(&request, definition, &observed.status),
         StatusRelation::Postcondition
     ) {
-        return encode_replica_observation::<A>(EffectObservation::Applied {
-            observed_at_unix_seconds: now,
-        })
-        .map(DirectEvaluation::Observe);
+        return encode_effect_applied::<A>(now).map(DirectEvaluation::Observe);
     }
     if command_generation_change_proves_no_admission(
         &command.expected_agent_generation,
         &command.action_id,
         &observed.status,
     ) {
-        return encode_replica_observation::<A>(EffectObservation::ProvenNoAdmission {
-            observed_at_unix_seconds: now,
-        })
-        .map(DirectEvaluation::Observe);
+        return encode_effect_outcome::<A>(EffectOutcome::ProvenNoAdmission)
+            .map(DirectEvaluation::Observe);
     }
     Ok(DirectEvaluation::AwaitEvidence)
 }
 
-fn pending<A: ReplicaOperation>(request: &ReplicaRequest<'_>) -> PendingActionStatus {
+fn pending<A: ReplicaOperation>(
+    request: &ReplicaRequest<'_>,
+    command: Option<&ReplicaEffectCommand>,
+) -> PendingActionStatus {
     let mut pending = PendingActionStatus {
         action_id: request_action_id(request),
         sequence: request.sequence,
@@ -2327,16 +1416,16 @@ fn pending<A: ReplicaOperation>(request: &ReplicaRequest<'_>) -> PendingActionSt
         target_instance_id: request.target_instance_id.to_string(),
         expected_epoch: request.expected_epoch.clone(),
         desired_postcondition: A::postcondition(),
-        attempts: u32::from(request.redelivery),
+        attempts: 0,
         deadline_unix_seconds: request.deadline_unix_seconds,
         last_error: None,
-        dispatch_authorized: request.prepared_command.is_some(),
+        dispatch_authorized: command.is_some(),
         dispatch_agent_generation: None,
         dispatch_agent_control_version: None,
         dispatch_observed_runtime_epoch: None,
         dispatch_action_payload: String::new(),
     };
-    if let Some(command) = request.prepared_command {
+    if let Some(command) = command {
         pending.dispatch_agent_generation = Some(command.expected_agent_generation.clone());
         pending.dispatch_agent_control_version = Some(command.expected_control_version);
         pending.dispatch_observed_runtime_epoch = Some(command.observed_runtime_epoch.clone());
@@ -2354,7 +1443,7 @@ fn action_id(definition: &DirectSwitchoverDefinition, sequence: u32) -> String {
 }
 
 fn validate_label<A: LabelOperation>(
-    input: &A::Input,
+    input: &A::Request,
     definition: &DirectSwitchoverDefinition,
 ) -> Result<(), String> {
     let request = A::request(input, definition)?;
@@ -2363,10 +1452,16 @@ fn validate_label<A: LabelOperation>(
         request.execution_id,
         request.deadline_unix_seconds,
         definition,
-    )?;
-    let Some(command) = request.prepared_command else {
-        return Ok(());
-    };
+    )
+}
+
+fn validate_label_command<A: LabelOperation>(
+    input: &A::Request,
+    command: &LabelEffectCommand,
+    definition: &DirectSwitchoverDefinition,
+) -> Result<(), String> {
+    validate_label::<A>(input, definition)?;
+    let request = A::request(input, definition)?;
     if command.target_id != request.target_id
         || command.expected_uid != request.target_instance_id
         || command.role != request.desired_role
@@ -2379,7 +1474,7 @@ fn validate_label<A: LabelOperation>(
 }
 
 fn evaluate_label<A: LabelOperation>(
-    input: &A::Input,
+    input: &A::Request,
     definition: &DirectSwitchoverDefinition,
     observations: &OperationObservations,
     now: i64,
@@ -2387,45 +1482,46 @@ fn evaluate_label<A: LabelOperation>(
     let request = A::request(input, definition)?;
     let Some(observed) = observations.get(&request.target_id) else {
         return deadline_or_wait(request.deadline_unix_seconds, now, || {
-            encode_label_observation::<A>(EffectObservation::UnavailableAtDeadline {
-                observed_at_unix_seconds: now,
-                message: format!(
+            encode_effect_error::<A>(
+                EffectErrorKind::UnavailableAtDeadline,
+                now,
+                format!(
                     "direct switchover label target {} is unavailable at deadline",
                     request.target_id
                 ),
-            })
+            )
         });
     };
     if observed.status.instance_id.as_str() != request.target_instance_id {
-        return encode_label_observation::<A>(EffectObservation::Conflicting {
-            observed_at_unix_seconds: now,
-            message: "direct switchover label target incarnation changed".to_string(),
-        })
+        return encode_effect_error::<A>(
+            EffectErrorKind::ConflictingEvidence,
+            now,
+            "direct switchover label target incarnation changed".to_string(),
+        )
         .map(DirectEvaluation::Observe);
     }
     let expected_role = label_role(request.desired_role);
     if observed.status.epoch != epoch(&definition.target_snapshot.epoch)
         || observed.status.role != expected_role
     {
-        return encode_label_observation::<A>(EffectObservation::Conflicting {
-            observed_at_unix_seconds: now,
-            message: "direct switchover label target runtime role is not exact".to_string(),
-        })
+        return encode_effect_error::<A>(
+            EffectErrorKind::ConflictingEvidence,
+            now,
+            "direct switchover label target runtime role is not exact".to_string(),
+        )
         .map(DirectEvaluation::Observe);
     }
     if observed.pod_role_label.as_deref() == Some(request.desired_role) {
-        encode_label_observation::<A>(EffectObservation::Applied {
-            observed_at_unix_seconds: now,
-        })
-        .map(DirectEvaluation::Observe)
+        encode_effect_applied::<A>(now).map(DirectEvaluation::Observe)
     } else if now >= request.deadline_unix_seconds {
-        encode_label_observation::<A>(EffectObservation::DeadlineExceeded {
-            observed_at_unix_seconds: now,
-            message: format!(
+        encode_effect_error::<A>(
+            EffectErrorKind::DeadlineExceeded,
+            now,
+            format!(
                 "direct switchover label action {} reached its deadline",
                 request.sequence
             ),
-        })
+        )
         .map(DirectEvaluation::Observe)
     } else {
         Ok(DirectEvaluation::DispatchLabel)
@@ -2433,13 +1529,14 @@ fn evaluate_label<A: LabelOperation>(
 }
 
 fn evaluate_quarantined_label<A: LabelOperation>(
-    input: &A::Input,
+    input: &A::Request,
+    command: &Option<LabelEffectCommand>,
     definition: &DirectSwitchoverDefinition,
     observations: &OperationObservations,
     now: i64,
 ) -> Result<DirectEvaluation, String> {
     let request = A::request(input, definition)?;
-    if request.prepared_command.is_none() {
+    if command.is_none() {
         return match evaluate_label::<A>(input, definition, observations, now)? {
             observation @ DirectEvaluation::Observe(_) => Ok(observation),
             DirectEvaluation::AwaitEvidence
@@ -2455,10 +1552,7 @@ fn evaluate_quarantined_label<A: LabelOperation>(
         && observed.status.role == label_role(request.desired_role)
         && observed.pod_role_label.as_deref() == Some(request.desired_role)
     {
-        return encode_label_observation::<A>(EffectObservation::Applied {
-            observed_at_unix_seconds: now,
-        })
-        .map(DirectEvaluation::Observe);
+        return encode_effect_applied::<A>(now).map(DirectEvaluation::Observe);
     }
     Ok(DirectEvaluation::AwaitEvidence)
 }
@@ -2522,49 +1616,264 @@ fn validate_common(
     Ok(())
 }
 
-fn decode<A: DurableActivity>(spec: &ActivitySpec) -> Result<A::Input, String> {
-    validate_spec_identity::<A>(spec)?;
-    decode_activity_input::<A>(spec.input())
-        .map_err(|error| format!("decode {} activity input: {error}", A::NAME))
+fn encode_effect_outcome<A>(outcome: EffectOutcome<A::Output>) -> Result<ExactBytes, String>
+where
+    A: DurableEffect,
+{
+    encode_activity_result::<EffectActivity<A>>(&outcome)
+        .map_err(|error| format!("encode {} result: {error}", <A as DurableEffect>::NAME))
 }
 
-fn validate_spec_identity<A: DurableActivity>(spec: &ActivitySpec) -> Result<(), String> {
-    if spec.name().name() != A::NAME
-        || spec.name().version() != A::VERSION
-        || spec.max_result_bytes() != A::MAX_RESULT_BYTES
-    {
-        return Err(format!(
-            "{} activity identity or result bound changed",
-            A::NAME
-        ));
+fn encode_effect_applied<A>(observed_at_unix_seconds: i64) -> Result<ExactBytes, String>
+where
+    A: DurableEffect<Output = EffectApplied>,
+{
+    encode_effect_outcome::<A>(EffectOutcome::Applied(EffectApplied {
+        observed_at_unix_seconds,
+    }))
+}
+
+fn encode_effect_error<A>(
+    kind: EffectErrorKind,
+    observed_at_unix_seconds: i64,
+    message: String,
+) -> Result<ExactBytes, String>
+where
+    A: DurableEffect<Output = EffectApplied>,
+{
+    let error = effect_error::<A>(kind, observed_at_unix_seconds, message)?;
+    let outcome = match kind {
+        EffectErrorKind::ProvenNoAdmission => EffectOutcome::ProvenNoAdmission,
+        EffectErrorKind::DomainFailure => EffectOutcome::DomainFailure(error),
+        EffectErrorKind::DeadlineExceeded => EffectOutcome::DeadlineExceeded(error),
+        EffectErrorKind::UnavailableAtDeadline => EffectOutcome::UnavailableAtDeadline(error),
+        EffectErrorKind::ConflictingEvidence => EffectOutcome::ConflictingEvidence(error),
+    };
+    encode_effect_outcome::<A>(outcome)
+}
+
+fn effect_error<A: DurableEffect>(
+    kind: EffectErrorKind,
+    observed_at_unix_seconds: i64,
+    message: String,
+) -> Result<BoundedEffectError, String> {
+    BoundedEffectError::observed_at(
+        kind,
+        super::bounded_utf8(&message, super::SWITCHOVER_MAX_ERROR_BYTES),
+        observed_at_unix_seconds,
+        A::MAX_ERROR_MESSAGE_BYTES,
+    )
+    .map_err(|error| format!("bound {} effect error: {error}", A::NAME))
+}
+
+fn decode_evaluation<A>(
+    evaluation: DirectEvaluation,
+) -> Result<Option<EffectOutcome<A::Output>>, String>
+where
+    A: DurableEffect,
+{
+    match evaluation {
+        DirectEvaluation::Observe(result) => decode_activity_result::<EffectActivity<A>>(&result)
+            .map(Some)
+            .map_err(|error| format!("decode {} observation: {error}", A::NAME)),
+        DirectEvaluation::AwaitEvidence
+        | DirectEvaluation::DispatchReplica { .. }
+        | DirectEvaluation::DispatchLabel => Ok(None),
     }
-    Ok(())
 }
 
-fn spec<A: DurableActivity>(input: &A::Input) -> Result<ActivitySpec, String> {
-    Ok(ActivitySpec::new(
-        ActivityName::new(A::NAME, A::VERSION)
-            .map_err(|error| format!("construct {} activity identity: {error}", A::NAME))?,
-        encode_activity_input::<A>(input)
-            .map_err(|error| format!("encode {} activity input: {error}", A::NAME))?,
-        A::MAX_RESULT_BYTES,
-    ))
+impl<A> SwitchoverEffectFamily<A> for ReplicaEffectFamily
+where
+    A: ReplicaOperation,
+{
+    fn deadline_unix_seconds(
+        request: &A::Request,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<i64, PreparedActivityError> {
+        A::request(request, definition)
+            .map(|request| request.deadline_unix_seconds)
+            .map_err(|_| PreparedActivityError::Validation)
+    }
+
+    fn prepare_command(
+        request: &A::Request,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
+        now: i64,
+    ) -> Result<A::Command, PreparedActivityError> {
+        validate_replica::<A>(request, definition)
+            .map_err(|_| PreparedActivityError::Validation)?;
+        match evaluate_replica::<A>(request, definition, observations, now)
+            .map_err(|_| PreparedActivityError::Validation)?
+        {
+            DirectEvaluation::Observe(_) => Ok(None),
+            DirectEvaluation::AwaitEvidence => Err(PreparedActivityError::Derivation),
+            DirectEvaluation::DispatchReplica { action, pending } => {
+                let observed = observations
+                    .get(&pending.target_id)
+                    .ok_or(PreparedActivityError::Derivation)?;
+                let addressed = addressed_instances
+                    .get(&pending.target_id)
+                    .ok_or(PreparedActivityError::Derivation)?;
+                let (_, command) =
+                    prepare_replica_effect_command(&pending, &observed.status, addressed, &action)
+                        .map_err(preparation_error)?;
+                validate_replica_command::<A>(request, &command, definition)
+                    .map_err(|_| PreparedActivityError::Validation)?;
+                Ok(Some(command))
+            }
+            DirectEvaluation::DispatchLabel => Err(PreparedActivityError::Validation),
+        }
+    }
+
+    fn validate_recorded_command(
+        request: &A::Request,
+        command: &A::Command,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<(), PreparedActivityError> {
+        validate_replica::<A>(request, definition)
+            .map_err(|_| PreparedActivityError::Validation)?;
+        if let Some(command) = command {
+            validate_replica_command::<A>(request, command, definition)
+                .map_err(|_| PreparedActivityError::Validation)?;
+        }
+        Ok(())
+    }
+
+    fn observe(
+        request: &A::Request,
+        _command: &A::Command,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
+        decode_evaluation::<A>(evaluate_replica::<A>(
+            request,
+            definition,
+            observations,
+            now,
+        )?)
+    }
+
+    fn observe_quarantined(
+        request: &A::Request,
+        command: &A::Command,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
+        decode_evaluation::<A>(evaluate_quarantined_replica::<A>(
+            request,
+            command,
+            definition,
+            observations,
+            now,
+        )?)
+    }
+
+    fn dispatch(command: &A::Command) -> SwitchoverDispatch<'_> {
+        command
+            .as_ref()
+            .map(SwitchoverDispatch::Replica)
+            .unwrap_or(SwitchoverDispatch::ObservationOnly)
+    }
 }
 
-fn encode_replica_observation<A: ReplicaDirectActivity>(
-    observation: EffectObservation,
-) -> Result<ExactBytes, String> {
-    let output = A::output(observation.bounded())?;
-    encode_activity_result::<A>(&output)
-        .map_err(|error| format!("encode {} result: {error}", A::NAME))
-}
+impl<A> SwitchoverEffectFamily<A> for LabelEffectFamily
+where
+    A: LabelOperation,
+{
+    fn deadline_unix_seconds(
+        request: &A::Request,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<i64, PreparedActivityError> {
+        A::request(request, definition)
+            .map(|request| request.deadline_unix_seconds)
+            .map_err(|_| PreparedActivityError::Validation)
+    }
 
-fn encode_label_observation<A: LabelDirectActivity>(
-    observation: EffectObservation,
-) -> Result<ExactBytes, String> {
-    let output = A::output(observation.bounded())?;
-    encode_activity_result::<A>(&output)
-        .map_err(|error| format!("encode {} result: {error}", A::NAME))
+    fn prepare_command(
+        request: &A::Request,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        _addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
+        now: i64,
+    ) -> Result<A::Command, PreparedActivityError> {
+        validate_label::<A>(request, definition).map_err(|_| PreparedActivityError::Validation)?;
+        match evaluate_label::<A>(request, definition, observations, now)
+            .map_err(|_| PreparedActivityError::Validation)?
+        {
+            DirectEvaluation::Observe(_) => Ok(None),
+            DirectEvaluation::AwaitEvidence => Err(PreparedActivityError::Derivation),
+            DirectEvaluation::DispatchLabel => {
+                let label = A::request(request, definition)
+                    .map_err(|_| PreparedActivityError::Validation)?;
+                let observed = observations
+                    .get(&label.target_id)
+                    .ok_or(PreparedActivityError::Derivation)?;
+                if observed.status.instance_id.as_str() != label.target_instance_id {
+                    return Err(PreparedActivityError::Validation);
+                }
+                let command = LabelEffectCommand::new(
+                    label.target_id,
+                    observed.pod_name.clone(),
+                    label.target_instance_id.to_string(),
+                    label.desired_role.to_string(),
+                );
+                validate_label_command::<A>(request, &command, definition)
+                    .map_err(|_| PreparedActivityError::Validation)?;
+                Ok(Some(command))
+            }
+            DirectEvaluation::DispatchReplica { .. } => Err(PreparedActivityError::Validation),
+        }
+    }
+
+    fn validate_recorded_command(
+        request: &A::Request,
+        command: &A::Command,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<(), PreparedActivityError> {
+        validate_label::<A>(request, definition).map_err(|_| PreparedActivityError::Validation)?;
+        if let Some(command) = command {
+            validate_label_command::<A>(request, command, definition)
+                .map_err(|_| PreparedActivityError::Validation)?;
+        }
+        Ok(())
+    }
+
+    fn observe(
+        request: &A::Request,
+        _command: &A::Command,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
+        decode_evaluation::<A>(evaluate_label::<A>(request, definition, observations, now)?)
+    }
+
+    fn observe_quarantined(
+        request: &A::Request,
+        command: &A::Command,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
+        decode_evaluation::<A>(evaluate_quarantined_label::<A>(
+            request,
+            command,
+            definition,
+            observations,
+            now,
+        )?)
+    }
+
+    fn dispatch(command: &A::Command) -> SwitchoverDispatch<'_> {
+        command
+            .as_ref()
+            .map(SwitchoverDispatch::Label)
+            .unwrap_or(SwitchoverDispatch::ObservationOnly)
+    }
 }
 
 fn preparation_error(error: DurableEffectPreparationError) -> PreparedActivityError {
@@ -2582,29 +1891,31 @@ fn evaluate_capture(
     observations: &OperationObservations,
     now: i64,
 ) -> Result<DirectEvaluation, String> {
-    let output = match observations.get(&input.old_primary_id) {
+    let outcome = match observations.get(&input.old_primary_id) {
         None if now < input.deadline_unix_seconds => return Ok(DirectEvaluation::AwaitEvidence),
-        None => CaptureFrozenLsnOutput::DeadlineExceeded {
-            observed_at_unix_seconds: now,
-            message: "old primary was unavailable at frozen-LSN deadline".to_string(),
-        },
+        None => EffectOutcome::UnavailableAtDeadline(effect_error::<CaptureFrozenLsnActivity>(
+            EffectErrorKind::UnavailableAtDeadline,
+            now,
+            "old primary was unavailable at frozen-LSN deadline".to_string(),
+        )?),
         Some(observed)
             if observed.status.instance_id.as_str() != input.old_primary_instance_id
                 || observed.status.epoch != epoch(&input.expected_epoch)
                 || observed.status.role != Role::Primary
                 || observed.status.write_status != AccessStatus::ReconfigurationPending =>
         {
-            CaptureFrozenLsnOutput::Conflicting {
-                observed_at_unix_seconds: now,
-                message: "old primary frozen-LSN observation is not exact".to_string(),
-            }
+            EffectOutcome::ConflictingEvidence(effect_error::<CaptureFrozenLsnActivity>(
+                EffectErrorKind::ConflictingEvidence,
+                now,
+                "old primary frozen-LSN observation is not exact".to_string(),
+            )?)
         }
-        Some(observed) => CaptureFrozenLsnOutput::Captured {
+        Some(observed) => EffectOutcome::Applied(CaptureFrozenLsnOutput {
             frozen_lsn: observed.status.current_progress,
             observed_at_unix_seconds: now,
-        },
+        }),
     };
-    encode_activity_result::<CaptureFrozenLsnActivity>(&output)
+    encode_activity_result::<EffectActivity<CaptureFrozenLsnActivity>>(&outcome)
         .map(DirectEvaluation::Observe)
         .map_err(|error| format!("encode capture-frozen-lsn result: {error}"))
 }
@@ -2614,70 +1925,301 @@ fn evaluate_target_catch_up(
     observations: &OperationObservations,
     now: i64,
 ) -> Result<DirectEvaluation, String> {
-    let output = match observations.get(&input.target_id) {
+    let outcome = match observations.get(&input.target_id) {
         None if now < input.deadline_unix_seconds => return Ok(DirectEvaluation::AwaitEvidence),
-        None => WaitTargetCaughtUpOutput::DeadlineExceeded {
-            observed_at_unix_seconds: now,
-            message: "target was unavailable at catch-up deadline".to_string(),
-        },
+        None => EffectOutcome::UnavailableAtDeadline(effect_error::<WaitTargetCaughtUpActivity>(
+            EffectErrorKind::UnavailableAtDeadline,
+            now,
+            "target was unavailable at catch-up deadline".to_string(),
+        )?),
         Some(observed)
             if observed.status.instance_id.as_str() != input.target_instance_id
                 || observed.status.epoch != epoch(&input.expected_epoch)
                 || observed.status.role != Role::ActiveSecondary =>
         {
-            WaitTargetCaughtUpOutput::Conflicting {
-                observed_at_unix_seconds: now,
-                message: "target catch-up observation is not exact".to_string(),
-            }
+            EffectOutcome::ConflictingEvidence(effect_error::<WaitTargetCaughtUpActivity>(
+                EffectErrorKind::ConflictingEvidence,
+                now,
+                "target catch-up observation is not exact".to_string(),
+            )?)
         }
         Some(observed) if observed.status.current_progress >= input.frozen_lsn => {
-            WaitTargetCaughtUpOutput::CaughtUp {
+            EffectOutcome::Applied(WaitTargetCaughtUpOutput {
                 observed_at_unix_seconds: now,
-            }
+            })
         }
         Some(_) if now < input.deadline_unix_seconds => {
             return Ok(DirectEvaluation::AwaitEvidence);
         }
-        Some(_) => WaitTargetCaughtUpOutput::DeadlineExceeded {
-            observed_at_unix_seconds: now,
-            message: "target did not reach the frozen LSN before deadline".to_string(),
-        },
+        Some(_) => EffectOutcome::DeadlineExceeded(effect_error::<WaitTargetCaughtUpActivity>(
+            EffectErrorKind::DeadlineExceeded,
+            now,
+            "target did not reach the frozen LSN before deadline".to_string(),
+        )?),
     };
-    encode_activity_result::<WaitTargetCaughtUpActivity>(&output)
+    encode_activity_result::<EffectActivity<WaitTargetCaughtUpActivity>>(&outcome)
         .map(DirectEvaluation::Observe)
         .map_err(|error| format!("encode wait-target-caught-up result: {error}"))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn evaluate_attestation<A, FAttested, FDeadline, FConflicting>(
+fn evaluate_attestation<A, FAttested>(
     snapshot: &StablePartitionSnapshotStatus,
     deadline_unix_seconds: i64,
     observations: &OperationObservations,
     now: i64,
     attested: FAttested,
-    deadline: FDeadline,
-    conflicting: FConflicting,
 ) -> Result<DirectEvaluation, String>
 where
-    A: DurableActivity,
+    A: DurableEffect,
     FAttested: FnOnce(i64, StablePartitionSnapshotStatus) -> A::Output,
-    FDeadline: FnOnce(i64, String) -> A::Output,
-    FConflicting: FnOnce(i64, String) -> A::Output,
 {
-    let result = match attestation_error(snapshot, observations) {
-        Ok(()) => attested(
+    let outcome = match attestation_error(snapshot, observations) {
+        Ok(()) => EffectOutcome::Applied(attested(
             now,
             crate::reconciler::snapshot_with_observed_metadata(snapshot.clone(), observations),
-        ),
+        )),
         Err(AttestationError::Unavailable(_)) if now < deadline_unix_seconds => {
             return Ok(DirectEvaluation::AwaitEvidence);
         }
-        Err(AttestationError::Unavailable(message)) => deadline(now, message),
-        Err(AttestationError::Conflicting(message)) => conflicting(now, message),
+        Err(AttestationError::Unavailable(message)) => EffectOutcome::UnavailableAtDeadline(
+            effect_error::<A>(EffectErrorKind::UnavailableAtDeadline, now, message)?,
+        ),
+        Err(AttestationError::Conflicting(message)) => EffectOutcome::ConflictingEvidence(
+            effect_error::<A>(EffectErrorKind::ConflictingEvidence, now, message)?,
+        ),
     };
-    encode_activity_result::<A>(&result)
+    encode_activity_result::<EffectActivity<A>>(&outcome)
         .map(DirectEvaluation::Observe)
-        .map_err(|error| format!("encode {} result: {error}", A::NAME))
+        .map_err(|error| format!("encode {} result: {error}", <A as DurableEffect>::NAME))
+}
+
+trait PassiveOperation:
+    DurableEffect<Command = ()> + SwitchoverEffect<Family = PassiveEffectFamily>
+{
+    fn deadline_unix_seconds(request: &Self::Request) -> i64;
+
+    fn validate_request(
+        request: &Self::Request,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<(), String>;
+
+    fn evaluate_request(
+        request: &Self::Request,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<DirectEvaluation, String>;
+}
+
+impl PassiveOperation for CaptureFrozenLsnActivity {
+    fn deadline_unix_seconds(input: &CaptureFrozenLsnInput) -> i64 {
+        input.deadline_unix_seconds
+    }
+
+    fn validate_request(
+        input: &CaptureFrozenLsnInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<(), String> {
+        validate_common(
+            input.contract_version,
+            &input.execution_id,
+            input.deadline_unix_seconds,
+            definition,
+        )?;
+        let old = definition.member(definition.old_primary_id)?;
+        if input.old_primary_id != definition.old_primary_id
+            || input.old_primary_instance_id != old.instance_id
+            || input.expected_epoch != definition.previous_snapshot.epoch
+        {
+            return Err("capture-frozen-lsn input conflicts with admission".to_string());
+        }
+        Ok(())
+    }
+
+    fn evaluate_request(
+        input: &CaptureFrozenLsnInput,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<DirectEvaluation, String> {
+        evaluate_capture(input, observations, now)
+    }
+}
+
+impl PassiveOperation for WaitTargetCaughtUpActivity {
+    fn deadline_unix_seconds(input: &WaitTargetCaughtUpInput) -> i64 {
+        input.deadline_unix_seconds
+    }
+
+    fn validate_request(
+        input: &WaitTargetCaughtUpInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<(), String> {
+        validate_common(
+            input.contract_version,
+            &input.execution_id,
+            input.deadline_unix_seconds,
+            definition,
+        )?;
+        let target = definition.member(definition.target_primary_id)?;
+        if input.target_id != definition.target_primary_id
+            || input.target_instance_id != target.instance_id
+            || input.expected_epoch != definition.previous_snapshot.epoch
+            || input.frozen_lsn < 0
+        {
+            return Err("wait-target-caught-up input conflicts with admission".to_string());
+        }
+        Ok(())
+    }
+
+    fn evaluate_request(
+        input: &WaitTargetCaughtUpInput,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<DirectEvaluation, String> {
+        evaluate_target_catch_up(input, observations, now)
+    }
+}
+
+impl PassiveOperation for AttestTargetTopologyActivity {
+    fn deadline_unix_seconds(input: &AttestTargetTopologyInput) -> i64 {
+        input.deadline_unix_seconds
+    }
+
+    fn validate_request(
+        input: &AttestTargetTopologyInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<(), String> {
+        validate_common(
+            input.contract_version,
+            &input.execution_id,
+            input.deadline_unix_seconds,
+            definition,
+        )?;
+        if input.expected_snapshot != definition.target_snapshot {
+            return Err("target attestation snapshot conflicts with admission".to_string());
+        }
+        Ok(())
+    }
+
+    fn evaluate_request(
+        input: &AttestTargetTopologyInput,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<DirectEvaluation, String> {
+        evaluate_attestation::<Self, _>(
+            &input.expected_snapshot,
+            input.deadline_unix_seconds,
+            observations,
+            now,
+            |observed_at_unix_seconds, snapshot| AttestTargetTopologyOutput {
+                observed_at_unix_seconds,
+                snapshot,
+            },
+        )
+    }
+}
+
+impl PassiveOperation for AttestCompensatedTopologyActivity {
+    fn deadline_unix_seconds(input: &AttestCompensatedTopologyInput) -> i64 {
+        input.deadline_unix_seconds
+    }
+
+    fn validate_request(
+        input: &AttestCompensatedTopologyInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<(), String> {
+        validate_common(
+            input.contract_version,
+            &input.execution_id,
+            input.deadline_unix_seconds,
+            definition,
+        )?;
+        let compensation = definition.compensation_snapshot();
+        if input.expected_snapshot != definition.previous_snapshot
+            && input.expected_snapshot != compensation
+        {
+            return Err("compensated attestation snapshot conflicts with admission".to_string());
+        }
+        Ok(())
+    }
+
+    fn evaluate_request(
+        input: &AttestCompensatedTopologyInput,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<DirectEvaluation, String> {
+        evaluate_attestation::<Self, _>(
+            &input.expected_snapshot,
+            input.deadline_unix_seconds,
+            observations,
+            now,
+            |observed_at_unix_seconds, snapshot| AttestCompensatedTopologyOutput {
+                observed_at_unix_seconds,
+                snapshot,
+            },
+        )
+    }
+}
+
+impl<A> SwitchoverEffectFamily<A> for PassiveEffectFamily
+where
+    A: PassiveOperation,
+{
+    fn deadline_unix_seconds(
+        request: &A::Request,
+        _definition: &DirectSwitchoverDefinition,
+    ) -> Result<i64, PreparedActivityError> {
+        Ok(A::deadline_unix_seconds(request))
+    }
+
+    fn prepare_command(
+        request: &A::Request,
+        definition: &DirectSwitchoverDefinition,
+        _observations: &OperationObservations,
+        _addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
+        _now: i64,
+    ) -> Result<A::Command, PreparedActivityError> {
+        A::validate_request(request, definition).map_err(|_| PreparedActivityError::Validation)?;
+        Ok(())
+    }
+
+    fn validate_recorded_command(
+        request: &A::Request,
+        _command: &A::Command,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<(), PreparedActivityError> {
+        A::validate_request(request, definition).map_err(|_| PreparedActivityError::Validation)
+    }
+
+    fn observe(
+        request: &A::Request,
+        _command: &A::Command,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
+        A::validate_request(request, definition)?;
+        decode_evaluation::<A>(A::evaluate_request(request, observations, now)?)
+    }
+
+    fn observe_quarantined(
+        request: &A::Request,
+        command: &A::Command,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
+        <Self as SwitchoverEffectFamily<A>>::observe(
+            request,
+            command,
+            definition,
+            observations,
+            now,
+        )
+    }
+
+    fn dispatch(_command: &A::Command) -> SwitchoverDispatch<'_> {
+        SwitchoverDispatch::ObservationOnly
+    }
 }
 
 enum AttestationError {

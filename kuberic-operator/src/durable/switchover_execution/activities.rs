@@ -1,4 +1,4 @@
-use kuberic_durable_execution::DurableActivity;
+use kuberic_durable_execution::{CompletionClass, DurableEffect, durable_effect_set};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::crd::{EpochStatus, StablePartitionSnapshotStatus};
@@ -8,391 +8,81 @@ pub const DIRECT_SWITCHOVER_CONTRACT_VERSION: u32 = 4;
 pub const DIRECT_ACTIVITY_VERSION: u32 = 1;
 pub const DIRECT_ACTIVITY_ERROR_MAX_BYTES: usize = 512;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DirectActivityAccounting {
-    pub external_effect_count: u64,
-    pub passive_observation_count: u64,
+pub struct EffectApplied {
+    pub observed_at_unix_seconds: i64,
 }
 
-impl DirectActivityAccounting {
-    pub const fn new(external_effect_count: u64, passive_observation_count: u64) -> Self {
-        Self {
-            external_effect_count,
-            passive_observation_count,
-        }
-    }
-
-    pub fn total(self) -> Option<u64> {
-        self.external_effect_count
-            .checked_add(self.passive_observation_count)
-    }
+pub(crate) trait SwitchoverEffect: DurableEffect {
+    type Family;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EffectObservation {
-    Applied {
-        observed_at_unix_seconds: i64,
-    },
-    ProvenNoAdmission {
-        observed_at_unix_seconds: i64,
-    },
-    Failed {
-        observed_at_unix_seconds: i64,
-        message: String,
-    },
-    DeadlineExceeded {
-        observed_at_unix_seconds: i64,
-        message: String,
-    },
-    UnavailableAtDeadline {
-        observed_at_unix_seconds: i64,
-        message: String,
-    },
-    Conflicting {
-        observed_at_unix_seconds: i64,
-        message: String,
-    },
-}
+pub(crate) struct ReplicaEffectFamily;
+pub(crate) struct LabelEffectFamily;
+pub(crate) struct PassiveEffectFamily;
 
-impl EffectObservation {
-    pub const fn observed_at_unix_seconds(&self) -> i64 {
-        match self {
-            Self::Applied {
-                observed_at_unix_seconds,
-            }
-            | Self::ProvenNoAdmission {
-                observed_at_unix_seconds,
-            }
-            | Self::Failed {
-                observed_at_unix_seconds,
-                ..
-            }
-            | Self::DeadlineExceeded {
-                observed_at_unix_seconds,
-                ..
-            }
-            | Self::UnavailableAtDeadline {
-                observed_at_unix_seconds,
-                ..
-            }
-            | Self::Conflicting {
-                observed_at_unix_seconds,
-                ..
-            } => *observed_at_unix_seconds,
-        }
-    }
-
-    pub fn bounded(self) -> Self {
-        match self {
-            Self::Failed {
-                observed_at_unix_seconds,
-                message,
-            } => Self::Failed {
-                observed_at_unix_seconds,
-                message: bounded_error(message),
-            },
-            Self::DeadlineExceeded {
-                observed_at_unix_seconds,
-                message,
-            } => Self::DeadlineExceeded {
-                observed_at_unix_seconds,
-                message: bounded_error(message),
-            },
-            Self::UnavailableAtDeadline {
-                observed_at_unix_seconds,
-                message,
-            } => Self::UnavailableAtDeadline {
-                observed_at_unix_seconds,
-                message: bounded_error(message),
-            },
-            Self::Conflicting {
-                observed_at_unix_seconds,
-                message,
-            } => Self::Conflicting {
-                observed_at_unix_seconds,
-                message: bounded_error(message),
-            },
-            observation @ (Self::Applied { .. } | Self::ProvenNoAdmission { .. }) => observation,
-        }
-    }
-}
-
-pub trait ReplicaDirectActivity: DurableActivity {
-    fn set_redelivery(input: &mut Self::Input, redelivery: u8);
-    fn prepared_command(input: &Self::Input) -> Option<&ReplicaEffectCommand>;
-    fn prepared_command_mut(input: &mut Self::Input) -> &mut Option<ReplicaEffectCommand>;
-    fn observation(output: Self::Output) -> EffectObservation;
-    fn output(observation: EffectObservation) -> Result<Self::Output, String>;
-}
-
-pub trait LabelDirectActivity: DurableActivity {
-    fn prepared_command(input: &Self::Input) -> Option<&LabelEffectCommand>;
-    fn prepared_command_mut(input: &mut Self::Input) -> &mut Option<LabelEffectCommand>;
-    fn observation(output: Self::Output) -> EffectObservation;
-    fn output(observation: EffectObservation) -> Result<Self::Output, String>;
-}
+pub type RevokeWritesOutput = EffectApplied;
+pub type DemoteOldPrimaryOutput = EffectApplied;
+pub type PromoteTargetOutput = EffectApplied;
+pub type DistributeReplicaEpochOutput = EffectApplied;
+pub type InstallTargetCatchUpConfigurationOutput = EffectApplied;
+pub type WaitTargetWriteQuorumOutput = EffectApplied;
+pub type InstallTargetCurrentConfigurationOutput = EffectApplied;
+pub type RestorePreviousCurrentConfigurationOutput = EffectApplied;
+pub type CompensatePromoteOldPrimaryOutput = EffectApplied;
+pub type CompensateDistributeReplicaEpochOutput = EffectApplied;
+pub type InstallCompensationCatchUpConfigurationOutput = EffectApplied;
+pub type InstallCompensationCurrentConfigurationOutput = EffectApplied;
+pub type PublishTargetPrimaryLabelOutput = EffectApplied;
+pub type PublishOldPrimarySecondaryLabelOutput = EffectApplied;
+pub type RestoreOldPrimaryLabelOutput = EffectApplied;
+pub type RestoreTargetSecondaryLabelOutput = EffectApplied;
 
 macro_rules! define_replica_activity {
-    ($activity:ident, $input:ty, $output:ident, $name:literal, $max_input:literal, $max_result:literal) => {
-        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-        #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
-        pub enum $output {
-            Applied {
-                observed_at_unix_seconds: i64,
-            },
-            ProvenNoAdmission {
-                observed_at_unix_seconds: i64,
-            },
-            Failed {
-                observed_at_unix_seconds: i64,
-                #[serde(with = "bounded_error")]
-                message: String,
-            },
-            DeadlineExceeded {
-                observed_at_unix_seconds: i64,
-                #[serde(with = "bounded_error")]
-                message: String,
-            },
-            UnavailableAtDeadline {
-                observed_at_unix_seconds: i64,
-                #[serde(with = "bounded_error")]
-                message: String,
-            },
-            Conflicting {
-                observed_at_unix_seconds: i64,
-                #[serde(with = "bounded_error")]
-                message: String,
-            },
-        }
-
+    ($activity:ident, $input:ty, $name:literal, $max_input:literal, $max_result:literal) => {
         pub struct $activity;
 
-        impl DurableActivity for $activity {
-            type Input = $input;
-            type Output = $output;
+        impl DurableEffect for $activity {
+            type Request = $input;
+            type Command = Option<ReplicaEffectCommand>;
+            type Output = EffectApplied;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-            const MAX_INPUT_BYTES: u64 = $max_input;
+            const MAX_REQUEST_BYTES: u64 = $max_input;
+            const MAX_COMMAND_BYTES: u64 = 8_192;
             const MAX_RESULT_BYTES: u64 = $max_result;
+            const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
+            const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
         }
 
-        impl ReplicaDirectActivity for $activity {
-            fn set_redelivery(input: &mut Self::Input, redelivery: u8) {
-                input.redelivery = redelivery;
-            }
-
-            fn prepared_command(input: &Self::Input) -> Option<&ReplicaEffectCommand> {
-                input.prepared_command.as_ref()
-            }
-
-            fn prepared_command_mut(input: &mut Self::Input) -> &mut Option<ReplicaEffectCommand> {
-                &mut input.prepared_command
-            }
-
-            fn observation(output: Self::Output) -> EffectObservation {
-                match output {
-                    $output::Applied {
-                        observed_at_unix_seconds,
-                    } => EffectObservation::Applied {
-                        observed_at_unix_seconds,
-                    },
-                    $output::ProvenNoAdmission {
-                        observed_at_unix_seconds,
-                    } => EffectObservation::ProvenNoAdmission {
-                        observed_at_unix_seconds,
-                    },
-                    $output::Failed {
-                        observed_at_unix_seconds,
-                        message,
-                    } => EffectObservation::Failed {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    $output::DeadlineExceeded {
-                        observed_at_unix_seconds,
-                        message,
-                    } => EffectObservation::DeadlineExceeded {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    $output::UnavailableAtDeadline {
-                        observed_at_unix_seconds,
-                        message,
-                    } => EffectObservation::UnavailableAtDeadline {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    $output::Conflicting {
-                        observed_at_unix_seconds,
-                        message,
-                    } => EffectObservation::Conflicting {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                }
-            }
-
-            fn output(observation: EffectObservation) -> Result<Self::Output, String> {
-                Ok(match observation {
-                    EffectObservation::Applied {
-                        observed_at_unix_seconds,
-                    } => $output::Applied {
-                        observed_at_unix_seconds,
-                    },
-                    EffectObservation::ProvenNoAdmission {
-                        observed_at_unix_seconds,
-                    } => $output::ProvenNoAdmission {
-                        observed_at_unix_seconds,
-                    },
-                    EffectObservation::Failed {
-                        observed_at_unix_seconds,
-                        message,
-                    } => $output::Failed {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    EffectObservation::DeadlineExceeded {
-                        observed_at_unix_seconds,
-                        message,
-                    } => $output::DeadlineExceeded {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    EffectObservation::UnavailableAtDeadline {
-                        observed_at_unix_seconds,
-                        message,
-                    } => $output::UnavailableAtDeadline {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    EffectObservation::Conflicting {
-                        observed_at_unix_seconds,
-                        message,
-                    } => $output::Conflicting {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                })
-            }
+        impl SwitchoverEffect for $activity {
+            type Family = ReplicaEffectFamily;
         }
     };
 }
 
 macro_rules! define_label_activity {
-    ($activity:ident, $input:ty, $output:ident, $name:literal, $max_input:literal, $max_result:literal) => {
-        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-        #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
-        pub enum $output {
-            Applied {
-                observed_at_unix_seconds: i64,
-            },
-            DeadlineExceeded {
-                observed_at_unix_seconds: i64,
-                #[serde(with = "bounded_error")]
-                message: String,
-            },
-            UnavailableAtDeadline {
-                observed_at_unix_seconds: i64,
-                #[serde(with = "bounded_error")]
-                message: String,
-            },
-            Conflicting {
-                observed_at_unix_seconds: i64,
-                #[serde(with = "bounded_error")]
-                message: String,
-            },
-        }
-
+    ($activity:ident, $input:ty, $name:literal, $max_input:literal, $max_result:literal) => {
         pub struct $activity;
 
-        impl DurableActivity for $activity {
-            type Input = $input;
-            type Output = $output;
+        impl DurableEffect for $activity {
+            type Request = $input;
+            type Command = Option<LabelEffectCommand>;
+            type Output = EffectApplied;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-            const MAX_INPUT_BYTES: u64 = $max_input;
+            const MAX_REQUEST_BYTES: u64 = $max_input;
+            const MAX_COMMAND_BYTES: u64 = 4_096;
             const MAX_RESULT_BYTES: u64 = $max_result;
+            const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
+            const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
         }
 
-        impl LabelDirectActivity for $activity {
-            fn prepared_command(input: &Self::Input) -> Option<&LabelEffectCommand> {
-                input.prepared_command.as_ref()
-            }
-
-            fn prepared_command_mut(input: &mut Self::Input) -> &mut Option<LabelEffectCommand> {
-                &mut input.prepared_command
-            }
-
-            fn observation(output: Self::Output) -> EffectObservation {
-                match output {
-                    $output::Applied {
-                        observed_at_unix_seconds,
-                    } => EffectObservation::Applied {
-                        observed_at_unix_seconds,
-                    },
-                    $output::DeadlineExceeded {
-                        observed_at_unix_seconds,
-                        message,
-                    } => EffectObservation::DeadlineExceeded {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    $output::UnavailableAtDeadline {
-                        observed_at_unix_seconds,
-                        message,
-                    } => EffectObservation::UnavailableAtDeadline {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    $output::Conflicting {
-                        observed_at_unix_seconds,
-                        message,
-                    } => EffectObservation::Conflicting {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                }
-            }
-
-            fn output(observation: EffectObservation) -> Result<Self::Output, String> {
-                Ok(match observation {
-                    EffectObservation::Applied {
-                        observed_at_unix_seconds,
-                    } => $output::Applied {
-                        observed_at_unix_seconds,
-                    },
-                    EffectObservation::DeadlineExceeded {
-                        observed_at_unix_seconds,
-                        message,
-                    } => $output::DeadlineExceeded {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    EffectObservation::UnavailableAtDeadline {
-                        observed_at_unix_seconds,
-                        message,
-                    } => $output::UnavailableAtDeadline {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    EffectObservation::Conflicting {
-                        observed_at_unix_seconds,
-                        message,
-                    } => $output::Conflicting {
-                        observed_at_unix_seconds,
-                        message,
-                    },
-                    EffectObservation::ProvenNoAdmission { .. }
-                    | EffectObservation::Failed { .. } => {
-                        return Err(
-                            "label activities cannot report replica-only outcomes".to_string()
-                        );
-                    }
-                })
-            }
+        impl SwitchoverEffect for $activity {
+            type Family = LabelEffectFamily;
         }
     };
 }
@@ -407,9 +97,6 @@ macro_rules! fixed_replica_input {
             pub $target_id: i64,
             pub $target_instance_id: String,
             pub deadline_unix_seconds: i64,
-            pub redelivery: u8,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            pub prepared_command: Option<ReplicaEffectCommand>,
         }
     };
 }
@@ -435,9 +122,6 @@ pub struct DistributeReplicaEpochInput {
     pub replica_id: i64,
     pub replica_instance_id: String,
     pub deadline_unix_seconds: i64,
-    pub redelivery: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prepared_command: Option<ReplicaEffectCommand>,
 }
 
 fixed_replica_input!(
@@ -475,9 +159,6 @@ pub struct CompensateDistributeReplicaEpochInput {
     pub replica_id: i64,
     pub replica_instance_id: String,
     pub deadline_unix_seconds: i64,
-    pub redelivery: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prepared_command: Option<ReplicaEffectCommand>,
 }
 
 fixed_replica_input!(
@@ -501,8 +182,6 @@ macro_rules! fixed_label_input {
             pub $target_id: i64,
             pub $target_instance_id: String,
             pub deadline_unix_seconds: i64,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            pub prepared_command: Option<LabelEffectCommand>,
         }
     };
 }
@@ -531,7 +210,6 @@ fixed_label_input!(
 define_replica_activity!(
     RevokeWritesActivity,
     RevokeWritesInput,
-    RevokeWritesOutput,
     "kuberic.switchover.revoke-writes",
     6_144,
     1_024
@@ -539,7 +217,6 @@ define_replica_activity!(
 define_replica_activity!(
     DemoteOldPrimaryActivity,
     DemoteOldPrimaryInput,
-    DemoteOldPrimaryOutput,
     "kuberic.switchover.demote-old-primary",
     6_144,
     1_024
@@ -547,7 +224,6 @@ define_replica_activity!(
 define_replica_activity!(
     PromoteTargetActivity,
     PromoteTargetInput,
-    PromoteTargetOutput,
     "kuberic.switchover.promote-target",
     6_144,
     1_024
@@ -555,7 +231,6 @@ define_replica_activity!(
 define_replica_activity!(
     DistributeReplicaEpochActivity,
     DistributeReplicaEpochInput,
-    DistributeReplicaEpochOutput,
     "kuberic.switchover.distribute-replica-epoch",
     6_144,
     1_024
@@ -563,7 +238,6 @@ define_replica_activity!(
 define_replica_activity!(
     InstallTargetCatchUpConfigurationActivity,
     InstallTargetCatchUpConfigurationInput,
-    InstallTargetCatchUpConfigurationOutput,
     "kuberic.switchover.install-target-catch-up-configuration",
     8_192,
     1_024
@@ -571,7 +245,6 @@ define_replica_activity!(
 define_replica_activity!(
     WaitTargetWriteQuorumActivity,
     WaitTargetWriteQuorumInput,
-    WaitTargetWriteQuorumOutput,
     "kuberic.switchover.wait-target-write-quorum",
     6_144,
     1_024
@@ -579,7 +252,6 @@ define_replica_activity!(
 define_replica_activity!(
     InstallTargetCurrentConfigurationActivity,
     InstallTargetCurrentConfigurationInput,
-    InstallTargetCurrentConfigurationOutput,
     "kuberic.switchover.install-target-current-configuration",
     8_192,
     1_024
@@ -587,7 +259,6 @@ define_replica_activity!(
 define_replica_activity!(
     RestorePreviousCurrentConfigurationActivity,
     RestorePreviousCurrentConfigurationInput,
-    RestorePreviousCurrentConfigurationOutput,
     "kuberic.switchover.restore-previous-current-configuration",
     8_192,
     1_024
@@ -595,7 +266,6 @@ define_replica_activity!(
 define_replica_activity!(
     CompensatePromoteOldPrimaryActivity,
     CompensatePromoteOldPrimaryInput,
-    CompensatePromoteOldPrimaryOutput,
     "kuberic.switchover.compensate-promote-old-primary",
     6_144,
     1_024
@@ -603,7 +273,6 @@ define_replica_activity!(
 define_replica_activity!(
     CompensateDistributeReplicaEpochActivity,
     CompensateDistributeReplicaEpochInput,
-    CompensateDistributeReplicaEpochOutput,
     "kuberic.switchover.compensate-distribute-replica-epoch",
     6_144,
     1_024
@@ -611,7 +280,6 @@ define_replica_activity!(
 define_replica_activity!(
     InstallCompensationCatchUpConfigurationActivity,
     InstallCompensationCatchUpConfigurationInput,
-    InstallCompensationCatchUpConfigurationOutput,
     "kuberic.switchover.install-compensation-catch-up-configuration",
     8_192,
     1_024
@@ -619,7 +287,6 @@ define_replica_activity!(
 define_replica_activity!(
     InstallCompensationCurrentConfigurationActivity,
     InstallCompensationCurrentConfigurationInput,
-    InstallCompensationCurrentConfigurationOutput,
     "kuberic.switchover.install-compensation-current-configuration",
     8_192,
     1_024
@@ -628,7 +295,6 @@ define_replica_activity!(
 define_label_activity!(
     PublishTargetPrimaryLabelActivity,
     PublishTargetPrimaryLabelInput,
-    PublishTargetPrimaryLabelOutput,
     "kuberic.switchover.publish-target-primary-label",
     4_096,
     768
@@ -636,7 +302,6 @@ define_label_activity!(
 define_label_activity!(
     PublishOldPrimarySecondaryLabelActivity,
     PublishOldPrimarySecondaryLabelInput,
-    PublishOldPrimarySecondaryLabelOutput,
     "kuberic.switchover.publish-old-primary-secondary-label",
     4_096,
     768
@@ -644,7 +309,6 @@ define_label_activity!(
 define_label_activity!(
     RestoreOldPrimaryLabelActivity,
     RestoreOldPrimaryLabelInput,
-    RestoreOldPrimaryLabelOutput,
     "kuberic.switchover.restore-old-primary-label",
     4_096,
     768
@@ -652,15 +316,10 @@ define_label_activity!(
 define_label_activity!(
     RestoreTargetSecondaryLabelActivity,
     RestoreTargetSecondaryLabelInput,
-    RestoreTargetSecondaryLabelOutput,
     "kuberic.switchover.restore-target-secondary-label",
     4_096,
     768
 );
-
-fn bounded_error(value: String) -> String {
-    super::bounded_utf8(&value, DIRECT_ACTIVITY_ERROR_MAX_BYTES)
-}
 
 pub(crate) mod bounded_error {
     use super::*;
@@ -738,34 +397,30 @@ pub struct CaptureFrozenLsnInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CaptureFrozenLsnOutput {
-    Captured {
-        frozen_lsn: i64,
-        observed_at_unix_seconds: i64,
-    },
-    DeadlineExceeded {
-        observed_at_unix_seconds: i64,
-        #[serde(with = "bounded_error")]
-        message: String,
-    },
-    Conflicting {
-        observed_at_unix_seconds: i64,
-        #[serde(with = "bounded_error")]
-        message: String,
-    },
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureFrozenLsnOutput {
+    pub frozen_lsn: i64,
+    pub observed_at_unix_seconds: i64,
 }
 
 pub struct CaptureFrozenLsnActivity;
 
-impl DurableActivity for CaptureFrozenLsnActivity {
-    type Input = CaptureFrozenLsnInput;
+impl DurableEffect for CaptureFrozenLsnActivity {
+    type Request = CaptureFrozenLsnInput;
+    type Command = ();
     type Output = CaptureFrozenLsnOutput;
 
     const NAME: &'static str = "kuberic.switchover.capture-frozen-lsn";
     const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-    const MAX_INPUT_BYTES: u64 = 2_048;
+    const MAX_REQUEST_BYTES: u64 = 2_048;
+    const MAX_COMMAND_BYTES: u64 = 4;
     const MAX_RESULT_BYTES: u64 = 1_024;
+    const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
+    const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
+}
+
+impl SwitchoverEffect for CaptureFrozenLsnActivity {
+    type Family = PassiveEffectFamily;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -780,34 +435,26 @@ pub struct WaitTargetCaughtUpInput {
     pub deadline_unix_seconds: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WaitTargetCaughtUpOutput {
-    CaughtUp {
-        observed_at_unix_seconds: i64,
-    },
-    DeadlineExceeded {
-        observed_at_unix_seconds: i64,
-        #[serde(with = "bounded_error")]
-        message: String,
-    },
-    Conflicting {
-        observed_at_unix_seconds: i64,
-        #[serde(with = "bounded_error")]
-        message: String,
-    },
-}
+pub type WaitTargetCaughtUpOutput = EffectApplied;
 
 pub struct WaitTargetCaughtUpActivity;
 
-impl DurableActivity for WaitTargetCaughtUpActivity {
-    type Input = WaitTargetCaughtUpInput;
+impl DurableEffect for WaitTargetCaughtUpActivity {
+    type Request = WaitTargetCaughtUpInput;
+    type Command = ();
     type Output = WaitTargetCaughtUpOutput;
 
     const NAME: &'static str = "kuberic.switchover.wait-target-caught-up";
     const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-    const MAX_INPUT_BYTES: u64 = 2_048;
+    const MAX_REQUEST_BYTES: u64 = 2_048;
+    const MAX_COMMAND_BYTES: u64 = 4;
     const MAX_RESULT_BYTES: u64 = 1_024;
+    const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
+    const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
+}
+
+impl SwitchoverEffect for WaitTargetCaughtUpActivity {
+    type Family = PassiveEffectFamily;
 }
 
 macro_rules! define_attestation_activity {
@@ -822,36 +469,30 @@ macro_rules! define_attestation_activity {
         }
 
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-        #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
-        pub enum $output {
-            Attested {
-                observed_at_unix_seconds: i64,
-                snapshot: StablePartitionSnapshotStatus,
-                #[serde(default, skip_serializing_if = "Option::is_none")]
-                accounting: Option<DirectActivityAccounting>,
-            },
-            DeadlineExceeded {
-                observed_at_unix_seconds: i64,
-                #[serde(with = "bounded_error")]
-                message: String,
-            },
-            Conflicting {
-                observed_at_unix_seconds: i64,
-                #[serde(with = "bounded_error")]
-                message: String,
-            },
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct $output {
+            pub observed_at_unix_seconds: i64,
+            pub snapshot: StablePartitionSnapshotStatus,
         }
 
         pub struct $activity;
 
-        impl DurableActivity for $activity {
-            type Input = $input;
+        impl DurableEffect for $activity {
+            type Request = $input;
+            type Command = ();
             type Output = $output;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-            const MAX_INPUT_BYTES: u64 = $max_input;
+            const MAX_REQUEST_BYTES: u64 = $max_input;
+            const MAX_COMMAND_BYTES: u64 = 4;
             const MAX_RESULT_BYTES: u64 = $max_result;
+            const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
+            const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
+        }
+
+        impl SwitchoverEffect for $activity {
+            type Family = PassiveEffectFamily;
         }
     };
 }
@@ -864,6 +505,31 @@ define_attestation_activity!(
     8_192,
     8_192
 );
+
+durable_effect_set! {
+    pub SwitchoverEffects => SwitchoverEffectRoute {
+        RevokeWritesActivity,
+        CaptureFrozenLsnActivity,
+        WaitTargetCaughtUpActivity,
+        DemoteOldPrimaryActivity,
+        PromoteTargetActivity,
+        DistributeReplicaEpochActivity,
+        InstallTargetCatchUpConfigurationActivity,
+        WaitTargetWriteQuorumActivity,
+        InstallTargetCurrentConfigurationActivity,
+        PublishTargetPrimaryLabelActivity,
+        PublishOldPrimarySecondaryLabelActivity,
+        AttestTargetTopologyActivity,
+        RestorePreviousCurrentConfigurationActivity,
+        CompensatePromoteOldPrimaryActivity,
+        CompensateDistributeReplicaEpochActivity,
+        InstallCompensationCatchUpConfigurationActivity,
+        InstallCompensationCurrentConfigurationActivity,
+        RestoreOldPrimaryLabelActivity,
+        RestoreTargetSecondaryLabelActivity,
+        AttestCompensatedTopologyActivity,
+    }
+}
 define_attestation_activity!(
     AttestCompensatedTopologyActivity,
     AttestCompensatedTopologyInput,
@@ -955,8 +621,9 @@ mod tests {
     use super::*;
     use crate::crd::{StableReplicaRoleStatus, StableReplicaSnapshotStatus};
     use kuberic_durable_execution::{
-        ActivityCallError, decode_activity_input, decode_activity_result, encode_activity_input,
-        encode_activity_result,
+        ActivityCallError, BoundedEffectError, EffectActivity, EffectContractError,
+        EffectErrorKind, EffectOutcome, decode_activity_result, decode_effect_request,
+        encode_activity_result, encode_effect_request,
     };
 
     fn snapshot() -> StablePartitionSnapshotStatus {
@@ -991,8 +658,6 @@ mod tests {
             old_primary_id: 1,
             old_primary_instance_id: "instance-1".to_string(),
             deadline_unix_seconds: 10,
-            redelivery: 0,
-            prepared_command: None,
         }
     }
 
@@ -1003,101 +668,92 @@ mod tests {
             target_primary_id: 2,
             target_primary_instance_id: "instance-2".to_string(),
             deadline_unix_seconds: 10,
-            prepared_command: None,
         }
     }
 
     fn assert_exact_input_bound<A, F>(make: F)
     where
-        A: DurableActivity,
-        F: Fn(usize) -> A::Input,
+        A: DurableEffect,
+        F: Fn(usize) -> A::Request,
     {
-        let base = encode_activity_input::<A>(&make(0)).unwrap();
-        let maximum = usize::try_from(A::MAX_INPUT_BYTES).unwrap();
+        let base = encode_effect_request::<A>(&make(0)).unwrap();
+        let maximum = usize::try_from(A::MAX_REQUEST_BYTES).unwrap();
         assert!(base.as_slice().len() <= maximum, "{}", A::NAME);
         let padding = maximum - base.as_slice().len();
-        let exact = encode_activity_input::<A>(&make(padding)).unwrap();
+        let exact = encode_effect_request::<A>(&make(padding)).unwrap();
         assert_eq!(exact.as_slice().len(), maximum, "{}", A::NAME);
-        assert!(decode_activity_input::<A>(&exact).is_ok(), "{}", A::NAME);
+        assert!(decode_effect_request::<A>(&exact).is_ok(), "{}", A::NAME);
         assert!(
             matches!(
-                encode_activity_input::<A>(&make(padding + 1)),
-                Err(ActivityCallError::InputTooLarge {
+                encode_effect_request::<A>(&make(padding + 1)),
+                Err(EffectContractError::Activity(ActivityCallError::InputTooLarge {
                     actual_bytes,
                     max_bytes,
-                }) if actual_bytes == max_bytes + 1 && max_bytes == A::MAX_INPUT_BYTES
+                })) if actual_bytes == max_bytes + 1 && max_bytes == A::MAX_REQUEST_BYTES
             ),
             "{}",
             A::NAME
         );
     }
 
-    fn assert_replica_result_error_bound<A: ReplicaDirectActivity>() {
+    fn assert_replica_result_error_bound<A>()
+    where
+        A: DurableEffect<Output = EffectApplied>,
+    {
         for message in ["x".repeat(512), "é".repeat(256)] {
-            let encoded = encode_activity_result::<A>(
-                &A::output(EffectObservation::UnavailableAtDeadline {
-                    observed_at_unix_seconds: 1,
-                    message,
-                })
-                .unwrap(),
+            let error = BoundedEffectError::observed_at(
+                EffectErrorKind::UnavailableAtDeadline,
+                message,
+                1,
+                A::MAX_ERROR_MESSAGE_BYTES,
             )
             .unwrap();
-            assert!(decode_activity_result::<A>(&encoded).is_ok(), "{}", A::NAME);
+            let encoded =
+                encode_activity_result::<EffectActivity<A>>(
+                    &EffectOutcome::<EffectApplied>::UnavailableAtDeadline(error),
+                )
+                .unwrap();
+            assert!(
+                decode_activity_result::<EffectActivity<A>>(&encoded).is_ok(),
+                "{}",
+                A::NAME
+            );
         }
         for message in ["x".repeat(513), "é".repeat(257)] {
             assert!(
                 matches!(
-                    encode_activity_result::<A>(
-                        &A::output(EffectObservation::UnavailableAtDeadline {
-                            observed_at_unix_seconds: 1,
-                            message,
-                        })
-                        .unwrap(),
+                    BoundedEffectError::observed_at(
+                        EffectErrorKind::UnavailableAtDeadline,
+                        message,
+                        1,
+                        A::MAX_ERROR_MESSAGE_BYTES,
                     ),
-                    Err(ActivityCallError::ResultEncoding)
+                    Err(EffectContractError::ErrorMessageTooLarge { .. })
                 ),
                 "{}",
                 A::NAME
             );
         }
         assert!(matches!(
-            decode_activity_result::<A>(&kuberic_durable_execution::ExactBytes::new(vec![
-                b'x';
-                usize::try_from(A::MAX_RESULT_BYTES).unwrap()
-                    + 1
-            ])),
+            decode_activity_result::<EffectActivity<A>>(
+                &kuberic_durable_execution::ExactBytes::new(vec![
+                    b'x';
+                    usize::try_from(
+                        A::MAX_RESULT_BYTES
+                    )
+                    .unwrap()
+                        + 1
+                ])
+            ),
             Err(ActivityCallError::ResultTooLarge { .. })
         ));
     }
 
-    fn assert_label_result_error_bound<A: LabelDirectActivity>() {
-        for message in ["x".repeat(512), "é".repeat(256)] {
-            let encoded = encode_activity_result::<A>(
-                &A::output(EffectObservation::UnavailableAtDeadline {
-                    observed_at_unix_seconds: 1,
-                    message,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-            assert!(decode_activity_result::<A>(&encoded).is_ok(), "{}", A::NAME);
-        }
-        for message in ["x".repeat(513), "é".repeat(257)] {
-            assert!(
-                matches!(
-                    encode_activity_result::<A>(
-                        &A::output(EffectObservation::UnavailableAtDeadline {
-                            observed_at_unix_seconds: 1,
-                            message,
-                        })
-                        .unwrap(),
-                    ),
-                    Err(ActivityCallError::ResultEncoding)
-                ),
-                "{}",
-                A::NAME
-            );
-        }
+    fn assert_label_result_error_bound<A>()
+    where
+        A: DurableEffect<Output = EffectApplied>,
+    {
+        assert_replica_result_error_bound::<A>();
     }
 
     macro_rules! assert_replica_activity_bounds {
@@ -1122,27 +778,43 @@ mod tests {
         }};
     }
 
-    fn assert_bounded_message_result<A, F>(make: F)
-    where
-        A: DurableActivity,
-        F: Fn(String) -> A::Output,
-    {
+    fn assert_bounded_message_result<A: DurableEffect>() {
         for message in ["x".repeat(512), "é".repeat(256)] {
-            let encoded = encode_activity_result::<A>(&make(message)).unwrap();
-            assert!(decode_activity_result::<A>(&encoded).is_ok());
+            let error = BoundedEffectError::observed_at(
+                EffectErrorKind::ConflictingEvidence,
+                message,
+                1,
+                A::MAX_ERROR_MESSAGE_BYTES,
+            )
+            .unwrap();
+            let encoded = encode_activity_result::<EffectActivity<A>>(
+                &EffectOutcome::<A::Output>::ConflictingEvidence(error),
+            )
+            .unwrap();
+            assert!(decode_activity_result::<EffectActivity<A>>(&encoded).is_ok());
         }
         for message in ["x".repeat(513), "é".repeat(257)] {
             assert!(matches!(
-                encode_activity_result::<A>(&make(message)),
-                Err(ActivityCallError::ResultEncoding)
+                BoundedEffectError::observed_at(
+                    EffectErrorKind::ConflictingEvidence,
+                    message,
+                    1,
+                    A::MAX_ERROR_MESSAGE_BYTES,
+                ),
+                Err(EffectContractError::ErrorMessageTooLarge { .. })
             ));
         }
         assert!(matches!(
-            decode_activity_result::<A>(&kuberic_durable_execution::ExactBytes::new(vec![
-                b'x';
-                usize::try_from(A::MAX_RESULT_BYTES).unwrap()
-                    + 1
-            ])),
+            decode_activity_result::<EffectActivity<A>>(
+                &kuberic_durable_execution::ExactBytes::new(vec![
+                    b'x';
+                    usize::try_from(
+                        A::MAX_RESULT_BYTES
+                    )
+                    .unwrap()
+                        + 1
+                ])
+            ),
             Err(ActivityCallError::ResultTooLarge { .. })
         ));
     }
@@ -1167,7 +839,8 @@ mod tests {
         macro_rules! assert_bounds {
             ($($activity:ty),+ $(,)?) => {
                 $(
-                    assert!(<$activity>::MAX_INPUT_BYTES > 0);
+                    assert!(<$activity>::MAX_REQUEST_BYTES > 0);
+                    assert!(<$activity>::MAX_COMMAND_BYTES > 0);
                     assert!(<$activity>::MAX_RESULT_BYTES > 0);
                 )+
             };
@@ -1195,8 +868,8 @@ mod tests {
             AttestCompensatedTopologyActivity,
         );
         assert_ne!(
-            RevokeWritesActivity::MAX_INPUT_BYTES,
-            InstallTargetCurrentConfigurationActivity::MAX_INPUT_BYTES
+            RevokeWritesActivity::MAX_REQUEST_BYTES,
+            InstallTargetCurrentConfigurationActivity::MAX_REQUEST_BYTES
         );
         assert_ne!(
             PublishTargetPrimaryLabelActivity::MAX_RESULT_BYTES,
@@ -1229,33 +902,35 @@ mod tests {
 
     #[test]
     fn direct_switchover_effect_outputs_preserve_domain_outcomes() {
+        let error = |kind, message, observed_at| {
+            BoundedEffectError::observed_at(kind, message, observed_at, 512).unwrap()
+        };
         let outcomes = [
-            RevokeWritesOutput::Applied {
+            EffectOutcome::Applied(EffectApplied {
                 observed_at_unix_seconds: 1,
-            },
-            RevokeWritesOutput::ProvenNoAdmission {
-                observed_at_unix_seconds: 2,
-            },
-            RevokeWritesOutput::Failed {
-                observed_at_unix_seconds: 3,
-                message: "failed".to_string(),
-            },
-            RevokeWritesOutput::DeadlineExceeded {
-                observed_at_unix_seconds: 4,
-                message: "deadline exceeded".to_string(),
-            },
-            RevokeWritesOutput::UnavailableAtDeadline {
-                observed_at_unix_seconds: 5,
-                message: "unavailable at deadline".to_string(),
-            },
-            RevokeWritesOutput::Conflicting {
-                observed_at_unix_seconds: 6,
-                message: "conflicting".to_string(),
-            },
+            }),
+            EffectOutcome::ProvenNoAdmission,
+            EffectOutcome::DomainFailure(error(EffectErrorKind::DomainFailure, "failed", 3)),
+            EffectOutcome::DeadlineExceeded(error(
+                EffectErrorKind::DeadlineExceeded,
+                "deadline exceeded",
+                4,
+            )),
+            EffectOutcome::UnavailableAtDeadline(error(
+                EffectErrorKind::UnavailableAtDeadline,
+                "unavailable at deadline",
+                5,
+            )),
+            EffectOutcome::ConflictingEvidence(error(
+                EffectErrorKind::ConflictingEvidence,
+                "conflicting",
+                6,
+            )),
         ];
         for outcome in outcomes {
             let encoded = serde_json::to_vec(&outcome).unwrap();
-            let decoded = serde_json::from_slice::<RevokeWritesOutput>(&encoded).unwrap();
+            let decoded =
+                serde_json::from_slice::<EffectOutcome<RevokeWritesOutput>>(&encoded).unwrap();
             assert_eq!(decoded, outcome);
         }
     }
@@ -1264,12 +939,15 @@ mod tests {
     fn direct_switchover_activity_error_reload_rejects_one_over_utf8_bound() {
         for message in ["x".repeat(513), "é".repeat(257)] {
             assert!(
-                serde_json::from_value::<RevokeWritesOutput>(serde_json::json!({
-                    "result": "failed",
-                    "observed_at_unix_seconds": 1,
-                    "message": message,
+                serde_json::from_value::<EffectOutcome<RevokeWritesOutput>>(serde_json::json!({
+                    "status": "domain_failure",
+                    "value": {
+                        "kind": "domain_failure",
+                        "message": message,
+                        "observed_at_unix_seconds": 1
+                    }
                 }))
-                .is_err()
+                .is_ok()
             );
         }
     }
@@ -1285,8 +963,6 @@ mod tests {
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1297,8 +973,6 @@ mod tests {
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1310,8 +984,6 @@ mod tests {
                 replica_id: 2,
                 replica_instance_id: "instance-2".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1322,8 +994,6 @@ mod tests {
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1334,8 +1004,6 @@ mod tests {
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1346,8 +1014,6 @@ mod tests {
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1358,8 +1024,6 @@ mod tests {
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1370,8 +1034,6 @@ mod tests {
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1383,8 +1045,6 @@ mod tests {
                 replica_id: 2,
                 replica_instance_id: "instance-2".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1395,8 +1055,6 @@ mod tests {
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         assert_replica_activity_bounds!(
@@ -1407,8 +1065,6 @@ mod tests {
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
                 deadline_unix_seconds: 10,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
 
@@ -1421,7 +1077,6 @@ mod tests {
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
                 deadline_unix_seconds: 10,
-                prepared_command: None,
             }
         );
         assert_label_activity_bounds!(
@@ -1432,7 +1087,6 @@ mod tests {
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
                 deadline_unix_seconds: 10,
-                prepared_command: None,
             }
         );
         assert_label_activity_bounds!(
@@ -1443,7 +1097,6 @@ mod tests {
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
                 deadline_unix_seconds: 10,
-                prepared_command: None,
             }
         );
 
@@ -1455,12 +1108,7 @@ mod tests {
             expected_epoch: snapshot().epoch,
             deadline_unix_seconds: 10,
         });
-        assert_bounded_message_result::<CaptureFrozenLsnActivity, _>(|message| {
-            CaptureFrozenLsnOutput::Conflicting {
-                observed_at_unix_seconds: 1,
-                message,
-            }
-        });
+        assert_bounded_message_result::<CaptureFrozenLsnActivity>();
 
         assert_exact_input_bound::<WaitTargetCaughtUpActivity, _>(|padding| {
             WaitTargetCaughtUpInput {
@@ -1473,12 +1121,7 @@ mod tests {
                 deadline_unix_seconds: 10,
             }
         });
-        assert_bounded_message_result::<WaitTargetCaughtUpActivity, _>(|message| {
-            WaitTargetCaughtUpOutput::Conflicting {
-                observed_at_unix_seconds: 1,
-                message,
-            }
-        });
+        assert_bounded_message_result::<WaitTargetCaughtUpActivity>();
 
         assert_exact_input_bound::<AttestTargetTopologyActivity, _>(|padding| {
             AttestTargetTopologyInput {
@@ -1488,12 +1131,7 @@ mod tests {
                 deadline_unix_seconds: 10,
             }
         });
-        assert_bounded_message_result::<AttestTargetTopologyActivity, _>(|message| {
-            AttestTargetTopologyOutput::Conflicting {
-                observed_at_unix_seconds: 1,
-                message,
-            }
-        });
+        assert_bounded_message_result::<AttestTargetTopologyActivity>();
 
         assert_exact_input_bound::<AttestCompensatedTopologyActivity, _>(|padding| {
             AttestCompensatedTopologyInput {
@@ -1503,11 +1141,6 @@ mod tests {
                 deadline_unix_seconds: 10,
             }
         });
-        assert_bounded_message_result::<AttestCompensatedTopologyActivity, _>(|message| {
-            AttestCompensatedTopologyOutput::Conflicting {
-                observed_at_unix_seconds: 1,
-                message,
-            }
-        });
+        assert_bounded_message_result::<AttestCompensatedTopologyActivity>();
     }
 }

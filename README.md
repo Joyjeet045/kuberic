@@ -8,7 +8,7 @@ A stateful replication framework for Kubernetes. Provides quorum-based replicati
 
 - **Quorum replication** — primary replicates to secondaries, blocks until write quorum ACKs
 - **Automatic failover** — operator detects primary failure, promotes best secondary
-- **Graceful switchover** — direct named durable workflow with visible
+- **Graceful switchover** — typed durable effects with visible
   write-revocation, promotion, and compensation paths
 - **Copy protocol** — new replicas built from full snapshot + incremental replay
 - **Epoch fencing** — stale primaries rejected via monotonic epoch numbers

@@ -365,6 +365,7 @@ impl MeasuredDurableCheckpointStore {
             CheckpointState::Terminal {
                 outcome,
                 completed_activity_count,
+                completion_metadata,
                 ..
             } => {
                 measurements.latest_terminal_checkpoint_bytes = Some(bytes);
@@ -376,7 +377,12 @@ impl MeasuredDurableCheckpointStore {
                 measurements.maximum_terminal_checkpoint_bytes =
                     measurements.maximum_terminal_checkpoint_bytes.max(bytes);
                 measurements.completed_activity_count = Some(*completed_activity_count);
-                let accounting = self.decoder.terminal(outcome, *completed_activity_count);
+                let accounting = completion_metadata
+                    .map(|metadata| DurableActivityAccounting {
+                        external_effect_count: metadata.external_effect_count(),
+                        passive_observation_count: metadata.passive_observation_count(),
+                    })
+                    .or_else(|| self.decoder.terminal(outcome, *completed_activity_count));
                 if let Some(accounting) = accounting {
                     measurements.completed_external_effect_count =
                         Some(accounting.external_effect_count);
@@ -849,40 +855,6 @@ mod checkpoint_store_tests {
         .unwrap()
     }
 
-    fn two_member_terminal_accounting_payload() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "status": "complete",
-            "snapshot": {
-                "epoch": {
-                    "dataLossNumber": 4,
-                    "configurationNumber": 9,
-                },
-                "primaryId": 2,
-                "members": [
-                    {
-                        "id": 1,
-                        "instanceId": "pod-1-uid",
-                        "role": "activeSecondary",
-                    },
-                    {
-                        "id": 2,
-                        "instanceId": "pod-2-uid",
-                        "role": "primary",
-                    },
-                ],
-                "writeQuorum": 2,
-            },
-            "compensated": false,
-            "branch": "target_success",
-            "reason": null,
-            "accounting": {
-                "externalEffectCount": 8,
-                "passiveObservationCount": 3,
-            },
-        }))
-        .unwrap()
-    }
-
     #[tokio::test]
     async fn measurements_distinguish_authoritative_and_unknown_bytes() {
         let execution_id = ExecutionId::from_bytes([9; 16]);
@@ -901,6 +873,7 @@ mod checkpoint_store_tests {
         store.correlate_host_outcome(&HostOutcome::WorkflowCompleted {
             outcome: TerminalOutcome::succeeded(ExactBytes::new(b"terminal")),
             completed_activity_count: 0,
+            completion_metadata: None,
             revision: revision.clone(),
             boundary: PersistenceBoundary::Completion,
             checkpoint_status: kuberic_durable_execution::TerminalCheckpointStatus::Accepted,
@@ -1100,46 +1073,12 @@ mod checkpoint_store_tests {
     }
 
     #[tokio::test]
-    async fn switchover_terminal_accounting_uses_the_direct_terminal_contract() {
-        let mismatched_total_payload = terminal_accounting_payload(3, false, 10, 2);
-        let mismatched_total =
-            terminal_accounting_measurements(12, &mismatched_total_payload, 13).await;
-        assert_eq!(mismatched_total.completed_activity_count, Some(13));
-        assert_eq!(mismatched_total.completed_external_effect_count, None);
-        assert_eq!(mismatched_total.completed_passive_observation_count, None);
-
-        let successful_redelivery_payload = terminal_accounting_payload(3, false, 10, 3);
-        let successful_redelivery =
-            terminal_accounting_measurements(13, &successful_redelivery_payload, 13).await;
-        assert_eq!(
-            successful_redelivery.completed_external_effect_count,
-            Some(10)
-        );
-        assert_eq!(
-            successful_redelivery.completed_passive_observation_count,
-            Some(3)
-        );
-
-        let two_member_payload = two_member_terminal_accounting_payload();
-        let two_member = terminal_accounting_measurements(14, &two_member_payload, 11).await;
-        assert_eq!(two_member.completed_external_effect_count, Some(8));
-        assert_eq!(two_member.completed_passive_observation_count, Some(3));
-
-        let compensation_payload = terminal_accounting_payload(3, true, 8, 5);
-        let compensation = terminal_accounting_measurements(15, &compensation_payload, 13).await;
-        assert_eq!(compensation.completed_activity_count, Some(13));
-        assert_eq!(compensation.completed_external_effect_count, Some(8));
-        assert_eq!(compensation.completed_passive_observation_count, Some(5));
-
-        let exact_maximum_payload = terminal_accounting_payload(9, true, 28, 5);
-        let exact_maximum = terminal_accounting_measurements(16, &exact_maximum_payload, 33).await;
-        assert_eq!(exact_maximum.completed_external_effect_count, Some(28));
-        assert_eq!(exact_maximum.completed_passive_observation_count, Some(5));
-
-        let one_over_payload = terminal_accounting_payload(9, true, 29, 5);
-        let one_over = terminal_accounting_measurements(17, &one_over_payload, 34).await;
-        assert_eq!(one_over.completed_external_effect_count, None);
-        assert_eq!(one_over.completed_passive_observation_count, None);
+    async fn switchover_terminal_payload_cannot_inject_accounting() {
+        let payload = terminal_accounting_payload(3, false, 10, 3);
+        let measurements = terminal_accounting_measurements(12, &payload, 13).await;
+        assert_eq!(measurements.completed_activity_count, Some(13));
+        assert_eq!(measurements.completed_external_effect_count, None);
+        assert_eq!(measurements.completed_passive_observation_count, None);
     }
 
     #[tokio::test]

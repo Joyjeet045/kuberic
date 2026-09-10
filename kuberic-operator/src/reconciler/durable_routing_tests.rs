@@ -15,8 +15,8 @@ use kuberic_core::types::{
 };
 use kuberic_durable_execution::{
     ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome, CheckpointEnvelope,
-    CheckpointPayload, CheckpointStore, ExactBytes, ExecutionContract, InMemoryCheckpointStore,
-    InMemoryFault, StoreErrorKind, TerminalOutcome,
+    CheckpointPayload, CheckpointStore, CompletionMetadata, ExactBytes, ExecutionContract,
+    InMemoryCheckpointStore, InMemoryFault, StoreErrorKind, TerminalOutcome,
 };
 
 use super::*;
@@ -33,7 +33,7 @@ use crate::durable::remove_replica_execution::{
 use crate::durable::switchover_execution::{
     DirectSwitchoverTerminalBranch, DirectSwitchoverTerminalRecord,
     SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES, SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
-    SwitchoverActivityAccounting, checkpoint_limits as switchover_checkpoint_limits,
+    checkpoint_limits as switchover_checkpoint_limits,
     encode_terminal as encode_switchover_terminal, is_switchover_activity_identity,
     native_execution_spec, native_initial_operation, new_switchover_execution,
 };
@@ -714,13 +714,12 @@ async fn store_switchover_terminal(
         compensated: false,
         branch: DirectSwitchoverTerminalBranch::TargetSuccess,
         reason: None,
-        accounting: Some(SwitchoverActivityAccounting::new(9, 3)),
     };
     store_switchover_terminal_outcome(
         store,
         reference,
         TerminalOutcome::succeeded(encode_switchover_terminal(&terminal).unwrap()),
-        12,
+        (9, 3),
     )
     .await;
 }
@@ -729,18 +728,23 @@ async fn store_switchover_terminal_outcome(
     store: &InMemoryCheckpointStore,
     reference: &SwitchoverExecutionStatus,
     outcome: TerminalOutcome,
-    completed_activity_count: u64,
+    completion_counts: (u64, u64),
 ) {
     let execution = native_execution_spec(reference).unwrap();
     let envelope = CheckpointEnvelope::encode_with_limits(
-        &CheckpointPayload::terminal(
+        &CheckpointPayload::terminal_with_metadata(
             ExecutionContract::with_encoded_limits(
                 execution.clone(),
                 SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES as u64,
                 SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
             ),
             outcome,
-            completed_activity_count,
+            CompletionMetadata::from_counts(
+                completion_counts.0 + completion_counts.1,
+                completion_counts.0,
+                completion_counts.1,
+            )
+            .unwrap(),
         ),
         switchover_checkpoint_limits(),
     )
@@ -1007,17 +1011,16 @@ async fn framework_native_switchover_route_rejects_unreachable_terminal_transcri
     let initial = native_initial_operation(&reference).unwrap();
     let store = InMemoryCheckpointStore::new();
     let impossible_success = DirectSwitchoverTerminalRecord::Complete {
-        snapshot: initial.target_snapshot.clone(),
+        snapshot: initial.previous_snapshot.clone().0.unwrap(),
         compensated: false,
         branch: DirectSwitchoverTerminalBranch::TargetSuccess,
         reason: None,
-        accounting: Some(SwitchoverActivityAccounting::new(1, 0)),
     };
     store_switchover_terminal_outcome(
         &store,
         &reference,
         TerminalOutcome::succeeded(encode_switchover_terminal(&impossible_success).unwrap()),
-        1,
+        (1, 0),
     )
     .await;
     let rejected_status = assert_native_switchover_condition_for_store(
@@ -1037,20 +1040,17 @@ async fn framework_native_switchover_route_rejects_unreachable_terminal_transcri
     let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
     let initial = native_initial_operation(&reference).unwrap();
     let store = InMemoryCheckpointStore::new();
-    let mut compensation_snapshot = initial.previous_snapshot.cloned().unwrap();
-    compensation_snapshot.epoch = initial.target_snapshot.epoch.clone();
     let impossible_compensation = DirectSwitchoverTerminalRecord::Complete {
-        snapshot: compensation_snapshot,
+        snapshot: initial.target_snapshot.clone(),
         compensated: true,
         branch: DirectSwitchoverTerminalBranch::PostPromotionCompensated,
         reason: Some("unreachable compensation transcript".to_string()),
-        accounting: Some(SwitchoverActivityAccounting::new(1, 1)),
     };
     store_switchover_terminal_outcome(
         &store,
         &reference,
         TerminalOutcome::succeeded(encode_switchover_terminal(&impossible_compensation).unwrap()),
-        2,
+        (2, 0),
     )
     .await;
     let rejected_status = assert_native_switchover_condition_for_store(
@@ -1074,25 +1074,25 @@ async fn framework_native_switchover_route_publishes_reachable_passive_effect_tr
         (
             "demotion-deadline",
             DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
-            SwitchoverActivityAccounting::new(2, 4),
+            (2_u64, 4_u64),
             "set-0",
         ),
         (
             "promotion-deadline",
             DirectSwitchoverTerminalBranch::PostPromotionCompensated,
-            SwitchoverActivityAccounting::new(7, 6),
+            (7_u64, 6_u64),
             "set-0",
         ),
         (
             "exact-replica-postcondition",
             DirectSwitchoverTerminalBranch::TargetSuccess,
-            SwitchoverActivityAccounting::new(8, 4),
+            (8_u64, 4_u64),
             "set-1",
         ),
         (
             "already-exact-labels",
             DirectSwitchoverTerminalBranch::TargetSuccess,
-            SwitchoverActivityAccounting::new(7, 5),
+            (7_u64, 5_u64),
             "set-1",
         ),
     ] {
@@ -1116,14 +1116,13 @@ async fn framework_native_switchover_route_publishes_reachable_passive_effect_tr
             branch,
             reason: (branch != DirectSwitchoverTerminalBranch::TargetSuccess)
                 .then(|| label.to_string()),
-            accounting: Some(accounting),
         };
         let store = InMemoryCheckpointStore::new();
         store_switchover_terminal_outcome(
             &store,
             &reference,
             TerminalOutcome::succeeded(encode_switchover_terminal(&terminal).unwrap()),
-            accounting.total().unwrap(),
+            accounting,
         )
         .await;
         let state = ReconcilerState::with_switchover_store(store);
@@ -1161,17 +1160,17 @@ async fn framework_native_switchover_route_publishes_reachable_passive_effect_tr
             .unwrap();
         assert_eq!(
             measurements.completed_activity_count,
-            accounting.total(),
+            Some(accounting.0 + accounting.1),
             "{label}"
         );
         assert_eq!(
             measurements.completed_external_effect_count,
-            Some(accounting.external_effect_count),
+            Some(accounting.0),
             "{label}"
         );
         assert_eq!(
             measurements.completed_passive_observation_count,
-            Some(accounting.passive_observation_count),
+            Some(accounting.1),
             "{label}"
         );
     }
@@ -1211,7 +1210,7 @@ async fn framework_native_switchover_route_records_reload_and_persistence_failur
 }
 
 #[tokio::test]
-async fn framework_native_switchover_route_records_adapter_wait_and_fuel_exhaustion() {
+async fn framework_native_switchover_route_records_preparation_and_redelivery_waits() {
     let reference = new_switchover_execution("set-uid", snapshot(), 2, unix_seconds()).unwrap();
     let state = ReconcilerState::with_switchover_store(InMemoryCheckpointStore::new());
     let api = RoutingApi::new(vec![
@@ -1260,7 +1259,7 @@ async fn framework_native_switchover_route_records_adapter_wait_and_fuel_exhaust
             .iter()
             .any(|condition| {
                 condition.type_ == "FrameworkNativeSwitchover"
-                    && condition.reason == "FuelExhausted"
+                    && condition.reason == "RefreshingReplicaObservation"
             })
     );
 
@@ -1342,14 +1341,13 @@ async fn framework_native_switchover_route_publishes_compensation_and_quarantine
         compensated: true,
         branch: DirectSwitchoverTerminalBranch::PostPromotionCompensated,
         reason: Some("target promotion failed and the old primary was restored".to_string()),
-        accounting: Some(SwitchoverActivityAccounting::new(8, 5)),
     };
     let store = InMemoryCheckpointStore::new();
     store_switchover_terminal_outcome(
         &store,
         &compensation_reference,
         TerminalOutcome::succeeded(encode_switchover_terminal(&terminal).unwrap()),
-        13,
+        (10, 3),
     )
     .await;
     let state = ReconcilerState::with_switchover_store(store);
@@ -1388,7 +1386,7 @@ async fn framework_native_switchover_route_publishes_compensation_and_quarantine
         &store,
         &quarantine_reference,
         TerminalOutcome::failed(encode_switchover_terminal(&terminal).unwrap()),
-        1,
+        (1, 0),
     )
     .await;
     let state = ReconcilerState::with_switchover_store(store);

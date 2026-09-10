@@ -5,8 +5,9 @@ use thiserror::Error;
 
 use crate::{
     ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, CheckpointEnvelope,
-    CheckpointError, CheckpointLimits, CheckpointPayload, ExecutionContract, ExecutionSpec,
-    LogicalActivityId, TerminalOutcome, Workflow, WorkflowContext,
+    CheckpointError, CheckpointLimits, CheckpointPayload, CompletionClass, ExecutionContract,
+    ExecutionSpec, LogicalActivityId, PreparedCommand, PreparedEffectResolver, TerminalOutcome,
+    Workflow, WorkflowContext,
     typed::{IDENTITY_ACTIVITY_RESOLVER, PreparedActivityError, PreparedActivityResolver},
     workflow::ContextDecision,
 };
@@ -46,6 +47,18 @@ pub enum Nondeterminism {
         recorded: ActivitySpec,
         requested: ActivitySpec,
     },
+    #[error("activity {sequence} prepared command differs from recorded history")]
+    PreparedCommandMismatch {
+        sequence: ActivitySequence,
+        recorded: Option<PreparedCommand>,
+        requested: PreparedCommand,
+    },
+    #[error("activity {sequence} completion classification differs from recorded history")]
+    CompletionClassMismatch {
+        sequence: ActivitySequence,
+        recorded: Option<CompletionClass>,
+        requested: CompletionClass,
+    },
     #[error(
         "workflow completed after consuming {consumed} activities with {remaining} history records unused"
     )]
@@ -78,6 +91,36 @@ pub fn evaluate_prepared<W: Workflow>(
     checkpoint: Option<&CheckpointEnvelope>,
     limits: CheckpointLimits,
     resolver: &dyn PreparedActivityResolver,
+) -> Evaluation {
+    evaluate_internal(workflow, execution, checkpoint, limits, resolver, None)
+}
+
+/// Validate a checkpoint and evaluate typed durable effects with exact command
+/// preparation and replay validation.
+pub fn evaluate_effects<W: Workflow>(
+    workflow: &W,
+    execution: &ExecutionSpec,
+    checkpoint: Option<&CheckpointEnvelope>,
+    limits: CheckpointLimits,
+    resolver: &dyn PreparedEffectResolver,
+) -> Evaluation {
+    evaluate_internal(
+        workflow,
+        execution,
+        checkpoint,
+        limits,
+        &IDENTITY_ACTIVITY_RESOLVER,
+        Some(resolver),
+    )
+}
+
+fn evaluate_internal<W: Workflow>(
+    workflow: &W,
+    execution: &ExecutionSpec,
+    checkpoint: Option<&CheckpointEnvelope>,
+    limits: CheckpointLimits,
+    resolver: &dyn PreparedActivityResolver,
+    effect_resolver: Option<&dyn PreparedEffectResolver>,
 ) -> Evaluation {
     let mut payload = match checkpoint {
         Some(envelope) => match envelope.decode_and_validate(execution, limits) {
@@ -122,7 +165,15 @@ pub fn evaluate_prepared<W: Workflow>(
         .active_activities()
         .expect("terminal state returned before active replay");
     let (poll, cursor, decision) = {
-        let mut context = WorkflowContext::new(execution.execution_id(), history, resolver);
+        let mut context = match effect_resolver {
+            Some(effect_resolver) => WorkflowContext::new_with_effects(
+                execution.execution_id(),
+                history,
+                resolver,
+                effect_resolver,
+            ),
+            None => WorkflowContext::new(execution.execution_id(), history, resolver),
+        };
         let poll = {
             let mut future = workflow.run(&mut context, execution.workflow_input().clone());
             let mut task_context = Context::from_waker(noop_waker_ref());
@@ -141,6 +192,36 @@ pub fn evaluate_prepared<W: Workflow>(
                 .active_activities_mut()
                 .expect("validated replay state is active")
                 .push(ActivityRecord::scheduled(sequence, spec));
+            match CheckpointEnvelope::encode_with_limits(&payload, limits) {
+                Ok(checkpoint) => Evaluation::Scheduled {
+                    activity: logical_id,
+                    checkpoint,
+                },
+                Err(error) => Evaluation::CheckpointRejected(error),
+            }
+        }
+        Some(ContextDecision::ScheduleEffect {
+            sequence,
+            spec,
+            logical_id,
+            prepared_command,
+            completion_class,
+        }) => {
+            let record = match ActivityRecord::prepared_effect(
+                sequence,
+                spec,
+                prepared_command,
+                completion_class,
+                Vec::new(),
+                ActivityState::Scheduled,
+            ) {
+                Ok(record) => record,
+                Err(error) => return Evaluation::CheckpointRejected(error),
+            };
+            payload
+                .active_activities_mut()
+                .expect("validated replay state is active")
+                .push(record);
             match CheckpointEnvelope::encode_with_limits(&payload, limits) {
                 Ok(checkpoint) => Evaluation::Scheduled {
                     activity: logical_id,

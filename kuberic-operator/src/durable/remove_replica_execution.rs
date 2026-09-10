@@ -3749,6 +3749,7 @@ mod remove_replica_execution_tests {
         let HostOutcome::Quarantined {
             activity,
             attempt_id,
+            ..
         } = restarted
             .turn(&RemoveReplicaWorkflow, execution.clone())
             .await

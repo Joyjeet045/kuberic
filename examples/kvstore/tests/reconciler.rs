@@ -441,9 +441,7 @@ impl ReplicaHandle for ObservedHandle {
                 .take();
             let observation = CorrelatedActionObservation {
                 generation: request.expected_agent_generation.clone(),
-                control_version: kuberic_core::types::AgentControlVersion::new(
-                    request.expected_control_version.value().saturating_add(1),
-                ),
+                control_version: request.expected_control_version,
                 action: DurableActionObservation {
                     action_id: request.action_id,
                     signature: request.input_signature,
@@ -1566,12 +1564,11 @@ async fn exposed_native_switchover_activity(
         activity.state(),
         ActivityState::DispatchExposed { .. }
     ));
-    let input: serde_json::Value = serde_json::from_slice(activity.input().as_slice()).unwrap();
     (
         activity.name().name().to_string(),
-        input
-            .get("preparedCommand")
-            .is_some_and(|command| !command.is_null()),
+        activity
+            .prepared_command()
+            .is_some_and(|command| command.bytes().as_slice() != b"null"),
     )
 }
 
@@ -3938,8 +3935,8 @@ async fn test_framework_native_switchover_happy_path() {
         measurements.completed_activity_count,
         Some(durable_boundary_count)
     );
-    assert!(measurements.accepted_writes <= 13);
-    assert_eq!(measurements.accepted_writes, 13);
+    assert!(measurements.accepted_writes <= 25);
+    assert_eq!(measurements.accepted_writes, 25);
     assert_eq!(
         measurements.latest_terminal_checkpoint_bytes,
         Some(terminal_bytes)
@@ -4190,11 +4187,11 @@ fn expected_production_switchover_history(
                 "kuberic.switchover.compensate-promote-old-primary",
                 redeliver_replica_effects,
             );
-            for index in 0..member_count.saturating_sub(1) {
+            for _ in 0..member_count.saturating_sub(1) {
                 push(
                     &mut identities,
                     "kuberic.switchover.compensate-distribute-replica-epoch",
-                    redeliver_replica_effects || index == 0,
+                    redeliver_replica_effects,
                 );
             }
             for name in [
@@ -4326,9 +4323,9 @@ async fn test_framework_native_switchover_production_topology_compensation_matri
                     }
                     ProductionSwitchoverScenario::PostPromotionCompensation => (
                         original_primary.as_str(),
-                        member_count as u64 + 11,
-                        member_count as u64 + 6,
-                        5,
+                        member_count as u64 + 10,
+                        member_count as u64 + 7,
+                        3,
                     ),
                 };
             assert_eq!(completed.current_primary.as_deref(), Some(expected_primary));
@@ -4361,12 +4358,7 @@ async fn test_framework_native_switchover_production_topology_compensation_matri
             );
             assert_eq!(
                 measurements.accepted_writes,
-                expected_activities
-                    + if scenario == ProductionSwitchoverScenario::PostPromotionCompensation {
-                        2
-                    } else {
-                        1
-                    }
+                expected_activities.saturating_mul(2).saturating_add(1)
             );
             assert!(
                 measurements.maximum_active_checkpoint_bytes
@@ -4438,7 +4430,7 @@ async fn test_framework_native_switchover_production_nine_member_maximum_fault_h
     let expected_history = expected_persisted_production_switchover_history(
         9,
         ProductionSwitchoverScenario::PostPromotionCompensation,
-        true,
+        false,
     );
     assert_eq!(history.len(), expected_history.len(), "{history:?}");
     for (index, (actual, expected)) in history.iter().zip(&expected_history).enumerate() {
@@ -4475,10 +4467,10 @@ async fn test_framework_native_switchover_production_nine_member_maximum_fault_h
         .framework_native_switchover_measurements("default", name, "test-uid", &execution_id)
         .await
         .unwrap();
-    assert_eq!(measurements.completed_activity_count, Some(33));
-    assert_eq!(measurements.completed_external_effect_count, Some(28));
-    assert_eq!(measurements.completed_passive_observation_count, Some(5));
-    assert_eq!(measurements.accepted_writes, 48);
+    assert_eq!(measurements.completed_activity_count, Some(19));
+    assert_eq!(measurements.completed_external_effect_count, Some(16));
+    assert_eq!(measurements.completed_passive_observation_count, Some(3));
+    assert_eq!(measurements.accepted_writes, 67);
     assert!(
         measurements.maximum_active_checkpoint_bytes
             <= kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
@@ -4488,7 +4480,7 @@ async fn test_framework_native_switchover_production_nine_member_maximum_fault_h
             <= kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES
     );
     println!(
-        "KUBERIC_SWITCHOVER_PHASE4_MAXIMUM_FAULT members=9 activities=33 external_effects=28 passive_observations=5 accepted_writes={} maximum_active_checkpoint_bytes={} active_headroom={} maximum_terminal_checkpoint_bytes={} terminal_headroom={}",
+        "KUBERIC_SWITCHOVER_PHASE4_MAXIMUM_FAULT members=9 activities=19 external_effects=16 passive_observations=3 accepted_writes={} maximum_active_checkpoint_bytes={} active_headroom={} maximum_terminal_checkpoint_bytes={} terminal_headroom={}",
         measurements.accepted_writes,
         measurements.maximum_active_checkpoint_bytes,
         kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
@@ -5025,7 +5017,7 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
             kuberic_operator::durable::switchover_execution::checkpoint_limits(),
         )
         .unwrap();
-    assert_eq!(terminal_payload.terminal_outcome().unwrap().1, 13);
+    assert_eq!(terminal_payload.terminal_outcome().unwrap().1, 12);
 
     let measurements = native_state
         .framework_native_switchover_measurements(
@@ -5036,11 +5028,11 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
         )
         .await
         .expect("completed redelivery measurements must remain available");
-    assert_eq!(measurements.completed_external_effect_count, Some(10));
+    assert_eq!(measurements.completed_external_effect_count, Some(9));
     assert_eq!(measurements.completed_passive_observation_count, Some(3));
-    assert_eq!(measurements.completed_activity_count, Some(13));
+    assert_eq!(measurements.completed_activity_count, Some(12));
     assert_eq!(
-        measurements.accepted_writes, 15,
+        measurements.accepted_writes, 27,
         "the non-fused rejection observation and fresh retry exposure add two writes"
     );
 }
@@ -5347,8 +5339,8 @@ async fn test_framework_native_switchover_unprepared_exact_replica_exposure_reco
         .await
         .unwrap();
     assert_eq!(measurements.completed_activity_count, Some(12));
-    assert_eq!(measurements.completed_external_effect_count, Some(8));
-    assert_eq!(measurements.completed_passive_observation_count, Some(4));
+    assert_eq!(measurements.completed_external_effect_count, Some(9));
+    assert_eq!(measurements.completed_passive_observation_count, Some(3));
 }
 
 #[test_log::test(tokio::test)]
@@ -5439,9 +5431,9 @@ async fn test_framework_native_switchover_passive_compensation_label_exposures_s
             .framework_native_switchover_measurements("default", &name, "test-uid", &execution_id)
             .await
             .unwrap();
-        assert_eq!(measurements.completed_external_effect_count, Some(9));
-        assert_eq!(measurements.completed_passive_observation_count, Some(5));
-        assert_eq!(measurements.completed_activity_count, Some(14));
+        assert_eq!(measurements.completed_external_effect_count, Some(10));
+        assert_eq!(measurements.completed_passive_observation_count, Some(3));
+        assert_eq!(measurements.completed_activity_count, Some(13));
     }
 }
 
@@ -5655,9 +5647,9 @@ async fn test_framework_native_switchover_publication_compensates_failed_promoti
         )
         .await
         .expect("completed compensation measurements must remain available");
-    assert_eq!(measurements.completed_external_effect_count, Some(9));
-    assert_eq!(measurements.completed_passive_observation_count, Some(5));
-    assert_eq!(measurements.completed_activity_count, Some(14));
+    assert_eq!(measurements.completed_external_effect_count, Some(10));
+    assert_eq!(measurements.completed_passive_observation_count, Some(3));
+    assert_eq!(measurements.completed_activity_count, Some(13));
     assert_eq!(
         api.operations()
             .iter()
@@ -6126,11 +6118,15 @@ async fn test_framework_native_switchover_reloads_after_terminal_cas_conflict() 
         matches!(action, kuberic_operator::reconciler::ReconcileAction::Requeue(delay) if delay == Duration::from_secs(1))
     );
     status = api.last_status().unwrap();
-    assert!(status.conditions.iter().any(|condition| {
-        condition.type_ == "FrameworkNativeSwitchover"
-            && condition.reason == "ReloadRequired"
-            && condition.message.contains("ObservationProgression")
-    }));
+    assert!(
+        status.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeSwitchover"
+                && condition.reason == "ReloadRequired"
+                && condition.message.contains("ScheduleExposure")
+        }),
+        "unexpected terminal conflict conditions: {:?}",
+        status.conditions
+    );
     let completed =
         drive_native_switchover(&api, &state, "native-terminal-conflict", 3, status).await;
     assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
@@ -6321,12 +6317,10 @@ async fn test_framework_native_switchover_unknown_checkpoint_outcomes_requeue_wi
                     )
                 );
                 assert_eq!(exposed.name().version(), 1);
-                let input: serde_json::Value =
-                    serde_json::from_slice(exposed.input().as_slice()).unwrap();
                 assert!(
-                    input
-                        .get("preparedCommand")
-                        .is_some_and(|value| !value.is_null())
+                    exposed
+                        .prepared_command()
+                        .is_some_and(|command| command.bytes().as_slice() != b"null")
                 );
             }
             _ => unreachable!("test covers only unknown checkpoint outcomes"),
@@ -6525,16 +6519,17 @@ async fn test_framework_native_switchover_compatibility_fixtures_fail_closed() {
     )
     .await
     .unwrap();
+    let malformed_status = api.last_status().unwrap();
     assert!(
-        api.last_status()
-            .unwrap()
-            .conditions
-            .iter()
-            .any(|condition| {
-                condition.type_ == "FrameworkNativeSwitchover"
-                    && condition.reason == "Rejected"
-                    && condition.message.contains("terminal")
-            })
+        malformed_status.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeSwitchover"
+                && condition.reason == "Isolated"
+                && condition
+                    .message
+                    .contains("authenticated completion metadata")
+        }),
+        "unexpected malformed-terminal conditions: {:?}",
+        malformed_status.conditions
     );
 }
 

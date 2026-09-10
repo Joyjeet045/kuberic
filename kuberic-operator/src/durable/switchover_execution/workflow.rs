@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    DurableActivity, ExactBytes, TerminalOutcome, Workflow, WorkflowContext,
+    DurableEffect, EffectCallError, EffectErrorKind, ExactBytes, TerminalOutcome, Workflow,
+    WorkflowContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,20 +15,18 @@ use super::activities::{
     CaptureFrozenLsnOutput, CompensateDistributeReplicaEpochActivity,
     CompensateDistributeReplicaEpochInput, CompensatePromoteOldPrimaryActivity,
     CompensatePromoteOldPrimaryInput, DIRECT_SWITCHOVER_CONTRACT_VERSION, DemoteOldPrimaryActivity,
-    DemoteOldPrimaryInput, DirectActivityAccounting, DistributeReplicaEpochActivity,
-    DistributeReplicaEpochInput, EffectObservation,
+    DemoteOldPrimaryInput, DistributeReplicaEpochActivity, DistributeReplicaEpochInput,
     InstallCompensationCatchUpConfigurationActivity, InstallCompensationCatchUpConfigurationInput,
     InstallCompensationCurrentConfigurationActivity, InstallCompensationCurrentConfigurationInput,
     InstallTargetCatchUpConfigurationActivity, InstallTargetCatchUpConfigurationInput,
     InstallTargetCurrentConfigurationActivity, InstallTargetCurrentConfigurationInput,
-    LabelDirectActivity, PromoteTargetActivity, PromoteTargetInput,
-    PublishOldPrimarySecondaryLabelActivity, PublishOldPrimarySecondaryLabelInput,
-    PublishTargetPrimaryLabelActivity, PublishTargetPrimaryLabelInput, ReplicaDirectActivity,
-    RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
+    PromoteTargetActivity, PromoteTargetInput, PublishOldPrimarySecondaryLabelActivity,
+    PublishOldPrimarySecondaryLabelInput, PublishTargetPrimaryLabelActivity,
+    PublishTargetPrimaryLabelInput, RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
     RestorePreviousCurrentConfigurationActivity, RestorePreviousCurrentConfigurationInput,
     RestoreTargetSecondaryLabelActivity, RestoreTargetSecondaryLabelInput, RevokeWritesActivity,
     RevokeWritesInput, WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput,
-    WaitTargetCaughtUpOutput, WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
+    WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
 };
 use super::model::{DirectSwitchoverDefinition, next_deadline};
 
@@ -50,8 +49,6 @@ pub enum DirectSwitchoverTerminalRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[serde(with = "super::activities::bounded_optional_error")]
         reason: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        accounting: Option<DirectActivityAccounting>,
     },
     Stopped {
         #[serde(with = "super::activities::bounded_error")]
@@ -108,7 +105,7 @@ impl Workflow for DirectSwitchoverWorkflow {
             Err(error) => return stopped(error),
         };
 
-        let revoke = match call_replica::<RevokeWritesActivity>(
+        let revoke = call_activity_branch::<RevokeWritesActivity>(
             context,
             &mut budget,
             RevokeWritesInput {
@@ -117,17 +114,11 @@ impl Workflow for DirectSwitchoverWorkflow {
                 old_primary_id: definition.old_primary_id,
                 old_primary_instance_id: old_primary.instance_id.clone(),
                 deadline_unix_seconds: deadline,
-                redelivery: 0,
-                prepared_command: None,
             },
         )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => return stopped(error),
-        };
-        deadline = match effect_applied(revoke) {
-            Ok(observed_at) => match next_deadline(observed_at) {
+        .await;
+        deadline = match revoke {
+            Ok(revoke) => match next_deadline(revoke.observed_at_unix_seconds) {
                 Ok(deadline) => deadline,
                 Err(error) => return stopped(error),
             },
@@ -166,14 +157,10 @@ impl Workflow for DirectSwitchoverWorkflow {
             Ok(result) => result,
             Err(error) => return stopped(format!("capture frozen LSN activity failed: {error}")),
         };
-        let (frozen_lsn, observed_at) = match captured {
-            CaptureFrozenLsnOutput::Captured {
-                frozen_lsn,
-                observed_at_unix_seconds,
-            } => (frozen_lsn, observed_at_unix_seconds),
-            CaptureFrozenLsnOutput::DeadlineExceeded { message, .. }
-            | CaptureFrozenLsnOutput::Conflicting { message, .. } => return stopped(message),
-        };
+        let CaptureFrozenLsnOutput {
+            frozen_lsn,
+            observed_at_unix_seconds: observed_at,
+        } = captured;
         deadline = match next_deadline(observed_at) {
             Ok(deadline) => deadline,
             Err(error) => return stopped(error),
@@ -183,7 +170,7 @@ impl Workflow for DirectSwitchoverWorkflow {
             Ok(member) => member,
             Err(error) => return stopped(error),
         };
-        let caught_up = match call_activity::<WaitTargetCaughtUpActivity>(
+        let caught_up = match call_activity_branch::<WaitTargetCaughtUpActivity>(
             context,
             &mut budget,
             WaitTargetCaughtUpInput {
@@ -199,32 +186,27 @@ impl Workflow for DirectSwitchoverWorkflow {
         .await
         {
             Ok(result) => result,
-            Err(error) => return stopped(format!("target catch-up activity failed: {error}")),
-        };
-        deadline = match caught_up {
-            WaitTargetCaughtUpOutput::CaughtUp {
-                observed_at_unix_seconds,
-            } => match next_deadline(observed_at_unix_seconds) {
-                Ok(deadline) => deadline,
-                Err(error) => return stopped(error),
-            },
-            WaitTargetCaughtUpOutput::DeadlineExceeded {
-                observed_at_unix_seconds,
+            Err(EffectBranch::DomainFailure {
+                observed_at,
                 message,
-            } => {
+            }) => {
                 return restore_previous_configuration(
                     context,
                     &mut budget,
                     &definition,
-                    observed_at_unix_seconds,
+                    observed_at,
                     message,
                 )
                 .await;
             }
-            WaitTargetCaughtUpOutput::Conflicting { message, .. } => return stopped(message),
+            Err(EffectBranch::Stopped(message)) => return stopped(message),
+        };
+        deadline = match next_deadline(caught_up.observed_at_unix_seconds) {
+            Ok(deadline) => deadline,
+            Err(error) => return stopped(error),
         };
 
-        let demote = match call_replica::<DemoteOldPrimaryActivity>(
+        let demote = call_activity_branch::<DemoteOldPrimaryActivity>(
             context,
             &mut budget,
             DemoteOldPrimaryInput {
@@ -233,17 +215,11 @@ impl Workflow for DirectSwitchoverWorkflow {
                 old_primary_id: definition.old_primary_id,
                 old_primary_instance_id: old_primary.instance_id.clone(),
                 deadline_unix_seconds: deadline,
-                redelivery: 0,
-                prepared_command: None,
             },
         )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => return stopped(error),
-        };
-        deadline = match effect_applied(demote) {
-            Ok(observed_at) => match next_deadline(observed_at) {
+        .await;
+        deadline = match demote {
+            Ok(demote) => match next_deadline(demote.observed_at_unix_seconds) {
                 Ok(deadline) => deadline,
                 Err(error) => return stopped(error),
             },
@@ -263,7 +239,7 @@ impl Workflow for DirectSwitchoverWorkflow {
             Err(EffectBranch::Stopped(message)) => return stopped(message),
         };
 
-        let promote = match call_replica::<PromoteTargetActivity>(
+        let promote = call_activity_branch::<PromoteTargetActivity>(
             context,
             &mut budget,
             PromoteTargetInput {
@@ -272,17 +248,11 @@ impl Workflow for DirectSwitchoverWorkflow {
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
                 deadline_unix_seconds: deadline,
-                redelivery: 0,
-                prepared_command: None,
             },
         )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => return stopped(error),
-        };
-        deadline = match effect_applied(promote) {
-            Ok(observed_at) => match next_deadline(observed_at) {
+        .await;
+        deadline = match promote {
+            Ok(promote) => match next_deadline(promote.observed_at_unix_seconds) {
                 Ok(deadline) => deadline,
                 Err(error) => return stopped(error),
             },
@@ -315,7 +285,7 @@ impl Workflow for DirectSwitchoverWorkflow {
                 Ok(member) => member,
                 Err(error) => return stopped(error),
             };
-            let result = match call_replica::<DistributeReplicaEpochActivity>(
+            let result = match call_activity::<DistributeReplicaEpochActivity>(
                 context,
                 &mut budget,
                 DistributeReplicaEpochInput {
@@ -325,8 +295,6 @@ impl Workflow for DirectSwitchoverWorkflow {
                     replica_id,
                     replica_instance_id: replica.instance_id.clone(),
                     deadline_unix_seconds: deadline,
-                    redelivery: 0,
-                    prepared_command: None,
                 },
             )
             .await
@@ -334,7 +302,7 @@ impl Workflow for DirectSwitchoverWorkflow {
                 Ok(result) => result,
                 Err(error) => return stopped(error),
             };
-            deadline = match late_effect_deadline(result) {
+            deadline = match next_deadline(result.observed_at_unix_seconds) {
                 Ok(deadline) => deadline,
                 Err(message) => return stopped(message),
             };
@@ -342,11 +310,11 @@ impl Workflow for DirectSwitchoverWorkflow {
 
         macro_rules! run_target_replica_step {
             ($activity:ty, $input:expr) => {{
-                let result = match call_replica::<$activity>(context, &mut budget, $input).await {
+                let result = match call_activity::<$activity>(context, &mut budget, $input).await {
                     Ok(result) => result,
                     Err(error) => return stopped(error),
                 };
-                deadline = match late_effect_deadline(result) {
+                deadline = match next_deadline(result.observed_at_unix_seconds) {
                     Ok(deadline) => deadline,
                     Err(message) => return stopped(message),
                 };
@@ -361,8 +329,6 @@ impl Workflow for DirectSwitchoverWorkflow {
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
                 deadline_unix_seconds: deadline,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         run_target_replica_step!(
@@ -373,8 +339,6 @@ impl Workflow for DirectSwitchoverWorkflow {
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
                 deadline_unix_seconds: deadline,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
         run_target_replica_step!(
@@ -385,12 +349,10 @@ impl Workflow for DirectSwitchoverWorkflow {
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
                 deadline_unix_seconds: deadline,
-                redelivery: 0,
-                prepared_command: None,
             }
         );
 
-        let target_label = match call_label::<PublishTargetPrimaryLabelActivity>(
+        let target_label = match call_activity::<PublishTargetPrimaryLabelActivity>(
             context,
             &mut budget,
             PublishTargetPrimaryLabelInput {
@@ -399,7 +361,6 @@ impl Workflow for DirectSwitchoverWorkflow {
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
                 deadline_unix_seconds: deadline,
-                prepared_command: None,
             },
         )
         .await
@@ -407,12 +368,12 @@ impl Workflow for DirectSwitchoverWorkflow {
             Ok(result) => result,
             Err(error) => return stopped(error),
         };
-        deadline = match late_effect_deadline(target_label) {
+        deadline = match next_deadline(target_label.observed_at_unix_seconds) {
             Ok(deadline) => deadline,
             Err(message) => return stopped(message),
         };
 
-        let old_label = match call_label::<PublishOldPrimarySecondaryLabelActivity>(
+        let old_label = match call_activity::<PublishOldPrimarySecondaryLabelActivity>(
             context,
             &mut budget,
             PublishOldPrimarySecondaryLabelInput {
@@ -421,7 +382,6 @@ impl Workflow for DirectSwitchoverWorkflow {
                 old_primary_id: definition.old_primary_id,
                 old_primary_instance_id: old_primary.instance_id.clone(),
                 deadline_unix_seconds: deadline,
-                prepared_command: None,
             },
         )
         .await
@@ -429,7 +389,7 @@ impl Workflow for DirectSwitchoverWorkflow {
             Ok(result) => result,
             Err(error) => return stopped(error),
         };
-        deadline = match late_effect_deadline(old_label) {
+        deadline = match next_deadline(old_label.observed_at_unix_seconds) {
             Ok(deadline) => deadline,
             Err(message) => return stopped(message),
         };
@@ -446,19 +406,12 @@ impl Workflow for DirectSwitchoverWorkflow {
         )
         .await
         {
-            Ok(AttestTargetTopologyOutput::Attested {
-                snapshot,
-                accounting,
-                ..
-            }) => complete(
+            Ok(AttestTargetTopologyOutput { snapshot, .. }) => complete(
                 snapshot,
                 false,
                 DirectSwitchoverTerminalBranch::TargetSuccess,
                 None,
-                accounting,
             ),
-            Ok(AttestTargetTopologyOutput::DeadlineExceeded { message, .. })
-            | Ok(AttestTargetTopologyOutput::Conflicting { message, .. }) => stopped(message),
             Err(error) => stopped(format!("target topology attestation failed: {error}")),
         }
     }
@@ -479,7 +432,7 @@ async fn restore_previous_configuration(
         Ok(member) => member,
         Err(error) => return stopped(error),
     };
-    let restore = match call_replica::<RestorePreviousCurrentConfigurationActivity>(
+    let restore = call_activity_branch::<RestorePreviousCurrentConfigurationActivity>(
         context,
         budget,
         RestorePreviousCurrentConfigurationInput {
@@ -488,17 +441,11 @@ async fn restore_previous_configuration(
             old_primary_id: definition.old_primary_id,
             old_primary_instance_id: old_primary.instance_id.clone(),
             deadline_unix_seconds: deadline,
-            redelivery: 0,
-            prepared_command: None,
         },
     )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => return stopped(error),
-    };
-    let observed_at = match effect_applied(restore) {
-        Ok(observed_at) => observed_at,
+    .await;
+    let observed_at = match restore {
+        Ok(restore) => restore.observed_at_unix_seconds,
         Err(EffectBranch::DomainFailure { message, .. }) | Err(EffectBranch::Stopped(message)) => {
             return stopped(message);
         }
@@ -532,7 +479,7 @@ async fn compensate_after_promotion_failure(
         Err(error) => return stopped(error),
     };
 
-    let promote_old = match call_replica::<CompensatePromoteOldPrimaryActivity>(
+    let promote_old = match call_activity::<CompensatePromoteOldPrimaryActivity>(
         context,
         budget,
         CompensatePromoteOldPrimaryInput {
@@ -541,8 +488,6 @@ async fn compensate_after_promotion_failure(
             old_primary_id: definition.old_primary_id,
             old_primary_instance_id: old_primary.instance_id.clone(),
             deadline_unix_seconds: deadline,
-            redelivery: 0,
-            prepared_command: None,
         },
     )
     .await
@@ -550,7 +495,7 @@ async fn compensate_after_promotion_failure(
         Ok(result) => result,
         Err(error) => return stopped(error),
     };
-    deadline = match late_effect_deadline(promote_old) {
+    deadline = match next_deadline(promote_old.observed_at_unix_seconds) {
         Ok(deadline) => deadline,
         Err(message) => return stopped(message),
     };
@@ -568,7 +513,7 @@ async fn compensate_after_promotion_failure(
             Ok(member) => member,
             Err(error) => return stopped(error),
         };
-        let result = match call_replica::<CompensateDistributeReplicaEpochActivity>(
+        let result = match call_activity::<CompensateDistributeReplicaEpochActivity>(
             context,
             budget,
             CompensateDistributeReplicaEpochInput {
@@ -578,8 +523,6 @@ async fn compensate_after_promotion_failure(
                 replica_id,
                 replica_instance_id: replica.instance_id.clone(),
                 deadline_unix_seconds: deadline,
-                redelivery: 0,
-                prepared_command: None,
             },
         )
         .await
@@ -587,7 +530,7 @@ async fn compensate_after_promotion_failure(
             Ok(result) => result,
             Err(error) => return stopped(error),
         };
-        deadline = match late_effect_deadline(result) {
+        deadline = match next_deadline(result.observed_at_unix_seconds) {
             Ok(deadline) => deadline,
             Err(message) => return stopped(message),
         };
@@ -599,7 +542,7 @@ async fn compensate_after_promotion_failure(
     ] {
         let result = match step {
             CompensationStep::CatchUpConfiguration => {
-                call_replica::<InstallCompensationCatchUpConfigurationActivity>(
+                call_activity::<InstallCompensationCatchUpConfigurationActivity>(
                     context,
                     budget,
                     InstallCompensationCatchUpConfigurationInput {
@@ -608,14 +551,12 @@ async fn compensate_after_promotion_failure(
                         old_primary_id: definition.old_primary_id,
                         old_primary_instance_id: old_primary.instance_id.clone(),
                         deadline_unix_seconds: deadline,
-                        redelivery: 0,
-                        prepared_command: None,
                     },
                 )
                 .await
             }
             CompensationStep::CurrentConfiguration => {
-                call_replica::<InstallCompensationCurrentConfigurationActivity>(
+                call_activity::<InstallCompensationCurrentConfigurationActivity>(
                     context,
                     budget,
                     InstallCompensationCurrentConfigurationInput {
@@ -624,8 +565,6 @@ async fn compensate_after_promotion_failure(
                         old_primary_id: definition.old_primary_id,
                         old_primary_instance_id: old_primary.instance_id.clone(),
                         deadline_unix_seconds: deadline,
-                        redelivery: 0,
-                        prepared_command: None,
                     },
                 )
                 .await
@@ -635,13 +574,13 @@ async fn compensate_after_promotion_failure(
             Ok(result) => result,
             Err(error) => return stopped(error),
         };
-        deadline = match late_effect_deadline(result) {
+        deadline = match next_deadline(result.observed_at_unix_seconds) {
             Ok(deadline) => deadline,
             Err(message) => return stopped(message),
         };
     }
 
-    let restore_old_label = match call_label::<RestoreOldPrimaryLabelActivity>(
+    let restore_old_label = match call_activity::<RestoreOldPrimaryLabelActivity>(
         context,
         budget,
         RestoreOldPrimaryLabelInput {
@@ -650,7 +589,6 @@ async fn compensate_after_promotion_failure(
             old_primary_id: definition.old_primary_id,
             old_primary_instance_id: old_primary.instance_id.clone(),
             deadline_unix_seconds: deadline,
-            prepared_command: None,
         },
     )
     .await
@@ -658,12 +596,12 @@ async fn compensate_after_promotion_failure(
         Ok(result) => result,
         Err(error) => return stopped(error),
     };
-    deadline = match late_effect_deadline(restore_old_label) {
+    deadline = match next_deadline(restore_old_label.observed_at_unix_seconds) {
         Ok(deadline) => deadline,
         Err(message) => return stopped(message),
     };
 
-    let restore_target_label = match call_label::<RestoreTargetSecondaryLabelActivity>(
+    let restore_target_label = match call_activity::<RestoreTargetSecondaryLabelActivity>(
         context,
         budget,
         RestoreTargetSecondaryLabelInput {
@@ -675,7 +613,6 @@ async fn compensate_after_promotion_failure(
                 .map(|member| member.instance_id.clone())
                 .unwrap_or_default(),
             deadline_unix_seconds: deadline,
-            prepared_command: None,
         },
     )
     .await
@@ -683,12 +620,7 @@ async fn compensate_after_promotion_failure(
         Ok(result) => result,
         Err(error) => return stopped(error),
     };
-    let observed_at = match effect_applied(restore_target_label) {
-        Ok(observed_at) => observed_at,
-        Err(EffectBranch::DomainFailure { message, .. }) | Err(EffectBranch::Stopped(message)) => {
-            return stopped(message);
-        }
-    };
+    let observed_at = restore_target_label.observed_at_unix_seconds;
 
     attest_compensated(
         context,
@@ -727,111 +659,57 @@ async fn attest_compensated(
     )
     .await
     {
-        Ok(AttestCompensatedTopologyOutput::Attested {
-            snapshot,
-            accounting,
-            ..
-        }) => complete(snapshot, true, branch, Some(reason), accounting),
-        Ok(AttestCompensatedTopologyOutput::DeadlineExceeded { message, .. })
-        | Ok(AttestCompensatedTopologyOutput::Conflicting { message, .. }) => stopped(message),
+        Ok(AttestCompensatedTopologyOutput { snapshot, .. }) => {
+            complete(snapshot, true, branch, Some(reason))
+        }
         Err(error) => stopped(format!("compensated topology attestation failed: {error}")),
     }
 }
 
-async fn call_replica<A>(
+async fn call_activity<A: DurableEffect>(
     context: &mut WorkflowContext<'_>,
     budget: &mut TransitionBudget,
-    mut input: A::Input,
-) -> Result<EffectObservation, String>
-where
-    A: ReplicaDirectActivity,
-    A::Input: Clone,
-{
-    let first = call_activity::<A>(context, budget, input.clone())
-        .await
-        .map(A::observation)
-        .map_err(|error| format!("{} activity failed: {error}", A::NAME))?;
-    if !matches!(first, EffectObservation::ProvenNoAdmission { .. }) {
-        return Ok(first);
-    }
-    A::set_redelivery(&mut input, 1);
-    let second = call_activity::<A>(context, budget, input)
-        .await
-        .map(A::observation)
-        .map_err(|error| format!("{} redelivery failed: {error}", A::NAME))?;
-    if matches!(second, EffectObservation::ProvenNoAdmission { .. }) {
-        return Err(format!(
-            "{} exceeded one proven-no-admission redelivery",
-            A::NAME
-        ));
-    }
-    Ok(second)
-}
-
-async fn call_label<A: LabelDirectActivity>(
-    context: &mut WorkflowContext<'_>,
-    budget: &mut TransitionBudget,
-    input: A::Input,
-) -> Result<EffectObservation, String> {
-    call_activity::<A>(context, budget, input)
-        .await
-        .map(A::observation)
-        .map_err(|error| format!("{} activity failed: {error}", A::NAME))
-}
-
-async fn call_activity<A: DurableActivity>(
-    context: &mut WorkflowContext<'_>,
-    budget: &mut TransitionBudget,
-    input: A::Input,
+    input: A::Request,
 ) -> Result<A::Output, String> {
     budget.consume(A::NAME)?;
     context
-        .call::<A>(input)
+        .call_effect::<A>(input)
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn call_activity_branch<A: DurableEffect>(
+    context: &mut WorkflowContext<'_>,
+    budget: &mut TransitionBudget,
+    input: A::Request,
+) -> Result<A::Output, EffectBranch> {
+    budget.consume(A::NAME).map_err(EffectBranch::Stopped)?;
+    context
+        .call_effect::<A>(input)
+        .await
+        .map_err(effect_call_branch)
+}
+
+fn effect_call_branch(error: EffectCallError) -> EffectBranch {
+    match error {
+        EffectCallError::Effect(error)
+            if matches!(
+                error.kind(),
+                EffectErrorKind::DomainFailure | EffectErrorKind::DeadlineExceeded
+            ) =>
+        {
+            EffectBranch::DomainFailure {
+                observed_at: error.observed_at_unix_seconds().unwrap_or_default(),
+                message: error.message().to_string(),
+            }
+        }
+        other => EffectBranch::Stopped(other.to_string()),
+    }
 }
 
 enum EffectBranch {
     DomainFailure { observed_at: i64, message: String },
     Stopped(String),
-}
-
-fn effect_applied(observation: EffectObservation) -> Result<i64, EffectBranch> {
-    match observation {
-        EffectObservation::Applied {
-            observed_at_unix_seconds,
-        } => Ok(observed_at_unix_seconds),
-        EffectObservation::Failed {
-            observed_at_unix_seconds,
-            message,
-        }
-        | EffectObservation::DeadlineExceeded {
-            observed_at_unix_seconds,
-            message,
-        } => Err(EffectBranch::DomainFailure {
-            observed_at: observed_at_unix_seconds,
-            message,
-        }),
-        EffectObservation::UnavailableAtDeadline { message, .. }
-        | EffectObservation::Conflicting { message, .. } => Err(EffectBranch::Stopped(message)),
-        EffectObservation::ProvenNoAdmission { .. } => Err(EffectBranch::Stopped(
-            "unresolved proven-no-admission result".to_string(),
-        )),
-    }
-}
-
-fn late_effect_deadline(observation: EffectObservation) -> Result<i64, String> {
-    let observed_at = observation.observed_at_unix_seconds();
-    match observation {
-        EffectObservation::Applied { .. } => next_deadline(observed_at),
-        EffectObservation::Failed { message, .. }
-        | EffectObservation::DeadlineExceeded { message, .. }
-        | EffectObservation::UnavailableAtDeadline { message, .. }
-        | EffectObservation::Conflicting { message, .. } => Err(message),
-        EffectObservation::ProvenNoAdmission { .. } => {
-            Err("unresolved proven-no-admission result".to_string())
-        }
-    }
 }
 
 enum CompensationStep {
@@ -844,7 +722,6 @@ fn complete(
     compensated: bool,
     branch: DirectSwitchoverTerminalBranch,
     reason: Option<String>,
-    accounting: Option<DirectActivityAccounting>,
 ) -> TerminalOutcome {
     terminal(DirectSwitchoverTerminalRecord::Complete {
         snapshot,
@@ -852,7 +729,6 @@ fn complete(
         branch,
         reason: reason
             .map(|reason| super::bounded_utf8(&reason, super::SWITCHOVER_MAX_ERROR_BYTES)),
-        accounting,
     })
 }
 
@@ -874,8 +750,9 @@ fn terminal(record: DirectSwitchoverTerminalRecord) -> TerminalOutcome {
 mod tests {
     use super::*;
     use kuberic_durable_execution::{
-        ActivityObservation, CheckpointLimits, DurableActivity, DurableHost, ExecutionId,
-        ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore,
+        ActivityObservation, CheckpointLimits, DurableActivity, DurableEffectSet, DurableHost,
+        EffectMetadata, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome,
+        InMemoryCheckpointStore, PreparedActivityError, PreparedCommand, PreparedEffectResolver,
     };
 
     use crate::crd::{EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus};
@@ -919,6 +796,24 @@ mod tests {
         message: &'static str,
     }
 
+    struct ScriptedResolver;
+
+    impl PreparedEffectResolver for ScriptedResolver {
+        fn resolve(
+            &self,
+            _execution_id: ExecutionId,
+            _logical: &kuberic_durable_execution::ActivitySpec,
+            metadata: EffectMetadata,
+            _recorded: Option<&PreparedCommand>,
+        ) -> Result<PreparedCommand, PreparedActivityError> {
+            PreparedCommand::new(
+                ExactBytes::new(b"null".to_vec()),
+                metadata.max_command_bytes(),
+            )
+            .map_err(|_| PreparedActivityError::Encoding)
+        }
+    }
+
     async fn run_script(
         replica_count: i64,
         failures: &[ScriptedFailure],
@@ -954,7 +849,10 @@ mod tests {
         let mut occurrences = std::collections::BTreeMap::<String, usize>::new();
 
         loop {
-            match host.turn(&workflow, execution.clone()).await {
+            match host
+                .turn_and_expose_effects(&workflow, execution.clone(), &ScriptedResolver)
+                .await
+            {
                 HostOutcome::ScheduleAccepted { .. } => {}
                 HostOutcome::DispatchPermitted { permit, .. } => {
                     let name = permit.activity().name().name().to_string();
@@ -981,12 +879,13 @@ mod tests {
                     );
                     *occurrence += 1;
                     observed_at += 1;
-                    let outcome = host
-                        .observe(
-                            &execution,
-                            ActivityObservation::new(permit.activity().clone(), result),
-                        )
-                        .await;
+                    let observation = super::super::activities::SwitchoverEffects::observation(
+                        permit.activity().clone(),
+                        permit.attempt_id(),
+                        &result,
+                    )
+                    .unwrap();
+                    let outcome = host.observe_effect(&execution, observation).await;
                     assert!(matches!(outcome, HostOutcome::ObservationAccepted { .. }));
                 }
                 HostOutcome::WorkflowCompleted { outcome, .. } => {
@@ -1010,43 +909,55 @@ mod tests {
     ) -> ExactBytes {
         let value = if proven_no_admission {
             serde_json::json!({
-                "result": "proven_no_admission",
-                "observed_at_unix_seconds": observed_at,
+                "status": "proven_no_admission",
             })
         } else if let Some(failure) = failure {
-            let result = match failure.kind {
-                ScriptedFailureKind::Failed => "failed",
-                ScriptedFailureKind::DeadlineExceeded => "deadline_exceeded",
-                ScriptedFailureKind::UnavailableAtDeadline => "unavailable_at_deadline",
+            let (status, kind) = match failure.kind {
+                ScriptedFailureKind::Failed => ("domain_failure", "domain_failure"),
+                ScriptedFailureKind::DeadlineExceeded => ("deadline_exceeded", "deadline_exceeded"),
+                ScriptedFailureKind::UnavailableAtDeadline => {
+                    ("unavailable_at_deadline", "unavailable_at_deadline")
+                }
             };
             serde_json::json!({
-                "result": result,
-                "observed_at_unix_seconds": observed_at,
-                "message": failure.message,
+                "status": status,
+                "value": {
+                    "kind": kind,
+                    "message": failure.message,
+                    "observed_at_unix_seconds": observed_at,
+                }
             })
         } else if name == CaptureFrozenLsnActivity::NAME {
             serde_json::json!({
-                "result": "captured",
-                "frozen_lsn": 55,
-                "observed_at_unix_seconds": observed_at,
+                "status": "applied",
+                "value": {
+                    "frozenLsn": 55,
+                    "observedAtUnixSeconds": observed_at,
+                }
             })
         } else if name == WaitTargetCaughtUpActivity::NAME {
             serde_json::json!({
-                "result": "caught_up",
-                "observed_at_unix_seconds": observed_at,
+                "status": "applied",
+                "value": {
+                    "observedAtUnixSeconds": observed_at,
+                }
             })
         } else if name == AttestTargetTopologyActivity::NAME
             || name == AttestCompensatedTopologyActivity::NAME
         {
             serde_json::json!({
-                "result": "attested",
-                "observed_at_unix_seconds": observed_at,
-                "snapshot": activity_input.get("expectedSnapshot").unwrap(),
+                "status": "applied",
+                "value": {
+                    "observedAtUnixSeconds": observed_at,
+                    "snapshot": activity_input.get("expectedSnapshot").unwrap(),
+                }
             })
         } else {
             serde_json::json!({
-                "result": "applied",
-                "observed_at_unix_seconds": observed_at,
+                "status": "applied",
+                "value": {
+                    "observedAtUnixSeconds": observed_at,
+                }
             })
         };
         ExactBytes::new(serde_json::to_vec(&value).unwrap())
@@ -1404,7 +1315,6 @@ mod tests {
                     compensated: true,
                     branch: DirectSwitchoverTerminalBranch::RevokeSafeFailure,
                     reason: Some(exact),
-                    accounting: Some(DirectActivityAccounting::new(1, 1)),
                 })
                 .is_ok()
             );
@@ -1416,7 +1326,6 @@ mod tests {
                     compensated: true,
                     branch: DirectSwitchoverTerminalBranch::RevokeSafeFailure,
                     reason: Some(one_over.clone()),
-                    accounting: Some(DirectActivityAccounting::new(1, 1)),
                 })
                 .is_err()
             );
@@ -1470,14 +1379,14 @@ mod tests {
         ) -> TerminalOutcome {
             let mut budget = TransitionBudget::new();
             for index in 0..self.calls {
-                if let Err(error) = call_activity::<BudgetProbeActivity>(
-                    context,
-                    &mut budget,
-                    BudgetProbeInput { index },
-                )
-                .await
-                {
+                if let Err(error) = budget.consume(BudgetProbeActivity::NAME) {
                     return stopped(error);
+                }
+                if let Err(error) = context
+                    .call::<BudgetProbeActivity>(BudgetProbeInput { index })
+                    .await
+                {
+                    return stopped(error.to_string());
                 }
             }
             TerminalOutcome::succeeded(ExactBytes::new(b"{}".to_vec()))

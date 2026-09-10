@@ -16,8 +16,10 @@ compatibility with either project.
 The implemented kernel provides:
 
 - deterministic linear replay;
-- typed, versioned, bounded activity declarations and ordinary async calls
-  over the compatible exact-byte API;
+- typed, versioned durable effects with separate bounded logical requests,
+  exact prepared commands, typed outputs, and ordinary async calls;
+- static effect-set registration and reusable preparation, dispatch,
+  observation, bounded redelivery, and observation-only quarantine hosting;
 - exact activity matching and stable logical identity;
 - asynchronous load and compare-and-swap persistence;
 - opaque provider revision tokens and conservative unknown outcomes;
@@ -27,7 +29,8 @@ The implemented kernel provides:
   checkpoint sizes;
 - maximum-result capacity reservation before dispatch;
 - immutable execution-level terminal payload and admitted capacity;
-- completion-only active-to-terminal checkpoint compaction;
+- completion-only active-to-terminal checkpoint compaction with authenticated
+  completed, external-effect, and passive-observation counts;
 - direct terminal outcome reload without workflow polling;
 - ambiguity quarantine and authoritative observation recovery;
 - opt-in atomic observation/replay/next-exposure or terminal progression;
@@ -114,13 +117,14 @@ need. Short topology workflows should complete and use terminal compaction.
 
 ### Kernel Ergonomics
 
-1. **Implemented:** typed serde activity declarations and calls retaining exact
-   canonical encoded-byte matching, immutable version identity, declared
-   bounds, and portable deterministic codec/call failures.
-2. Keep domain rejection/failure in each typed bounded activity output; add a
-   generic activity-failure lifecycle only if a broader workflow demonstrates
-   that need.
-3. Add an activity registry only if a non-operator host needs runtime lookup.
+1. **Implemented:** typed effect declarations and calls retaining exact
+   canonical request matching, immutable version identity, independent
+   request/command/result bounds, shared bounded outcomes, and portable
+   deterministic codec/call failures.
+2. **Implemented:** compile-time effect-set registration for operator-hosted
+   workflows. Runtime discovery remains deferred.
+3. Add a runtime activity registry only if a non-operator host needs dynamic
+   lookup.
 4. Generalize passive convergence resolution only after another workflow
    demonstrates reusable policy beyond the in-process operator adapters.
 5. Add replay-aware tracing and checkpoint inspection.
@@ -179,8 +183,10 @@ queue, lease, watcher, distributed owner, or retry scheduler was added.
 
 Switchover is now a production framework-native consumer with no public
 selection model or optional build feature. Its representative no-redelivery
-path remains nine external effects, three passive observations, 12 boundaries,
-and 13 accepted writes. It is also the reference direct-style authoring slice:
+path has nine external effects, three passive observations, 12 logical
+boundaries, and 25 accepted writes: exposure and observation are separate
+accepted writes, followed by terminal compaction. It is also the reference
+direct-style authoring slice:
 the workflow source names each protocol boundary and owns normal and
 compensating control flow, while the adapter owns observations, exact command
 preparation/dispatch, quarantine, and terminal validation. Its byte
@@ -193,7 +199,9 @@ A resource in the `Switchover` phase without a current native reference fails
 closed; removed historical formats are neither migrated nor converted.
 
 The operation reuses the shared runner and ConfigMap provider through 20
-operation-specific version-1 typed activities. The direct async workflow
+operation-specific version-1 typed effects in one static effect set. Logical
+requests and exact prepared replica/label commands are persisted separately.
+The direct async workflow
 visibly spells out ordered normal, pre-promotion restore, and post-promotion
 compensation paths. The adapter prepares individually correlated
 `ReplicaAgent` and exact-UID label commands but does not select protocol
@@ -202,34 +210,35 @@ add and remove, the sequence spans multiple replicas and Kubernetes routing
 objects, and the existing per-command fences already supply authoritative
 ambiguity recovery.
 
-The activity payloads are operation-local rather than aliases of a shared
-replica/label request. Prepared exposed commands use a stricter recovery mode
+The effect requests are operation-local rather than aliases of a shared
+replica/label request and contain no host redelivery or prepared-command
+fields. Prepared exposed commands use a stricter recovery mode
 than undispatched requests: replica quarantine accepts only matching terminal
 ledger evidence, an exact postcondition, or generation-change non-admission;
 labels accept only their exact UID-fenced postcondition. Evidence-only exposed
 effects are re-evaluated without dispatch authority and wait rather than
 isolate if a command would be required. Compact terminals record the completed
-branch and are checked against member-count-specific activity classifications
-and replica-only redelivery rules before publication.
+branch; the kernel authenticates exact completion and classification totals
+while the operator validates the legal branch and topology before publication.
 
 The product supports 1–9 replicas. A one-member set has no distinct switchover
 target; direct switchover accepts valid stable topologies with 2–9 members.
-The upper bound is enforced by the CRD and reconciler because the nine-member
-maximum-fault rollback consumes all 33 admitted activity records while
-remaining within the ConfigMap budget. The status schema has one
+The upper bound is enforced by the CRD and reconciler. The nine-member
+maximum-fault rollback uses 19 logical activity records; redelivery attempts
+remain inside those records. The status schema has one
 contract-version-4 execution-reference shape with required immutable input;
 there is no compatibility variant or migration. Missing fields fail schema
 admission, while strict Kubernetes field validation rejects removed or unknown
 fields before persistence.
 
-The independent limits are 33 activity records, 4,096 workflow-input bytes,
+The independent limits are 19 logical activity records, 4,096 workflow-input bytes,
 8,192 maximum activity-input and activity-result bytes, 524,288 active bytes,
 16,384 terminal bytes, 4,096 terminal-payload bytes, 512 error bytes, 64
 workflow transitions, and 32 runner outcomes per reconcile. Declared-maximum
-fixtures measure 444,601 active bytes and 15,077 terminal bytes. The measured
-three-member no-fault sample was 20,857 active bytes, 3,961 terminal bytes, and
-a 924-byte terminal payload. The nine-member maximum-fault production sample
-was 64,061 active bytes and 4,921 terminal bytes.
+fixtures remain below the 524,288-byte active and 16,384-byte terminal limits.
+Run-specific tests report exact active and terminal measurements. The
+nine-member maximum-fault production case completes 19 logical activities
+(16 external effects and three passive observations) with 67 accepted writes.
 
 The 64-transition limit is one workflow-wide budget consumed by normal,
 compensation, attestation, and redelivery calls. Activity and terminal error

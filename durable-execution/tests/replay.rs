@@ -5,10 +5,12 @@ use async_trait::async_trait;
 use kuberic_durable_execution::{
     ActivityCallError, ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ActivityState,
     AttemptId, CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload,
-    DurableActivity, Evaluation, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec,
-    HostEpoch, IdentityError, LogicalActivityId, Nondeterminism, PreparedActivityError,
-    PreparedActivityResolver, TerminalOutcome, Workflow, WorkflowContext, encode_activity_input,
-    encode_activity_result, evaluate as evaluate_with_spec, evaluate_prepared,
+    CompletionClass, DurableActivity, DurableEffect, EffectActivity, EffectAttempt,
+    EffectAttemptState, EffectCallError, EffectMetadata, EffectOutcome, Evaluation, ExactBytes,
+    ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
+    Nondeterminism, PreparedActivityError, PreparedActivityResolver, PreparedCommand,
+    PreparedEffectResolver, TerminalOutcome, Workflow, WorkflowContext, encode_activity_input,
+    encode_activity_result, evaluate as evaluate_with_spec, evaluate_effects, evaluate_prepared,
 };
 use serde::{Deserialize, Serialize};
 
@@ -622,6 +624,13 @@ fn active_and_terminal_encoded_limits_are_enforced_independently() {
             admitted_terminal = required;
             continue;
         }
+        let external = 10_000_000_000_000_000_000_u64;
+        let metadata = kuberic_durable_execution::CompletionMetadata::from_counts(
+            u64::MAX,
+            external,
+            u64::MAX - external,
+        )
+        .unwrap();
         let terminals = [
             CheckpointPayload::terminal(
                 contract.clone(),
@@ -629,9 +638,19 @@ fn active_and_terminal_encoded_limits_are_enforced_independently() {
                 u64::MAX,
             ),
             CheckpointPayload::terminal(
-                contract,
+                contract.clone(),
                 TerminalOutcome::failed(vec![7; MAX_RESULT_BYTES as usize]),
                 u64::MAX,
+            ),
+            CheckpointPayload::terminal_with_metadata(
+                contract.clone(),
+                TerminalOutcome::succeeded(vec![7; MAX_RESULT_BYTES as usize]),
+                metadata,
+            ),
+            CheckpointPayload::terminal_with_metadata(
+                contract,
+                TerminalOutcome::failed(vec![7; MAX_RESULT_BYTES as usize]),
+                metadata,
             ),
         ];
         let terminal = terminals
@@ -930,6 +949,105 @@ fn typed_identity_change_remains_nondeterminism() {
         ),
         Evaluation::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
     ));
+}
+
+struct WorkflowEffect;
+
+impl DurableEffect for WorkflowEffect {
+    type Request = String;
+    type Command = String;
+    type Output = String;
+
+    const NAME: &'static str = "typed.workflow.effect";
+    const VERSION: u32 = 1;
+    const MAX_REQUEST_BYTES: u64 = 32;
+    const MAX_COMMAND_BYTES: u64 = 32;
+    const MAX_RESULT_BYTES: u64 = 128;
+    const MAX_ERROR_MESSAGE_BYTES: u64 = 64;
+    const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
+}
+
+struct EffectWorkflow;
+
+struct ExactEffectResolver;
+
+impl PreparedEffectResolver for ExactEffectResolver {
+    fn resolve(
+        &self,
+        _execution_id: ExecutionId,
+        _logical: &ActivitySpec,
+        metadata: EffectMetadata,
+        recorded: Option<&PreparedCommand>,
+    ) -> Result<PreparedCommand, PreparedActivityError> {
+        if let Some(recorded) = recorded {
+            return Ok(recorded.clone());
+        }
+        PreparedCommand::new(
+            ExactBytes::new(br#"{"command":"exact"}"#),
+            metadata.max_command_bytes(),
+        )
+        .map_err(|_| PreparedActivityError::Encoding)
+    }
+}
+
+async fn effect_body(context: &mut WorkflowContext<'_>) -> Result<String, EffectCallError> {
+    let value = context
+        .call_effect::<WorkflowEffect>("hello".to_owned())
+        .await?;
+    Ok(format!("{value}!"))
+}
+
+#[async_trait]
+impl Workflow for EffectWorkflow {
+    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
+        match effect_body(context).await {
+            Ok(value) => TerminalOutcome::succeeded(value.into_bytes()),
+            Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
+        }
+    }
+}
+
+#[test]
+fn typed_effect_call_supports_standard_error_propagation() {
+    let execution_id = execution(26);
+    let workflow_input = bytes(b"workflow");
+    let checkpoint = envelope(
+        execution_id,
+        workflow_input.clone(),
+        vec![
+            ActivityRecord::prepared_effect(
+                ActivitySequence::new(0),
+                typed_spec::<EffectActivity<WorkflowEffect>>("hello"),
+                PreparedCommand::new(ExactBytes::new(br#"{"command":"exact"}"#), 32).unwrap(),
+                CompletionClass::ExternalEffect,
+                vec![EffectAttempt::new(
+                    AttemptId::new(HostEpoch::from_bytes([8; 16]), 1).unwrap(),
+                    EffectAttemptState::Observed,
+                )],
+                ActivityState::Completed {
+                    result: encode_activity_result::<EffectActivity<WorkflowEffect>>(
+                        &EffectOutcome::Applied("done".to_owned()),
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap(),
+        ],
+    );
+
+    let Evaluation::Complete { outcome, .. } = evaluate_effects(
+        &EffectWorkflow,
+        &ExecutionSpec::new(execution_id, workflow_input, 1024),
+        Some(&checkpoint),
+        limits(),
+        &ExactEffectResolver,
+    ) else {
+        panic!("typed effect did not replay to completion");
+    };
+    assert_eq!(
+        outcome,
+        TerminalOutcome::succeeded(ExactBytes::new(b"done!"))
+    );
 }
 
 #[test]

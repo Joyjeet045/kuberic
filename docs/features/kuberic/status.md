@@ -182,7 +182,7 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 **Maximum supported:** `replicas <= 9`. The CRD and reconciler enforce this
 product-wide bound. Direct switchover accepts valid stable topologies with
 2–9 members and a distinct target. Its nine-member maximum-fault compensation
-history consumes all 33 admitted records while remaining within the
+history consumes all 19 admitted logical records while remaining within the
 524,288-byte active and 16,384-byte terminal checkpoint limits.
 
 ---

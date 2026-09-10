@@ -115,20 +115,19 @@ Terminal state is compacted, reloaded, and validated before stable
 topology/status publication. The compact terminal records its immutable branch
 (`target_success`, `revoke_safe_failure`,
 `previous_configuration_restored`, or
-`post_promotion_compensated`), and reload accepts only member-count-specific
-reachable external/passive accounting for that branch. Error strings are
+`post_promotion_compensated`). Kernel-authenticated completion metadata supplies
+the exact logical, external-effect, and passive-observation counts; the adapter
+continues to validate the legal branch and topology. Error strings are
 bounded to 512 UTF-8 bytes before activity or terminal persistence. Use
 `status.switchoverExecution`, its referenced ConfigMap, and the
 `FrameworkNativeSwitchover` condition to inspect admission, named history,
 reloads, quarantine, incompatibility, completion, or safe compensation.
 
 The canonical three-member no-fault sample records nine external effects,
-three passive observations, 12 completed boundaries, 13 accepted writes,
-20,857 maximum active-checkpoint bytes, a 3,961-byte terminal checkpoint, and
-a 924-byte terminal payload. The nine-member maximum-fault production sample
-records 33 boundaries, 28 external effects, five passive observations,
-48 accepted writes, 64,061 maximum active bytes, and 4,921 maximum terminal
-bytes. The contract limits are 33 records, 4,096 workflow-input bytes,
+three passive observations, 12 logical boundaries, and 25 accepted writes.
+The nine-member maximum-fault production sample records 19 logical boundaries,
+16 external effects, three passive observations, and 67 accepted writes.
+The contract limits are 19 logical records, 4,096 workflow-input bytes,
 8,192 maximum activity-input/result bytes, 524,288 active bytes, 16,384
 terminal bytes, 4,096 terminal-payload bytes, 512 error bytes, 64 workflow
 transitions, and 32 runner outcomes per reconcile. The single 64-transition

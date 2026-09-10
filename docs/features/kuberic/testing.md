@@ -421,11 +421,10 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
 
 The authoritative three-member happy-path gate expects exactly nine external
 effects plus three passive observations, giving 12 completed durable
-boundaries and 13 accepted checkpoint writes including terminal persistence.
-The current sample observed 20,857 maximum active-checkpoint bytes, a
-3,961-byte terminal checkpoint, and a 924-byte terminal payload. These are
-run-specific snapshots because runtime-generated values affect serialized
-length; no exact byte value is a compatibility contract.
+boundaries and 25 accepted checkpoint writes including terminal persistence.
+Checkpoint byte measurements are run-specific snapshots because
+runtime-generated values affect serialized length; no exact byte value is a
+compatibility contract.
 
 The product-wide replica range is 1–9 and is enforced by both the CRD schema
 and reconciliation. A one-member set has no distinct switchover target.
@@ -436,35 +435,28 @@ exact current native property set and required fields. Isolated KinD
 all-features validation exercises the checked-in CRD and provider without
 touching an existing CAPI environment.
 
-The independent contract limits are 33 activity records, 4,096 workflow-input
+The independent contract limits are 19 logical activity records, 4,096 workflow-input
 bytes, 8,192 maximum activity-input and activity-result bytes, 524,288 active
 encoded bytes, 16,384 terminal encoded bytes, 4,096 terminal-payload bytes,
 512 error bytes, 64 workflow transitions, and 32 runner outcomes per
 reconcile. The transition limit is enforced by one workflow-wide budget used
 by normal calls, compensation, attestation, and redelivery. Persisted activity
 and terminal errors enforce the 512-byte UTF-8 limit with ASCII and multibyte
-exact/one-over cases. The declared-maximum 33-record projection measures
-444,601 active bytes and 15,077 terminal bytes. The nine-member maximum-fault
-production run uses all 33 records and measures 64,061 active bytes and 4,921
-terminal bytes, with 28 external effects, five passive observations, and 48
-accepted writes. Exact-bound and one-byte-over tests cover every activity
+exact/one-over cases. The nine-member maximum-fault production run uses all 19
+logical records, with 16 external effects, three passive observations, and 67
+accepted writes. Exact-bound and one-byte-over tests cover every effect
 declaration and each global limit independently.
 
-The terminal payload carries a branch discriminator plus the external-effect
-and passive-observation counts, so a fresh measurement store can recover and
-validate the classification without prior active-checkpoint cache state.
-Reachability is derived per activity slot: every replica effect may be a
-passive observation, one external command, or one external command followed
-by the single allowed external/passive redelivery; every label may be passive
-or external but cannot redeliver; observation-only activities remain passive.
-For the canonical three-member success path the no-redelivery target remains
-9/3, 12 boundaries, and 13 accepted writes, with at most seven replica
-redeliveries. Exact postconditions, deadline outcomes, and already-exact labels
-produce other valid splits. Revoke-safe failure, previous-configuration
-restore, and post-promotion compensation have distinct terminal branches.
-Each is validated against its member-count-specific activity slots and
-redelivery rules. Cross-branch, short, zero-count, wrong-split, and
-over-redelivery compact terminals are rejected before `Healthy` publication.
+The kernel terminal metadata authenticates exact logical completion and
+external-effect/passive-observation counts from immutable registered effect
+metadata. The terminal payload carries only the operation-specific branch and
+topology. For the canonical three-member success path the target is 9/3, 12
+logical boundaries, and 25 accepted writes. Exact postconditions and
+already-exact labels do not change immutable effect classification. Revoke-safe
+failure, previous-configuration restore, and post-promotion compensation have
+distinct terminal branches and topology validation. Missing or inconsistent
+kernel metadata and illegal branch/topology combinations are rejected before
+`Healthy` publication.
 `external_effects` counts ReplicaAgent commands and
 UID-fenced label patches; `passive_observations` counts evidence-only
 activities; `durable_boundaries` is their completed total.

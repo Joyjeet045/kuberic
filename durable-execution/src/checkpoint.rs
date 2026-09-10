@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ActivityName, ActivitySequence, ActivitySpec, AttemptId, ExactBytes, ExecutionId,
-    ExecutionSpec, LogicalActivityId, PreparedActivityError, TerminalOutcome,
+    ActivityName, ActivitySequence, ActivitySpec, AttemptId, CompletionClass, CompletionMetadata,
+    EffectAttempt, EffectAttemptState, EffectObservationDisposition, ExactBytes, ExecutionId,
+    ExecutionSpec, LogicalActivityId, PreparedActivityError, PreparedCommand, TerminalOutcome,
+    validate_effect_attempts,
 };
 
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 3;
@@ -223,6 +225,8 @@ pub enum CheckpointState {
     Terminal {
         outcome: TerminalOutcome,
         completed_activity_count: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_metadata: Option<CompletionMetadata>,
     },
 }
 
@@ -252,6 +256,22 @@ impl CheckpointPayload {
             state: CheckpointState::Terminal {
                 outcome,
                 completed_activity_count,
+                completion_metadata: None,
+            },
+        }
+    }
+
+    pub const fn terminal_with_metadata(
+        execution: ExecutionContract,
+        outcome: TerminalOutcome,
+        completion_metadata: CompletionMetadata,
+    ) -> Self {
+        Self {
+            execution,
+            state: CheckpointState::Terminal {
+                outcome,
+                completed_activity_count: completion_metadata.completed_activity_count(),
+                completion_metadata: Some(completion_metadata),
             },
         }
     }
@@ -276,7 +296,18 @@ impl CheckpointPayload {
             CheckpointState::Terminal {
                 outcome,
                 completed_activity_count,
+                ..
             } => Some((outcome, *completed_activity_count)),
+            CheckpointState::Active { .. } => None,
+        }
+    }
+
+    pub const fn terminal_completion_metadata(&self) -> Option<CompletionMetadata> {
+        match &self.state {
+            CheckpointState::Terminal {
+                completion_metadata,
+                ..
+            } => *completion_metadata,
             CheckpointState::Active { .. } => None,
         }
     }
@@ -293,15 +324,34 @@ impl CheckpointPayload {
         outcome: TerminalOutcome,
         completed_activity_count: u64,
     ) -> Result<Self, CheckpointError> {
-        if !matches!(self.state, CheckpointState::Active { .. }) {
+        let CheckpointState::Active { ref activities } = self.state else {
             return Err(CheckpointError::ExpectedActiveCheckpoint);
-        }
+        };
         validate_terminal_outcome(&outcome, self.execution.spec.max_terminal_payload_bytes())?;
-        Ok(Self::terminal(
-            self.execution,
-            outcome,
-            completed_activity_count,
-        ))
+        let completion_metadata = if !activities.is_empty()
+            && activities
+                .iter()
+                .all(|record| record.completion_class.is_some())
+        {
+            let metadata = CompletionMetadata::from_classes(
+                activities
+                    .iter()
+                    .map(|record| record.completion_class.expect("checked above")),
+            )
+            .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
+            if metadata.completed_activity_count() != completed_activity_count {
+                return Err(CheckpointError::EffectContract(
+                    "authenticated completion count differs from replay cursor".to_owned(),
+                ));
+            }
+            Some(metadata)
+        } else {
+            None
+        };
+        Ok(match completion_metadata {
+            Some(metadata) => Self::terminal_with_metadata(self.execution, outcome, metadata),
+            None => Self::terminal(self.execution, outcome, completed_activity_count),
+        })
     }
 
     pub fn validate(
@@ -339,13 +389,40 @@ impl CheckpointPayload {
         let payload_base64_len =
             encoded_len(declared_len, true).ok_or(CheckpointError::EncodedLengthOverflow)?;
 
+        let maximum_metadata = CompletionMetadata::from_counts(u64::MAX, u64::MAX, 0)
+            .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
+        let maximum_split = 10_000_000_000_000_000_000_u64;
+        let maximum_split_metadata =
+            CompletionMetadata::from_counts(u64::MAX, maximum_split, u64::MAX - maximum_split)
+                .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
         [
-            TerminalOutcome::succeeded(ExactBytes::default()),
-            TerminalOutcome::failed(ExactBytes::default()),
+            (TerminalOutcome::succeeded(ExactBytes::default()), None),
+            (TerminalOutcome::failed(ExactBytes::default()), None),
+            (
+                TerminalOutcome::succeeded(ExactBytes::default()),
+                Some(maximum_metadata),
+            ),
+            (
+                TerminalOutcome::failed(ExactBytes::default()),
+                Some(maximum_metadata),
+            ),
+            (
+                TerminalOutcome::succeeded(ExactBytes::default()),
+                Some(maximum_split_metadata),
+            ),
+            (
+                TerminalOutcome::failed(ExactBytes::default()),
+                Some(maximum_split_metadata),
+            ),
         ]
         .into_iter()
-        .map(|outcome| {
-            let empty_terminal = Self::terminal(self.execution.clone(), outcome, u64::MAX);
+        .map(|(outcome, metadata)| {
+            let empty_terminal = match metadata {
+                Some(metadata) => {
+                    Self::terminal_with_metadata(self.execution.clone(), outcome, metadata)
+                }
+                None => Self::terminal(self.execution.clone(), outcome, u64::MAX),
+            };
             let empty_inner_len = serde_json::to_vec(&empty_terminal)
                 .map_err(invalid_json)?
                 .len();
@@ -446,8 +523,29 @@ impl CheckpointPayload {
                 validate_activity_count(activities, limits)?;
                 validate_active_history(activities)
             }
-            CheckpointState::Terminal { outcome, .. } => {
-                validate_terminal_outcome(outcome, self.execution.spec.max_terminal_payload_bytes())
+            CheckpointState::Terminal {
+                outcome,
+                completed_activity_count,
+                completion_metadata,
+            } => {
+                validate_terminal_outcome(
+                    outcome,
+                    self.execution.spec.max_terminal_payload_bytes(),
+                )?;
+                if let Some(metadata) = completion_metadata {
+                    CompletionMetadata::from_counts(
+                        metadata.completed_activity_count(),
+                        metadata.external_effect_count(),
+                        metadata.passive_observation_count(),
+                    )
+                    .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
+                    if metadata.completed_activity_count() != *completed_activity_count {
+                        return Err(CheckpointError::EffectContract(
+                            "terminal completion metadata count mismatch".to_owned(),
+                        ));
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -459,6 +557,12 @@ impl CheckpointPayload {
 pub struct ActivityRecord {
     sequence: ActivitySequence,
     spec: ActivitySpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_command: Option<PreparedCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_class: Option<CompletionClass>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attempts: Vec<EffectAttempt>,
     state: ActivityState,
 }
 
@@ -467,8 +571,31 @@ impl ActivityRecord {
         Self {
             sequence,
             spec,
+            prepared_command: None,
+            completion_class: None,
+            attempts: Vec::new(),
             state,
         }
+    }
+
+    pub fn prepared_effect(
+        sequence: ActivitySequence,
+        spec: ActivitySpec,
+        prepared_command: PreparedCommand,
+        completion_class: CompletionClass,
+        attempts: Vec<EffectAttempt>,
+        state: ActivityState,
+    ) -> Result<Self, CheckpointError> {
+        validate_effect_attempts(&attempts)
+            .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
+        Ok(Self {
+            sequence,
+            spec,
+            prepared_command: Some(prepared_command),
+            completion_class: Some(completion_class),
+            attempts,
+            state,
+        })
     }
 
     pub const fn scheduled(sequence: ActivitySequence, spec: ActivitySpec) -> Self {
@@ -517,6 +644,70 @@ impl ActivityRecord {
 
     pub const fn state(&self) -> &ActivityState {
         &self.state
+    }
+
+    pub const fn prepared_command(&self) -> Option<&PreparedCommand> {
+        self.prepared_command.as_ref()
+    }
+
+    pub const fn completion_class(&self) -> Option<CompletionClass> {
+        self.completion_class
+    }
+
+    pub fn attempts(&self) -> &[EffectAttempt] {
+        &self.attempts
+    }
+
+    pub(crate) fn with_state(mut self, state: ActivityState) -> Self {
+        self.state = state;
+        self
+    }
+
+    pub(crate) fn expose_attempt(mut self, attempt_id: AttemptId) -> Result<Self, CheckpointError> {
+        if self.prepared_command.is_some() {
+            self.attempts
+                .push(EffectAttempt::new(attempt_id, EffectAttemptState::Exposed));
+            validate_effect_attempts(&self.attempts)
+                .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
+        }
+        self.state = ActivityState::DispatchExposed { attempt_id };
+        Ok(self)
+    }
+
+    pub(crate) fn observe_effect_attempt(
+        mut self,
+        attempt_id: AttemptId,
+        disposition: EffectObservationDisposition,
+        result: ExactBytes,
+    ) -> Result<Self, CheckpointError> {
+        let attempt_count = self.attempts.len();
+        let Some(attempt) = self.attempts.last_mut() else {
+            return Err(CheckpointError::EffectContract(
+                "effect observation requires a recorded attempt".to_owned(),
+            ));
+        };
+        if attempt.attempt_id() != attempt_id || attempt.state() != EffectAttemptState::Exposed {
+            return Err(CheckpointError::EffectContract(
+                "effect observation attempt does not match the exposed attempt".to_owned(),
+            ));
+        }
+        match disposition {
+            EffectObservationDisposition::Completed => {
+                *attempt = EffectAttempt::new(attempt_id, EffectAttemptState::Observed);
+                self.state = ActivityState::Completed { result };
+            }
+            EffectObservationDisposition::ProvenNoAdmission if attempt_count == 1 => {
+                *attempt = EffectAttempt::new(attempt_id, EffectAttemptState::ProvenNoAdmission);
+                self.state = ActivityState::Scheduled;
+            }
+            EffectObservationDisposition::ProvenNoAdmission => {
+                *attempt = EffectAttempt::new(attempt_id, EffectAttemptState::Observed);
+                self.state = ActivityState::Completed { result };
+            }
+        }
+        validate_effect_attempts(&self.attempts)
+            .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
+        Ok(self)
     }
 
     pub fn logical_id(&self, execution_id: ExecutionId) -> LogicalActivityId {
@@ -608,6 +799,12 @@ pub enum CheckpointError {
     },
     #[error("pending activity {sequence} must be the final history record")]
     PendingActivityNotFinal { sequence: ActivitySequence },
+    #[error("durable effect contract is invalid: {0}")]
+    EffectContract(String),
+    #[error("activity {sequence} has effect metadata without an exact prepared command")]
+    MissingPreparedCommand { sequence: ActivitySequence },
+    #[error("activity {sequence} has an exact prepared command without effect classification")]
+    MissingCompletionClass { sequence: ActivitySequence },
 }
 
 fn validate_activity_count(
@@ -633,6 +830,31 @@ fn validate_active_history(activities: &[ActivityRecord]) -> Result<(), Checkpoi
                 actual: record.sequence,
             });
         }
+        match (&record.prepared_command, record.completion_class) {
+            (Some(command), Some(_)) => {
+                PreparedCommand::new(command.bytes().clone(), command.max_bytes())
+                    .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
+                validate_effect_attempts(&record.attempts)
+                    .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
+                validate_effect_record_state(record)?;
+            }
+            (None, None) if record.attempts.is_empty() => {}
+            (None, Some(_)) => {
+                return Err(CheckpointError::MissingPreparedCommand {
+                    sequence: record.sequence,
+                });
+            }
+            (Some(_), None) => {
+                return Err(CheckpointError::MissingCompletionClass {
+                    sequence: record.sequence,
+                });
+            }
+            (None, None) => {
+                return Err(CheckpointError::MissingPreparedCommand {
+                    sequence: record.sequence,
+                });
+            }
+        }
         if let ActivityState::Completed { result } = &record.state {
             let actual = u64::try_from(result.as_slice().len())
                 .map_err(|_| CheckpointError::ResultLengthUnrepresentable)?;
@@ -650,6 +872,38 @@ fn validate_active_history(activities: &[ActivityRecord]) -> Result<(), Checkpoi
         }
     }
     Ok(())
+}
+
+fn validate_effect_record_state(record: &ActivityRecord) -> Result<(), CheckpointError> {
+    let valid = match (record.attempts.as_slice(), &record.state) {
+        ([], ActivityState::Scheduled) => true,
+        ([attempt], ActivityState::DispatchExposed { attempt_id }) => {
+            attempt.state() == EffectAttemptState::Exposed && attempt.attempt_id() == *attempt_id
+        }
+        ([attempt], ActivityState::Scheduled) => {
+            attempt.state() == EffectAttemptState::ProvenNoAdmission
+        }
+        ([attempt], ActivityState::Completed { .. }) => {
+            attempt.state() == EffectAttemptState::Observed
+        }
+        ([first, second], ActivityState::DispatchExposed { attempt_id }) => {
+            first.state() == EffectAttemptState::ProvenNoAdmission
+                && second.state() == EffectAttemptState::Exposed
+                && second.attempt_id() == *attempt_id
+        }
+        ([first, second], ActivityState::Completed { .. }) => {
+            first.state() == EffectAttemptState::ProvenNoAdmission
+                && second.state() == EffectAttemptState::Observed
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(CheckpointError::EffectContract(
+            "effect attempt ledger does not match activity state".to_owned(),
+        ))
+    }
 }
 
 fn validate_terminal_outcome(
@@ -721,6 +975,47 @@ mod tests {
     }
 
     #[test]
+    fn terminal_projection_covers_authenticated_completion_metadata() {
+        let payload = CheckpointPayload::active(contract(8, 1_000_000), Vec::new());
+        let projected = payload.maximum_terminal_encoded_len().unwrap();
+        let external = 10_000_000_000_000_000_000_u64;
+        let metadata =
+            CompletionMetadata::from_counts(u64::MAX, external, u64::MAX - external).unwrap();
+        let terminal = CheckpointPayload::terminal_with_metadata(
+            payload.execution.clone(),
+            TerminalOutcome::succeeded(ExactBytes::new([7; 8])),
+            metadata,
+        );
+        assert!(
+            CheckpointEnvelope::encode(&terminal)
+                .unwrap()
+                .encoded_len()
+                .unwrap()
+                <= projected
+        );
+    }
+
+    #[test]
+    fn terminal_rejects_internally_inconsistent_completion_metadata() {
+        let terminal = CheckpointPayload::terminal_with_metadata(
+            contract(8, 1_000_000),
+            TerminalOutcome::succeeded(ExactBytes::new(b"done")),
+            CompletionMetadata::from_counts(2, 1, 1).unwrap(),
+        );
+        let mut value = serde_json::to_value(terminal).unwrap();
+        value["state"]["completion_metadata"]["completed_activity_count"] =
+            serde_json::json!(3_u64);
+        let tampered: CheckpointPayload = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            tampered.validate(
+                &spec(8),
+                CheckpointLimits::new(4, 1_000_000, 1_000_000).unwrap()
+            ),
+            Err(CheckpointError::EffectContract(_))
+        ));
+    }
+
+    #[test]
     fn terminal_projection_rejects_unrepresentable_length_without_allocating() {
         let payload = CheckpointPayload::active(contract(u64::MAX, u64::MAX), Vec::new());
         assert!(matches!(
@@ -769,5 +1064,45 @@ mod tests {
             CheckpointLimits::new(1, 1024, 0),
             Err(CheckpointError::ZeroTerminalEncodedCheckpointLimit)
         );
+    }
+
+    #[test]
+    fn prepared_effect_command_and_attempt_ledger_round_trip_exactly() {
+        let activity_spec = ActivitySpec::new(
+            ActivityName::new("effect", 1).unwrap(),
+            ExactBytes::new(br#"{"request":1}"#),
+            64,
+        );
+        let first = AttemptId::new(crate::HostEpoch::from_bytes([2; 16]), 1).unwrap();
+        let second = AttemptId::new(crate::HostEpoch::from_bytes([2; 16]), 2).unwrap();
+        let record = ActivityRecord::prepared_effect(
+            ActivitySequence::new(0),
+            activity_spec,
+            PreparedCommand::new(ExactBytes::new(br#"{"command":2}"#), 13).unwrap(),
+            CompletionClass::ExternalEffect,
+            vec![
+                EffectAttempt::new(first, crate::EffectAttemptState::ProvenNoAdmission),
+                EffectAttempt::new(second, crate::EffectAttemptState::Exposed),
+            ],
+            ActivityState::DispatchExposed { attempt_id: second },
+        )
+        .unwrap();
+        let payload = CheckpointPayload::active(
+            ExecutionContract::with_encoded_limits(spec(16), 4096, 4096),
+            vec![record],
+        );
+        let limits = CheckpointLimits::new(1, 4096, 4096).unwrap();
+        let envelope = CheckpointEnvelope::encode_with_limits(&payload, limits).unwrap();
+        let decoded = envelope.decode_and_validate(&spec(16), limits).unwrap();
+        let decoded = &decoded.active_activities().unwrap()[0];
+        assert_eq!(
+            decoded.prepared_command().unwrap().bytes().as_slice(),
+            br#"{"command":2}"#
+        );
+        assert_eq!(
+            decoded.completion_class(),
+            Some(CompletionClass::ExternalEffect)
+        );
+        assert_eq!(decoded.attempts().len(), 2);
     }
 }

@@ -46,10 +46,8 @@ pub mod activities;
 mod adapter;
 mod model;
 mod prepare;
-mod quarantine;
 mod workflow;
 
-pub use activities::DirectActivityAccounting as SwitchoverActivityAccounting;
 pub use adapter::{DirectSwitchoverPreparedActivityResolver, DirectSwitchoverRunnerAdapter};
 pub use workflow::{
     DirectSwitchoverTerminalBranch, DirectSwitchoverTerminalRecord, DirectSwitchoverWorkflow,

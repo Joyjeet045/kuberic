@@ -15,9 +15,12 @@ use kuberic_core::{
 #[cfg(test)]
 use kuberic_durable_execution::ExecutionContract;
 use kuberic_durable_execution::{
-    ActivityObservation, ActivitySpec, CheckpointError, CheckpointLimits, ExactBytes, ExecutionId,
-    ExecutionSpec, LogicalActivityId, PreparedActivityError, PreparedActivityResolver,
-    TerminalOutcome, decode_activity_result, encode_activity_result,
+    ActivitySpec, BoundedEffectError, CheckpointError, CheckpointLimits, CompletionMetadata,
+    DispatchEffect, DurableEffectSet, EffectErrorKind, EffectHostStep, EffectMetadata,
+    EffectOutcome, EffectQuarantineContext, ExactBytes, ExecutionId, ExecutionSpec,
+    HostedEffectSet, LogicalActivityId, ObserveEffect, ObserveQuarantinedEffect, PrepareEffect,
+    PreparedActivityError, PreparedCommand, PreparedEffectResolver, PreparedEffectSet,
+    TerminalOutcome,
 };
 
 use crate::{
@@ -34,8 +37,8 @@ use crate::{
             execute_replica_command,
         },
         runner::{
-            DurableAdapterBoundary, DurableAdapterWait, DurableCheckpointDisposition,
-            DurableOperationAdapter,
+            DurableAdapterWait, DurableCheckpointDisposition, DurableEffectQuarantine,
+            TypedDurableAdapterBoundary, TypedDurableOperationAdapter,
         },
         workflow_host::DurablePermitGuard,
     },
@@ -45,20 +48,15 @@ use crate::{
 use super::workflow::DirectSwitchoverWorkflow;
 use super::{
     SwitchoverExposureFault, SwitchoverRunnerContext, SwitchoverWorkflowInput,
-    activities::{
-        ALL_DIRECT_ACTIVITY_IDENTITIES, AttestCompensatedTopologyActivity,
-        AttestCompensatedTopologyOutput, AttestTargetTopologyActivity, AttestTargetTopologyOutput,
-        DIRECT_SWITCHOVER_CONTRACT_VERSION, DirectActivityAccounting,
-    },
+    activities::{DIRECT_SWITCHOVER_CONTRACT_VERSION, SwitchoverEffect, SwitchoverEffects},
     collect_switchover_runner_context, encode_execution_id,
     model::{DirectSwitchoverDefinition, same_topology},
-    prepare::{DirectActivity, DirectEvaluation},
-    quarantine::{DirectQuarantineOutcome, resolve_direct_quarantine},
+    prepare::{SwitchoverDispatch, SwitchoverEffectFamily},
     workflow::{DirectSwitchoverTerminalBranch, DirectSwitchoverTerminalRecord},
 };
 
 pub const DIRECT_SWITCHOVER_MAX_ACTIVITY_RECORDS: usize =
-    2 * crate::crd::KUBERIC_MAX_REPLICAS as usize + 15;
+    crate::crd::KUBERIC_MAX_REPLICAS as usize + 10;
 pub const DIRECT_SWITCHOVER_MAX_RUNNER_FUEL: usize = 32;
 pub const DIRECT_SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES: usize = 4_096;
 pub const DIRECT_SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES: usize = 512 * 1_024;
@@ -89,59 +87,65 @@ impl DirectSwitchoverPreparedActivityResolver {
             deadline,
         }
     }
+}
 
-    fn decode_logical(
+impl PreparedEffectResolver for DirectSwitchoverPreparedActivityResolver {
+    fn resolve(
         &self,
+        _execution_id: ExecutionId,
         logical: &ActivitySpec,
-    ) -> Result<DirectActivity, PreparedActivityError> {
-        let activity =
-            DirectActivity::decode(logical).map_err(|_| PreparedActivityError::Encoding)?;
-        if !activity.is_logical() {
-            return Err(PreparedActivityError::Validation);
-        }
-        activity
-            .validate(&self.definition)
-            .map_err(|_| PreparedActivityError::Validation)?;
-        self.deadline
-            .store(activity.deadline_unix_seconds(), Ordering::Relaxed);
-        Ok(activity)
+        _metadata: EffectMetadata,
+        recorded: Option<&PreparedCommand>,
+    ) -> Result<PreparedCommand, PreparedActivityError> {
+        SwitchoverEffects::resolve_prepared(self, _execution_id, logical, _metadata, recorded)
     }
 }
 
-impl PreparedActivityResolver for DirectSwitchoverPreparedActivityResolver {
-    fn resolve(
+impl<E> PrepareEffect<E> for DirectSwitchoverPreparedActivityResolver
+where
+    E: SwitchoverEffect + 'static,
+    E::Family: SwitchoverEffectFamily<E>,
+{
+    type Evidence = ();
+    type Authority = ();
+    type Error = PreparedActivityError;
+
+    fn prepare(
         &self,
-        logical: &ActivitySpec,
-        recorded: Option<&ActivitySpec>,
-    ) -> Result<ActivitySpec, PreparedActivityError> {
-        let logical_activity = self.decode_logical(logical)?;
-        if let Some(recorded) = recorded {
-            if recorded.name() != logical.name()
-                || recorded.max_result_bytes() != logical.max_result_bytes()
-            {
-                return Ok(logical.clone());
-            }
-            let Ok(recorded_activity) = DirectActivity::decode(recorded) else {
-                return Ok(logical.clone());
-            };
-            if recorded_activity.logical_predecessor() != logical_activity
-                || recorded_activity.validate(&self.definition).is_err()
-            {
-                return Ok(logical.clone());
-            }
-            self.deadline
-                .store(recorded_activity.deadline_unix_seconds(), Ordering::Relaxed);
-            return Ok(recorded.clone());
-        }
-        logical_activity
-            .prepare(
-                &self.definition,
-                &self.observations,
-                &self.addressed_instances,
-                self.now,
-            )?
-            .spec()
-            .map_err(|_| PreparedActivityError::Encoding)
+        request: &E::Request,
+        _authority: &Self::Authority,
+        _evidence: &Self::Evidence,
+    ) -> Result<E::Command, Self::Error> {
+        let deadline = <E::Family as SwitchoverEffectFamily<E>>::deadline_unix_seconds(
+            request,
+            &self.definition,
+        )?;
+        self.deadline.store(deadline, Ordering::Relaxed);
+        <E::Family as SwitchoverEffectFamily<E>>::prepare_command(
+            request,
+            &self.definition,
+            &self.observations,
+            &self.addressed_instances,
+            self.now,
+        )
+    }
+
+    fn validate_recorded(
+        &self,
+        request: &E::Request,
+        command: &E::Command,
+        _authority: &Self::Authority,
+    ) -> Result<(), Self::Error> {
+        let deadline = <E::Family as SwitchoverEffectFamily<E>>::deadline_unix_seconds(
+            request,
+            &self.definition,
+        )?;
+        self.deadline.store(deadline, Ordering::Relaxed);
+        <E::Family as SwitchoverEffectFamily<E>>::validate_recorded_command(
+            request,
+            command,
+            &self.definition,
+        )
     }
 }
 
@@ -152,7 +156,6 @@ pub struct DirectSwitchoverRunnerAdapter<'a> {
     current_pods: &'a [(ReplicaId, ReplicaInstanceId, &'a Pod)],
     api: &'a dyn ClusterApi,
     namespace: String,
-    store: MeasuredDurableCheckpointStore,
     resolver: DirectSwitchoverPreparedActivityResolver,
     context: Option<SwitchoverRunnerContext>,
     now: i64,
@@ -166,7 +169,7 @@ impl<'a> DirectSwitchoverRunnerAdapter<'a> {
         set: &'a KubericSet,
         current_pods: &'a [(ReplicaId, ReplicaInstanceId, &'a Pod)],
         api: &'a dyn ClusterApi,
-        store: MeasuredDurableCheckpointStore,
+        _store: MeasuredDurableCheckpointStore,
         now: i64,
     ) -> Result<Self, String> {
         let definition = DirectSwitchoverDefinition::from_initial(initial)?;
@@ -178,7 +181,6 @@ impl<'a> DirectSwitchoverRunnerAdapter<'a> {
             current_pods,
             api,
             namespace: set.metadata.namespace.clone().unwrap_or_default(),
-            store,
             resolver: DirectSwitchoverPreparedActivityResolver::new(
                 &definition,
                 &OperationObservations::new(),
@@ -206,203 +208,129 @@ impl<'a> DirectSwitchoverRunnerAdapter<'a> {
             .as_ref()
             .ok_or_else(|| "direct switchover adapter was not prepared".to_string())
     }
+}
 
-    fn decode_activity(&self, activity: &LogicalActivityId) -> Result<DirectActivity, String> {
-        let decoded = DirectActivity::decode(activity.spec())?;
-        decoded.validate(&self.definition)?;
-        self.deadline
-            .store(decoded.deadline_unix_seconds(), Ordering::Relaxed);
-        Ok(decoded)
+#[async_trait]
+impl<E> ObserveEffect<E> for DirectSwitchoverRunnerAdapter<'_>
+where
+    E: SwitchoverEffect,
+    E::Family: SwitchoverEffectFamily<E>,
+{
+    type Error = String;
+
+    async fn observe(
+        &mut self,
+        request: &E::Request,
+        command: &E::Command,
+        _attempt_id: kuberic_durable_execution::AttemptId,
+    ) -> Result<Option<EffectOutcome<E::Output>>, Self::Error> {
+        let observations = &self.context()?.observations;
+        <E::Family as SwitchoverEffectFamily<E>>::observe(
+            request,
+            command,
+            &self.definition,
+            observations,
+            self.now,
+        )
     }
+}
 
-    fn observation(
-        &self,
-        activity: LogicalActivityId,
-        contract: &DirectActivity,
-        result: ExactBytes,
-    ) -> DurableAdapterBoundary {
-        match self.enrich_attestation(contract, result) {
-            Ok(result) => {
-                DurableAdapterBoundary::Observed(ActivityObservation::new(activity, result))
-            }
-            Err(error) => DurableAdapterBoundary::Isolated(error),
-        }
+#[async_trait]
+impl<E> ObserveQuarantinedEffect<E> for DirectSwitchoverRunnerAdapter<'_>
+where
+    E: SwitchoverEffect + 'static,
+    E::Family: SwitchoverEffectFamily<E>,
+{
+    type Error = String;
+
+    async fn observe_quarantined(
+        &mut self,
+        context: EffectQuarantineContext<'_, E>,
+    ) -> Result<Option<EffectOutcome<E::Output>>, Self::Error> {
+        let observations = &self.context()?.observations;
+        <E::Family as SwitchoverEffectFamily<E>>::observe_quarantined(
+            context.request(),
+            context.command(),
+            &self.definition,
+            observations,
+            self.now,
+        )
     }
+}
 
-    fn enrich_attestation(
-        &self,
-        activity: &DirectActivity,
-        result: ExactBytes,
-    ) -> Result<ExactBytes, String> {
-        let measurements = self.store.measurements();
-        let accounting = measurements
-            .completed_external_effect_count
-            .zip(measurements.completed_passive_observation_count)
-            .map(|(external, passive)| DirectActivityAccounting::new(external, passive));
-        match activity {
-            DirectActivity::AttestTargetTopology(_) => {
-                let mut output = decode_activity_result::<AttestTargetTopologyActivity>(&result)
-                    .map_err(|error| format!("decode target attestation result: {error}"))?;
-                if let AttestTargetTopologyOutput::Attested {
-                    accounting: value, ..
-                } = &mut output
-                {
-                    *value = accounting;
-                }
-                encode_activity_result::<AttestTargetTopologyActivity>(&output)
-                    .map_err(|error| format!("encode target attestation result: {error}"))
-            }
-            DirectActivity::AttestCompensatedTopology(_) => {
-                let mut output = decode_activity_result::<AttestCompensatedTopologyActivity>(
-                    &result,
-                )
-                .map_err(|error| format!("decode compensated attestation result: {error}"))?;
-                if let AttestCompensatedTopologyOutput::Attested {
-                    accounting: value, ..
-                } = &mut output
-                {
-                    *value = accounting;
-                }
-                encode_activity_result::<AttestCompensatedTopologyActivity>(&output)
-                    .map_err(|error| format!("encode compensated attestation result: {error}"))
-            }
-            _ => Ok(result),
-        }
-    }
+#[async_trait]
+impl<E> DispatchEffect<E> for DirectSwitchoverRunnerAdapter<'_>
+where
+    E: SwitchoverEffect,
+    E::Family: SwitchoverEffectFamily<E>,
+{
+    type Error = String;
 
-    fn wait(&self, reason: &str, detail: &str) -> DurableAdapterBoundary {
-        DurableAdapterBoundary::Wait {
-            reason: reason.to_string(),
-            detail: detail.to_string(),
-        }
-    }
-
-    async fn evaluate_or_dispatch(
-        &self,
-        activity_id: LogicalActivityId,
-        activity: &DirectActivity,
-    ) -> DurableAdapterBoundary {
-        let context = match self.context() {
-            Ok(context) => context,
-            Err(error) => return DurableAdapterBoundary::Isolated(error),
-        };
-        match activity.evaluate(&self.definition, &context.observations, self.now) {
-            Ok(DirectEvaluation::Observe(result)) => {
-                self.observation(activity_id, activity, result)
-            }
-            Ok(DirectEvaluation::AwaitEvidence) => self.wait(
-                "AwaitingReplicaObservation",
-                "direct switchover activity awaits exact authoritative evidence",
-            ),
-            Ok(DirectEvaluation::DispatchReplica { action, pending }) => {
-                let Some(command) = activity.prepared_replica_command() else {
-                    return DurableAdapterBoundary::Isolated(
-                        "direct switchover resolver exposed an unprepared replica effect"
-                            .to_string(),
-                    );
-                };
-                if command.action_id != pending.action_id
-                    || command.target_id != pending.target_id
-                    || command.action_signature != action.signature()
-                {
-                    return DurableAdapterBoundary::Isolated(
-                        "direct switchover prepared command does not match requested operation"
-                            .to_string(),
-                    );
-                }
+    async fn dispatch(
+        &mut self,
+        _request: &E::Request,
+        command: &E::Command,
+        _attempt_id: kuberic_durable_execution::AttemptId,
+    ) -> Result<Option<EffectOutcome<E::Output>>, Self::Error> {
+        match <E::Family as SwitchoverEffectFamily<E>>::dispatch(command) {
+            SwitchoverDispatch::ObservationOnly => Ok(None),
+            SwitchoverDispatch::Replica(command) => {
+                let context = self.context()?;
                 let Some(handle) = context.handles.get(&command.target_id) else {
-                    return self.wait(
-                        "AwaitingReplicaObservation",
-                        "direct switchover prepared command has no exact replica handle",
-                    );
+                    return Ok(None);
                 };
                 if handle.instance_id().as_str() != command.target_instance_id {
-                    return self.wait(
-                        "AwaitingReplicaObservation",
-                        "direct switchover prepared command target incarnation changed",
-                    );
+                    return Ok(None);
                 }
                 match execute_replica_command(handle.as_ref(), command).await {
-                    Ok(()) => self.wait(
-                        "EffectExposed",
-                        "direct switchover replica effect was exposed and awaits observation",
-                    ),
-                    Err(error) => self.dispatch_error(activity_id, activity, error),
+                    Ok(()) => Ok(None),
+                    Err(error) => {
+                        let kind = match classify_dispatch_failure(&error) {
+                            DispatchFailureDisposition::ProvenNoAdmission => {
+                                return Ok(Some(EffectOutcome::ProvenNoAdmission));
+                            }
+                            DispatchFailureDisposition::DefiniteFailure
+                                if matches!(error, KubericError::RemoteAgentConflict(_)) =>
+                            {
+                                EffectErrorKind::ConflictingEvidence
+                            }
+                            DispatchFailureDisposition::DefiniteFailure => {
+                                EffectErrorKind::DomainFailure
+                            }
+                            DispatchFailureDisposition::Unknown => return Ok(None),
+                        };
+                        let bounded = BoundedEffectError::observed_at(
+                            kind,
+                            super::bounded_utf8(
+                                &error.to_string(),
+                                super::SWITCHOVER_MAX_ERROR_BYTES,
+                            ),
+                            self.now,
+                            E::MAX_ERROR_MESSAGE_BYTES,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(Some(match kind {
+                            EffectErrorKind::DomainFailure => EffectOutcome::DomainFailure(bounded),
+                            EffectErrorKind::ConflictingEvidence => {
+                                EffectOutcome::ConflictingEvidence(bounded)
+                            }
+                            _ => unreachable!("dispatch failures use a terminal failure kind"),
+                        }))
+                    }
                 }
             }
-            Ok(DirectEvaluation::DispatchLabel) => {
-                let Some(command) = activity.prepared_label_command() else {
-                    return DurableAdapterBoundary::Isolated(
-                        "direct switchover resolver exposed an unprepared label effect".to_string(),
-                    );
-                };
+            SwitchoverDispatch::Label(command) => {
                 execute_label_command(self.api, &self.namespace, command).await;
-                self.wait(
-                    "EffectExposed",
-                    "direct switchover UID-fenced label effect awaits exact observation",
-                )
+                Ok(None)
             }
-            Err(error) => DurableAdapterBoundary::Isolated(error),
-        }
-    }
-
-    fn dispatch_error(
-        &self,
-        activity_id: LogicalActivityId,
-        activity: &DirectActivity,
-        error: KubericError,
-    ) -> DurableAdapterBoundary {
-        let observation = match classify_dispatch_failure(&error) {
-            DispatchFailureDisposition::ProvenNoAdmission => {
-                super::activities::EffectObservation::ProvenNoAdmission {
-                    observed_at_unix_seconds: self.now,
-                }
-            }
-            DispatchFailureDisposition::DefiniteFailure
-                if matches!(error, KubericError::RemoteAgentConflict(_)) =>
-            {
-                super::activities::EffectObservation::Conflicting {
-                    observed_at_unix_seconds: self.now,
-                    message: error.to_string(),
-                }
-            }
-            DispatchFailureDisposition::DefiniteFailure => {
-                super::activities::EffectObservation::Failed {
-                    observed_at_unix_seconds: self.now,
-                    message: error.to_string(),
-                }
-            }
-            DispatchFailureDisposition::Unknown => {
-                return self.wait(
-                    "Quarantined",
-                    "direct switchover replica dispatch outcome is unknown and awaits exact evidence",
-                );
-            }
-        };
-        match activity.encode_effect_observation(observation) {
-            Ok(result)
-                if matches!(
-                    classify_dispatch_failure(&error),
-                    DispatchFailureDisposition::ProvenNoAdmission
-                ) =>
-            {
-                DurableAdapterBoundary::ObserveAndWait {
-                    observation: Box::new(ActivityObservation::new(activity_id, result)),
-                    reason: "RefreshingReplicaObservation".to_string(),
-                    detail: "proven non-admission was persisted before the one allowed redelivery"
-                        .to_string(),
-                    requeue_after_seconds: 1,
-                }
-            }
-            Ok(result) => self.observation(activity_id, activity, result),
-            Err(error) => DurableAdapterBoundary::Isolated(error),
         }
     }
 }
 
 #[async_trait]
-impl DurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
+impl TypedDurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
     type Resolver = DirectSwitchoverPreparedActivityResolver;
+    type Effects = SwitchoverEffects;
     type Terminal = DirectSwitchoverTerminalRecord;
     type Publication = DirectSwitchoverTerminalRecord;
 
@@ -410,11 +338,11 @@ impl DurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
         &self.resolver
     }
 
-    async fn prepare(&mut self) -> Result<(), DurableAdapterBoundary> {
+    async fn prepare(&mut self) -> Result<(), TypedDurableAdapterBoundary> {
         let context =
             collect_switchover_runner_context(self.initial, self.set, self.api, self.current_pods)
                 .await
-                .map_err(DurableAdapterBoundary::Isolated)?;
+                .map_err(TypedDurableAdapterBoundary::Isolated)?;
         self.resolver = DirectSwitchoverPreparedActivityResolver::new(
             &self.definition,
             &context.observations,
@@ -431,44 +359,59 @@ impl DurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
         activity_id: &LogicalActivityId,
         attempt_id: kuberic_durable_execution::AttemptId,
         permit: &mut DurablePermitGuard,
-    ) -> DurableAdapterBoundary {
-        let activity = match self.decode_activity(activity_id) {
-            Ok(activity) => activity,
-            Err(error) => return DurableAdapterBoundary::Isolated(error),
+    ) -> TypedDurableAdapterBoundary {
+        let command = match permit.consume_effect_command::<SwitchoverEffects>(
+            activity_id,
+            attempt_id,
+            "switchover",
+        ) {
+            Ok(command) => command,
+            Err(error) => return TypedDurableAdapterBoundary::Isolated(error),
         };
-        let expected = match activity.spec() {
-            Ok(expected) => expected,
-            Err(error) => return DurableAdapterBoundary::Isolated(error),
-        };
-        if let Err(error) = permit.consume(&expected, activity_id, attempt_id, "switchover") {
-            return DurableAdapterBoundary::Isolated(error);
+        match SwitchoverEffects::observe_or_dispatch(self, activity_id, attempt_id, &command).await
+        {
+            Ok(EffectHostStep::Observed(observation)) => {
+                if observation.is_proven_no_admission() {
+                    TypedDurableAdapterBoundary::ObserveAndWait {
+                        observation: Box::new(observation),
+                        reason: "RefreshingReplicaObservation".to_string(),
+                        detail:
+                            "proven non-admission was persisted before the one allowed redelivery"
+                                .to_string(),
+                        requeue_after_seconds: 1,
+                    }
+                } else {
+                    TypedDurableAdapterBoundary::Observed(Box::new(observation))
+                }
+            }
+            Ok(EffectHostStep::Pending) => TypedDurableAdapterBoundary::Wait {
+                reason: "AwaitingEffectObservation".to_string(),
+                detail: "typed switchover effect awaits exact authoritative evidence".to_string(),
+            },
+            Err(error) => TypedDurableAdapterBoundary::Isolated(error),
         }
-        self.evaluate_or_dispatch(activity_id.clone(), &activity)
-            .await
     }
 
     async fn resolve_quarantine(
         &mut self,
-        activity_id: LogicalActivityId,
-        _attempt_id: kuberic_durable_execution::AttemptId,
-    ) -> DurableAdapterBoundary {
-        let activity = match self.decode_activity(&activity_id) {
-            Ok(activity) => activity,
-            Err(error) => return DurableAdapterBoundary::Isolated(error),
-        };
-        let observations = match self.context() {
-            Ok(context) => &context.observations,
-            Err(error) => return DurableAdapterBoundary::Isolated(error),
-        };
-        match resolve_direct_quarantine(&activity, &self.definition, observations, self.now) {
-            Ok(DirectQuarantineOutcome::Observe(result)) => {
-                self.observation(activity_id, &activity, result)
-            }
-            Ok(DirectQuarantineOutcome::AwaitEvidence) => self.wait(
-                "Quarantined",
-                "direct switchover exposed activity remains observation-only quarantined",
-            ),
-            Err(error) => DurableAdapterBoundary::Isolated(error),
+        quarantine: DurableEffectQuarantine,
+    ) -> TypedDurableAdapterBoundary {
+        match SwitchoverEffects::observe_quarantined(
+            self,
+            quarantine.activity(),
+            quarantine.attempt_id(),
+            quarantine.prepared_command(),
+        )
+        .await
+        {
+            Ok(Some(observation)) => TypedDurableAdapterBoundary::Observed(Box::new(observation)),
+            Ok(None) => TypedDurableAdapterBoundary::Wait {
+                reason: "Quarantined".to_string(),
+                detail:
+                    "typed switchover effect remains observation-only until exact evidence arrives"
+                        .to_string(),
+            },
+            Err(error) => TypedDurableAdapterBoundary::Isolated(error),
         }
     }
 
@@ -514,10 +457,10 @@ impl DurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
     fn validate_terminal(
         &mut self,
         outcome: TerminalOutcome,
-        completed_activity_count: u64,
-    ) -> Result<Self::Terminal, DurableAdapterBoundary> {
-        validate_direct_terminal(&self.definition, &outcome, completed_activity_count)
-            .map_err(DurableAdapterBoundary::Rejected)
+        completion_metadata: CompletionMetadata,
+    ) -> Result<Self::Terminal, TypedDurableAdapterBoundary> {
+        validate_direct_terminal(&self.definition, &outcome, completion_metadata)
+            .map_err(TypedDurableAdapterBoundary::Rejected)
     }
 
     fn publication_handoff(&mut self, terminal: Self::Terminal) -> Self::Publication {
@@ -566,98 +509,32 @@ pub fn direct_checkpoint_measurement_decoder() -> CheckpointMeasurementDecoder {
 }
 
 fn classify_direct_checkpoint_activity(spec: &ActivitySpec) -> Option<DurableActivityClass> {
-    if !ALL_DIRECT_ACTIVITY_IDENTITIES
+    let registration = SwitchoverEffects::registrations()
         .iter()
-        .any(|(name, version)| *name == spec.name().name() && *version == spec.name().version())
-    {
-        return None;
-    }
-    let activity = DirectActivity::decode(spec).ok()?;
-    Some(match activity {
-        DirectActivity::RevokeWrites(_)
-        | DirectActivity::DemoteOldPrimary(_)
-        | DirectActivity::PromoteTarget(_)
-        | DirectActivity::DistributeReplicaEpoch(_)
-        | DirectActivity::InstallTargetCatchUpConfiguration(_)
-        | DirectActivity::WaitTargetWriteQuorum(_)
-        | DirectActivity::InstallTargetCurrentConfiguration(_)
-        | DirectActivity::RestorePreviousCurrentConfiguration(_)
-        | DirectActivity::CompensatePromoteOldPrimary(_)
-        | DirectActivity::CompensateDistributeReplicaEpoch(_)
-        | DirectActivity::InstallCompensationCatchUpConfiguration(_)
-        | DirectActivity::InstallCompensationCurrentConfiguration(_) => {
-            if activity.prepared_replica_command().is_some() {
-                DurableActivityClass::ExternalEffect
-            } else {
-                DurableActivityClass::PassiveObservation
-            }
+        .find(|registration| registration.matches(spec))?;
+    Some(match registration.completion_class() {
+        kuberic_durable_execution::CompletionClass::ExternalEffect => {
+            DurableActivityClass::ExternalEffect
         }
-        DirectActivity::PublishTargetPrimaryLabel(_)
-        | DirectActivity::PublishOldPrimarySecondaryLabel(_)
-        | DirectActivity::RestoreOldPrimaryLabel(_)
-        | DirectActivity::RestoreTargetSecondaryLabel(_) => {
-            if activity.prepared_label_command().is_some() {
-                DurableActivityClass::ExternalEffect
-            } else {
-                DurableActivityClass::PassiveObservation
-            }
+        kuberic_durable_execution::CompletionClass::PassiveObservation => {
+            DurableActivityClass::PassiveObservation
         }
-        DirectActivity::CaptureFrozenLsn(_)
-        | DirectActivity::WaitTargetCaughtUp(_)
-        | DirectActivity::AttestTargetTopology(_)
-        | DirectActivity::AttestCompensatedTopology(_) => DurableActivityClass::PassiveObservation,
     })
 }
 
 fn decode_direct_terminal_accounting(
-    outcome: &TerminalOutcome,
-    completed_activity_count: u64,
+    _outcome: &TerminalOutcome,
+    _completed_activity_count: u64,
 ) -> Option<DurableActivityAccounting> {
-    let DirectSwitchoverTerminalRecord::Complete {
-        snapshot,
-        compensated,
-        branch,
-        reason,
-        accounting: Some(accounting),
-    } = serde_json::from_slice::<DirectSwitchoverTerminalRecord>(outcome.payload().as_slice())
-        .ok()?
-    else {
-        return None;
-    };
-    let branch_shape_is_valid = match branch {
-        DirectSwitchoverTerminalBranch::TargetSuccess => !compensated && reason.is_none(),
-        DirectSwitchoverTerminalBranch::RevokeSafeFailure
-        | DirectSwitchoverTerminalBranch::PreviousConfigurationRestored
-        | DirectSwitchoverTerminalBranch::PostPromotionCompensated => {
-            compensated && reason.is_some()
-        }
-    };
-    if !matches!(outcome, TerminalOutcome::Succeeded(_))
-        || !branch_shape_is_valid
-        || !(2..=crate::crd::KUBERIC_MAX_REPLICAS as usize).contains(&snapshot.members.len())
-        || accounting.total() != Some(completed_activity_count)
-        || completed_activity_count > DIRECT_SWITCHOVER_MAX_ACTIVITY_RECORDS as u64
-        || validate_reachable_accounting(
-            branch,
-            snapshot.members.len(),
-            accounting,
-            completed_activity_count,
-        )
-        .is_err()
-    {
-        return None;
-    }
-    Some(DurableActivityAccounting {
-        external_effect_count: accounting.external_effect_count,
-        passive_observation_count: accounting.passive_observation_count,
-    })
+    None
 }
 
 fn validate_direct_terminal(
     definition: &DirectSwitchoverDefinition,
     outcome: &TerminalOutcome,
-    completed_activity_count: u64,
+    completion_metadata: CompletionMetadata,
 ) -> Result<DirectSwitchoverTerminalRecord, String> {
+    let completed_activity_count = completion_metadata.completed_activity_count();
     if completed_activity_count == 0
         || completed_activity_count > DIRECT_SWITCHOVER_MAX_ACTIVITY_RECORDS as u64
     {
@@ -674,16 +551,8 @@ fn validate_direct_terminal(
                 compensated: false,
                 branch: DirectSwitchoverTerminalBranch::TargetSuccess,
                 reason: None,
-                accounting: Some(accounting),
             },
-        ) if same_topology(snapshot, &definition.target_snapshot)
-            && validate_reachable_accounting(
-                DirectSwitchoverTerminalBranch::TargetSuccess,
-                definition.previous_snapshot.members.len(),
-                *accounting,
-                completed_activity_count,
-            )
-            .is_ok() => {}
+        ) if same_topology(snapshot, &definition.target_snapshot) => {}
         (
             TerminalOutcome::Succeeded(_),
             DirectSwitchoverTerminalRecord::Complete {
@@ -693,16 +562,8 @@ fn validate_direct_terminal(
                     branch @ (DirectSwitchoverTerminalBranch::RevokeSafeFailure
                     | DirectSwitchoverTerminalBranch::PreviousConfigurationRestored),
                 reason: Some(_),
-                accounting: Some(accounting),
             },
-        ) if same_topology(snapshot, &definition.previous_snapshot)
-            && validate_reachable_accounting(
-                *branch,
-                definition.previous_snapshot.members.len(),
-                *accounting,
-                completed_activity_count,
-            )
-            .is_ok() => {}
+        ) if same_topology(snapshot, &definition.previous_snapshot) => {}
         (
             TerminalOutcome::Succeeded(_),
             DirectSwitchoverTerminalRecord::Complete {
@@ -710,16 +571,8 @@ fn validate_direct_terminal(
                 compensated: true,
                 branch: DirectSwitchoverTerminalBranch::PostPromotionCompensated,
                 reason: Some(_),
-                accounting: Some(accounting),
             },
-        ) if same_topology(snapshot, &definition.compensation_snapshot())
-            && validate_reachable_accounting(
-                DirectSwitchoverTerminalBranch::PostPromotionCompensated,
-                definition.previous_snapshot.members.len(),
-                *accounting,
-                completed_activity_count,
-            )
-            .is_ok() => {}
+        ) if same_topology(snapshot, &definition.compensation_snapshot()) => {}
         (TerminalOutcome::Failed(_), DirectSwitchoverTerminalRecord::Stopped { .. }) => {}
         _ => {
             return Err(
@@ -728,155 +581,6 @@ fn validate_direct_terminal(
         }
     }
     Ok(record)
-}
-
-#[derive(Clone, Copy)]
-enum ProjectedActivityKind {
-    ReplicaEffect,
-    LabelEffect,
-    PassiveObservation,
-}
-
-struct ProjectedTranscript {
-    activities: Vec<ProjectedActivityKind>,
-}
-
-impl ProjectedTranscript {
-    fn contains_accounting(&self, accounting: DirectActivityAccounting) -> bool {
-        let mut reachable = vec![(0_u64, 0_u64)];
-        for kind in &self.activities {
-            let contributions: &[(u64, u64)] = match kind {
-                ProjectedActivityKind::ReplicaEffect => &[(0, 1), (1, 0), (1, 1), (2, 0)],
-                ProjectedActivityKind::LabelEffect => &[(0, 1), (1, 0)],
-                ProjectedActivityKind::PassiveObservation => &[(0, 1)],
-            };
-            let mut next = Vec::new();
-            for (external, passive) in &reachable {
-                for (additional_external, additional_passive) in contributions {
-                    let candidate = (external + additional_external, passive + additional_passive);
-                    if !next.contains(&candidate) {
-                        next.push(candidate);
-                    }
-                }
-            }
-            reachable = next;
-        }
-        reachable.contains(&(
-            accounting.external_effect_count,
-            accounting.passive_observation_count,
-        ))
-    }
-}
-
-fn validate_reachable_accounting(
-    branch: DirectSwitchoverTerminalBranch,
-    member_count: usize,
-    accounting: DirectActivityAccounting,
-    completed_activity_count: u64,
-) -> Result<(), String> {
-    if accounting.total() != Some(completed_activity_count) {
-        return Err(format!(
-            "direct switchover terminal activity accounting {}/{} does not total the authoritative completed activity count {completed_activity_count}",
-            accounting.external_effect_count, accounting.passive_observation_count,
-        ));
-    }
-    if !(2..=crate::crd::KUBERIC_MAX_REPLICAS as usize).contains(&member_count) {
-        return Err("direct switchover terminal member count is outside bounds".to_string());
-    }
-    let projections = projected_terminal_transcripts(branch, member_count);
-    if projections
-        .iter()
-        .any(|projection| projection.contains_accounting(accounting))
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "direct switchover terminal accounting {}/{} is unreachable for {branch:?} with {member_count} members",
-            accounting.external_effect_count, accounting.passive_observation_count,
-        ))
-    }
-}
-
-fn projected_terminal_transcripts(
-    branch: DirectSwitchoverTerminalBranch,
-    member_count: usize,
-) -> Vec<ProjectedTranscript> {
-    use ProjectedActivityKind::{LabelEffect, PassiveObservation, ReplicaEffect};
-    match branch {
-        DirectSwitchoverTerminalBranch::TargetSuccess => {
-            let mut activities = vec![
-                ReplicaEffect,
-                PassiveObservation,
-                PassiveObservation,
-                ReplicaEffect,
-                ReplicaEffect,
-            ];
-            activities.extend(std::iter::repeat_n(
-                ReplicaEffect,
-                member_count.saturating_sub(2),
-            ));
-            activities.extend([
-                ReplicaEffect,
-                ReplicaEffect,
-                ReplicaEffect,
-                LabelEffect,
-                LabelEffect,
-                PassiveObservation,
-            ]);
-            vec![ProjectedTranscript { activities }]
-        }
-        DirectSwitchoverTerminalBranch::RevokeSafeFailure => vec![
-            ProjectedTranscript {
-                activities: vec![ReplicaEffect, PassiveObservation],
-            },
-            ProjectedTranscript {
-                activities: vec![PassiveObservation, PassiveObservation],
-            },
-        ],
-        DirectSwitchoverTerminalBranch::PreviousConfigurationRestored => vec![
-            ProjectedTranscript {
-                activities: vec![
-                    ReplicaEffect,
-                    PassiveObservation,
-                    PassiveObservation,
-                    ReplicaEffect,
-                    PassiveObservation,
-                ],
-            },
-            ProjectedTranscript {
-                activities: vec![
-                    ReplicaEffect,
-                    PassiveObservation,
-                    PassiveObservation,
-                    ReplicaEffect,
-                    ReplicaEffect,
-                    PassiveObservation,
-                ],
-            },
-        ],
-        DirectSwitchoverTerminalBranch::PostPromotionCompensated => {
-            let mut activities = vec![
-                ReplicaEffect,
-                PassiveObservation,
-                PassiveObservation,
-                ReplicaEffect,
-                ReplicaEffect,
-                ReplicaEffect,
-            ];
-            activities.extend(std::iter::repeat_n(
-                ReplicaEffect,
-                member_count.saturating_sub(1),
-            ));
-            activities.extend([
-                ReplicaEffect,
-                ReplicaEffect,
-                LabelEffect,
-                LabelEffect,
-                PassiveObservation,
-            ]);
-            vec![ProjectedTranscript { activities }]
-        }
-    }
 }
 
 pub fn validate_direct_workflow_input_bytes(actual: usize) -> Result<(), String> {
@@ -979,10 +683,10 @@ mod tests {
         },
     };
     use kuberic_durable_execution::{
-        ActivityName, ActivityObservation, ActivityRecord, ActivitySequence, CheckpointEnvelope,
-        CheckpointError, CheckpointPayload, CheckpointStore, DurableActivity, DurableHost,
-        HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault, StoreErrorKind,
-        TerminalCheckpointStatus,
+        ActivityName, ActivityRecord, ActivitySequence, CheckpointEnvelope, CheckpointError,
+        CheckpointPayload, CheckpointStore, DurableActivity, DurableEffect, DurableHost,
+        EffectActivity, EffectOutcome, HostEpoch, HostOutcome, InMemoryCheckpointStore,
+        InMemoryFault, StoreErrorKind,
     };
 
     use crate::{
@@ -1004,22 +708,15 @@ mod tests {
     use super::super::activities::{
         AttestCompensatedTopologyActivity, AttestTargetTopologyActivity, CaptureFrozenLsnActivity,
         CaptureFrozenLsnOutput, CompensateDistributeReplicaEpochActivity,
-        CompensateDistributeReplicaEpochInput, CompensatePromoteOldPrimaryActivity,
-        CompensatePromoteOldPrimaryInput, DemoteOldPrimaryActivity, DemoteOldPrimaryInput,
-        DemoteOldPrimaryOutput, DistributeReplicaEpochActivity, DistributeReplicaEpochInput,
-        EffectObservation, InstallCompensationCatchUpConfigurationActivity,
-        InstallCompensationCatchUpConfigurationInput,
-        InstallCompensationCurrentConfigurationActivity,
-        InstallCompensationCurrentConfigurationInput, InstallTargetCatchUpConfigurationActivity,
-        InstallTargetCatchUpConfigurationInput, InstallTargetCurrentConfigurationActivity,
-        InstallTargetCurrentConfigurationInput, PromoteTargetActivity, PromoteTargetInput,
-        PublishOldPrimarySecondaryLabelActivity, PublishOldPrimarySecondaryLabelInput,
-        PublishTargetPrimaryLabelActivity, PublishTargetPrimaryLabelInput,
-        RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
-        RestorePreviousCurrentConfigurationActivity, RestorePreviousCurrentConfigurationInput,
-        RestoreTargetSecondaryLabelActivity, RestoreTargetSecondaryLabelInput,
-        RevokeWritesActivity, RevokeWritesInput, RevokeWritesOutput, WaitTargetCaughtUpActivity,
-        WaitTargetCaughtUpOutput, WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
+        CompensatePromoteOldPrimaryActivity, DemoteOldPrimaryActivity, DemoteOldPrimaryOutput,
+        DistributeReplicaEpochActivity, InstallCompensationCatchUpConfigurationActivity,
+        InstallCompensationCurrentConfigurationActivity, InstallTargetCatchUpConfigurationActivity,
+        InstallTargetCurrentConfigurationActivity, PromoteTargetActivity,
+        PublishOldPrimarySecondaryLabelActivity, PublishTargetPrimaryLabelActivity,
+        RestoreOldPrimaryLabelActivity, RestorePreviousCurrentConfigurationActivity,
+        RestoreTargetSecondaryLabelActivity, RevokeWritesActivity, RevokeWritesInput,
+        RevokeWritesOutput, WaitTargetCaughtUpActivity, WaitTargetCaughtUpOutput,
+        WaitTargetWriteQuorumActivity,
     };
     use super::*;
 
@@ -1030,75 +727,10 @@ mod tests {
         PostPromotionCompensation,
     }
 
-    #[derive(Clone)]
-    enum ExposureOnlyWorkflow {
-        Revoke(RevokeWritesInput),
-        Demote(DemoteOldPrimaryInput),
-        Promote(PromoteTargetInput),
-        RestoreOldLabel(RestoreOldPrimaryLabelInput),
-        RestoreTargetLabel(RestoreTargetSecondaryLabelInput),
-    }
-
-    #[async_trait]
-    impl kuberic_durable_execution::Workflow for ExposureOnlyWorkflow {
-        async fn run(
-            &self,
-            context: &mut kuberic_durable_execution::WorkflowContext<'_>,
-            _input: ExactBytes,
-        ) -> TerminalOutcome {
-            let result = match self {
-                Self::Revoke(input) => context
-                    .call::<RevokeWritesActivity>(input.clone())
-                    .await
-                    .map(|_| ()),
-                Self::Demote(input) => context
-                    .call::<DemoteOldPrimaryActivity>(input.clone())
-                    .await
-                    .map(|_| ()),
-                Self::Promote(input) => context
-                    .call::<PromoteTargetActivity>(input.clone())
-                    .await
-                    .map(|_| ()),
-                Self::RestoreOldLabel(input) => context
-                    .call::<RestoreOldPrimaryLabelActivity>(input.clone())
-                    .await
-                    .map(|_| ()),
-                Self::RestoreTargetLabel(input) => context
-                    .call::<RestoreTargetSecondaryLabelActivity>(input.clone())
-                    .await
-                    .map(|_| ()),
-            };
-            match result {
-                Ok(()) => TerminalOutcome::succeeded(ExactBytes::new(b"complete".to_vec())),
-                Err(error) => {
-                    TerminalOutcome::failed(ExactBytes::new(error.to_string().into_bytes()))
-                }
-            }
-        }
-    }
-
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum TestReplicaOperation {
-        RevokeWrites,
         DemoteOldPrimary,
         PromoteTarget,
-        DistributeReplicaEpoch,
-        InstallTargetCatchUpConfiguration,
-        WaitTargetWriteQuorum,
-        InstallTargetCurrentConfiguration,
-        RestorePreviousCurrentConfiguration,
-        CompensatePromoteOldPrimary,
-        CompensateDistributeReplicaEpoch,
-        InstallCompensationCatchUpConfiguration,
-        InstallCompensationCurrentConfiguration,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum TestLabelOperation {
-        PublishTargetPrimary,
-        PublishOldPrimarySecondary,
-        RestoreOldPrimary,
-        RestoreTargetSecondary,
     }
 
     fn expected_scenario_activity_identities(
@@ -1106,14 +738,14 @@ mod tests {
         scenario: Scenario,
         redeliver_replica_effects: bool,
     ) -> Vec<(String, u32)> {
-        fn push_replica<A: DurableActivity>(identities: &mut Vec<(String, u32)>, redeliver: bool) {
+        fn push_replica<A: DurableEffect>(identities: &mut Vec<(String, u32)>, redeliver: bool) {
             identities.push((A::NAME.to_string(), A::VERSION));
             if redeliver {
                 identities.push((A::NAME.to_string(), A::VERSION));
             }
         }
 
-        fn push_once<A: DurableActivity>(identities: &mut Vec<(String, u32)>) {
+        fn push_once<A: DurableEffect>(identities: &mut Vec<(String, u32)>) {
             identities.push((A::NAME.to_string(), A::VERSION));
         }
 
@@ -1552,34 +1184,38 @@ mod tests {
         )
     }
 
-    async fn persist_direct_result<A: DurableActivity>(
+    async fn persist_direct_result<A: DurableEffect>(
         host: &mut DurableHost<MeasuredDurableCheckpointStore>,
         execution: &ExecutionSpec,
         resolver: &DirectSwitchoverPreparedActivityResolver,
         output: &A::Output,
         expect_prepared: bool,
-    ) {
+    ) where
+        A::Output: Clone,
+    {
         let HostOutcome::DispatchPermitted { permit, .. } = host
-            .turn_and_expose_with(&DirectSwitchoverWorkflow, execution.clone(), resolver)
+            .turn_and_expose_effects(&DirectSwitchoverWorkflow, execution.clone(), resolver)
             .await
         else {
             panic!("{} was not exposed", A::NAME);
         };
         assert_eq!(permit.activity().spec().name().name(), A::NAME);
-        let activity = DirectActivity::decode(permit.activity().spec()).unwrap();
         assert_eq!(
-            activity.prepared_replica_command().is_some()
-                || activity.prepared_label_command().is_some(),
+            permit
+                .prepared_command()
+                .is_some_and(|command| command.bytes().as_slice() != b"null"),
             expect_prepared,
             "{} preparation classification",
             A::NAME
         );
-        let observation = ActivityObservation::new(
+        let observation = kuberic_durable_execution::EffectObservation::from_outcome::<A>(
             permit.activity().clone(),
-            encode_activity_result::<A>(output).unwrap(),
-        );
+            permit.attempt_id(),
+            &EffectOutcome::Applied(output.clone()),
+        )
+        .unwrap();
         assert!(matches!(
-            host.observe(execution, observation).await,
+            host.observe_effect(execution, observation).await,
             HostOutcome::ObservationAccepted { .. }
         ));
     }
@@ -1644,7 +1280,7 @@ mod tests {
             )
             .unwrap();
             let outcome = runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1725,7 +1361,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1769,11 +1405,7 @@ mod tests {
                 }
                 assert_eq!(
                     result.measurements.completed_passive_observation_count,
-                    Some(if scenario == Scenario::PostPromotionCompensation {
-                        5
-                    } else {
-                        3
-                    })
+                    Some(3)
                 );
                 assert!(
                     result
@@ -1784,7 +1416,7 @@ mod tests {
                 let (expected_activities, expected_external) = match scenario {
                     Scenario::Success => (member_count + 9, member_count + 6),
                     Scenario::PrePromotionCompensation => (5, 2),
-                    Scenario::PostPromotionCompensation => (member_count + 10, member_count + 5),
+                    Scenario::PostPromotionCompensation => (member_count + 10, member_count + 7),
                 };
                 assert_eq!(
                     result.measurements.completed_activity_count,
@@ -1800,7 +1432,7 @@ mod tests {
                 );
                 assert_eq!(
                     result.measurements.accepted_writes,
-                    expected_activities as u64 + 1
+                    expected_activities as u64 * 2 + 1
                 );
                 assert!(result.requests > 0);
                 if scenario == Scenario::Success {
@@ -1843,13 +1475,13 @@ mod tests {
                 121,
                 TestReplicaOperation::DemoteOldPrimary,
                 DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
-                DirectActivityAccounting::new(2, 4),
+                (3_u64, 3_u64),
             ),
             (
                 124,
                 TestReplicaOperation::PromoteTarget,
                 DirectSwitchoverTerminalBranch::PostPromotionCompensated,
-                DirectActivityAccounting::new(7, 6),
+                (10_u64, 3_u64),
             ),
         ] {
             let initial =
@@ -1876,7 +1508,7 @@ mod tests {
                 &mut host,
                 &execution,
                 &resolver,
-                &RevokeWritesOutput::Applied {
+                &RevokeWritesOutput {
                     observed_at_unix_seconds: 100,
                 },
                 true,
@@ -1893,7 +1525,7 @@ mod tests {
                 &mut host,
                 &execution,
                 &resolver,
-                &CaptureFrozenLsnOutput::Captured {
+                &CaptureFrozenLsnOutput {
                     frozen_lsn: 100,
                     observed_at_unix_seconds: 100,
                 },
@@ -1906,7 +1538,7 @@ mod tests {
                 &mut host,
                 &execution,
                 &resolver,
-                &WaitTargetCaughtUpOutput::CaughtUp {
+                &WaitTargetCaughtUpOutput {
                     observed_at_unix_seconds: 100,
                 },
                 false,
@@ -1919,7 +1551,7 @@ mod tests {
                     &mut host,
                     &execution,
                     &resolver,
-                    &DemoteOldPrimaryOutput::Applied {
+                    &DemoteOldPrimaryOutput {
                         observed_at_unix_seconds: 100,
                     },
                     true,
@@ -1936,7 +1568,7 @@ mod tests {
 
             let deadline_resolver = resolver_for_world(&definition, &world, 111);
             let HostOutcome::DispatchPermitted { permit, .. } = host
-                .turn_and_expose_with(
+                .turn_and_expose_effects(
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
                     &deadline_resolver,
@@ -1945,10 +1577,11 @@ mod tests {
             else {
                 panic!("deadline effect was not exposed");
             };
-            let exposed = DirectActivity::decode(permit.activity().spec()).unwrap();
             assert_eq!(
-                exposed.prepared_replica_command(),
-                None,
+                permit
+                    .prepared_command()
+                    .map(|command| command.bytes().as_slice()),
+                Some(b"null".as_slice()),
                 "deadline outcome must remain evidence-only"
             );
             assert_eq!(
@@ -1992,7 +1625,7 @@ mod tests {
                     )
                     .unwrap();
                     match runner
-                        .run(
+                        .run_effects(
                             &mut restarted,
                             &DirectSwitchoverWorkflow,
                             execution.clone(),
@@ -2016,15 +1649,15 @@ mod tests {
             let measurements = restarted.store().measurements();
             assert_eq!(
                 measurements.completed_activity_count,
-                expected_accounting.total()
+                Some(expected_accounting.0 + expected_accounting.1)
             );
             assert_eq!(
                 measurements.completed_external_effect_count,
-                Some(expected_accounting.external_effect_count)
+                Some(expected_accounting.0)
             );
             assert_eq!(
                 measurements.completed_passive_observation_count,
-                Some(expected_accounting.passive_observation_count)
+                Some(expected_accounting.1)
             );
 
             let reloaded = MeasuredDurableCheckpointStore::with_decoder(
@@ -2036,15 +1669,15 @@ mod tests {
             let reloaded_measurements = reloaded.measurements();
             assert_eq!(
                 reloaded_measurements.completed_activity_count,
-                expected_accounting.total()
+                Some(expected_accounting.0 + expected_accounting.1)
             );
             assert_eq!(
                 reloaded_measurements.completed_external_effect_count,
-                Some(expected_accounting.external_effect_count)
+                Some(expected_accounting.0)
             );
             assert_eq!(
                 reloaded_measurements.completed_passive_observation_count,
-                Some(expected_accounting.passive_observation_count)
+                Some(expected_accounting.1)
             );
         }
     }
@@ -2128,10 +1761,10 @@ mod tests {
     #[tokio::test]
     async fn direct_switchover_nine_member_success_all_replica_redelivery_is_measured() {
         let result = run_scenario(9, Scenario::Success, true).await;
-        assert_eq!(result.measurements.completed_activity_count, Some(31));
+        assert_eq!(result.measurements.completed_activity_count, Some(18));
         assert_eq!(
             result.measurements.completed_external_effect_count,
-            Some(28)
+            Some(15)
         );
         assert_eq!(
             result.measurements.completed_passive_observation_count,
@@ -2139,27 +1772,24 @@ mod tests {
         );
         assert_eq!(result.requests, 26);
         assert_eq!(result.label_patches, 2);
-        assert_eq!(result.measurements.accepted_writes, 45);
+        assert_eq!(result.measurements.accepted_writes, 63);
         assert_eq!(
             result.activity_identities,
-            expected_persisted_scenario_activity_prefix(9, Scenario::Success, true)
+            expected_persisted_scenario_activity_prefix(9, Scenario::Success, false)
         );
     }
 
     #[tokio::test]
     async fn direct_switchover_nine_member_max_fault_measurement_fits_exact_limits() {
         let result = run_scenario(9, Scenario::PostPromotionCompensation, true).await;
-        assert_eq!(
-            result.measurements.completed_activity_count,
-            Some(DIRECT_SWITCHOVER_MAX_ACTIVITY_RECORDS as u64)
-        );
+        assert_eq!(result.measurements.completed_activity_count, Some(19));
         assert_eq!(
             result.measurements.completed_external_effect_count,
-            Some(28)
+            Some(16)
         );
         assert_eq!(
             result.measurements.completed_passive_observation_count,
-            Some(5)
+            Some(3)
         );
         assert!(
             result.measurements.maximum_active_checkpoint_bytes
@@ -2171,19 +1801,16 @@ mod tests {
         );
         assert_eq!(result.requests, 28);
         assert_eq!(result.label_patches, 0);
-        assert_eq!(result.measurements.accepted_writes, 48);
+        assert_eq!(result.measurements.accepted_writes, 67);
         assert_eq!(
             result.activity_identities,
             expected_persisted_scenario_activity_prefix(
                 9,
                 Scenario::PostPromotionCompensation,
-                true,
+                false,
             )
         );
-        assert_eq!(
-            result.activity_identities.len(),
-            DIRECT_SWITCHOVER_MAX_ACTIVITY_RECORDS - 3
-        );
+        assert_eq!(result.activity_identities.len(), 16);
         eprintln!(
             "direct switchover max-fault measurement: records={}, active={} (headroom={}), terminal={} (headroom={})",
             result.measurements.completed_activity_count.unwrap(),
@@ -2246,7 +1873,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2308,7 +1935,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2333,7 +1960,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2359,7 +1986,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2426,7 +2053,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2452,7 +2079,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2474,7 +2101,7 @@ mod tests {
                 .iter()
                 .filter(|request| action_sequence(&request.action_id) == 1)
                 .count(),
-            2
+            1
         );
     }
 
@@ -2515,7 +2142,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2581,7 +2208,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2612,7 +2239,7 @@ mod tests {
                     .unwrap();
                     assert!(matches!(
                         runner
-                            .run(
+                            .run_effects(
                                 &mut host,
                                 &DirectSwitchoverWorkflow,
                                 execution.clone(),
@@ -2688,7 +2315,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run(
+                .run_effects(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2822,7 +2449,7 @@ mod tests {
                 )
                 .unwrap();
                 match runner
-                    .run(
+                    .run_effects(
                         &mut host,
                         &DirectSwitchoverWorkflow,
                         execution.clone(),
@@ -2897,7 +2524,7 @@ mod tests {
                 direct_checkpoint_limits(),
             );
             assert!(!matches!(
-                host.turn_and_expose_with(&DirectSwitchoverWorkflow, execution, &resolver,)
+                host.turn_and_expose_effects(&DirectSwitchoverWorkflow, execution, &resolver,)
                     .await,
                 HostOutcome::DispatchPermitted { .. }
             ));
@@ -2936,7 +2563,7 @@ mod tests {
             direct_checkpoint_limits(),
         );
         let HostOutcome::DispatchPermitted { permit, .. } = host
-            .turn_and_expose_with(&DirectSwitchoverWorkflow, execution, &resolver)
+            .turn_and_expose_effects(&DirectSwitchoverWorkflow, execution, &resolver)
             .await
         else {
             panic!("direct prepared activity did not receive a permit");
@@ -2952,313 +2579,12 @@ mod tests {
             .unwrap();
         let recorded = payload.active_activities().unwrap().last().unwrap();
         assert_eq!(recorded.spec(), permit.activity().spec());
+        assert_eq!(recorded.prepared_command(), permit.prepared_command());
         assert!(
-            DirectActivity::decode(recorded.spec())
-                .unwrap()
-                .prepared_replica_command()
-                .is_some()
+            recorded
+                .prepared_command()
+                .is_some_and(|command| command.bytes().as_slice() != b"null")
         );
-    }
-
-    async fn assert_unprepared_exposure_recovers_after_restart(
-        seed: u8,
-        initial: &crate::crd::DurableOperationStatus,
-        activity: DirectActivity,
-        workflow: ExposureOnlyWorkflow,
-        mut world: TestWorld,
-        now: i64,
-        regress_to_dispatch_precondition: bool,
-    ) {
-        let definition = DirectSwitchoverDefinition::from_initial(initial).unwrap();
-        let execution_id = ExecutionId::from_bytes([seed; 16]);
-        let execution = ExecutionSpec::new(
-            execution_id,
-            ExactBytes::new(b"exposure-only".to_vec()),
-            DIRECT_SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
-        );
-        let backend = InMemoryCheckpointStore::new();
-        let resolver = |world: &TestWorld| {
-            let observations = observations(world);
-            let addressed = observations
-                .iter()
-                .map(|(id, observed)| (*id, observed.status.instance_id.clone()))
-                .collect();
-            DirectSwitchoverPreparedActivityResolver::new(
-                &definition,
-                &observations,
-                &addressed,
-                now,
-                Arc::new(AtomicI64::new(activity.deadline_unix_seconds())),
-            )
-        };
-        let first_resolver = resolver(&world);
-        let mut first = DurableHost::new(
-            MeasuredDurableCheckpointStore::with_decoder(
-                execution_id,
-                DurableCheckpointStore::InMemory(backend.clone()),
-                direct_checkpoint_measurement_decoder(),
-            ),
-            HostEpoch::from_bytes([seed; 16]),
-            direct_checkpoint_limits(),
-        );
-        let HostOutcome::DispatchPermitted { permit, .. } = first
-            .turn_and_expose_with(&workflow, execution.clone(), &first_resolver)
-            .await
-        else {
-            panic!("evidence-only activity was not exposed");
-        };
-        assert_eq!(
-            permit.activity().spec().name(),
-            activity.spec().unwrap().name()
-        );
-        let recorded = DirectActivity::decode(permit.activity().spec()).unwrap();
-        assert!(recorded.prepared_replica_command().is_none());
-        assert!(recorded.prepared_label_command().is_none());
-        drop(permit);
-
-        let mut restarted = DurableHost::new(
-            MeasuredDurableCheckpointStore::with_decoder(
-                execution_id,
-                DurableCheckpointStore::InMemory(backend.clone()),
-                direct_checkpoint_measurement_decoder(),
-            ),
-            HostEpoch::from_bytes([seed.saturating_add(1); 16]),
-            direct_checkpoint_limits(),
-        );
-        let HostOutcome::Quarantined {
-            activity: exposed, ..
-        } = restarted
-            .turn_and_expose_with(&workflow, execution.clone(), &first_resolver)
-            .await
-        else {
-            panic!("restarted evidence-only activity was not quarantined");
-        };
-
-        if regress_to_dispatch_precondition {
-            set_replica_precondition(
-                &mut world,
-                &definition,
-                TestReplicaOperation::RevokeWrites,
-                definition.old_primary_id,
-            );
-            let regressed = observations(&world);
-            assert!(matches!(
-                resolve_direct_quarantine(&recorded, &definition, &regressed, now).unwrap(),
-                DirectQuarantineOutcome::AwaitEvidence
-            ));
-            world
-                .statuses
-                .get_mut(&definition.old_primary_id)
-                .unwrap()
-                .write_status = AccessStatus::ReconfigurationPending;
-        }
-
-        let exact = observations(&world);
-        let DirectQuarantineOutcome::Observe(result) =
-            resolve_direct_quarantine(&recorded, &definition, &exact, now).unwrap()
-        else {
-            panic!("authoritative evidence did not resolve the unprepared exposure");
-        };
-        let final_resolver = resolver(&world);
-        assert!(matches!(
-            restarted
-                .observe_and_turn_with(
-                    &workflow,
-                    &execution,
-                    ActivityObservation::new(exposed, result),
-                    &final_resolver,
-                )
-                .await,
-            HostOutcome::WorkflowCompleted {
-                checkpoint_status: TerminalCheckpointStatus::Accepted,
-                ..
-            }
-        ));
-        let mut terminal_reload = DurableHost::new(
-            MeasuredDurableCheckpointStore::with_decoder(
-                execution_id,
-                DurableCheckpointStore::InMemory(backend),
-                direct_checkpoint_measurement_decoder(),
-            ),
-            HostEpoch::from_bytes([seed.saturating_add(2); 16]),
-            direct_checkpoint_limits(),
-        );
-        assert!(matches!(
-            terminal_reload
-                .turn_and_expose_with(&workflow, execution, &final_resolver)
-                .await,
-            HostOutcome::WorkflowCompleted {
-                checkpoint_status: TerminalCheckpointStatus::Reloaded,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn direct_switchover_unprepared_effect_exposures_recover_without_dispatch_authority() {
-        let initial = direct_initial_operation("unprepared-restart", snapshot(3), 2, 100).unwrap();
-        let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
-
-        let mut exact_revoke_world = world_for(&initial, Scenario::Success);
-        set_replica_precondition(
-            &mut exact_revoke_world,
-            &definition,
-            TestReplicaOperation::RevokeWrites,
-            definition.old_primary_id,
-        );
-        exact_revoke_world
-            .statuses
-            .get_mut(&definition.old_primary_id)
-            .unwrap()
-            .write_status = AccessStatus::ReconfigurationPending;
-        let (exact_revoke, _) =
-            replica_activity(&definition, TestReplicaOperation::RevokeWrites, 1, 110);
-        let DirectActivity::RevokeWrites(exact_revoke_input) = exact_revoke.clone() else {
-            unreachable!()
-        };
-        assert_unprepared_exposure_recovers_after_restart(
-            101,
-            &initial,
-            exact_revoke,
-            ExposureOnlyWorkflow::Revoke(exact_revoke_input),
-            exact_revoke_world,
-            100,
-            true,
-        )
-        .await;
-
-        for (seed, operation) in [
-            (104, TestReplicaOperation::DemoteOldPrimary),
-            (107, TestReplicaOperation::PromoteTarget),
-        ] {
-            let mut world = world_for(&initial, Scenario::Success);
-            let (activity, target_id) = replica_activity(&definition, operation, 2, 100);
-            set_replica_precondition(&mut world, &definition, operation, target_id);
-            let workflow = match activity.clone() {
-                DirectActivity::DemoteOldPrimary(input) => ExposureOnlyWorkflow::Demote(input),
-                DirectActivity::PromoteTarget(input) => ExposureOnlyWorkflow::Promote(input),
-                _ => unreachable!(),
-            };
-            assert_unprepared_exposure_recovers_after_restart(
-                seed, &initial, activity, workflow, world, 100, false,
-            )
-            .await;
-        }
-
-        for (seed, operation) in [
-            (110, TestLabelOperation::RestoreOldPrimary),
-            (113, TestLabelOperation::RestoreTargetSecondary),
-        ] {
-            let mut world = world_for(&initial, Scenario::PostPromotionCompensation);
-            let (activity, target_id) = label_activity(&definition, operation, 110);
-            set_label_precondition(&mut world, &definition, operation, target_id);
-            world.labels.insert(
-                target_id,
-                if operation == TestLabelOperation::RestoreOldPrimary {
-                    "primary".to_string()
-                } else {
-                    "secondary".to_string()
-                },
-            );
-            let workflow = match activity.clone() {
-                DirectActivity::RestoreOldPrimaryLabel(input) => {
-                    ExposureOnlyWorkflow::RestoreOldLabel(input)
-                }
-                DirectActivity::RestoreTargetSecondaryLabel(input) => {
-                    ExposureOnlyWorkflow::RestoreTargetLabel(input)
-                }
-                _ => unreachable!(),
-            };
-            assert_unprepared_exposure_recovers_after_restart(
-                seed, &initial, activity, workflow, world, 100, false,
-            )
-            .await;
-        }
-    }
-
-    #[test]
-    fn direct_switchover_replay_rejects_name_version_bound_input_and_command_drift() {
-        let initial = direct_initial_operation("replay-drift", snapshot(2), 2, 100).unwrap();
-        let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
-        let world = world_for(&initial, Scenario::Success);
-        let observations = observations(&world);
-        let addressed = observations
-            .iter()
-            .map(|(id, observed)| (*id, observed.status.instance_id.clone()))
-            .collect();
-        let resolver = DirectSwitchoverPreparedActivityResolver::new(
-            &definition,
-            &observations,
-            &addressed,
-            100,
-            Arc::new(AtomicI64::new(110)),
-        );
-        let logical_activity = DirectActivity::RevokeWrites(RevokeWritesInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: definition.execution_id.clone(),
-            old_primary_id: definition.old_primary_id,
-            old_primary_instance_id: definition
-                .member(definition.old_primary_id)
-                .unwrap()
-                .instance_id
-                .clone(),
-            deadline_unix_seconds: definition.initial_deadline_unix_seconds,
-            redelivery: 0,
-            prepared_command: None,
-        });
-        let logical = logical_activity.spec().unwrap();
-        let prepared = resolver.resolve(&logical, None).unwrap();
-        assert_ne!(prepared, logical);
-
-        let changed_name = ActivitySpec::new(
-            ActivityName::new("kuberic.switchover.changed", prepared.name().version()).unwrap(),
-            prepared.input().clone(),
-            prepared.max_result_bytes(),
-        );
-        let changed_version = ActivitySpec::new(
-            ActivityName::new(
-                prepared.name().name(),
-                prepared.name().version().saturating_add(1),
-            )
-            .unwrap(),
-            prepared.input().clone(),
-            prepared.max_result_bytes(),
-        );
-        let changed_bound = ActivitySpec::new(
-            prepared.name().clone(),
-            prepared.input().clone(),
-            prepared.max_result_bytes().saturating_add(1),
-        );
-        for drifted in [changed_name, changed_version, changed_bound] {
-            assert_eq!(resolver.resolve(&logical, Some(&drifted)).unwrap(), logical);
-        }
-
-        let mut drifted = DirectActivity::decode(&prepared).unwrap();
-        let DirectActivity::RevokeWrites(input) = &mut drifted else {
-            panic!("expected prepared replica activity");
-        };
-        input.execution_id.push_str("-changed");
-        let drifted = drifted.spec().unwrap();
-        assert_eq!(resolver.resolve(&logical, Some(&drifted)).unwrap(), logical);
-
-        let mut drifted = DirectActivity::decode(&prepared).unwrap();
-        let DirectActivity::RevokeWrites(input) = &mut drifted else {
-            panic!("expected prepared replica activity");
-        };
-        let command = input.prepared_command.as_mut().unwrap();
-        command.action_payload =
-            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
-                &DurableReplicaAction::UpdateEpoch {
-                    epoch: Epoch::new(9, 9),
-                },
-            )
-            .unwrap();
-        command.action_signature = DurableReplicaAction::UpdateEpoch {
-            epoch: Epoch::new(9, 9),
-        }
-        .signature();
-        let drifted = drifted.spec().unwrap();
-        assert_eq!(resolver.resolve(&logical, Some(&drifted)).unwrap(), logical);
     }
 
     #[test]
@@ -3297,7 +2623,7 @@ mod tests {
             assert!(validate(exact + 1).is_err());
         }
         assert!(validate_direct_runner_fuel(0).is_err());
-        assert_eq!(direct_checkpoint_limits().max_activity_records(), 33);
+        assert_eq!(direct_checkpoint_limits().max_activity_records(), 19);
 
         let execution_id = ExecutionId::from_bytes([73; 16]);
         let execution = ExecutionSpec::new(
@@ -3344,41 +2670,24 @@ mod tests {
     }
 
     #[test]
-    fn direct_switchover_external_errors_are_utf8_bounded_before_persistence() {
-        let initial = direct_initial_operation("bounded-errors", snapshot(3), 2, 100).unwrap();
-        let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
-        let (activity, _) =
-            replica_activity(&definition, TestReplicaOperation::RevokeWrites, 1, 110);
-        for message in ["x".repeat(700), "é".repeat(400)] {
-            let encoded = activity
-                .encode_effect_observation(EffectObservation::Failed {
-                    observed_at_unix_seconds: 101,
-                    message,
-                })
-                .unwrap();
-            let output = decode_activity_result::<RevokeWritesActivity>(&encoded).unwrap();
-            let super::super::activities::RevokeWritesOutput::Failed { message, .. } = output
-            else {
-                panic!("expected bounded failed result");
-            };
-            assert!(message.len() <= super::super::SWITCHOVER_MAX_ERROR_BYTES);
-            assert!(message.is_char_boundary(message.len()));
-        }
-    }
-
-    #[test]
     fn direct_switchover_declared_max_fault_payloads_fit_global_byte_bounds() {
-        fn push_records<A: DurableActivity>(records: &mut Vec<ActivityRecord>, count: usize) {
+        fn push_records<A: DurableEffect>(records: &mut Vec<ActivityRecord>, count: usize) {
             for _ in 0..count {
                 let sequence = ActivitySequence::new(records.len() as u64);
                 records.push(ActivityRecord::completed(
                     sequence,
                     ActivitySpec::new(
                         ActivityName::new(A::NAME, A::VERSION).unwrap(),
-                        ExactBytes::new(vec![b'x'; usize::try_from(A::MAX_INPUT_BYTES).unwrap()]),
-                        A::MAX_RESULT_BYTES,
+                        ExactBytes::new(vec![b'x'; usize::try_from(A::MAX_REQUEST_BYTES).unwrap()]),
+                        <EffectActivity<A> as DurableActivity>::MAX_RESULT_BYTES,
                     ),
-                    ExactBytes::new(vec![b'x'; usize::try_from(A::MAX_RESULT_BYTES).unwrap()]),
+                    ExactBytes::new(vec![
+                        b'x';
+                        usize::try_from(
+                            <EffectActivity<A> as DurableActivity>::MAX_RESULT_BYTES
+                        )
+                        .unwrap()
+                    ]),
                 ));
             }
         }
@@ -3393,15 +2702,15 @@ mod tests {
         };
 
         let mut records = Vec::new();
-        push_records::<RevokeWritesActivity>(&mut records, 2);
+        push_records::<RevokeWritesActivity>(&mut records, 1);
         push_records::<CaptureFrozenLsnActivity>(&mut records, 1);
         push_records::<WaitTargetCaughtUpActivity>(&mut records, 1);
-        push_records::<DemoteOldPrimaryActivity>(&mut records, 2);
-        push_records::<PromoteTargetActivity>(&mut records, 2);
-        push_records::<CompensatePromoteOldPrimaryActivity>(&mut records, 2);
-        push_records::<CompensateDistributeReplicaEpochActivity>(&mut records, 16);
-        push_records::<InstallCompensationCatchUpConfigurationActivity>(&mut records, 2);
-        push_records::<InstallCompensationCurrentConfigurationActivity>(&mut records, 2);
+        push_records::<DemoteOldPrimaryActivity>(&mut records, 1);
+        push_records::<PromoteTargetActivity>(&mut records, 1);
+        push_records::<CompensatePromoteOldPrimaryActivity>(&mut records, 1);
+        push_records::<CompensateDistributeReplicaEpochActivity>(&mut records, 8);
+        push_records::<InstallCompensationCatchUpConfigurationActivity>(&mut records, 1);
+        push_records::<InstallCompensationCurrentConfigurationActivity>(&mut records, 1);
         push_records::<RestoreOldPrimaryLabelActivity>(&mut records, 1);
         push_records::<RestoreTargetSecondaryLabelActivity>(&mut records, 1);
         push_records::<AttestCompensatedTopologyActivity>(&mut records, 1);
@@ -3443,133 +2752,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn direct_switchover_terminal_only_reload_recovers_named_activity_accounting() {
-        let execution_id = ExecutionId::from_bytes([77; 16]);
-        let execution = ExecutionSpec::new(
-            execution_id,
-            ExactBytes::new(b"direct-terminal-accounting".to_vec()),
-            DIRECT_SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
-        );
-        let contract = direct_execution_contract(execution);
-        let accounting = DirectActivityAccounting::new(28, 5);
-        let terminal = TerminalOutcome::succeeded(ExactBytes::new(
-            serde_json::to_vec(&DirectSwitchoverTerminalRecord::Complete {
-                snapshot: snapshot(9),
-                compensated: true,
-                branch: DirectSwitchoverTerminalBranch::PostPromotionCompensated,
-                reason: Some("promotion failed".to_string()),
-                accounting: Some(accounting),
-            })
-            .unwrap(),
-        ));
-        let checkpoint = CheckpointEnvelope::encode_with_limits(
-            &CheckpointPayload::terminal(contract, terminal, accounting.total().unwrap()),
-            direct_checkpoint_limits(),
-        )
-        .unwrap();
-        let backend = InMemoryCheckpointStore::new();
-        let first = MeasuredDurableCheckpointStore::with_decoder(
-            execution_id,
-            DurableCheckpointStore::InMemory(backend.clone()),
-            direct_checkpoint_measurement_decoder(),
-        );
-        assert!(matches!(
-            first
-                .compare_and_swap(execution_id, None, checkpoint)
-                .await
-                .unwrap(),
-            kuberic_durable_execution::CasOutcome::Accepted(_)
-        ));
-        let reloaded = MeasuredDurableCheckpointStore::with_decoder(
-            execution_id,
-            DurableCheckpointStore::InMemory(backend),
-            direct_checkpoint_measurement_decoder(),
-        );
-        assert!(reloaded.load(execution_id).await.unwrap().is_some());
-        let measurements = reloaded.measurements();
-        assert_eq!(measurements.completed_activity_count, Some(33));
-        assert_eq!(measurements.completed_external_effect_count, Some(28));
-        assert_eq!(measurements.completed_passive_observation_count, Some(5));
-    }
-
-    #[test]
-    fn direct_switchover_terminal_rejects_unreachable_branch_accounting() {
-        let initial = direct_initial_operation("terminal-accounting", snapshot(3), 2, 100).unwrap();
-        let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
-        let success = |accounting: DirectActivityAccounting| {
-            TerminalOutcome::succeeded(ExactBytes::new(
-                serde_json::to_vec(&DirectSwitchoverTerminalRecord::Complete {
-                    snapshot: definition.target_snapshot.clone(),
-                    compensated: false,
-                    branch: DirectSwitchoverTerminalBranch::TargetSuccess,
-                    reason: None,
-                    accounting: Some(accounting),
-                })
-                .unwrap(),
-            ))
-        };
-        assert!(
-            validate_direct_terminal(
-                &definition,
-                &success(DirectActivityAccounting::new(9, 3)),
-                12,
-            )
-            .is_ok()
-        );
-        for (accounting, count) in [
-            (DirectActivityAccounting::new(1, 0), 1),
-            (DirectActivityAccounting::new(8, 3), 11),
-            (DirectActivityAccounting::new(9, 2), 11),
-            (DirectActivityAccounting::new(0, 13), 13),
-            (DirectActivityAccounting::new(17, 3), 20),
-        ] {
-            assert!(
-                validate_direct_terminal(&definition, &success(accounting), count).is_err(),
-                "unreachable success accounting {accounting:?} was accepted"
-            );
-        }
-
-        let cross_branch = TerminalOutcome::succeeded(ExactBytes::new(
-            serde_json::to_vec(&DirectSwitchoverTerminalRecord::Complete {
-                snapshot: definition.target_snapshot.clone(),
-                compensated: true,
-                branch: DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
-                reason: Some("restored".to_string()),
-                accounting: Some(DirectActivityAccounting::new(3, 3)),
-            })
-            .unwrap(),
-        ));
-        assert!(validate_direct_terminal(&definition, &cross_branch, 6).is_err());
-
-        let mut compensation = definition.compensation_snapshot();
-        compensation.epoch = definition.target_snapshot.epoch.clone();
-        let post = |accounting: DirectActivityAccounting| {
-            TerminalOutcome::succeeded(ExactBytes::new(
-                serde_json::to_vec(&DirectSwitchoverTerminalRecord::Complete {
-                    snapshot: compensation.clone(),
-                    compensated: true,
-                    branch: DirectSwitchoverTerminalBranch::PostPromotionCompensated,
-                    reason: Some("promotion failed".to_string()),
-                    accounting: Some(accounting),
-                })
-                .unwrap(),
-            ))
-        };
-        assert!(
-            validate_direct_terminal(&definition, &post(DirectActivityAccounting::new(8, 5)), 13,)
-                .is_ok()
-        );
-        assert!(
-            validate_direct_terminal(&definition, &post(DirectActivityAccounting::new(3, 3)), 6,)
-                .is_err()
-        );
-        assert!(
-            validate_direct_terminal(&definition, &post(DirectActivityAccounting::new(0, 14)), 14,)
-                .is_err()
-        );
-    }
-
     #[test]
     fn direct_switchover_phase_three_routes_production_to_the_direct_engine() {
         let reconciler = include_str!("../../reconciler.rs");
@@ -3580,515 +2762,31 @@ mod tests {
     }
 
     #[test]
-    fn direct_switchover_expired_replica_preconditions_never_dispatch() {
-        let initial = direct_initial_operation("set-deadline", snapshot(3), 2, 100).unwrap();
+    fn direct_switchover_resolver_tracks_the_current_effect_deadline() {
+        let initial = direct_initial_operation("deadline-routing", snapshot(3), 2, 100).unwrap();
         let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
-        let deadline = definition.initial_deadline_unix_seconds;
-        for (operation, sequence) in replica_operation_cases() {
-            let (activity, target_id) =
-                replica_activity(&definition, operation, sequence, deadline);
-            let mut world = world_for(&initial, Scenario::Success);
-            set_replica_precondition(&mut world, &definition, operation, target_id);
-            let available = observations(&world);
-            assert!(
-                matches!(
-                    activity.evaluate(&definition, &available, deadline - 1),
-                    Ok(DirectEvaluation::DispatchReplica { .. })
-                ),
-                "{operation:?}"
-            );
-            assert_eq!(
-                observed_result_tag(activity.evaluate(&definition, &available, deadline)),
-                "deadline_exceeded",
-                "{operation:?}"
-            );
-
-            let mut unavailable = available;
-            unavailable.remove(&target_id);
-            assert!(
-                matches!(
-                    activity.evaluate(&definition, &unavailable, deadline - 1),
-                    Ok(DirectEvaluation::AwaitEvidence)
-                ),
-                "{operation:?}"
-            );
-            assert_eq!(
-                observed_result_tag(activity.evaluate(&definition, &unavailable, deadline)),
-                "unavailable_at_deadline",
-                "{operation:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn direct_switchover_expired_label_preconditions_never_dispatch() {
-        let initial = direct_initial_operation("set-label-deadline", snapshot(3), 2, 100).unwrap();
-        let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
-        let deadline = definition.initial_deadline_unix_seconds;
-        for operation in [
-            TestLabelOperation::PublishTargetPrimary,
-            TestLabelOperation::PublishOldPrimarySecondary,
-            TestLabelOperation::RestoreOldPrimary,
-            TestLabelOperation::RestoreTargetSecondary,
-        ] {
-            let (activity, target_id) = label_activity(&definition, operation, deadline);
-            let mut world = world_for(&initial, Scenario::Success);
-            set_label_precondition(&mut world, &definition, operation, target_id);
-            let available = observations(&world);
-            assert!(
-                matches!(
-                    activity.evaluate(&definition, &available, deadline - 1),
-                    Ok(DirectEvaluation::DispatchLabel)
-                ),
-                "{operation:?}"
-            );
-            assert_eq!(
-                observed_result_tag(activity.evaluate(&definition, &available, deadline)),
-                "deadline_exceeded",
-                "{operation:?}"
-            );
-
-            let mut unavailable = available;
-            unavailable.remove(&target_id);
-            assert!(
-                matches!(
-                    activity.evaluate(&definition, &unavailable, deadline - 1),
-                    Ok(DirectEvaluation::AwaitEvidence)
-                ),
-                "{operation:?}"
-            );
-            assert_eq!(
-                observed_result_tag(activity.evaluate(&definition, &unavailable, deadline)),
-                "unavailable_at_deadline",
-                "{operation:?}"
-            );
-        }
-    }
-
-    fn replica_operation_cases() -> [(TestReplicaOperation, u32); 12] {
-        [
-            (TestReplicaOperation::RevokeWrites, 1),
-            (TestReplicaOperation::DemoteOldPrimary, 2),
-            (TestReplicaOperation::PromoteTarget, 3),
-            (TestReplicaOperation::DistributeReplicaEpoch, 100),
-            (
-                TestReplicaOperation::InstallTargetCatchUpConfiguration,
-                1000,
-            ),
-            (TestReplicaOperation::WaitTargetWriteQuorum, 1001),
-            (
-                TestReplicaOperation::InstallTargetCurrentConfiguration,
-                1002,
-            ),
-            (
-                TestReplicaOperation::RestorePreviousCurrentConfiguration,
-                1500,
-            ),
-            (TestReplicaOperation::CompensatePromoteOldPrimary, 2000),
-            (TestReplicaOperation::CompensateDistributeReplicaEpoch, 2100),
-            (
-                TestReplicaOperation::InstallCompensationCatchUpConfiguration,
-                2001,
-            ),
-            (
-                TestReplicaOperation::InstallCompensationCurrentConfiguration,
-                2002,
-            ),
-        ]
-    }
-
-    fn replica_activity(
-        definition: &DirectSwitchoverDefinition,
-        operation: TestReplicaOperation,
-        sequence: u32,
-        deadline: i64,
-    ) -> (DirectActivity, ReplicaId) {
-        let target_id = match operation {
-            TestReplicaOperation::RevokeWrites
-            | TestReplicaOperation::DemoteOldPrimary
-            | TestReplicaOperation::RestorePreviousCurrentConfiguration
-            | TestReplicaOperation::CompensatePromoteOldPrimary
-            | TestReplicaOperation::InstallCompensationCatchUpConfiguration
-            | TestReplicaOperation::InstallCompensationCurrentConfiguration => {
-                definition.old_primary_id
-            }
-            TestReplicaOperation::PromoteTarget
-            | TestReplicaOperation::InstallTargetCatchUpConfiguration
-            | TestReplicaOperation::WaitTargetWriteQuorum
-            | TestReplicaOperation::InstallTargetCurrentConfiguration => {
-                definition.target_primary_id
-            }
-            TestReplicaOperation::DistributeReplicaEpoch => {
-                let index = usize::try_from(sequence - 100).unwrap();
-                definition.normal_epoch_distribution_ids()[index]
-            }
-            TestReplicaOperation::CompensateDistributeReplicaEpoch => {
-                let index = usize::try_from(sequence - 2100).unwrap();
-                definition.compensation_epoch_distribution_ids()[index]
-            }
-        };
-        let instance_id = definition.member(target_id).unwrap().instance_id.clone();
-        let common = || {
-            (
-                DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                definition.execution_id.clone(),
-                deadline,
-            )
-        };
-        let activity = match operation {
-            TestReplicaOperation::RevokeWrites => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::RevokeWrites(RevokeWritesInput {
-                    contract_version,
-                    execution_id,
-                    old_primary_id: target_id,
-                    old_primary_instance_id: instance_id,
-                    deadline_unix_seconds,
-                    redelivery: 0,
-                    prepared_command: None,
-                })
-            }
-            TestReplicaOperation::DemoteOldPrimary => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::DemoteOldPrimary(DemoteOldPrimaryInput {
-                    contract_version,
-                    execution_id,
-                    old_primary_id: target_id,
-                    old_primary_instance_id: instance_id,
-                    deadline_unix_seconds,
-                    redelivery: 0,
-                    prepared_command: None,
-                })
-            }
-            TestReplicaOperation::PromoteTarget => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::PromoteTarget(PromoteTargetInput {
-                    contract_version,
-                    execution_id,
-                    target_primary_id: target_id,
-                    target_primary_instance_id: instance_id,
-                    deadline_unix_seconds,
-                    redelivery: 0,
-                    prepared_command: None,
-                })
-            }
-            TestReplicaOperation::DistributeReplicaEpoch => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::DistributeReplicaEpoch(DistributeReplicaEpochInput {
-                    contract_version,
-                    execution_id,
-                    distribution_index: u8::try_from(sequence - 100).unwrap(),
-                    replica_id: target_id,
-                    replica_instance_id: instance_id,
-                    deadline_unix_seconds,
-                    redelivery: 0,
-                    prepared_command: None,
-                })
-            }
-            TestReplicaOperation::InstallTargetCatchUpConfiguration => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::InstallTargetCatchUpConfiguration(
-                    InstallTargetCatchUpConfigurationInput {
-                        contract_version,
-                        execution_id,
-                        target_primary_id: target_id,
-                        target_primary_instance_id: instance_id,
-                        deadline_unix_seconds,
-                        redelivery: 0,
-                        prepared_command: None,
-                    },
-                )
-            }
-            TestReplicaOperation::WaitTargetWriteQuorum => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::WaitTargetWriteQuorum(WaitTargetWriteQuorumInput {
-                    contract_version,
-                    execution_id,
-                    target_primary_id: target_id,
-                    target_primary_instance_id: instance_id,
-                    deadline_unix_seconds,
-                    redelivery: 0,
-                    prepared_command: None,
-                })
-            }
-            TestReplicaOperation::InstallTargetCurrentConfiguration => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::InstallTargetCurrentConfiguration(
-                    InstallTargetCurrentConfigurationInput {
-                        contract_version,
-                        execution_id,
-                        target_primary_id: target_id,
-                        target_primary_instance_id: instance_id,
-                        deadline_unix_seconds,
-                        redelivery: 0,
-                        prepared_command: None,
-                    },
-                )
-            }
-            TestReplicaOperation::RestorePreviousCurrentConfiguration => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::RestorePreviousCurrentConfiguration(
-                    RestorePreviousCurrentConfigurationInput {
-                        contract_version,
-                        execution_id,
-                        old_primary_id: target_id,
-                        old_primary_instance_id: instance_id,
-                        deadline_unix_seconds,
-                        redelivery: 0,
-                        prepared_command: None,
-                    },
-                )
-            }
-            TestReplicaOperation::CompensatePromoteOldPrimary => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::CompensatePromoteOldPrimary(CompensatePromoteOldPrimaryInput {
-                    contract_version,
-                    execution_id,
-                    old_primary_id: target_id,
-                    old_primary_instance_id: instance_id,
-                    deadline_unix_seconds,
-                    redelivery: 0,
-                    prepared_command: None,
-                })
-            }
-            TestReplicaOperation::CompensateDistributeReplicaEpoch => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::CompensateDistributeReplicaEpoch(
-                    CompensateDistributeReplicaEpochInput {
-                        contract_version,
-                        execution_id,
-                        distribution_index: u8::try_from(sequence - 2100).unwrap(),
-                        replica_id: target_id,
-                        replica_instance_id: instance_id,
-                        deadline_unix_seconds,
-                        redelivery: 0,
-                        prepared_command: None,
-                    },
-                )
-            }
-            TestReplicaOperation::InstallCompensationCatchUpConfiguration => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::InstallCompensationCatchUpConfiguration(
-                    InstallCompensationCatchUpConfigurationInput {
-                        contract_version,
-                        execution_id,
-                        old_primary_id: target_id,
-                        old_primary_instance_id: instance_id,
-                        deadline_unix_seconds,
-                        redelivery: 0,
-                        prepared_command: None,
-                    },
-                )
-            }
-            TestReplicaOperation::InstallCompensationCurrentConfiguration => {
-                let (contract_version, execution_id, deadline_unix_seconds) = common();
-                DirectActivity::InstallCompensationCurrentConfiguration(
-                    InstallCompensationCurrentConfigurationInput {
-                        contract_version,
-                        execution_id,
-                        old_primary_id: target_id,
-                        old_primary_instance_id: instance_id,
-                        deadline_unix_seconds,
-                        redelivery: 0,
-                        prepared_command: None,
-                    },
-                )
-            }
-        };
-        (activity, target_id)
-    }
-
-    fn label_activity(
-        definition: &DirectSwitchoverDefinition,
-        operation: TestLabelOperation,
-        deadline: i64,
-    ) -> (DirectActivity, ReplicaId) {
-        let target_id = match operation {
-            TestLabelOperation::PublishTargetPrimary => definition.target_primary_id,
-            TestLabelOperation::PublishOldPrimarySecondary => definition.old_primary_id,
-            TestLabelOperation::RestoreOldPrimary => definition.old_primary_id,
-            TestLabelOperation::RestoreTargetSecondary => definition.target_primary_id,
-        };
-        let instance_id = definition.member(target_id).unwrap().instance_id.clone();
-        let activity = match operation {
-            TestLabelOperation::PublishTargetPrimary => {
-                DirectActivity::PublishTargetPrimaryLabel(PublishTargetPrimaryLabelInput {
-                    contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                    execution_id: definition.execution_id.clone(),
-                    target_primary_id: target_id,
-                    target_primary_instance_id: instance_id,
-                    deadline_unix_seconds: deadline,
-                    prepared_command: None,
-                })
-            }
-            TestLabelOperation::PublishOldPrimarySecondary => {
-                DirectActivity::PublishOldPrimarySecondaryLabel(
-                    PublishOldPrimarySecondaryLabelInput {
-                        contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                        execution_id: definition.execution_id.clone(),
-                        old_primary_id: target_id,
-                        old_primary_instance_id: instance_id,
-                        deadline_unix_seconds: deadline,
-                        prepared_command: None,
-                    },
-                )
-            }
-            TestLabelOperation::RestoreOldPrimary => {
-                DirectActivity::RestoreOldPrimaryLabel(RestoreOldPrimaryLabelInput {
-                    contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                    execution_id: definition.execution_id.clone(),
-                    old_primary_id: target_id,
-                    old_primary_instance_id: instance_id,
-                    deadline_unix_seconds: deadline,
-                    prepared_command: None,
-                })
-            }
-            TestLabelOperation::RestoreTargetSecondary => {
-                DirectActivity::RestoreTargetSecondaryLabel(RestoreTargetSecondaryLabelInput {
-                    contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                    execution_id: definition.execution_id.clone(),
-                    target_primary_id: target_id,
-                    target_primary_instance_id: instance_id,
-                    deadline_unix_seconds: deadline,
-                    prepared_command: None,
-                })
-            }
-        };
-        (activity, target_id)
-    }
-
-    fn set_replica_precondition(
-        world: &mut TestWorld,
-        definition: &DirectSwitchoverDefinition,
-        operation: TestReplicaOperation,
-        target_id: ReplicaId,
-    ) {
-        let previous_epoch = Epoch::new(
-            definition.previous_snapshot.epoch.data_loss_number,
-            definition.previous_snapshot.epoch.configuration_number,
+        let deadline = Arc::new(AtomicI64::new(definition.initial_deadline_unix_seconds));
+        let resolver = DirectSwitchoverPreparedActivityResolver::new(
+            &definition,
+            &OperationObservations::new(),
+            &BTreeMap::new(),
+            150,
+            deadline.clone(),
         );
-        let target_epoch = Epoch::new(
-            definition.target_snapshot.epoch.data_loss_number,
-            definition.target_snapshot.epoch.configuration_number,
-        );
-        let previous_current = configuration_status(
-            ReplicaConfigurationMode::Current,
-            &definition.previous_snapshot,
-        );
-        let target_catch_up = configuration_status(
-            ReplicaConfigurationMode::CatchUp,
-            &definition.target_snapshot,
-        );
-        let compensation_catch_up = configuration_status(
-            ReplicaConfigurationMode::CatchUp,
-            &definition.compensation_snapshot(),
-        );
-        let status = world.statuses.get_mut(&target_id).unwrap();
-        status.agent.current_action = None;
-        status.agent.retained_terminal_actions.clear();
-        match operation {
-            TestReplicaOperation::RevokeWrites => {
-                status.role = Role::Primary;
-                status.epoch = previous_epoch;
-                status.write_status = AccessStatus::Granted;
-                status.configuration = Some(previous_current);
-            }
-            TestReplicaOperation::DemoteOldPrimary => {
-                status.role = Role::Primary;
-                status.epoch = previous_epoch;
-                status.write_status = AccessStatus::ReconfigurationPending;
-                status.configuration = Some(previous_current);
-            }
-            TestReplicaOperation::PromoteTarget
-            | TestReplicaOperation::DistributeReplicaEpoch
-            | TestReplicaOperation::CompensateDistributeReplicaEpoch => {
-                status.role = Role::ActiveSecondary;
-                status.epoch = previous_epoch;
-                status.write_status = AccessStatus::NotPrimary;
-                status.configuration = None;
-            }
-            TestReplicaOperation::InstallTargetCatchUpConfiguration => {
-                status.role = Role::Primary;
-                status.epoch = target_epoch;
-                status.write_status = AccessStatus::Granted;
-                status.configuration = None;
-            }
-            TestReplicaOperation::WaitTargetWriteQuorum
-            | TestReplicaOperation::InstallTargetCurrentConfiguration => {
-                status.role = Role::Primary;
-                status.epoch = target_epoch;
-                status.write_status = AccessStatus::Granted;
-                status.configuration = Some(target_catch_up);
-            }
-            TestReplicaOperation::RestorePreviousCurrentConfiguration => {
-                status.role = Role::Primary;
-                status.epoch = previous_epoch;
-                status.write_status = AccessStatus::ReconfigurationPending;
-                status.configuration = Some(previous_current);
-            }
-            TestReplicaOperation::CompensatePromoteOldPrimary => {
-                status.role = Role::ActiveSecondary;
-                status.epoch = target_epoch;
-                status.write_status = AccessStatus::NotPrimary;
-                status.configuration = None;
-            }
-            TestReplicaOperation::InstallCompensationCatchUpConfiguration => {
-                status.role = Role::Primary;
-                status.epoch = target_epoch;
-                status.write_status = AccessStatus::Granted;
-                status.configuration = Some(previous_current);
-            }
-            TestReplicaOperation::InstallCompensationCurrentConfiguration => {
-                status.role = Role::Primary;
-                status.epoch = target_epoch;
-                status.write_status = AccessStatus::Granted;
-                status.configuration = Some(compensation_catch_up);
-            }
-        }
-    }
-
-    fn set_label_precondition(
-        world: &mut TestWorld,
-        definition: &DirectSwitchoverDefinition,
-        operation: TestLabelOperation,
-        target_id: ReplicaId,
-    ) {
-        let target_epoch = Epoch::new(
-            definition.target_snapshot.epoch.data_loss_number,
-            definition.target_snapshot.epoch.configuration_number,
-        );
-        let status = world.statuses.get_mut(&target_id).unwrap();
-        status.epoch = target_epoch;
-        match operation {
-            TestLabelOperation::PublishTargetPrimary => {
-                status.role = Role::Primary;
-                world.labels.insert(target_id, "secondary".to_string());
-            }
-            TestLabelOperation::PublishOldPrimarySecondary => {
-                status.role = Role::ActiveSecondary;
-                world.labels.insert(target_id, "primary".to_string());
-            }
-            TestLabelOperation::RestoreOldPrimary => {
-                status.role = Role::Primary;
-                world.labels.insert(target_id, "secondary".to_string());
-            }
-            TestLabelOperation::RestoreTargetSecondary => {
-                status.role = Role::ActiveSecondary;
-                world.labels.insert(target_id, "primary".to_string());
-            }
-        }
-    }
-
-    fn observed_result_tag(result: Result<DirectEvaluation, String>) -> String {
-        let DirectEvaluation::Observe(result) = result.unwrap() else {
-            panic!("expired activity must return an observation without dispatch");
+        let old_primary = definition.member(definition.old_primary_id).unwrap();
+        let request = RevokeWritesInput {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: definition.execution_id.clone(),
+            old_primary_id: definition.old_primary_id,
+            old_primary_instance_id: old_primary.instance_id.clone(),
+            deadline_unix_seconds: 240,
         };
-        serde_json::from_slice::<serde_json::Value>(result.as_slice())
-            .unwrap()
-            .get("result")
-            .and_then(serde_json::Value::as_str)
-            .unwrap()
-            .to_string()
+
+        let _ = <DirectSwitchoverPreparedActivityResolver as PrepareEffect<
+            RevokeWritesActivity,
+        >>::prepare(&resolver, &request, &(), &());
+
+        assert_eq!(deadline.load(Ordering::Relaxed), 240);
     }
 
     fn snapshot(member_count: usize) -> StablePartitionSnapshotStatus {
