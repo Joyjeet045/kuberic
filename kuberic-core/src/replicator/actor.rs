@@ -183,11 +183,12 @@ impl WalReplicatorActor {
                                 ?new_epoch,
                                 "updating epoch"
                             );
-                            // Update local epoch first
-                            epoch = new_epoch;
-
+                            let prev_lsn = if new_epoch.data_loss_number == epoch.data_loss_number {
+                                state.current_progress().max(state.committed_lsn())
+                            } else {
+                                state.committed_lsn()
+                            };
                             // Forward to state provider (inline — must complete before next event)
-                            let prev_lsn = state.committed_lsn();
                             let (sp_tx, sp_rx) = tokio::sync::oneshot::channel();
                             if state_provider_tx.send(StateProviderEvent::UpdateEpoch {
                                 epoch: new_epoch,
@@ -200,7 +201,12 @@ impl WalReplicatorActor {
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(30), sp_rx
                             ).await {
-                                Ok(Ok(result)) => { let _ = reply.send(result); }
+                                Ok(Ok(result)) => {
+                                    if result.is_ok() {
+                                        epoch = new_epoch;
+                                    }
+                                    let _ = reply.send(result);
+                                }
                                 Ok(Err(_)) => { let _ = reply.send(Err(KubericError::Closed)); }
                                 Err(_) => { let _ = reply.send(Err(KubericError::Internal(
                                     "state provider UpdateEpoch timeout".into()))); }
@@ -715,6 +721,68 @@ mod tests {
         assert_eq!(harness.state.current_progress(), 7);
         assert_eq!(harness.state.catch_up_capability(), 7);
         assert_eq!(harness.state.committed_lsn(), 7);
+    }
+
+    #[tokio::test]
+    async fn configuration_epoch_preserves_accepted_suffix_but_data_loss_can_roll_back() {
+        let mut harness = ActorHarness::start(Duration::from_secs(5)).await;
+        harness.state.set_current_progress(5);
+        harness.state.set_committed_lsn(4);
+        for (epoch, expected_lsn) in [(Epoch::new(1, 2), 5), (Epoch::new(2, 3), 4)] {
+            let (reply, receiver) = oneshot::channel();
+            harness
+                .control_tx
+                .send(ReplicatorControlEvent::UpdateEpoch { epoch, reply })
+                .await
+                .unwrap();
+            match harness.state_provider_rx.recv().await.unwrap() {
+                StateProviderEvent::UpdateEpoch {
+                    previous_epoch_last_lsn,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(previous_epoch_last_lsn, expected_lsn);
+                    reply.send(Ok(())).unwrap();
+                }
+                _ => panic!("epoch update was not forwarded"),
+            }
+            receiver.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_data_loss_epoch_retry_preserves_rollback_boundary() {
+        let mut harness = ActorHarness::start(Duration::from_secs(5)).await;
+        harness.state.set_current_progress(5);
+        harness.state.set_committed_lsn(4);
+        for succeeds in [false, true] {
+            let (reply, receiver) = oneshot::channel();
+            harness
+                .control_tx
+                .send(ReplicatorControlEvent::UpdateEpoch {
+                    epoch: Epoch::new(2, 3),
+                    reply,
+                })
+                .await
+                .unwrap();
+            match harness.state_provider_rx.recv().await.unwrap() {
+                StateProviderEvent::UpdateEpoch {
+                    previous_epoch_last_lsn,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(previous_epoch_last_lsn, 4);
+                    let result = if succeeds {
+                        Ok(())
+                    } else {
+                        Err(KubericError::Internal("injected rollback failure".into()))
+                    };
+                    reply.send(result).unwrap();
+                }
+                _ => panic!("epoch update was not forwarded"),
+            }
+            assert_eq!(receiver.await.unwrap().is_ok(), succeeds);
+        }
     }
 
     #[tokio::test]

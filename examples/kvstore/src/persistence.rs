@@ -5,7 +5,7 @@
 //! - `wal.log` — append-only NDJSON log of KvOps since last snapshot
 //!
 //! Recovery: load snapshot + replay WAL. Crash-safe via:
-//! - WAL: append + fdatasync before ACK
+//! - WAL: append + flush before ACK (process-crash durability)
 //! - Snapshot: write-tmp + fdatasync + rename (atomic)
 //! - WAL truncation after replay (removes corrupt trailing bytes)
 
@@ -13,11 +13,29 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, BufReader, BufWriter};
 use tracing::{info, warn};
 
 use crate::state::{KvOp, KvState};
 use kuberic_core::types::Lsn;
+
+async fn atomic_write(path: &Path, contents: Vec<u8>) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let temporary = path.with_extension(format!(
+            "{}.tmp",
+            path.extension().unwrap().to_string_lossy()
+        ));
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(temporary, path)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
 
 /// A single WAL entry: one operation at one LSN.
 #[derive(Serialize, Deserialize)]
@@ -26,17 +44,40 @@ pub struct WalEntry {
     pub op: KvOp,
 }
 
+async fn read_wal_entry(
+    reader: &mut BufReader<fs::File>,
+) -> std::io::Result<Option<(WalEntry, Vec<u8>)>> {
+    let mut record = Vec::new();
+    if reader.read_until(b'\n', &mut record).await? == 0 {
+        return Ok(None);
+    }
+    match serde_json::from_slice(&record) {
+        Ok(entry) => {
+            if record.last() != Some(&b'\n') {
+                record.push(b'\n');
+            }
+            Ok(Some((entry, record)))
+        }
+        Err(error) => {
+            warn!(%error, "truncated WAL entry, stopping replay");
+            Ok(None)
+        }
+    }
+}
+
 /// Snapshot format: full HashMap + LSN.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct SnapshotData {
     pub last_applied_lsn: Lsn,
     pub data: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub key_versions: std::collections::HashMap<String, Lsn>,
+    #[serde(default)]
+    pub committed_transactions: std::collections::HashMap<String, Lsn>,
 }
 
 /// Load a snapshot from disk, or return empty state if no snapshot exists.
-pub async fn load_snapshot(
-    dir: &Path,
-) -> std::io::Result<(std::collections::HashMap<String, String>, Lsn)> {
+pub async fn load_snapshot(dir: &Path) -> std::io::Result<SnapshotData> {
     let path = dir.join("state.json");
     match fs::read_to_string(&path).await {
         Ok(contents) => {
@@ -47,11 +88,11 @@ pub async fn load_snapshot(
                 keys = snap.data.len(),
                 "loaded snapshot"
             );
-            Ok((snap.data, snap.last_applied_lsn))
+            Ok(snap)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             info!("no snapshot found, starting empty");
-            Ok((std::collections::HashMap::new(), 0))
+            Ok(SnapshotData::default())
         }
         Err(e) => Err(e),
     }
@@ -60,27 +101,28 @@ pub async fn load_snapshot(
 /// Replay WAL entries from disk, applying only entries with LSN > current.
 /// Returns the number of entries replayed.
 pub async fn replay_wal(state: &mut KvState, dir: &Path) -> std::io::Result<u64> {
+    replay_wal_up_to(state, dir, Lsn::MAX).await
+}
+
+pub async fn replay_wal_up_to(
+    state: &mut KvState,
+    dir: &Path,
+    max_lsn: Lsn,
+) -> std::io::Result<u64> {
     let path = dir.join("wal.log");
     let file = match fs::File::open(&path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e),
     };
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
+    let mut reader = BufReader::new(file);
     let mut replayed = 0u64;
-    while let Ok(Some(line)) = lines.next_line().await {
-        match serde_json::from_str::<WalEntry>(&line) {
-            Ok(entry) if entry.lsn > state.last_applied_lsn => {
-                // Apply directly to HashMap (no WAL write during replay)
-                state.apply_op_in_memory(entry.lsn, &entry.op);
-                replayed += 1;
-            }
-            Ok(_) => {} // Already in snapshot, skip
-            Err(e) => {
-                warn!(error = %e, "truncated WAL entry, stopping replay");
-                break; // Crash mid-write — stop at corrupt line
-            }
+    while let Some((entry, _)) = read_wal_entry(&mut reader).await? {
+        if entry.lsn <= max_lsn
+            && (entry.lsn > state.last_applied_lsn || matches!(entry.op, KvOp::Snapshot(_)))
+        {
+            state.apply_op_in_memory(entry.lsn, &entry.op);
+            replayed += 1;
         }
     }
     info!(
@@ -96,34 +138,19 @@ pub async fn replay_wal(state: &mut KvState, dir: &Path) -> std::io::Result<u64>
 /// the corrupt line would be lost on next recovery.
 pub async fn truncate_wal_to_valid(dir: &Path) -> std::io::Result<()> {
     let wal_path = dir.join("wal.log");
-    let tmp_path = dir.join("wal.log.tmp");
 
-    let mut valid_lines = Vec::new();
-    if let Ok(file) = fs::File::open(&wal_path).await {
-        let mut lines = BufReader::new(file).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if serde_json::from_str::<WalEntry>(&line).is_ok() {
-                valid_lines.push(line);
-            } else {
-                break; // Stop at first corrupt line
-            }
-        }
-    } else {
-        return Ok(()); // No WAL file
+    let mut contents = Vec::new();
+    let file = match fs::File::open(&wal_path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut reader = BufReader::new(file);
+    while let Some((_, record)) = read_wal_entry(&mut reader).await? {
+        contents.extend_from_slice(&record);
     }
-
-    // Write valid entries to tmp, sync, rename
-    let tmp_file = fs::File::create(&tmp_path).await?;
-    let mut writer = BufWriter::new(tmp_file);
-    for line in &valid_lines {
-        writer.write_all(line.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-    }
-    writer.flush().await?;
-    writer.get_ref().sync_data().await?;
-    drop(writer);
-    fs::rename(&tmp_path, &wal_path).await?;
-    Ok(())
+    drop(reader);
+    atomic_write(&wal_path, contents).await
 }
 
 /// Open WAL file for appending.
@@ -139,21 +166,11 @@ pub async fn open_wal_append(dir: &Path) -> std::io::Result<BufWriter<fs::File>>
 /// Write a snapshot and truncate the WAL.
 /// Only call when committed_lsn == last_applied_lsn (no uncommitted ops).
 pub async fn write_checkpoint(state: &KvState, dir: &Path) -> std::io::Result<()> {
-    let snapshot = SnapshotData {
-        last_applied_lsn: state.last_applied_lsn,
-        data: state.data.clone(),
-    };
+    let snapshot = state.snapshot();
 
-    // Atomic write: tmp → sync → rename
-    let tmp = dir.join("state.json.tmp");
     let dst = dir.join("state.json");
-    let json = serde_json::to_string(&snapshot).map_err(std::io::Error::other)?;
-    fs::write(&tmp, &json).await?;
-    // fsync snapshot before rename
-    let tmp_file = fs::File::open(&tmp).await?;
-    tmp_file.sync_data().await?;
-    drop(tmp_file);
-    fs::rename(&tmp, &dst).await?;
+    let json = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
+    atomic_write(&dst, json).await?;
 
     info!(
         lsn = state.last_applied_lsn,
@@ -167,32 +184,17 @@ pub async fn write_checkpoint(state: &KvState, dir: &Path) -> std::io::Result<()
 /// Returns a new BufWriter for the rewritten WAL.
 pub async fn rewrite_wal_up_to(dir: &Path, max_lsn: Lsn) -> std::io::Result<BufWriter<fs::File>> {
     let wal_path = dir.join("wal.log");
-    let tmp_path = dir.join("wal.log.tmp");
 
-    // Read valid entries up to max_lsn
-    let mut entries = Vec::new();
-    if let Ok(file) = fs::File::open(&wal_path).await {
-        let mut lines = BufReader::new(file).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(entry) = serde_json::from_str::<WalEntry>(&line)
-                && entry.lsn <= max_lsn
-            {
-                entries.push(line);
-            }
+    let mut contents = Vec::new();
+    let file = fs::File::open(&wal_path).await?;
+    let mut reader = BufReader::new(file);
+    while let Some((entry, record)) = read_wal_entry(&mut reader).await? {
+        if entry.lsn <= max_lsn {
+            contents.extend_from_slice(&record);
         }
     }
-
-    // Write filtered entries, sync, rename
-    let tmp_file = fs::File::create(&tmp_path).await?;
-    let mut writer = BufWriter::new(tmp_file);
-    for line in &entries {
-        writer.write_all(line.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-    }
-    writer.flush().await?;
-    writer.get_ref().sync_data().await?;
-    drop(writer);
-    fs::rename(&tmp_path, &wal_path).await?;
+    drop(reader);
+    atomic_write(&wal_path, contents).await?;
 
     // Reopen for append
     open_wal_append(dir).await

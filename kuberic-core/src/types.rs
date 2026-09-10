@@ -619,11 +619,26 @@ pub struct Operation {
     pub lsn: Lsn,
     pub data: Bytes,
     ack_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    copy_completion: bool,
 }
 
 impl Operation {
     pub fn new(lsn: Lsn, data: Bytes, ack_tx: Option<tokio::sync::oneshot::Sender<()>>) -> Self {
-        Self { lsn, data, ack_tx }
+        Self {
+            lsn,
+            data,
+            ack_tx,
+            copy_completion: false,
+        }
+    }
+
+    pub(crate) fn copy_completion(lsn: Lsn, ack_tx: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self {
+            lsn,
+            data: Bytes::new(),
+            ack_tx: Some(ack_tx),
+            copy_completion: true,
+        }
     }
 
     /// Acknowledge this operation. Mandatory for persisted replicators —
@@ -649,22 +664,50 @@ impl std::fmt::Debug for Operation {
 /// Wraps an mpsc receiver — user calls `get_operation()` in a loop.
 pub struct OperationStream {
     rx: tokio::sync::mpsc::Receiver<Operation>,
+    completion: Option<Operation>,
 }
 
 impl OperationStream {
     pub fn new(rx: tokio::sync::mpsc::Receiver<Operation>) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            completion: None,
+        }
     }
 
     /// Returns the next operation, or None when the stream ends.
     pub async fn get_operation(&mut self) -> Option<Operation> {
-        self.rx.recv().await
+        if self.completion.is_some() {
+            return None;
+        }
+        let operation = self.rx.recv().await?;
+        if operation.copy_completion {
+            self.completion = Some(operation);
+            None
+        } else {
+            Some(operation)
+        }
+    }
+
+    /// The authoritative copy boundary, available after the copy stream ends.
+    pub fn copy_lsn(&self) -> Option<Lsn> {
+        self.completion.as_ref().map(|operation| operation.lsn)
+    }
+
+    /// Complete copy only after validation, installation, and required checkpoints.
+    /// Dropping the stream without this acknowledgement fails the copy RPC.
+    pub fn acknowledge_completion(&mut self) -> crate::Result<()> {
+        let completion = self.completion.take().ok_or_else(|| {
+            crate::KubericError::Internal("copy stream ended without a completion boundary".into())
+        })?;
+        completion.acknowledge();
+        Ok(())
     }
 
     /// Create a pair (sender, stream) for wiring.
     pub fn channel(buffer: usize) -> (tokio::sync::mpsc::Sender<Operation>, Self) {
         let (tx, rx) = tokio::sync::mpsc::channel(buffer);
-        (tx, Self { rx })
+        (tx, Self::new(rx))
     }
 }
 

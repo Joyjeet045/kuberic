@@ -6995,6 +6995,164 @@ async fn test_scale_up_replays_writes_buffered_during_copy() {
 
 #[test_log::test(tokio::test)]
 #[serial]
+async fn test_transaction_quorum_commit_survives_immediate_primary_failure() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "transaction-failover", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    let mut client = connect_kv(&api.client_address(&primary).unwrap()).await;
+    client
+        .put(proto::PutRequest {
+            key: "removed".into(),
+            value: "old".into(),
+        })
+        .await
+        .unwrap();
+    let mut transaction = kvstore::client::KvTransaction::begin(client.clone())
+        .await
+        .unwrap();
+    transaction.put("left", "committed").await.unwrap();
+    transaction.put("right", "committed").await.unwrap();
+    transaction.delete("removed").await.unwrap();
+    assert_eq!(
+        transaction.get("left").await.unwrap().as_deref(),
+        Some("committed")
+    );
+    let transaction_id = transaction.id().to_string();
+    let lsn = transaction.commit().await.unwrap();
+    api.crash_pod(&primary);
+
+    reconcile_set(
+        &make_set("transaction-failover", 3, Some(status)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let status =
+        drive_operation_to_healthy(&api, "transaction-failover", 3, api.last_status().unwrap())
+            .await;
+    let promoted = status.current_primary.unwrap();
+    assert_ne!(primary, promoted);
+    let mut client = connect_kv(&api.client_address(&promoted).unwrap()).await;
+    assert_eq!(
+        retry_get(&mut client, "left").await.into_inner().value,
+        "committed"
+    );
+    assert_eq!(
+        retry_get(&mut client, "right").await.into_inner().value,
+        "committed"
+    );
+    assert!(!retry_get(&mut client, "removed").await.into_inner().found);
+    let mut retry = kvstore::client::KvTransaction::from_id(client, transaction_id);
+    assert_eq!(retry.commit().await.unwrap(), lsn);
+    let promoted_state = api.live_pods.lock().unwrap()[&promoted].state.clone();
+    assert_eq!(promoted_state.read().await.last_applied_lsn, lsn);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_transaction_copy_catchup_and_secondary_visibility_are_atomic() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "transaction-copy", 1).await;
+    let primary = status.current_primary.clone().unwrap();
+    let mut client = connect_kv(&api.client_address(&primary).unwrap()).await;
+    for index in 0..12 {
+        client
+            .put(proto::PutRequest {
+                key: format!("large-{index}"),
+                value: "x".repeat(512 * 1024),
+            })
+            .await
+            .unwrap();
+    }
+    let mut transaction = kvstore::client::KvTransaction::begin(client.clone())
+        .await
+        .unwrap();
+    transaction.put("left", "initial").await.unwrap();
+    transaction.put("right", "initial").await.unwrap();
+    let copied_id = transaction.id().to_string();
+    let copied_lsn = transaction.commit().await.unwrap();
+    reconcile_set(&make_set("transaction-copy", 2, Some(status)), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    let pending = advance_until_pending_action(
+        &api,
+        "transaction-copy",
+        2,
+        api.last_status().unwrap(),
+        DurableActionKind::AddReplicaIntent,
+    )
+    .await;
+    let dispatch_set = make_set("transaction-copy", 2, Some(pending));
+    let restarted = ReconcilerState::default();
+    let writes = async {
+        for index in 0..40 {
+            let mut transaction = kvstore::client::KvTransaction::begin(client.clone())
+                .await
+                .unwrap();
+            transaction.put("left", index.to_string()).await.unwrap();
+            transaction.put("right", index.to_string()).await.unwrap();
+            transaction.commit().await.unwrap();
+        }
+    };
+    let (dispatch, ()) = tokio::join!(reconcile_set(&dispatch_set, &api, &restarted), writes);
+    dispatch.unwrap();
+    let status = drive_add_replica(
+        &api,
+        &state,
+        "transaction-copy",
+        2,
+        api.last_status().unwrap(),
+    )
+    .await;
+    assert_stable_snapshot(&api, &status, 2);
+    let secondary = api
+        .live_pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(name, _)| **name != primary)
+        .unwrap()
+        .1
+        .state
+        .clone();
+    {
+        let secondary = secondary.read().await;
+        assert_eq!(secondary.data["left"], "39");
+        assert_eq!(secondary.data["right"], "39");
+        assert_eq!(secondary.transaction_lsn(&copied_id), Some(copied_lsn));
+        assert_eq!(secondary.last_applied_lsn, copied_lsn + 40);
+        assert_eq!(secondary.data["large-0"].len(), 512 * 1024);
+    }
+    let observed = secondary.clone();
+    let reader = tokio::spawn(async move {
+        for _ in 0..5000 {
+            let state = observed.read().await;
+            assert_eq!(state.data.get("left"), state.data.get("right"));
+            drop(state);
+            tokio::task::yield_now().await;
+        }
+    });
+    let mut transaction = kvstore::client::KvTransaction::begin(client).await.unwrap();
+    transaction.delete("left").await.unwrap();
+    transaction.delete("right").await.unwrap();
+    transaction.commit().await.unwrap();
+    reader.await.unwrap();
+    assert_eq!(secondary.read().await.data.len(), 12);
+    assert!(!secondary.read().await.data.contains_key("left"));
+    let directory = secondary.read().await.data_dir().to_path_buf();
+    let recovered = KvState::open(directory).await.unwrap();
+    assert_eq!(recovered.data.len(), 12);
+    assert!(!recovered.data.contains_key("right"));
+    assert_eq!(recovered.transaction_lsn(&copied_id), Some(copied_lsn));
+    assert_eq!(recovered.last_applied_lsn, copied_lsn + 41);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
 async fn test_simultaneous_secondary_loss_bounds_new_and_inflight_writes() {
     async fn setup(
         name: &str,

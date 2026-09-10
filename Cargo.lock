@@ -1439,6 +1439,7 @@ dependencies = [
  "kuberic-operator",
  "kvstore",
  "prost",
+ "rand",
  "serde",
  "serde_json",
  "serial_test",
