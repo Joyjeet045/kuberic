@@ -2,7 +2,8 @@ use std::task::Poll;
 
 use async_trait::async_trait;
 use futures::future::poll_fn;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use thiserror::Error;
 
 use crate::{
     ActivityFailure, ActivityOptions, ActivityRecord, ActivitySequence, ActivitySpec,
@@ -10,7 +11,8 @@ use crate::{
     Nondeterminism, PreparedCommand, PreparedEffectResolver,
     typed::{
         ActivityCallError, ActivityInvocationError, DurableActivity, PreparedActivityError,
-        PreparedActivityResolver, activity_spec, activity_spec_named, decode_activity_result,
+        PreparedActivityResolver, activity_spec, activity_spec_named, canonical_json,
+        decode_activity_result,
     },
 };
 
@@ -43,10 +45,120 @@ impl TerminalOutcome {
     }
 }
 
-/// Provisional ordinary-async workflow authoring surface.
+/// Failure while encoding or decoding a typed orchestration boundary.
+#[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowCodecError {
+    #[error("workflow input could not be encoded")]
+    InputEncoding,
+    #[error("workflow input could not be decoded")]
+    InputDecoding,
+    #[error("workflow output could not be encoded")]
+    OutputEncoding,
+    #[error("workflow error could not be encoded")]
+    ErrorEncoding,
+    #[error("terminal workflow output could not be decoded")]
+    OutputDecoding,
+    #[error("terminal workflow error could not be decoded")]
+    ErrorDecoding,
+}
+
+/// Typed ordinary-async orchestration contract.
+///
+/// Implementations receive decoded input and return an ordinary [`Result`], so
+/// activity failures can be propagated with `?`. The replay kernel encodes the
+/// success or error value into the terminal checkpoint.
+#[async_trait]
+pub trait Orchestration: Sync {
+    type Input: Serialize + DeserializeOwned + Send;
+    type Output: Serialize + DeserializeOwned + Send;
+    type Error: Serialize + DeserializeOwned + Send;
+
+    async fn run(
+        &self,
+        context: &mut OrchestrationContext<'_>,
+        input: Self::Input,
+    ) -> Result<Self::Output, Self::Error>;
+}
+
+/// Encode typed orchestration input using DEX's canonical JSON codec.
+pub fn encode_workflow_input<T: Serialize>(input: &T) -> Result<ExactBytes, WorkflowCodecError> {
+    canonical_json(input)
+        .map(ExactBytes::new)
+        .map_err(|_| WorkflowCodecError::InputEncoding)
+}
+
+/// Decode a typed orchestration's terminal success or error value.
+pub fn decode_workflow_result<O: DeserializeOwned, E: DeserializeOwned>(
+    outcome: &TerminalOutcome,
+) -> Result<Result<O, E>, WorkflowCodecError> {
+    match outcome {
+        TerminalOutcome::Succeeded(payload) => serde_json::from_slice(payload.as_slice())
+            .map(Ok)
+            .map_err(|_| WorkflowCodecError::OutputDecoding),
+        TerminalOutcome::Failed(payload) => {
+            match serde_json::from_slice::<WorkflowFailure<E>>(payload.as_slice())
+                .map_err(|_| WorkflowCodecError::ErrorDecoding)?
+            {
+                WorkflowFailure::Application(error) => Ok(Err(error)),
+                WorkflowFailure::Codec(error) => Err(error),
+            }
+        }
+    }
+}
+
+/// Decode the terminal result using an orchestration's associated types.
+pub fn decode_orchestration_result<O: Orchestration>(
+    outcome: &TerminalOutcome,
+) -> Result<Result<O::Output, O::Error>, WorkflowCodecError> {
+    decode_workflow_result(outcome)
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+enum WorkflowFailure<E> {
+    Application(E),
+    Codec(WorkflowCodecError),
+}
+
+/// Low-level exact-byte workflow contract used by the replay kernel.
+///
+/// Application code should normally implement [`Orchestration`] instead.
 #[async_trait]
 pub trait Workflow: Sync {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome;
+}
+
+/// Duroxide-style name for the workflow replay context.
+pub type OrchestrationContext<'history> = WorkflowContext<'history>;
+
+#[async_trait]
+impl<T> Workflow for T
+where
+    T: Orchestration,
+{
+    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
+        let input = match serde_json::from_slice::<T::Input>(input.as_slice()) {
+            Ok(input) => input,
+            Err(_) => return codec_failure(WorkflowCodecError::InputDecoding),
+        };
+        match Orchestration::run(self, context, input).await {
+            Ok(output) => match canonical_json(&output) {
+                Ok(output) => TerminalOutcome::succeeded(output),
+                Err(_) => codec_failure(WorkflowCodecError::OutputEncoding),
+            },
+            Err(error) => match canonical_json(&WorkflowFailure::Application(error)) {
+                Ok(error) => TerminalOutcome::failed(error),
+                Err(_) => codec_failure(WorkflowCodecError::ErrorEncoding),
+            },
+        }
+    }
+}
+
+fn codec_failure(error: WorkflowCodecError) -> TerminalOutcome {
+    let payload = canonical_json(&WorkflowFailure::<()>::Codec(error))
+        .expect("serializing the framework-owned workflow codec error must succeed");
+    TerminalOutcome::failed(payload)
 }
 
 /// Linear replay context. `activity` is its only workflow-body operation.
@@ -91,6 +203,7 @@ impl<'history> WorkflowContext<'history> {
         }
     }
 
+    #[doc(hidden)]
     pub async fn activity(&mut self, spec: ActivitySpec) -> ExactBytes {
         match poll_fn(|_| self.poll_activity(&spec, None)).await {
             Ok(result) => result,
@@ -101,7 +214,8 @@ impl<'history> WorkflowContext<'history> {
         }
     }
 
-    /// Invoke a versioned activity with typed, bounded input and output.
+    /// Legacy typed call using the low-level domain-result failure model.
+    #[doc(hidden)]
     pub async fn call<A: DurableActivity>(
         &mut self,
         input: A::Input,
@@ -111,7 +225,27 @@ impl<'history> WorkflowContext<'history> {
         decode_activity_result::<A>(&result)
     }
 
+    /// Schedule a typed activity with its contract name and default options.
+    pub async fn schedule_activity<A: DurableActivity>(
+        &mut self,
+        input: &A::Input,
+    ) -> Result<A::Output, ActivityInvocationError> {
+        self.schedule_activity_with_options::<A>(input, ActivityOptions::default())
+            .await
+    }
+
+    /// Schedule a typed activity with replay-matched options.
+    pub async fn schedule_activity_with_options<A: DurableActivity>(
+        &mut self,
+        input: &A::Input,
+        options: ActivityOptions,
+    ) -> Result<A::Output, ActivityInvocationError> {
+        self.schedule_activity_typed::<A>(A::NAME, input, options)
+            .await
+    }
+
     /// Schedule an ordinary named typed activity with replay-matched options.
+    #[doc(hidden)]
     pub async fn schedule_activity_typed<A: DurableActivity>(
         &mut self,
         name: &str,

@@ -65,9 +65,10 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 
 /// A versioned, bounded durable activity contract.
 ///
-/// Workflow bodies invoke an activity with [`crate::WorkflowContext::call`].
-/// The activity type, rather than each call site, owns its immutable replay
-/// identity and encoded payload limits.
+/// Orchestration bodies invoke an activity with
+/// [`crate::OrchestrationContext::schedule_activity`].
+/// The activity type owns its immutable replay identity and encoded payload
+/// limits.
 ///
 /// Domain rejection and failure belong in `Output`; they are durable activity
 /// results rather than a second kernel failure lifecycle.
@@ -110,7 +111,7 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 /// ```
 ///
 /// ```compile_fail
-/// use kuberic_dex::{DurableActivity, WorkflowContext};
+/// use kuberic_dex::{DurableActivity, OrchestrationContext};
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Deserialize, Serialize)]
@@ -126,8 +127,8 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 ///     const MAX_RESULT_BYTES: u64 = 16;
 /// }
 ///
-/// async fn invalid_call(context: &mut WorkflowContext<'_>) {
-///     context.call::<Activity>("wrong input").await;
+/// async fn invalid_call(context: &mut OrchestrationContext<'_>) {
+///     context.schedule_activity::<Activity>(&"wrong input").await;
 /// }
 /// ```
 pub trait DurableActivity {
@@ -254,6 +255,7 @@ pub(crate) fn activity_spec_named<A: DurableActivity>(
             contract: A::NAME.to_owned(),
         });
     }
+
     let name = ActivityName::new(name, A::VERSION).map_err(|error| match error {
         crate::IdentityError::EmptyActivityName => ActivityCallError::EmptyName,
         crate::IdentityError::ZeroActivityVersion => ActivityCallError::ZeroVersion,
@@ -297,7 +299,7 @@ fn enforce_bound(
     })
 }
 
-fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
     let mut value = serde_json::to_value(value)?;
     canonicalize_object_keys(&mut value);
     serde_json::to_vec(&value)

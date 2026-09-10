@@ -113,7 +113,7 @@ impl CheckpointStore for CountingStore {
 #[tokio::test]
 async fn registry_invokes_an_ordinary_send_handler_with_runtime_identity() {
     let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", |context, input| async move {
+        .register_typed::<Echo, _, _>("Echo", |context, input| async move {
             assert_eq!(context.activity_instance_id().sequence().get(), 0);
             assert_eq!(context.attempt_ordinal(), 2);
             assert_eq!(context.action_deadline_unix_millis(), Some(9_000));

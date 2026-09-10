@@ -5,31 +5,47 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use futures::executor::block_on;
 use kuberic_dex::{
-    ActivityName, ActivitySpec, CheckpointLimits, DurableHost, ExactBytes, ExecutionId,
-    ExecutionSpec, FeasibilityClassification, FeasibilityInputs, HOST_OUTCOME_VARIANTS, HostEpoch,
-    HostOutcome, InMemoryCheckpointStore, TerminalOutcome, Workflow, WorkflowContext,
-    classify_feasibility,
+    CheckpointLimits, DurableActivity, DurableHost, ExecutionId, ExecutionSpec,
+    FeasibilityClassification, FeasibilityInputs, HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome,
+    InMemoryCheckpointStore, Orchestration, OrchestrationContext, classify_feasibility,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use support::scenarios::{ScenarioEvidence, ScenarioId, run_conformance_matrix};
 
 const EXPECTED_FR_013_SCENARIOS: usize = 45;
 
 struct SelectedOrdinaryAsyncSurface;
 
+#[derive(Deserialize, Serialize)]
+struct SelectedInput {
+    value: String,
+}
+
+struct SelectedActivity;
+
+impl DurableActivity for SelectedActivity {
+    type Input = SelectedInput;
+    type Output = String;
+
+    const NAME: &'static str = "ordinary-async";
+    const VERSION: u32 = 1;
+    const MAX_INPUT_BYTES: u64 = 1024;
+    const MAX_RESULT_BYTES: u64 = 1024;
+}
+
 // FR012_SELECTED_WORKFLOW_START
 #[async_trait]
-impl Workflow for SelectedOrdinaryAsyncSurface {
-    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
-        TerminalOutcome::succeeded(
-            context
-                .activity(ActivitySpec::new(
-                    ActivityName::new("ordinary-async", 1).unwrap(),
-                    input,
-                    1024,
-                ))
-                .await,
-        )
+impl Orchestration for SelectedOrdinaryAsyncSurface {
+    type Input = SelectedInput;
+    type Output = String;
+    type Error = kuberic_dex::ActivityInvocationError;
+
+    async fn run(
+        &self,
+        context: &mut OrchestrationContext<'_>,
+        input: SelectedInput,
+    ) -> Result<String, kuberic_dex::ActivityInvocationError> {
+        context.schedule_activity::<SelectedActivity>(&input).await
     }
 }
 // FR012_SELECTED_WORKFLOW_END
@@ -167,19 +183,16 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         .split_once("// FR012_SELECTED_WORKFLOW_END")
         .unwrap()
         .0;
-    let framework_operation_count = workflow_body.matches(".activity(").count();
+    let framework_operation_count = workflow_body.matches(".schedule_activity::<").count();
     let authored_poll_or_state_machine = workflow_body.contains(concat!("fn po", "ll("))
         || workflow_body.contains(concat!("impl Future", " for"))
         || workflow_body.contains(concat!("state_", "machine"));
 
     let library_exports = include_str!("../src/lib.rs");
-    let ordinary_async_exported =
-        library_exports.contains("pub use workflow::{TerminalOutcome, Workflow, WorkflowContext};");
-    let fallback_exported = library_exports.contains(concat!("mod po", "ll;"))
-        || library_exports.contains("ReplayWorkflow")
-        || library_exports.contains("ReplayContext");
-    let public_authoring_surface_count =
-        usize::from(ordinary_async_exported) + usize::from(fallback_exported);
+    let ordinary_async_exported = library_exports.contains("Orchestration, OrchestrationContext");
+    let low_level_surface_hidden =
+        library_exports.contains("#[doc(hidden)]\npub use workflow::{Workflow, WorkflowContext};");
+    let public_authoring_surface_count = usize::from(ordinary_async_exported);
 
     let store = InMemoryCheckpointStore::new();
     let mut host = DurableHost::new(
@@ -187,14 +200,19 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         HostEpoch::from_bytes([1; 16]),
         CheckpointLimits::new(16, 100_000, 100_000).unwrap(),
     );
-    let first_turn = block_on(host.turn(
-        &SelectedOrdinaryAsyncSurface,
-        ExecutionSpec::new(
-            ExecutionId::from_bytes([1; 16]),
-            ExactBytes::new(b"input"),
-            1024,
+    let first_turn = block_on(
+        host.turn(
+            &SelectedOrdinaryAsyncSurface,
+            ExecutionSpec::for_orchestration::<SelectedOrdinaryAsyncSurface>(
+                ExecutionId::from_bytes([1; 16]),
+                &SelectedInput {
+                    value: "input".to_owned(),
+                },
+                1024,
+            )
+            .unwrap(),
         ),
-    ));
+    );
 
     let fr_012 = [
         PredicateEvidence {
@@ -218,9 +236,9 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
                     .all(|scenario| !scenario.assertions.is_empty()),
         },
         PredicateEvidence {
-            name: "exactly one public authoring surface remains",
+            name: "exactly one documented application authoring surface remains",
             passed: ordinary_async_exported
-                && !fallback_exported
+                && low_level_surface_hidden
                 && public_authoring_surface_count == 1,
         },
     ];
@@ -309,7 +327,7 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         .flat_map(|scenario| &scenario.assertions)
         .filter(|assertion| assertion.passed)
         .count();
-    println!("EVIDENCE selected_surface=\"ordinary async Workflow::run\"");
+    println!("EVIDENCE selected_surface=\"typed async Orchestration::run\"");
     println!(
         "COUNT taxonomy=public_authoring_surfaces value={public_authoring_surface_count} bound=1"
     );

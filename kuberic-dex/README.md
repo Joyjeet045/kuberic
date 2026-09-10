@@ -5,17 +5,61 @@ provides deterministic, linear workflow replay, has no dependency on
 `kuberic-core` or `kuberic-operator`. It is not currently integrated into the
 operator and is not an end-user runtime.
 
-## Ordinary typed activity authoring
+Run the in-memory end-to-end example:
 
-`DurableActivity` is the default reusable authoring contract. An activity
-declares typed input and output, immutable versioned identity, and independent
-encoded bounds. Workflow and store futures are `Send`, so a host turn runs
-directly inside an asynchronous controller without a second executor.
+```bash
+cargo run -p kuberic-dex --example hello_world
+```
+
+The controller-shaped mock demonstrates repeated reconcile turns and a fake
+Kubernetes API mutation:
+
+```bash
+cargo run -p kuberic-dex --example reconciler_mock
+```
+
+## Typed orchestration and activity authoring
+
+Application workflows implement `Orchestration` with typed input, output, and
+error values. The body is ordinary async Rust and returns `Result`, allowing
+normal `?` propagation without handling `ExactBytes` or constructing
+`TerminalOutcome`.
 
 ```rust
-use kuberic_dex::{
-    ActivityOptions, DurableActivity,
-};
+use async_trait::async_trait;
+use kuberic_dex::{ActivityInvocationError, Orchestration, OrchestrationContext};
+
+struct GreetingWorkflow;
+
+#[async_trait]
+impl Orchestration for GreetingWorkflow {
+    type Input = GreetingInput;
+    type Output = GreetingResult;
+    type Error = ActivityInvocationError;
+
+    async fn run(
+        &self,
+        context: &mut OrchestrationContext<'_>,
+        input: GreetingInput,
+    ) -> Result<GreetingResult, ActivityInvocationError> {
+        let result = context.schedule_activity::<SendGreeting>(&input).await?;
+        Ok(result)
+    }
+}
+```
+
+`ExecutionSpec::for_orchestration` canonically encodes workflow input, and
+`decode_orchestration_result` decodes a terminal success or error value. The
+exact-byte `Workflow` contract remains the low-level replay-kernel interface;
+application code should normally use `Orchestration`.
+
+`DurableActivity` combines typed input/output with immutable versioned identity
+and independent encoded bounds. Workflow and store futures are `Send`, so a
+host turn runs directly inside an asynchronous controller without a second
+executor.
+
+```rust
+use kuberic_dex::DurableActivity;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
@@ -33,6 +77,7 @@ struct SendGreeting;
 impl DurableActivity for SendGreeting {
     type Input = GreetingInput;
     type Output = GreetingResult;
+
     const NAME: &'static str = "greeting";
     const VERSION: u32 = 1;
     const MAX_INPUT_BYTES: u64 = 1024;
@@ -40,16 +85,33 @@ impl DurableActivity for SendGreeting {
 }
 ```
 
-Inside `Workflow::run`, the ordinary direct-style call is:
+Handlers use the same typed async closure shape as Duroxide while DEX verifies
+the activity's versioned contract and payload bounds:
+
+```rust
+use kuberic_dex::{ActivityContext, ActivityHandlerError, ActivityRegistry};
+
+let activities = ActivityRegistry::builder()
+    .register_typed::<SendGreeting, _, _>(
+        SendGreeting::NAME,
+        |_context: ActivityContext, input: GreetingInput| async move {
+            Ok(GreetingResult {
+                message_id: input.recipient,
+            })
+        },
+    )
+    .build()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Inside `Orchestration::run`, the ordinary direct-style call is:
 
 ```rust
 let sent = context
-    .schedule_activity_typed::<SendGreeting>(
-        SendGreeting::NAME,
+    .schedule_activity::<SendGreeting>(
         &GreetingInput {
-        recipient: "Ada".to_owned(),
+            recipient: "Ada".to_owned(),
         },
-        ActivityOptions::default(),
     )
     .await?;
 ```
@@ -308,7 +370,7 @@ effect-specific proof that permits a safe retry. Process-local knowledge that
 a permit or reply was lost cannot override checkpoint state.
 
 This is an internal, opt-in host/evaluation behavior behind an ordinary
-activity call. `DurableActivity`, `WorkflowContext::call`, immutable
+activity call. `DurableActivity`, `OrchestrationContext::schedule_activity`, immutable
 name/version identity, canonical typed input/output encoding, exact replay
 matching, and declared input/result bounds remain the public model.
 

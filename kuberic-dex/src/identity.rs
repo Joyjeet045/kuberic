@@ -100,6 +100,28 @@ impl ExecutionSpec {
         }
     }
 
+    /// Construct an execution from canonically encoded typed workflow input.
+    pub fn typed<T: Serialize>(
+        execution_id: ExecutionId,
+        workflow_input: &T,
+        max_terminal_payload_bytes: u64,
+    ) -> Result<Self, crate::WorkflowCodecError> {
+        Ok(Self::new(
+            execution_id,
+            crate::encode_workflow_input(workflow_input)?,
+            max_terminal_payload_bytes,
+        ))
+    }
+
+    /// Construct an execution using an orchestration's declared input type.
+    pub fn for_orchestration<O: crate::Orchestration>(
+        execution_id: ExecutionId,
+        workflow_input: &O::Input,
+        max_terminal_payload_bytes: u64,
+    ) -> Result<Self, crate::WorkflowCodecError> {
+        Self::typed(execution_id, workflow_input, max_terminal_payload_bytes)
+    }
+
     pub const fn execution_id(&self) -> ExecutionId {
         self.execution_id
     }

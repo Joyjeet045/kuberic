@@ -7,7 +7,7 @@
 //! owns no executor and does not depend on Tokio.
 //!
 //! The crate README documents the selected
-//! [ordinary-async authoring surface](../README.md#selected-authoring-surface),
+//! [typed orchestration and activity authoring](../README.md#typed-orchestration-and-activity-authoring),
 //! [replay and checkpoint semantics](../README.md#replay-and-checkpoint-semantics),
 //! [turn and dispatch-permission boundary](../README.md#turns-and-dispatch-permission),
 //! [quarantine recovery](../README.md#quarantine-and-observation-recovery), and
@@ -21,6 +21,7 @@ mod identity;
 mod in_memory;
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
+pub mod reconciler_mock;
 mod registry;
 mod replay;
 mod store;
@@ -80,4 +81,9 @@ pub use typed::{
     PreparedActivityError, PreparedActivityResolver, decode_activity_input, decode_activity_result,
     encode_activity_input, encode_activity_result,
 };
-pub use workflow::{TerminalOutcome, Workflow, WorkflowContext};
+pub use workflow::{
+    Orchestration, OrchestrationContext, TerminalOutcome, WorkflowCodecError,
+    decode_orchestration_result, decode_workflow_result, encode_workflow_input,
+};
+#[doc(hidden)]
+pub use workflow::{Workflow, WorkflowContext};

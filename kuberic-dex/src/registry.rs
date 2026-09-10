@@ -407,6 +407,21 @@ impl<S> ScopedActivityRegistryBuilder<S> {
 }
 
 impl ActivityRegistryBuilder {
+    /// Register an ordinary typed async activity handler.
+    ///
+    /// This mirrors Duroxide's `register_typed` shape while retaining DEX's
+    /// versioned activity contract and payload bounds.
+    pub fn register_typed<A, H, F>(self, name: &str, handler: H) -> Self
+    where
+        A: DurableActivity + Send + Sync + 'static,
+        A::Input: Send + 'static,
+        A::Output: Send + 'static,
+        H: Fn(ActivityContext, A::Input) -> F + Send + Sync + 'static,
+        F: Future<Output = Result<A::Output, ActivityHandlerError>> + Send + 'static,
+    {
+        self.register::<A, H, F>(name, handler)
+    }
+
     pub fn register<A, H, F>(self, name: &str, handler: H) -> Self
     where
         A: DurableActivity + Send + Sync + 'static,
