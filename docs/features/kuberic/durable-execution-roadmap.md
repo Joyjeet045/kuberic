@@ -16,10 +16,13 @@ compatibility with either project.
 The implemented kernel provides:
 
 - deterministic linear replay;
-- typed, versioned durable effects with separate bounded logical requests,
-  exact prepared commands, typed outputs, and ordinary async calls;
-- static effect-set registration and reusable preparation, dispatch,
-  observation, bounded redelivery, and observation-only quarantine hosting;
+- named, typed, versioned ordinary activities with independent bounded inputs
+  and outputs, direct async calls, and immutable registry validation;
+- bounded at-least-once physical attempts under one stable logical identity,
+  with persisted retry policy, backoff, deadlines, and timeouts;
+- an optional narrow strict-effect facility with separate bounded logical
+  requests, exact prepared commands, one-use permits, observation,
+  proof-authorized redelivery, and observation-only quarantine;
 - exact activity matching and stable logical identity;
 - asynchronous load and compare-and-swap persistence;
 - opaque provider revision tokens and conservative unknown outcomes;
@@ -59,6 +62,17 @@ The bounds prevent unlimited growth and ensure a declared-valid result remains
 persistable after dispatch. Active history is never compacted: every completed
 activity input and result remains in the checkpoint until the workflow
 terminalizes or reaches a configured limit.
+
+### Duroxide Semantics
+
+| Semantic area | Status in Kuberic |
+|---|---|
+| Direct-style deterministic workflow, named typed activities, exact replay, ordinary `Result` handling, bounded at-least-once retries | Implemented |
+| Scheduling, retry wakeups, and deadlines | Adapted to existing Kubernetes watches and reconciliation requeues |
+| Durable storage | Adapted to one owner-bound ConfigMap per execution with API-server `resourceVersion` CAS |
+| Operations unsafe under ordinary duplicate ambiguity | Adapted through the optional four-operation strict prepared-command/quarantine facility |
+| Embedded Duroxide runtime, workers, queues, leases, heartbeat objects, auxiliary watchers/services | Intentionally omitted |
+| Parallel orchestration, child workflows, external events, cancellation, and generic Continue-as-New | Intentionally omitted until a concrete Kuberic workflow requires them |
 
 ## History Lifecycle
 
@@ -117,23 +131,25 @@ need. Short topology workflows should complete and use terminal compaction.
 
 ### Kernel Ergonomics
 
-1. **Implemented:** typed effect declarations and calls retaining exact
-   canonical request matching, immutable version identity, independent
-   request/command/result bounds, shared bounded outcomes, and portable
-   deterministic codec/call failures.
-2. **Implemented:** compile-time effect-set registration for operator-hosted
-   workflows. Runtime discovery remains deferred.
-3. Add a runtime activity registry only if a non-operator host needs dynamic
-   lookup.
+1. **Implemented:** ordinary typed activity declarations and calls retaining
+   exact canonical input matching, immutable version identity, independent
+   input/result bounds, persisted options, and portable deterministic
+   codec/call failures.
+2. **Implemented:** immutable activity registration and typed invocation for
+   operator-hosted handlers that borrow reconciliation state. Dynamic runtime
+   discovery remains deferred.
+3. **Implemented:** narrow strict-effect integration for operations whose
+   safety proof requires separately persisted prepared commands.
 4. Generalize passive convergence resolution only after another workflow
    demonstrates reusable policy beyond the in-process operator adapters.
 5. Add replay-aware tracing and checkpoint inspection.
 
 ### Workflow Primitives
 
-Add durable timers and retry policy only when a concrete Kuberic workflow
-requires them. Retry behavior must not turn an uncertain exposed activity into
-an automatic duplicate dispatch.
+Ordinary bounded retry policy and reconciler wakeups are implemented. Add
+durable timers only when a concrete Kuberic workflow requires them. Strict
+retry behavior must never turn an uncertain exposed write-authority operation
+into an automatic duplicate dispatch.
 
 External events, parallel scheduling, join/select, child workflows, and
 cancellation remain deferred until demonstrated by a specific workflow.
@@ -176,16 +192,15 @@ standalone kernel consumers that do not host that workflow:
 The shared in-process runner owns load/reload, terminal short-circuit,
 bounded-fuel requeue, one-use dispatch permits, fused progression, quarantine,
 conflict and unknown-write reload, persistence failures, and nondeterminism.
-Operation adapters retain observation collection, authority and exact-command
-preparation, effect/quarantine handling, deadlines, terminal validation, and
-publication. The Kubernetes reconciler remains the scheduler; no worker,
+Operation adapters retain observation collection, authority, ordinary typed
+handlers, the optional strict exact-command/quarantine path, deadlines,
+terminal validation, and publication. The Kubernetes reconciler remains the scheduler; no worker,
 queue, lease, watcher, distributed owner, or retry scheduler was added.
 
 Switchover is now a production framework-native consumer with no public
 selection model or optional build feature. Its representative no-redelivery
-path has nine external effects, three passive observations, 12 logical
-boundaries, and 25 accepted writes: exposure and observation are separate
-accepted writes, followed by terminal compaction. It is also the reference
+path has 12 logical boundaries and 25 accepted writes: each completed activity
+uses exposure/result persistence, followed by terminal compaction. It is also the reference
 direct-style authoring slice:
 the workflow source names each protocol boundary and owns normal and
 compensating control flow, while the adapter owns observations, exact command
@@ -199,27 +214,31 @@ A resource in the `Switchover` phase without a current native reference fails
 closed; removed historical formats are neither migrated nor converted.
 
 The operation reuses the shared runner and ConfigMap provider through 20
-operation-specific version-1 typed effects in one static effect set. Logical
-requests and exact prepared replica/label commands are persisted separately.
-The direct async workflow
-visibly spells out ordered normal, pre-promotion restore, and post-promotion
-compensation paths. The adapter prepares individually correlated
-`ReplicaAgent` and exact-UID label commands but does not select protocol
-progression. A coarse agent-owned switchover intent was not introduced: unlike
-add and remove, the sequence spans multiple replicas and Kubernetes routing
-objects, and the existing per-command fences already supply authoritative
-ambiguity recovery.
+operation-specific version-1 typed activities in one immutable registry.
+Four passive/read-only, four naturally idempotent, and eight identity-fenced
+idempotent handlers use ordinary at-least-once semantics. Only four
+write-authority handlers retain exact prepared-command strict handling.
+The direct async workflow visibly spells out ordered normal, pre-promotion
+restore, and post-promotion compensation paths. The scoped registry owns all
+16 ordinary async handlers and lends each one the current reconciliation
+state. The adapter prepares individually correlated `ReplicaAgent` commands
+only for the four strict write-authority operations; ordinary ReplicaAgent and
+exact-UID label handlers use normal typed results, retryable failures, and
+authoritative observation. A coarse agent-owned switchover intent was not
+introduced: unlike add and remove, the sequence spans multiple replicas and
+Kubernetes routing objects, and the existing per-command fences already
+supply authoritative ambiguity recovery.
 
-The effect requests are operation-local rather than aliases of a shared
+The activity requests are operation-local rather than aliases of a shared
 replica/label request and contain no host redelivery or prepared-command
-fields. Prepared exposed commands use a stricter recovery mode
-than undispatched requests: replica quarantine accepts only matching terminal
-ledger evidence, an exact postcondition, or generation-change non-admission;
-labels accept only their exact UID-fenced postcondition. Evidence-only exposed
-effects are re-evaluated without dispatch authority and wait rather than
-isolate if a command would be required. Compact terminals record the completed
-branch; the kernel authenticates exact completion and classification totals
-while the operator validates the legal branch and topology before publication.
+fields. Prepared exposed commands use a stricter recovery mode than undispatched
+requests: strict replica quarantine accepts only matching terminal ledger
+evidence, an exact postcondition, or generation-change non-admission.
+Ordinary recovery invokes the same registered handler observation-only; a
+missing result consumes a bounded persisted retry before redispatch. Compact
+terminals record the completed branch; the kernel authenticates exact
+completion and classification totals while the operator validates the legal
+branch and topology before publication.
 
 The product supports 1–9 replicas. A one-member set has no distinct switchover
 target; direct switchover accepts valid stable topologies with 2–9 members.
@@ -238,7 +257,9 @@ workflow transitions, and 32 runner outcomes per reconcile. Declared-maximum
 fixtures remain below the 524,288-byte active and 16,384-byte terminal limits.
 Run-specific tests report exact active and terminal measurements. The
 nine-member maximum-fault production case completes 19 logical activities
-(16 external effects and three passive observations) with 67 accepted writes.
+with a 39-write base, ten one-retry ordinary activities, and four
+proof-authorized strict redeliveries: `39 + (10 × 2) + (4 × 2) = 67`
+accepted writes.
 
 The 64-transition limit is one workflow-wide budget consumed by normal,
 compensation, attestation, and redelivery calls. Activity and terminal error

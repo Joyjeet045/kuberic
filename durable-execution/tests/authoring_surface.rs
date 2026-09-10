@@ -129,7 +129,7 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
     println!("workflow-body framework operations: {framework_operation_count}");
     let outcome_count = HOST_OUTCOME_VARIANTS.len();
     println!("public HostOutcome variants: {outcome_count}");
-    assert_eq!(outcome_count, 10);
+    assert_eq!(outcome_count, 12);
     for (predicate, passed) in predicates {
         println!("[{}] {predicate}", if passed { "PASS" } else { "FAIL" });
         assert!(passed, "FR-012 predicate failed: {predicate}");

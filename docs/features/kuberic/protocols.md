@@ -127,28 +127,28 @@ histories are not migrated or resumed.
 The production checkpoint history contains these 20 operation-specific names,
 all at version 1:
 
-| Activity | Role |
-|---|---|
-| `kuberic.switchover.revoke-writes` | Revoke old-primary writes |
-| `kuberic.switchover.capture-frozen-lsn` | Observe the frozen old-primary LSN |
-| `kuberic.switchover.wait-target-caught-up` | Observe target catch-up through the frozen LSN |
-| `kuberic.switchover.demote-old-primary` | Demote the old primary |
-| `kuberic.switchover.promote-target` | Promote the selected target |
-| `kuberic.switchover.distribute-replica-epoch` | Advance one retained replica to the target epoch |
-| `kuberic.switchover.install-target-catch-up-configuration` | Install target dual-configuration catch-up |
-| `kuberic.switchover.wait-target-write-quorum` | Observe target write-quorum catch-up |
-| `kuberic.switchover.install-target-current-configuration` | Commit the target current configuration |
-| `kuberic.switchover.publish-target-primary-label` | Publish target primary routing |
-| `kuberic.switchover.publish-old-primary-secondary-label` | Publish old-primary secondary routing |
-| `kuberic.switchover.attest-target-topology` | Attest the completed target topology |
-| `kuberic.switchover.restore-previous-current-configuration` | Restore the pre-promotion current configuration |
-| `kuberic.switchover.compensate-promote-old-primary` | Re-promote the old primary at the advanced epoch |
-| `kuberic.switchover.compensate-distribute-replica-epoch` | Advance one retained replica to the compensation epoch |
-| `kuberic.switchover.install-compensation-catch-up-configuration` | Install compensation dual-configuration catch-up |
-| `kuberic.switchover.install-compensation-current-configuration` | Commit the compensation current configuration |
-| `kuberic.switchover.restore-old-primary-label` | Restore old-primary routing |
-| `kuberic.switchover.restore-target-secondary-label` | Restore target secondary routing |
-| `kuberic.switchover.attest-compensated-topology` | Attest the safe compensated topology |
+| Activity | Class | Safety rationale |
+|---|---|---|
+| `kuberic.switchover.revoke-writes` | Strict-effect-required | Changes write authority; ambiguity requires prepared-command proof. |
+| `kuberic.switchover.capture-frozen-lsn` | Passive/read-only | Reads authoritative frozen progress. |
+| `kuberic.switchover.wait-target-caught-up` | Passive/read-only | Observes target catch-up through the frozen LSN. |
+| `kuberic.switchover.demote-old-primary` | Strict-effect-required | Changes primary authority; ambiguity requires prepared-command proof. |
+| `kuberic.switchover.promote-target` | Strict-effect-required | Grants primary authority; ambiguity requires prepared-command proof. |
+| `kuberic.switchover.distribute-replica-epoch` | Identity-fenced idempotent | Stable logical action ID fences a duplicate ReplicaAgent request. |
+| `kuberic.switchover.install-target-catch-up-configuration` | Identity-fenced idempotent | Stable action ID and exact configuration signature fence duplicates. |
+| `kuberic.switchover.wait-target-write-quorum` | Identity-fenced idempotent | Stable action ID and authoritative quorum evidence permit safe reinvocation. |
+| `kuberic.switchover.install-target-current-configuration` | Identity-fenced idempotent | Stable action ID and exact configuration signature fence duplicates. |
+| `kuberic.switchover.publish-target-primary-label` | Naturally idempotent | Exact UID-fenced label application converges. |
+| `kuberic.switchover.publish-old-primary-secondary-label` | Naturally idempotent | Exact UID-fenced label application converges. |
+| `kuberic.switchover.attest-target-topology` | Passive/read-only | Validates the completed target topology. |
+| `kuberic.switchover.restore-previous-current-configuration` | Identity-fenced idempotent | Stable action ID identifies the exact restoration. |
+| `kuberic.switchover.compensate-promote-old-primary` | Strict-effect-required | Restores primary authority; ambiguity requires prepared-command proof. |
+| `kuberic.switchover.compensate-distribute-replica-epoch` | Identity-fenced idempotent | Stable action ID fences a compensation duplicate. |
+| `kuberic.switchover.install-compensation-catch-up-configuration` | Identity-fenced idempotent | Stable action ID and exact configuration signature fence duplicates. |
+| `kuberic.switchover.install-compensation-current-configuration` | Identity-fenced idempotent | Stable action ID and exact configuration signature fence duplicates. |
+| `kuberic.switchover.restore-old-primary-label` | Naturally idempotent | Exact UID-fenced label application converges. |
+| `kuberic.switchover.restore-target-secondary-label` | Naturally idempotent | Exact UID-fenced label application converges. |
+| `kuberic.switchover.attest-compensated-topology` | Passive/read-only | Validates the safely restored topology. |
 
 The direct async workflow visibly owns the following normal sequence:
 
@@ -197,20 +197,19 @@ normal prefix through kuberic.switchover.promote-target@v1 failure
 → compensated stable snapshot publication
 ```
 
-Every dispatched activity has a deterministic action ID and exact prepared
-command persisted before dispatch. Before exposure, a matching precondition
-can dispatch and ordinary deadline policy can select a domain failure. After
-exposure, prepared-command rules are stricter: only a matching terminal
-agent-ledger record, the exact live postcondition, or generation-change proof
-of non-admission can resolve a replica command. A precondition, unavailable
-replica, or scheduled/in-progress ledger record remains quarantined even after
-the activity deadline. Replica actions receive at most one same-identity
-redelivery, and only after generation change proves that the previous request
-was not admitted. UID-fenced label actions are never redelivered and remain
-quarantined until the exact UID-bound label postcondition is observed.
-Evidence-only effects have no prepared command; after restart they are
-re-evaluated with dispatch disabled, accepting deterministic observations and
-waiting whenever a command would otherwise be required.
+Ordinary activities have at-least-once semantics: a crash can occur after the
+side effect but before its result is persisted. Passive handlers reread
+evidence, label handlers converge on an exact UID-fenced postcondition, and
+ReplicaAgent handlers reuse the same logical action ID across physical retry
+attempts. A retry never changes operation identity.
+
+Only the four strict write-authority activities persist an exact prepared
+command before dispatch. After exposure, only a matching terminal agent-ledger
+record, exact live postcondition, or generation-change proof of non-admission
+can resolve them. A precondition, unavailable replica, or
+scheduled/in-progress ledger record remains quarantined even after the
+activity deadline. Proof of non-admission authorizes at most one same-command
+strict redelivery.
 
 The shared runner uses fused checkpoint compare-and-swap, one-use dispatch
 permits, one end-to-end 64-transition workflow budget, and authoritative
@@ -225,27 +224,27 @@ distributed workflow history or an exactly-once claim.
 
 ### Framework-native durable replay
 
-The protocol decisions are recorded as the named linear format-3 history
+The protocol decisions are recorded as the named linear format-4 history
 above:
 
 ```
 persist native execution reference
   → direct workflow requests one named typed activity
-  → adapter validates authority and prepares the exact command
-  → host persists DispatchExposed and grants one-use permit
-  → adapter calls ReplicaAgent or applies an exact-UID label patch
-  → adapter supplies authoritative observation
-  → host persists observation plus next exposure or terminal
+  → immutable registry validates identity, exact bounds, and typed input
+  → host persists one physical attempt and grants one-use invocation authority
+  → class-specific handler rereads evidence or invokes ReplicaAgent/Kubernetes
+  → host persists result/retry plus next exposure or terminal
   → runner reloads and validates terminal
   → reconciler publishes stable topology/status
 ```
 
-A dispatch permit is not an exactly-once claim. A lost reply is resolved from
-the exact correlation record or live postcondition. New-process generation
-plus exact precondition can prove that the old request was not admitted and
-allows one bounded redelivery of the same action identity. All other exposed
-ambiguity remains quarantined. ConfigMap conflicts and unknown write outcomes
-reload before any later permit.
+Invocation authority is not an exactly-once claim. Ordinary handlers can be
+reinvoked after a lost result according to persisted retry policy. Strict
+handlers resolve a lost reply from the exact correlation record or live
+postcondition; new-process generation plus exact precondition can prove that
+the old request was not admitted and allow one bounded redelivery of the same
+command. All other strict ambiguity remains quarantined. ConfigMap conflicts
+and unknown write outcomes reload before any later invocation.
 
 A resource already in the `Switchover` phase must contain the current native
 execution reference. If it does not, reconciliation fails closed and does not

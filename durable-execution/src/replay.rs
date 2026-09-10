@@ -187,11 +187,18 @@ fn evaluate_internal<W: Workflow>(
             sequence,
             spec,
             logical_id,
+            completion_class,
         }) => {
+            let record = match completion_class {
+                Some(class) => {
+                    ActivityRecord::classified(sequence, spec, class, ActivityState::Scheduled)
+                }
+                None => ActivityRecord::scheduled(sequence, spec),
+            };
             payload
                 .active_activities_mut()
                 .expect("validated replay state is active")
-                .push(ActivityRecord::scheduled(sequence, spec));
+                .push(record);
             match CheckpointEnvelope::encode_with_limits(&payload, limits) {
                 Ok(checkpoint) => Evaluation::Scheduled {
                     activity: logical_id,

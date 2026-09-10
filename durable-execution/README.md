@@ -5,97 +5,89 @@ workflow replay. It has no dependency on `kuberic-core` or
 `kuberic-operator`; the operator uses it for production framework-native
 remove-replica and switchover workflows. It is not an end-user runtime.
 
-## Typed effect authoring
+## Ordinary typed activity authoring
 
-`DurableEffect` is the reusable authoring contract for operations that may
-change external state. An effect declares separate logical request, exact
-prepared command, and typed output types; immutable versioned identity;
-independent encoded bounds; bounded errors; and immutable completion
-classification. Workflow and store futures are `Send`, so a host turn can run
+`DurableActivity` is the default reusable authoring contract. An activity
+declares typed input and output, immutable versioned identity, and independent
+encoded bounds. Workflow and store futures are `Send`, so a host turn runs
 directly inside an asynchronous controller without a second executor.
 
 ```rust
 use kuberic_durable_execution::{
-    CompletionClass, DurableEffect,
+    ActivityOptions, DurableActivity,
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
-struct GreetingRequest {
+struct GreetingInput {
     recipient: String,
 }
 
 #[derive(Deserialize, Serialize)]
-struct GreetingCommand {
-    endpoint: String,
-    recipient: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct GreetingOutput {
+struct GreetingResult {
     message_id: String,
 }
 
 struct SendGreeting;
 
-impl DurableEffect for SendGreeting {
-    type Request = GreetingRequest;
-    type Command = GreetingCommand;
-    type Output = GreetingOutput;
+impl DurableActivity for SendGreeting {
+    type Input = GreetingInput;
+    type Output = GreetingResult;
     const NAME: &'static str = "greeting";
     const VERSION: u32 = 1;
-    const MAX_REQUEST_BYTES: u64 = 1024;
-    const MAX_COMMAND_BYTES: u64 = 2048;
+    const MAX_INPUT_BYTES: u64 = 1024;
     const MAX_RESULT_BYTES: u64 = 4096;
-    const MAX_ERROR_MESSAGE_BYTES: u64 = 512;
-    const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
 }
 ```
 
-Inside `Workflow::run`, an ordinary typed call is:
+Inside `Workflow::run`, the ordinary direct-style call is:
 
 ```rust
 let sent = context
-    .call_effect::<SendGreeting>(GreetingRequest {
+    .schedule_activity_typed::<SendGreeting>(
+        SendGreeting::NAME,
+        &GreetingInput {
         recipient: "Ada".to_owned(),
-    })
+        },
+        ActivityOptions::default(),
+    )
     .await?;
 ```
 
-`EffectCallError` distinguishes contract/call failures from a bounded
-`BoundedEffectError`. The common persisted `EffectOutcome<T>` represents
-applied typed data, proven non-admission, domain failure, deadline expiry,
-unavailability, and conflicting evidence. Workflows can use ordinary `?`
-propagation while explicitly matching the domain failures that lead to
-compensation.
+An immutable `ActivityRegistry` validates names, versions, exact recorded
+bounds, and typed input before invoking an owned handler.
+`ScopedActivityRegistry<S>` provides the same registry-owned dispatch while
+letting a handler borrow mutable embedding state, such as one reconciliation
+snapshot, for the duration of an invocation. Identity, codec validation, and
+handler selection remain framework-owned.
+`ActivityInvocationRuntime` applies the same action-deadline, attempt-timeout,
+retry-exhaustion, wait, result, and failure classification for both standalone
+`ActivityRunner` users and reconciler-hosted scoped handlers.
 
-Hosts implement `PrepareEffect`, `ObserveEffect`, `DispatchEffect`, and
-`ObserveQuarantinedEffect`. A declarative `durable_effect_set!` lists the
-allowed effect types and generates static identity, metadata, preparation,
-observation, and quarantine routing. It does not generate lifecycle policy or
-inspect conventionally named request fields.
+Ordinary activities have practical at-least-once semantics. One logical record
+contains bounded physical attempts; the default policy permits three attempts
+with persisted exponential backoff. Retryable application failures and lost
+ordinary results may consume an attempt. Codec, registration, nondeterminism,
+storage, and timeout failures do not silently become retries. `ActivityOptions`
+also carries action deadlines and attempt timeouts; all options participate in
+replay identity and supply requeue wakeups to an embedding reconciler.
+`ActivityRunner::with_timeout_runtime` accepts the embedding async runtime's
+timer/cancellation adapter, so elapsed in-flight deadlines become durable
+timeout failures without adding Tokio or another executor to the kernel.
 
-The logical request and prepared command are persisted separately. The command
-is derived from authoritative evidence, bounded, validated against immutable
-execution authority, and accepted before a one-use permit exposes it to
-dispatch. Replay validates the recorded command rather than deriving a
-replacement from mutable evidence.
+Handlers must expect a crash after changing external state but before result
+persistence. Read-only handlers reread evidence, naturally idempotent handlers
+converge, and identity-fenced handlers preserve a stable action ID across
+physical attempts. A narrow optional strict integration retains exact
+prepared-command, one-use permit, observe-before-dispatch, and quarantine
+machinery for operations where duplicate ambiguity would violate safety. It is
+not the default workflow model.
 
-One logical record has a bounded attempt ledger. A proven-no-admission
-observation may authorize one more exposure with a new attempt identity and
-the same logical request and command. An unknown exposed outcome enters
-observation-only quarantine and can never regain dispatch authority. Terminal
-compaction authenticates completed, external-effect, and passive-observation
-counts from registered effect metadata.
-
-`DurableActivity`, `WorkflowContext::call`, and the low-level
-`WorkflowContext::activity(ActivitySpec)` API remain available for compatible
-non-effect boundaries and advanced uses.
-
-This surface is inspired by Duroxide/Durable Task-style ordinary async
-authoring; it is not Duroxide API or runtime compatibility. The crate does not
-provide workers, queues, leases, timers, generic retries, external events,
-parallel orchestration, child workflows, or cancellation.
+This surface implements Duroxide-style direct workflow authoring, typed named
+activities, replay, and at-least-once retry semantics. Kubernetes adapts
+scheduling to existing watches and requeues. The crate intentionally omits an
+embedded Duroxide runtime, workers, queues, leases, heartbeats, external
+events, parallel orchestration, child workflows, and cancellation.
 
 ## Replay and checkpoint semantics
 
@@ -107,7 +99,7 @@ final pending activity. A requested activity must match the recorded sequence,
 immutable positive-versioned name, exact input, and declared result bound; a
 mismatch is nondeterminism rather than a new dispatch.
 
-Format version 3 stores JSON payload bytes in a versioned
+Format version 4 stores JSON payload bytes in a versioned
 `CheckpointEnvelope`. An immutable `ExecutionSpec` declares execution
 identity, exact workflow input, and the maximum exact-byte terminal payload.
 The persisted execution contract also records the active and terminal
@@ -118,7 +110,8 @@ polling.
 The payload has exactly one explicit lifecycle state:
 
 - `Active` contains the complete bounded linear history, with records in
-  `Scheduled`, `DispatchExposed`, or `Completed` state.
+  scheduled, exposed/retry-wait, or completed state and a bounded physical
+  attempt ledger under each logical activity.
 - `Terminal` contains `Succeeded` or `Failed` exact bytes and the completed
   activity count. It has no activity history or digest.
 
@@ -128,11 +121,13 @@ without a dispatch permit. Once terminal, a turn returns the stored outcome
 and observed revision directly without polling workflow code.
 
 Logical activity identity is the complete tuple of execution ID, sequence,
-versioned activity name, exact activity input, and declared maximum result
-bytes. Its external rendering contains the complete tuple without hashing or
-normalization. `AttemptId` is a separate host-epoch and monotonic-counter
-identity, so a discarded pre-exposure attempt may change without changing the
-logical activity.
+versioned activity name, exact activity input, declared input/result bounds,
+and scheduling options. Its stable external action rendering contains the
+execution ID, sequence, versioned name, exact input, and result bound without
+hashing or normalization; replay separately authenticates the input bound and
+options from the recorded specification. `AttemptId` is a separate host-epoch
+and monotonic-counter identity, so a physical retry may change without
+changing the logical activity.
 
 ## Checkpoint limits and result reservation
 
@@ -213,7 +208,7 @@ checkpoint between independent and owner-based retention.
 
 Each execution maps to
 `kuberic-checkpoint-<32-lowercase-execution-id-hex>` in that namespace. The
-format-3 envelope's canonical JSON is stored in
+format-4 envelope's canonical JSON is stored in
 `data["checkpoint.json"]`; the object is labeled
 `kuberic.io/component=durable-checkpoint`. Initial CAS uses create-if-absent.
 Successor CAS uses replace with the caller's exact, opaque
@@ -263,18 +258,20 @@ overhead.
 
 ## Turns and dispatch permission
 
-Awaiting `DurableHost::turn` evaluates and commits no more than one persistence
+Awaiting a host turn evaluates and commits no more than one persistence
 boundary:
 
-1. For an activity-bearing workflow, the first turn accepts a `Scheduled`
-   checkpoint and returns no permit.
-2. A later turn prepares an attempt, accepts a separate `DispatchExposed`
-   checkpoint revision, and only then returns an opaque `DispatchPermit`.
-3. After observations make active replay complete, the host CAS-replaces the
-   full active checkpoint with a minimal terminal checkpoint.
-4. `WorkflowCompleted` is returned only after that CAS is accepted or a later
-   load observes terminal state. It carries the exact success/failure outcome
-   and accepted/observed opaque revision.
+1. A new ordinary activity accepts one exposed physical attempt under its
+   stable logical record.
+2. The registered handler observes or invokes that attempt. Completion,
+   retry-wait, and lost-result recovery update the same logical record.
+3. Accepted completion may fuse the result with the next exposure, while each
+   additional physical attempt adds at most one exposure and one result write.
+4. After replay completes, the host CAS-replaces active history with a compact
+   terminal checkpoint.
+5. A newly accepted terminal returns an awaiting-reload outcome. Completion is
+   published only after a later authoritative load observes and validates the
+   terminal revision.
 
 A zero-activity workflow skips schedule, exposure, and observation. Its first
 turn validates terminal capacity and CAS-creates terminal state directly from
@@ -284,14 +281,14 @@ Construction requires the checkpoint store, caller-supplied host epoch, and
 validated `CheckpointLimits`; callers supply the executor used to await turns
 and observations.
 
-The permit is evidence that this in-process host observed acceptance of both
-persistence boundaries. It is **not** proof of exactly-once execution: a crash
-may occur after exposure persistence and before, during, or after the external
-effect.
+The permit is evidence that this in-process host observed acceptance of the
+exposure boundary. It is **not** proof of exactly-once execution: a crash may
+occur after exposure persistence and before, during, or after handler
+invocation.
 
 ### Internal prepared exposure
 
-Effect-specific adapters may pass a `PreparedActivityResolver` to
+Strict-effect adapters may pass a `PreparedActivityResolver` to
 `turn_and_expose_with` and `observe_and_turn_with`. For a new logical request,
 the resolver supplies the complete bounded `ActivitySpec` before checkpoint
 encoding, result-capacity reservation, and the exposure CAS. For replay, it
@@ -310,11 +307,10 @@ quarantined until the host receives authoritative completion or
 effect-specific proof that permits a safe retry. Process-local knowledge that
 a permit or reply was lost cannot override checkpoint state.
 
-This is an internal, opt-in host/evaluation behavior. The public typed
-authoring contract is unchanged: existing `DurableActivity` declarations,
-`WorkflowContext::call`, immutable name/version identity, canonical typed
-input/output encoding, exact replay matching, and declared input/result bounds
-continue to use identity preparation by default.
+This is an internal, opt-in host/evaluation behavior behind an ordinary
+activity call. `DurableActivity`, `WorkflowContext::call`, immutable
+name/version identity, canonical typed input/output encoding, exact replay
+matching, and declared input/result bounds remain the public model.
 
 Completion conflict or `OutcomeUnknown` returns `ReloadRequired` and never a
 permit or completion. If an unknown write applied, reload observes terminal
@@ -322,7 +318,7 @@ state. If it did not apply, reload replays completed active results and retries
 terminalization without redispatch. Provider failures return `StoreFailed`;
 every later attempt starts with a fresh load.
 
-Callers with effect-specific authoritative recovery can opt into the fused
+Callers with strict-effect authoritative recovery can opt into the fused
 host methods without changing the low-level behavior above:
 
 - `turn_and_expose` evaluates the next activity, reserves its maximum result,
@@ -336,8 +332,8 @@ host methods without changing the low-level behavior above:
 Conflict, definite store failure, and `OutcomeUnknown` at either fused boundary
 never return a permit. An unknown-after-apply next exposure reloads as
 quarantined, including the case where this process knows it never received the
-permit; generic recovery does not weaken that conservative rule. The original
-`turn` and `observe` methods remain the default for arbitrary effects.
+permit; generic recovery does not weaken that conservative rule. Ordinary activity handlers use the registry and bounded attempt lifecycle
+instead.
 
 Terminal success and failure payloads share the `ExecutionSpec` bound. An
 exact-bound outcome is accepted. A larger outcome is an explicit checkpoint
@@ -453,19 +449,20 @@ collection. Independently retained orphan cleanup remains a separately
 authorized lifecycle responsibility. No worker, queue, lease, watcher, or
 separate execution service is introduced.
 
-Direct-style switchover uses 20 operation-specific version-1 typed effects in
-one static effect set.
+Direct-style switchover uses 20 operation-specific version-1 typed activities
+in one immutable registry.
 Its workflow source, rather than the kernel or host adapter, visibly owns the
 normal and compensating sequence. The adapter resolves logical calls to exact
-prepared `ReplicaAgent` or UID-fenced label commands, persisted separately
-from domain requests before exposure, and supplies authoritative observations
-afterward. This demonstrates the reusable direct authoring pattern without
-adding runtime discovery, a generic compensation engine, or a distributed
-runtime.
+read-only, convergent label, identity-fenced ReplicaAgent, or strict handlers
+and supplies authoritative observations afterward. Exactly four
+write-authority operations retain separately persisted prepared commands
+before exposure. This demonstrates the reusable direct authoring pattern
+without adding runtime discovery, a generic compensation engine, or a
+distributed runtime.
 
-Those effect requests remain operation-local; the adapter does not persist a
-cross-operation kind/request union behind the typed names. Once an effect is
-exposed, its deadline is not evidence of failure: replica quarantine resolves
+Those activity requests remain operation-local; the adapter does not persist a
+cross-operation kind/request union behind the typed names. Once a strict
+activity is exposed, its deadline is not evidence of failure: quarantine resolves
 only from a matching terminal ledger record, the exact live postcondition, or
 generation-change proof of non-admission, while labels resolve only from the
 exact UID-fenced label postcondition. The workflow applies one checked
@@ -478,7 +475,7 @@ The crate intentionally stops at the durable-execution kernel.
 Completion-only compaction and an isolated Kubernetes checkpoint-provider spike
 are implemented. Production framework-native remove-replica and switchover
 adopt the kernel through a shared in-process operator runner without
-moving effect ownership into it. Generic active-history compaction and
+moving activity ownership into it. Generic active-history compaction and
 continuation remain excluded. The remaining ordered deferred work is tracked in
 [Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
 
@@ -489,8 +486,8 @@ The ConfigMap provider is production-required, not opt-in, for
 framework-native remove-replica and switchover: `kuberic-operator` enables it unconditionally
 and owns the provider contract described above. The earlier isolated real-API
 evaluation does not establish generic persistence fitness for other consumers,
-distributed execution ownership, a worker, queue, lease, activity
-handler, automatic observation polling, or passive-observation transport. The
+distributed execution ownership, a worker, queue, lease, automatic
+observation polling, or passive-observation transport. The
 kernel does not establish a canonical exact-byte representation across
 versions.
 
@@ -501,10 +498,10 @@ outcomes indistinguishable to the host. The lost-effect-reply fixture still
 invokes one synthetic effect under an opaque permit and discards its returned
 result before restart.
 
-Generic activity handlers/registries, a second activity-failure lifecycle,
-passive convergence, tracing/inspection, timers, retries, parallelism, generic
-lifecycle APIs, queries, external events, child workflows, workers, queues,
-leases, and distributed runtime ownership are excluded. So are migrations,
+Dynamic runtime discovery, passive convergence policy shared across products,
+tracing/inspection, durable timers, parallelism, generic lifecycle APIs,
+queries, external events, child workflows, workers, queues, leases, and
+distributed runtime ownership are excluded. So are migrations,
 upgrade guarantees, broad rollout of other operations, and production
 diagnostics. Framework-native remove-replica integrates typed calls and
 operator-owned effect adapters through its existing compact workflow;

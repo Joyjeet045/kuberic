@@ -21,9 +21,9 @@ use kuberic_core::types::{
     ReplicaInstanceId, ReplicaStatusInfo, Role,
 };
 use kuberic_durable_execution::{
-    ActivityName, ActivityObservation, ActivityRecord, ActivitySequence, ActivitySpec,
-    ActivityState, CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload,
-    DurableActivity, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec,
+    ActivityName, ActivityObservation, ActivityOptions, ActivityRecord, ActivitySequence,
+    ActivitySpec, ActivityState, CheckpointEnvelope, CheckpointError, CheckpointLimits,
+    CheckpointPayload, DurableActivity, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec,
     InMemoryCheckpointStore, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
     KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, LogicalActivityId,
     PreparedActivityError, PreparedActivityResolver, TerminalOutcome, Workflow, WorkflowContext,
@@ -1605,14 +1605,16 @@ pub fn decode_boundary_input(input: &ExactBytes) -> Result<RemoveReplicaBoundary
 pub fn activity_spec(input: &RemoveReplicaBoundaryInput) -> Result<ActivitySpec, String> {
     let input = encode_activity_input::<RemoveReplicaBoundary>(input)
         .map_err(|error| format!("serialize native remove boundary input: {error}"))?;
-    Ok(ActivitySpec::new(
+    Ok(ActivitySpec::with_bounds_and_options(
         ActivityName::new(
             REMOVE_REPLICA_ACTIVITY_NAME,
             REMOVE_REPLICA_ACTIVITY_VERSION,
         )
         .map_err(|error| format!("construct native remove activity name: {error}"))?,
         input,
+        REMOVE_REPLICA_MAX_BOUNDARY_INPUT_BYTES,
         REMOVE_REPLICA_MAX_BOUNDARY_RESULT_BYTES,
+        ActivityOptions::default(),
     ))
 }
 
@@ -2652,7 +2654,7 @@ impl<'a> FrameworkNativeRemoveReplicaAdapter<'a> {
                 requeue_after_seconds: 1,
             }
         } else {
-            DurableAdapterBoundary::Observed(observation)
+            DurableAdapterBoundary::Observed(Box::new(observation))
         }
     }
 
@@ -4081,7 +4083,7 @@ mod remove_replica_execution_tests {
         );
         assert_eq!(first, second);
         let Evaluation::Scheduled { activity, .. } = first else {
-            panic!("replay did not advance to the exact next boundary");
+            panic!("replay did not advance to the exact next boundary: {first:?}");
         };
         assert_eq!(activity.sequence(), ActivitySequence::new(1));
     }

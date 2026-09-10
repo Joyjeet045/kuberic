@@ -1,8 +1,8 @@
-use kuberic_durable_execution::{CompletionClass, DurableEffect, durable_effect_set};
+use kuberic_durable_execution::{CompletionClass, DurableActivity, DurableEffect};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::crd::{EpochStatus, StablePartitionSnapshotStatus};
-use crate::durable::effects::{LabelEffectCommand, ReplicaEffectCommand};
+use crate::durable::effects::ReplicaEffectCommand;
 
 pub const DIRECT_SWITCHOVER_CONTRACT_VERSION: u32 = 4;
 pub const DIRECT_ACTIVITY_VERSION: u32 = 1;
@@ -14,13 +14,22 @@ pub struct EffectApplied {
     pub observed_at_unix_seconds: i64,
 }
 
-pub(crate) trait SwitchoverEffect: DurableEffect {
+pub trait SwitchoverActivityContract {
+    type Request: Serialize + serde::de::DeserializeOwned;
+    type Output: Serialize + serde::de::DeserializeOwned;
+    const NAME: &'static str;
+    const VERSION: u32;
+    const MAX_REQUEST_BYTES: u64;
+    const MAX_RESULT_BYTES: u64;
+    const MAX_ERROR_MESSAGE_BYTES: u64;
+    const COMPLETION_CLASS: CompletionClass;
+}
+
+pub(crate) trait StrictSwitchoverActivityContract: SwitchoverActivityContract {
     type Family;
 }
 
 pub(crate) struct ReplicaEffectFamily;
-pub(crate) struct LabelEffectFamily;
-pub(crate) struct PassiveEffectFamily;
 
 pub type RevokeWritesOutput = EffectApplied;
 pub type DemoteOldPrimaryOutput = EffectApplied;
@@ -43,22 +52,16 @@ macro_rules! define_replica_activity {
     ($activity:ident, $input:ty, $name:literal, $max_input:literal, $max_result:literal) => {
         pub struct $activity;
 
-        impl DurableEffect for $activity {
+        impl SwitchoverActivityContract for $activity {
             type Request = $input;
-            type Command = Option<ReplicaEffectCommand>;
             type Output = EffectApplied;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
             const MAX_REQUEST_BYTES: u64 = $max_input;
-            const MAX_COMMAND_BYTES: u64 = 8_192;
             const MAX_RESULT_BYTES: u64 = $max_result;
             const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
             const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
-        }
-
-        impl SwitchoverEffect for $activity {
-            type Family = ReplicaEffectFamily;
         }
     };
 }
@@ -67,22 +70,16 @@ macro_rules! define_label_activity {
     ($activity:ident, $input:ty, $name:literal, $max_input:literal, $max_result:literal) => {
         pub struct $activity;
 
-        impl DurableEffect for $activity {
+        impl SwitchoverActivityContract for $activity {
             type Request = $input;
-            type Command = Option<LabelEffectCommand>;
             type Output = EffectApplied;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
             const MAX_REQUEST_BYTES: u64 = $max_input;
-            const MAX_COMMAND_BYTES: u64 = 4_096;
             const MAX_RESULT_BYTES: u64 = $max_result;
             const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
             const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
-        }
-
-        impl SwitchoverEffect for $activity {
-            type Family = LabelEffectFamily;
         }
     };
 }
@@ -92,11 +89,8 @@ macro_rules! fixed_replica_input {
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         pub struct $input {
-            pub contract_version: u32,
-            pub execution_id: String,
             pub $target_id: i64,
             pub $target_instance_id: String,
-            pub deadline_unix_seconds: i64,
         }
     };
 }
@@ -116,12 +110,9 @@ fixed_replica_input!(
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DistributeReplicaEpochInput {
-    pub contract_version: u32,
-    pub execution_id: String,
     pub distribution_index: u8,
     pub replica_id: i64,
     pub replica_instance_id: String,
-    pub deadline_unix_seconds: i64,
 }
 
 fixed_replica_input!(
@@ -153,12 +144,9 @@ fixed_replica_input!(
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompensateDistributeReplicaEpochInput {
-    pub contract_version: u32,
-    pub execution_id: String,
     pub distribution_index: u8,
     pub replica_id: i64,
     pub replica_instance_id: String,
-    pub deadline_unix_seconds: i64,
 }
 
 fixed_replica_input!(
@@ -177,11 +165,8 @@ macro_rules! fixed_label_input {
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         pub struct $input {
-            pub contract_version: u32,
-            pub execution_id: String,
             pub $target_id: i64,
             pub $target_instance_id: String,
-            pub deadline_unix_seconds: i64,
         }
     };
 }
@@ -299,6 +284,35 @@ define_label_activity!(
     4_096,
     768
 );
+
+macro_rules! implement_strict_effect {
+    ($activity:ty) => {
+        impl DurableEffect for $activity {
+            type Request = <Self as SwitchoverActivityContract>::Request;
+            type Command = Option<ReplicaEffectCommand>;
+            type Output = <Self as SwitchoverActivityContract>::Output;
+
+            const NAME: &'static str = <Self as SwitchoverActivityContract>::NAME;
+            const VERSION: u32 = <Self as SwitchoverActivityContract>::VERSION;
+            const MAX_REQUEST_BYTES: u64 = <Self as SwitchoverActivityContract>::MAX_REQUEST_BYTES;
+            const MAX_COMMAND_BYTES: u64 = 8_192;
+            const MAX_RESULT_BYTES: u64 = <Self as SwitchoverActivityContract>::MAX_RESULT_BYTES;
+            const MAX_ERROR_MESSAGE_BYTES: u64 =
+                <Self as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES;
+            const COMPLETION_CLASS: CompletionClass =
+                <Self as SwitchoverActivityContract>::COMPLETION_CLASS;
+        }
+
+        impl StrictSwitchoverActivityContract for $activity {
+            type Family = ReplicaEffectFamily;
+        }
+    };
+}
+
+implement_strict_effect!(RevokeWritesActivity);
+implement_strict_effect!(DemoteOldPrimaryActivity);
+implement_strict_effect!(PromoteTargetActivity);
+implement_strict_effect!(CompensatePromoteOldPrimaryActivity);
 define_label_activity!(
     PublishOldPrimarySecondaryLabelActivity,
     PublishOldPrimarySecondaryLabelInput,
@@ -388,12 +402,9 @@ pub(crate) mod bounded_optional_error {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaptureFrozenLsnInput {
-    pub contract_version: u32,
-    pub execution_id: String,
     pub old_primary_id: i64,
     pub old_primary_instance_id: String,
     pub expected_epoch: EpochStatus,
-    pub deadline_unix_seconds: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -405,56 +416,41 @@ pub struct CaptureFrozenLsnOutput {
 
 pub struct CaptureFrozenLsnActivity;
 
-impl DurableEffect for CaptureFrozenLsnActivity {
+impl SwitchoverActivityContract for CaptureFrozenLsnActivity {
     type Request = CaptureFrozenLsnInput;
-    type Command = ();
     type Output = CaptureFrozenLsnOutput;
 
     const NAME: &'static str = "kuberic.switchover.capture-frozen-lsn";
     const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
     const MAX_REQUEST_BYTES: u64 = 2_048;
-    const MAX_COMMAND_BYTES: u64 = 4;
     const MAX_RESULT_BYTES: u64 = 1_024;
     const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
     const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
 }
 
-impl SwitchoverEffect for CaptureFrozenLsnActivity {
-    type Family = PassiveEffectFamily;
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WaitTargetCaughtUpInput {
-    pub contract_version: u32,
-    pub execution_id: String,
     pub target_id: i64,
     pub target_instance_id: String,
     pub expected_epoch: EpochStatus,
     pub frozen_lsn: i64,
-    pub deadline_unix_seconds: i64,
 }
 
 pub type WaitTargetCaughtUpOutput = EffectApplied;
 
 pub struct WaitTargetCaughtUpActivity;
 
-impl DurableEffect for WaitTargetCaughtUpActivity {
+impl SwitchoverActivityContract for WaitTargetCaughtUpActivity {
     type Request = WaitTargetCaughtUpInput;
-    type Command = ();
     type Output = WaitTargetCaughtUpOutput;
 
     const NAME: &'static str = "kuberic.switchover.wait-target-caught-up";
     const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
     const MAX_REQUEST_BYTES: u64 = 2_048;
-    const MAX_COMMAND_BYTES: u64 = 4;
     const MAX_RESULT_BYTES: u64 = 1_024;
     const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
     const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
-}
-
-impl SwitchoverEffect for WaitTargetCaughtUpActivity {
-    type Family = PassiveEffectFamily;
 }
 
 macro_rules! define_attestation_activity {
@@ -462,10 +458,7 @@ macro_rules! define_attestation_activity {
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         pub struct $input {
-            pub contract_version: u32,
-            pub execution_id: String,
             pub expected_snapshot: StablePartitionSnapshotStatus,
-            pub deadline_unix_seconds: i64,
         }
 
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -477,22 +470,16 @@ macro_rules! define_attestation_activity {
 
         pub struct $activity;
 
-        impl DurableEffect for $activity {
+        impl SwitchoverActivityContract for $activity {
             type Request = $input;
-            type Command = ();
             type Output = $output;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
             const MAX_REQUEST_BYTES: u64 = $max_input;
-            const MAX_COMMAND_BYTES: u64 = 4;
             const MAX_RESULT_BYTES: u64 = $max_result;
             const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
             const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
-        }
-
-        impl SwitchoverEffect for $activity {
-            type Family = PassiveEffectFamily;
         }
     };
 }
@@ -506,30 +493,6 @@ define_attestation_activity!(
     8_192
 );
 
-durable_effect_set! {
-    pub SwitchoverEffects => SwitchoverEffectRoute {
-        RevokeWritesActivity,
-        CaptureFrozenLsnActivity,
-        WaitTargetCaughtUpActivity,
-        DemoteOldPrimaryActivity,
-        PromoteTargetActivity,
-        DistributeReplicaEpochActivity,
-        InstallTargetCatchUpConfigurationActivity,
-        WaitTargetWriteQuorumActivity,
-        InstallTargetCurrentConfigurationActivity,
-        PublishTargetPrimaryLabelActivity,
-        PublishOldPrimarySecondaryLabelActivity,
-        AttestTargetTopologyActivity,
-        RestorePreviousCurrentConfigurationActivity,
-        CompensatePromoteOldPrimaryActivity,
-        CompensateDistributeReplicaEpochActivity,
-        InstallCompensationCatchUpConfigurationActivity,
-        InstallCompensationCurrentConfigurationActivity,
-        RestoreOldPrimaryLabelActivity,
-        RestoreTargetSecondaryLabelActivity,
-        AttestCompensatedTopologyActivity,
-    }
-}
 define_attestation_activity!(
     AttestCompensatedTopologyActivity,
     AttestCompensatedTopologyInput,
@@ -540,7 +503,10 @@ define_attestation_activity!(
 );
 
 pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
-    (RevokeWritesActivity::NAME, RevokeWritesActivity::VERSION),
+    (
+        <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
+        <RevokeWritesActivity as SwitchoverActivityContract>::VERSION,
+    ),
     (
         CaptureFrozenLsnActivity::NAME,
         CaptureFrozenLsnActivity::VERSION,
@@ -550,10 +516,13 @@ pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
         WaitTargetCaughtUpActivity::VERSION,
     ),
     (
-        DemoteOldPrimaryActivity::NAME,
-        DemoteOldPrimaryActivity::VERSION,
+        <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+        <DemoteOldPrimaryActivity as SwitchoverActivityContract>::VERSION,
     ),
-    (PromoteTargetActivity::NAME, PromoteTargetActivity::VERSION),
+    (
+        <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
+        <PromoteTargetActivity as SwitchoverActivityContract>::VERSION,
+    ),
     (
         DistributeReplicaEpochActivity::NAME,
         DistributeReplicaEpochActivity::VERSION,
@@ -587,8 +556,8 @@ pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
         RestorePreviousCurrentConfigurationActivity::VERSION,
     ),
     (
-        CompensatePromoteOldPrimaryActivity::NAME,
-        CompensatePromoteOldPrimaryActivity::VERSION,
+        <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+        <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::VERSION,
     ),
     (
         CompensateDistributeReplicaEpochActivity::NAME,
@@ -616,14 +585,177 @@ pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
     ),
 ];
 
+pub(crate) struct OrdinarySwitchoverActivity<E>(std::marker::PhantomData<E>);
+
+pub(crate) struct SwitchoverActivityInput<E: SwitchoverActivityContract> {
+    request: E::Request,
+    action_deadline_unix_seconds: i64,
+}
+
+impl<E: SwitchoverActivityContract> SwitchoverActivityInput<E> {
+    pub fn new(request: E::Request, action_deadline_unix_seconds: i64) -> Self {
+        Self {
+            request,
+            action_deadline_unix_seconds,
+        }
+    }
+
+    pub const fn action_deadline_unix_seconds(&self) -> i64 {
+        self.action_deadline_unix_seconds
+    }
+
+    pub fn into_request(self) -> E::Request {
+        self.request
+    }
+}
+
+impl<E: SwitchoverActivityContract> Serialize for SwitchoverActivityInput<E> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.request.serialize(serializer)
+    }
+}
+
+impl<'de, E: SwitchoverActivityContract> Deserialize<'de> for SwitchoverActivityInput<E> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self {
+            request: E::Request::deserialize(deserializer)?,
+            action_deadline_unix_seconds: 0,
+        })
+    }
+}
+
+impl<E: SwitchoverActivityContract> DurableActivity for OrdinarySwitchoverActivity<E> {
+    type Input = SwitchoverActivityInput<E>;
+    type Output = E::Output;
+
+    const NAME: &'static str = E::NAME;
+    const VERSION: u32 = E::VERSION;
+    const MAX_INPUT_BYTES: u64 = E::MAX_REQUEST_BYTES;
+    const MAX_RESULT_BYTES: u64 = E::MAX_RESULT_BYTES;
+
+    fn completion_class() -> Option<CompletionClass> {
+        Some(E::COMPLETION_CLASS)
+    }
+
+    fn strict_effect_metadata() -> Option<kuberic_durable_execution::EffectMetadata> {
+        matches!(
+            activity_class(E::NAME),
+            Some(SwitchoverActivityClass::StrictEffectRequired)
+        )
+        .then(|| kuberic_durable_execution::EffectMetadata::new(8_192, E::COMPLETION_CLASS))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwitchoverActivityClass {
+    PassiveReadOnly,
+    NaturallyIdempotent,
+    IdentityFencedIdempotent,
+    StrictEffectRequired,
+}
+
+pub const SWITCHOVER_ACTIVITY_CLASSIFICATION: &[(&str, SwitchoverActivityClass)] = &[
+    (
+        CaptureFrozenLsnActivity::NAME,
+        SwitchoverActivityClass::PassiveReadOnly,
+    ),
+    (
+        WaitTargetCaughtUpActivity::NAME,
+        SwitchoverActivityClass::PassiveReadOnly,
+    ),
+    (
+        AttestTargetTopologyActivity::NAME,
+        SwitchoverActivityClass::PassiveReadOnly,
+    ),
+    (
+        AttestCompensatedTopologyActivity::NAME,
+        SwitchoverActivityClass::PassiveReadOnly,
+    ),
+    (
+        PublishTargetPrimaryLabelActivity::NAME,
+        SwitchoverActivityClass::NaturallyIdempotent,
+    ),
+    (
+        PublishOldPrimarySecondaryLabelActivity::NAME,
+        SwitchoverActivityClass::NaturallyIdempotent,
+    ),
+    (
+        RestoreOldPrimaryLabelActivity::NAME,
+        SwitchoverActivityClass::NaturallyIdempotent,
+    ),
+    (
+        RestoreTargetSecondaryLabelActivity::NAME,
+        SwitchoverActivityClass::NaturallyIdempotent,
+    ),
+    (
+        DistributeReplicaEpochActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        InstallTargetCatchUpConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        WaitTargetWriteQuorumActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        InstallTargetCurrentConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        RestorePreviousCurrentConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        CompensateDistributeReplicaEpochActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        InstallCompensationCatchUpConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        InstallCompensationCurrentConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
+        SwitchoverActivityClass::StrictEffectRequired,
+    ),
+    (
+        <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+        SwitchoverActivityClass::StrictEffectRequired,
+    ),
+    (
+        <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
+        SwitchoverActivityClass::StrictEffectRequired,
+    ),
+    (
+        <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+        SwitchoverActivityClass::StrictEffectRequired,
+    ),
+];
+
+pub fn activity_class(name: &str) -> Option<SwitchoverActivityClass> {
+    SWITCHOVER_ACTIVITY_CLASSIFICATION
+        .iter()
+        .find_map(|(registered, class)| (*registered == name).then_some(*class))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crd::{StableReplicaRoleStatus, StableReplicaSnapshotStatus};
     use kuberic_durable_execution::{
-        ActivityCallError, BoundedEffectError, EffectActivity, EffectContractError,
-        EffectErrorKind, EffectOutcome, decode_activity_result, decode_effect_request,
-        encode_activity_result, encode_effect_request,
+        ActivityCallError, BoundedEffectError, EffectContractError, EffectErrorKind, EffectOutcome,
+        decode_activity_input, decode_activity_result, encode_activity_input,
     };
 
     fn snapshot() -> StablePartitionSnapshotStatus {
@@ -653,70 +785,75 @@ mod tests {
 
     fn revoke_input() -> RevokeWritesInput {
         RevokeWritesInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: "execution".to_string(),
             old_primary_id: 1,
             old_primary_instance_id: "instance-1".to_string(),
-            deadline_unix_seconds: 10,
         }
     }
 
     fn target_label_input() -> PublishTargetPrimaryLabelInput {
         PublishTargetPrimaryLabelInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: "execution".to_string(),
             target_primary_id: 2,
             target_primary_instance_id: "instance-2".to_string(),
-            deadline_unix_seconds: 10,
         }
     }
 
     fn assert_exact_input_bound<A, F>(make: F)
     where
-        A: DurableEffect,
+        A: SwitchoverActivityContract,
         F: Fn(usize) -> A::Request,
     {
-        let base = encode_effect_request::<A>(&make(0)).unwrap();
-        let maximum = usize::try_from(A::MAX_REQUEST_BYTES).unwrap();
-        assert!(base.as_slice().len() <= maximum, "{}", A::NAME);
+        let input = |request| SwitchoverActivityInput::<A>::new(request, 0);
+        let base = encode_activity_input::<OrdinarySwitchoverActivity<A>>(&input(make(0))).unwrap();
+        let maximum =
+            usize::try_from(<A as SwitchoverActivityContract>::MAX_REQUEST_BYTES).unwrap();
+        assert!(
+            base.as_slice().len() <= maximum,
+            "{}",
+            <A as SwitchoverActivityContract>::NAME
+        );
         let padding = maximum - base.as_slice().len();
-        let exact = encode_effect_request::<A>(&make(padding)).unwrap();
-        assert_eq!(exact.as_slice().len(), maximum, "{}", A::NAME);
-        assert!(decode_effect_request::<A>(&exact).is_ok(), "{}", A::NAME);
+        let exact =
+            encode_activity_input::<OrdinarySwitchoverActivity<A>>(&input(make(padding))).unwrap();
+        assert_eq!(
+            exact.as_slice().len(),
+            maximum,
+            "{}",
+            <A as SwitchoverActivityContract>::NAME
+        );
+        assert!(
+            decode_activity_input::<OrdinarySwitchoverActivity<A>>(&exact).is_ok(),
+            "{}",
+            <A as SwitchoverActivityContract>::NAME
+        );
         assert!(
             matches!(
-                encode_effect_request::<A>(&make(padding + 1)),
-                Err(EffectContractError::Activity(ActivityCallError::InputTooLarge {
+                encode_activity_input::<OrdinarySwitchoverActivity<A>>(&input(make(padding + 1))),
+                Err(ActivityCallError::InputTooLarge {
                     actual_bytes,
                     max_bytes,
-                })) if actual_bytes == max_bytes + 1 && max_bytes == A::MAX_REQUEST_BYTES
+                }) if actual_bytes == max_bytes + 1
+                    && max_bytes == <A as SwitchoverActivityContract>::MAX_REQUEST_BYTES
             ),
             "{}",
-            A::NAME
+            <A as SwitchoverActivityContract>::NAME
         );
     }
 
     fn assert_replica_result_error_bound<A>()
     where
-        A: DurableEffect<Output = EffectApplied>,
+        A: SwitchoverActivityContract<Output = EffectApplied>,
     {
         for message in ["x".repeat(512), "é".repeat(256)] {
             let error = BoundedEffectError::observed_at(
                 EffectErrorKind::UnavailableAtDeadline,
                 message,
                 1,
-                A::MAX_ERROR_MESSAGE_BYTES,
+                <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
             )
             .unwrap();
-            let encoded =
-                encode_activity_result::<EffectActivity<A>>(
-                    &EffectOutcome::<EffectApplied>::UnavailableAtDeadline(error),
-                )
-                .unwrap();
             assert!(
-                decode_activity_result::<EffectActivity<A>>(&encoded).is_ok(),
-                "{}",
-                A::NAME
+                serde_json::to_vec(&error).unwrap().len()
+                    <= <A as SwitchoverActivityContract>::MAX_RESULT_BYTES as usize
             );
         }
         for message in ["x".repeat(513), "é".repeat(257)] {
@@ -726,20 +863,20 @@ mod tests {
                         EffectErrorKind::UnavailableAtDeadline,
                         message,
                         1,
-                        A::MAX_ERROR_MESSAGE_BYTES,
+                        <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
                     ),
                     Err(EffectContractError::ErrorMessageTooLarge { .. })
                 ),
                 "{}",
-                A::NAME
+                <A as SwitchoverActivityContract>::NAME
             );
         }
         assert!(matches!(
-            decode_activity_result::<EffectActivity<A>>(
+            decode_activity_result::<OrdinarySwitchoverActivity<A>>(
                 &kuberic_durable_execution::ExactBytes::new(vec![
                     b'x';
                     usize::try_from(
-                        A::MAX_RESULT_BYTES
+                        <A as SwitchoverActivityContract>::MAX_RESULT_BYTES
                     )
                     .unwrap()
                         + 1
@@ -751,47 +888,56 @@ mod tests {
 
     fn assert_label_result_error_bound<A>()
     where
-        A: DurableEffect<Output = EffectApplied>,
+        A: SwitchoverActivityContract<Output = EffectApplied>,
     {
         assert_replica_result_error_bound::<A>();
     }
 
     macro_rules! assert_replica_activity_bounds {
         ($activity:ty, $input:expr) => {{
-            assert_exact_input_bound::<$activity, _>(|padding| {
-                let mut input = $input;
-                input.execution_id = "x".repeat(padding);
-                input
-            });
+            let input = SwitchoverActivityInput::<$activity>::new($input, 0);
+            let encoded =
+                encode_activity_input::<OrdinarySwitchoverActivity<$activity>>(&input).unwrap();
+            assert!(
+                encoded.as_slice().len()
+                    <= <$activity as SwitchoverActivityContract>::MAX_REQUEST_BYTES as usize
+            );
+            assert!(
+                decode_activity_input::<OrdinarySwitchoverActivity<$activity>>(&encoded).is_ok()
+            );
             assert_replica_result_error_bound::<$activity>();
         }};
     }
 
     macro_rules! assert_label_activity_bounds {
         ($activity:ty, $input:expr) => {{
-            assert_exact_input_bound::<$activity, _>(|padding| {
-                let mut input = $input;
-                input.execution_id = "x".repeat(padding);
-                input
-            });
+            let input = SwitchoverActivityInput::<$activity>::new($input, 0);
+            let encoded =
+                encode_activity_input::<OrdinarySwitchoverActivity<$activity>>(&input).unwrap();
+            assert!(
+                encoded.as_slice().len()
+                    <= <$activity as SwitchoverActivityContract>::MAX_REQUEST_BYTES as usize
+            );
+            assert!(
+                decode_activity_input::<OrdinarySwitchoverActivity<$activity>>(&encoded).is_ok()
+            );
             assert_label_result_error_bound::<$activity>();
         }};
     }
 
-    fn assert_bounded_message_result<A: DurableEffect>() {
+    fn assert_bounded_message_result<A: SwitchoverActivityContract>() {
         for message in ["x".repeat(512), "é".repeat(256)] {
             let error = BoundedEffectError::observed_at(
                 EffectErrorKind::ConflictingEvidence,
                 message,
                 1,
-                A::MAX_ERROR_MESSAGE_BYTES,
+                <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
             )
             .unwrap();
-            let encoded = encode_activity_result::<EffectActivity<A>>(
-                &EffectOutcome::<A::Output>::ConflictingEvidence(error),
-            )
-            .unwrap();
-            assert!(decode_activity_result::<EffectActivity<A>>(&encoded).is_ok());
+            assert!(
+                serde_json::to_vec(&error).unwrap().len()
+                    <= <A as SwitchoverActivityContract>::MAX_RESULT_BYTES as usize
+            );
         }
         for message in ["x".repeat(513), "é".repeat(257)] {
             assert!(matches!(
@@ -799,17 +945,17 @@ mod tests {
                     EffectErrorKind::ConflictingEvidence,
                     message,
                     1,
-                    A::MAX_ERROR_MESSAGE_BYTES,
+                    <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
                 ),
                 Err(EffectContractError::ErrorMessageTooLarge { .. })
             ));
         }
         assert!(matches!(
-            decode_activity_result::<EffectActivity<A>>(
+            decode_activity_result::<OrdinarySwitchoverActivity<A>>(
                 &kuberic_durable_execution::ExactBytes::new(vec![
                     b'x';
                     usize::try_from(
-                        A::MAX_RESULT_BYTES
+                        <A as SwitchoverActivityContract>::MAX_RESULT_BYTES
                     )
                     .unwrap()
                         + 1
@@ -839,9 +985,8 @@ mod tests {
         macro_rules! assert_bounds {
             ($($activity:ty),+ $(,)?) => {
                 $(
-                    assert!(<$activity>::MAX_REQUEST_BYTES > 0);
-                    assert!(<$activity>::MAX_COMMAND_BYTES > 0);
-                    assert!(<$activity>::MAX_RESULT_BYTES > 0);
+                    assert!(<$activity as SwitchoverActivityContract>::MAX_REQUEST_BYTES > 0);
+                    assert!(<$activity as SwitchoverActivityContract>::MAX_RESULT_BYTES > 0);
                 )+
             };
         }
@@ -868,12 +1013,12 @@ mod tests {
             AttestCompensatedTopologyActivity,
         );
         assert_ne!(
-            RevokeWritesActivity::MAX_REQUEST_BYTES,
-            InstallTargetCurrentConfigurationActivity::MAX_REQUEST_BYTES
+            <RevokeWritesActivity as SwitchoverActivityContract>::MAX_REQUEST_BYTES,
+            <InstallTargetCurrentConfigurationActivity as SwitchoverActivityContract>::MAX_REQUEST_BYTES
         );
         assert_ne!(
-            PublishTargetPrimaryLabelActivity::MAX_RESULT_BYTES,
-            RevokeWritesActivity::MAX_RESULT_BYTES
+            <PublishTargetPrimaryLabelActivity as SwitchoverActivityContract>::MAX_RESULT_BYTES,
+            <RevokeWritesActivity as SwitchoverActivityContract>::MAX_RESULT_BYTES
         );
     }
 
@@ -958,113 +1103,80 @@ mod tests {
         assert_replica_activity_bounds!(
             DemoteOldPrimaryActivity,
             DemoteOldPrimaryInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             PromoteTargetActivity,
             PromoteTargetInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             DistributeReplicaEpochActivity,
             DistributeReplicaEpochInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 distribution_index: 0,
                 replica_id: 2,
                 replica_instance_id: "instance-2".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             InstallTargetCatchUpConfigurationActivity,
             InstallTargetCatchUpConfigurationInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             WaitTargetWriteQuorumActivity,
             WaitTargetWriteQuorumInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             InstallTargetCurrentConfigurationActivity,
             InstallTargetCurrentConfigurationInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             RestorePreviousCurrentConfigurationActivity,
             RestorePreviousCurrentConfigurationInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             CompensatePromoteOldPrimaryActivity,
             CompensatePromoteOldPrimaryInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             CompensateDistributeReplicaEpochActivity,
             CompensateDistributeReplicaEpochInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 distribution_index: 0,
                 replica_id: 2,
                 replica_instance_id: "instance-2".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             InstallCompensationCatchUpConfigurationActivity,
             InstallCompensationCatchUpConfigurationInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_replica_activity_bounds!(
             InstallCompensationCurrentConfigurationActivity,
             InstallCompensationCurrentConfigurationInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
 
@@ -1072,75 +1184,105 @@ mod tests {
         assert_label_activity_bounds!(
             PublishOldPrimarySecondaryLabelActivity,
             PublishOldPrimarySecondaryLabelInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_label_activity_bounds!(
             RestoreOldPrimaryLabelActivity,
             RestoreOldPrimaryLabelInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 old_primary_id: 1,
                 old_primary_instance_id: "instance-1".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
         assert_label_activity_bounds!(
             RestoreTargetSecondaryLabelActivity,
             RestoreTargetSecondaryLabelInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "execution".to_string(),
                 target_primary_id: 2,
                 target_primary_instance_id: "instance-2".to_string(),
-                deadline_unix_seconds: 10,
             }
         );
 
         assert_exact_input_bound::<CaptureFrozenLsnActivity, _>(|padding| CaptureFrozenLsnInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: "x".repeat(padding),
             old_primary_id: 1,
-            old_primary_instance_id: "instance-1".to_string(),
+            old_primary_instance_id: "x".repeat(padding),
             expected_epoch: snapshot().epoch,
-            deadline_unix_seconds: 10,
         });
         assert_bounded_message_result::<CaptureFrozenLsnActivity>();
 
         assert_exact_input_bound::<WaitTargetCaughtUpActivity, _>(|padding| {
             WaitTargetCaughtUpInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "x".repeat(padding),
                 target_id: 2,
-                target_instance_id: "instance-2".to_string(),
+                target_instance_id: "x".repeat(padding),
                 expected_epoch: snapshot().epoch,
                 frozen_lsn: 10,
-                deadline_unix_seconds: 10,
             }
         });
         assert_bounded_message_result::<WaitTargetCaughtUpActivity>();
 
         assert_exact_input_bound::<AttestTargetTopologyActivity, _>(|padding| {
-            AttestTargetTopologyInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "x".repeat(padding),
-                expected_snapshot: snapshot(),
-                deadline_unix_seconds: 10,
-            }
+            let mut expected_snapshot = snapshot();
+            expected_snapshot.members[0].instance_id = "x".repeat(padding);
+            AttestTargetTopologyInput { expected_snapshot }
         });
         assert_bounded_message_result::<AttestTargetTopologyActivity>();
 
         assert_exact_input_bound::<AttestCompensatedTopologyActivity, _>(|padding| {
-            AttestCompensatedTopologyInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: "x".repeat(padding),
-                expected_snapshot: snapshot(),
-                deadline_unix_seconds: 10,
-            }
+            let mut expected_snapshot = snapshot();
+            expected_snapshot.members[0].instance_id = "x".repeat(padding);
+            AttestCompensatedTopologyInput { expected_snapshot }
         });
         assert_bounded_message_result::<AttestCompensatedTopologyActivity>();
+    }
+
+    #[test]
+    fn every_switchover_activity_has_one_reviewed_implementation_class() {
+        let identities = ALL_DIRECT_ACTIVITY_IDENTITIES
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let classified = SWITCHOVER_ACTIVITY_CLASSIFICATION
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities, classified);
+        assert_eq!(classified.len(), 20);
+        for class in [
+            SwitchoverActivityClass::PassiveReadOnly,
+            SwitchoverActivityClass::NaturallyIdempotent,
+            SwitchoverActivityClass::IdentityFencedIdempotent,
+            SwitchoverActivityClass::StrictEffectRequired,
+        ] {
+            let expected = if class == SwitchoverActivityClass::IdentityFencedIdempotent {
+                8
+            } else {
+                4
+            };
+            assert_eq!(
+                SWITCHOVER_ACTIVITY_CLASSIFICATION
+                    .iter()
+                    .filter(|(_, actual)| *actual == class)
+                    .count(),
+                expected
+            );
+        }
+        assert!(identities.iter().all(|name| activity_class(name).is_some()));
+    }
+
+    #[test]
+    fn ordinary_contract_preserves_the_typed_name_and_bounds() {
+        type Contract = OrdinarySwitchoverActivity<PromoteTargetActivity>;
+        assert_eq!(
+            Contract::NAME,
+            <PromoteTargetActivity as SwitchoverActivityContract>::NAME
+        );
+        assert_eq!(
+            Contract::MAX_INPUT_BYTES,
+            <PromoteTargetActivity as SwitchoverActivityContract>::MAX_REQUEST_BYTES
+        );
+        assert_eq!(
+            Contract::MAX_RESULT_BYTES,
+            <PromoteTargetActivity as SwitchoverActivityContract>::MAX_RESULT_BYTES
+        );
     }
 }

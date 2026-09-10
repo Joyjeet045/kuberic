@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::{ActivityName, ActivitySpec, ExactBytes};
+use crate::{ActivityName, ActivityOptions, ActivitySpec, ExactBytes};
 
 /// Deterministic failure while resolving a logical activity into the exact
 /// specification that may be exposed.
@@ -138,6 +138,16 @@ pub trait DurableActivity {
     const VERSION: u32;
     const MAX_INPUT_BYTES: u64;
     const MAX_RESULT_BYTES: u64;
+
+    #[doc(hidden)]
+    fn completion_class() -> Option<crate::CompletionClass> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn strict_effect_metadata() -> Option<crate::EffectMetadata> {
+        None
+    }
 }
 
 /// Portable deterministic failure while constructing or decoding a typed call.
@@ -148,6 +158,15 @@ pub enum ActivityCallError {
     EmptyName,
     #[error("activity version must be greater than zero")]
     ZeroVersion,
+    #[error("registered activity name {registered:?} does not match contract name {contract:?}")]
+    NameMismatch {
+        registered: String,
+        contract: String,
+    },
+    #[error("activity {0} is not registered")]
+    UnregisteredActivity(String),
+    #[error("activity handler failed: {0}")]
+    Handler(String),
     #[error("activity input could not be encoded")]
     InputEncoding,
     #[error("activity input is {actual_bytes} bytes, exceeding the {max_bytes}-byte bound")]
@@ -160,6 +179,20 @@ pub enum ActivityCallError {
     ResultTooLarge { actual_bytes: u64, max_bytes: u64 },
     #[error("activity result could not be decoded")]
     ResultDecoding,
+}
+
+/// Durable result of invoking an ordinary activity.
+#[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActivityInvocationError {
+    #[error(transparent)]
+    Call(#[from] ActivityCallError),
+    #[error("activity application failed")]
+    Application(ExactBytes),
+    #[error("activity attempt timed out")]
+    TimedOut,
+    #[error("activity action deadline was exceeded")]
+    ActionDeadlineExceeded,
 }
 
 /// Encode and bound a typed activity input with the canonical JSON codec.
@@ -207,17 +240,33 @@ pub fn decode_activity_result<A: DurableActivity>(
 pub(crate) fn activity_spec<A: DurableActivity>(
     input: &A::Input,
 ) -> Result<ActivitySpec, ActivityCallError> {
-    let name = ActivityName::new(A::NAME, A::VERSION).map_err(|error| match error {
+    activity_spec_named::<A>(A::NAME, input, ActivityOptions::default())
+}
+
+pub(crate) fn activity_spec_named<A: DurableActivity>(
+    name: &str,
+    input: &A::Input,
+    options: ActivityOptions,
+) -> Result<ActivitySpec, ActivityCallError> {
+    if name != A::NAME {
+        return Err(ActivityCallError::NameMismatch {
+            registered: name.to_owned(),
+            contract: A::NAME.to_owned(),
+        });
+    }
+    let name = ActivityName::new(name, A::VERSION).map_err(|error| match error {
         crate::IdentityError::EmptyActivityName => ActivityCallError::EmptyName,
         crate::IdentityError::ZeroActivityVersion => ActivityCallError::ZeroVersion,
-        crate::IdentityError::ZeroAttemptCounter => {
+        crate::IdentityError::ZeroActivityAttempts | crate::IdentityError::ZeroAttemptCounter => {
             unreachable!("activity identity construction does not create an attempt")
         }
     })?;
-    Ok(ActivitySpec::new(
+    Ok(ActivitySpec::with_bounds_and_options(
         name,
         encode_activity_input::<A>(input)?,
+        A::MAX_INPUT_BYTES,
         A::MAX_RESULT_BYTES,
+        options,
     ))
 }
 

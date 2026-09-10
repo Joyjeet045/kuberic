@@ -3742,7 +3742,7 @@ async fn test_reconciler_switchover() {
     );
     reconcile_set(&set, &api, &state).await.unwrap();
     let mut status = api.last_status().unwrap();
-    for _ in 0..10 {
+    for _ in 0..60 {
         if status.phase == Phase::Switchover {
             break;
         }
@@ -5498,7 +5498,7 @@ async fn test_framework_native_switchover_uid_fenced_label_exposures_wait_for_ex
         assert!(fault.was_triggered(), "{activity_name}");
         assert_eq!(
             exposed_native_switchover_activity(&store, &status).await,
-            (activity_name.to_string(), true)
+            (activity_name.to_string(), false)
         );
         let label_attempts_before_restart = *api.uid_label_patch_attempts.lock().unwrap();
         let effects_before_restart = api
@@ -5518,12 +5518,26 @@ async fn test_framework_native_switchover_uid_fenced_label_exposures_wait_for_ex
         let quarantined = api.last_status().unwrap();
         assert_eq!(quarantined.phase, Phase::Switchover);
         assert!(quarantined.conditions.iter().any(|condition| {
-            condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "Quarantined"
+            condition.type_ == "FrameworkNativeSwitchover"
+                && condition.reason == "LostActivityResultRetryScheduled"
         }));
         assert_eq!(
             *api.uid_label_patch_attempts.lock().unwrap(),
             label_attempts_before_restart,
-            "the exposed UID-fenced label must not be retried"
+            "lost-result recovery must persist the bounded retry before reinvocation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        reconcile_set(
+            &make_native_switchover_set(&name, 3, Some(quarantined.clone())),
+            &api,
+            &restarted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *api.uid_label_patch_attempts.lock().unwrap(),
+            label_attempts_before_restart + 1,
+            "the persisted retry may reinvoke the exact-UID idempotent label"
         );
         assert_eq!(
             api.operations()
@@ -5556,8 +5570,8 @@ async fn test_framework_native_switchover_uid_fenced_label_exposures_wait_for_ex
         assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
         assert_eq!(
             *api.uid_label_patch_attempts.lock().unwrap(),
-            1,
-            "only the other normal label may require a UID-fenced patch"
+            2,
+            "both naturally idempotent labels use exact-UID patches"
         );
     }
 }
@@ -5774,6 +5788,7 @@ async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_l
         ControlOperation::UpdateEpoch,
         ControlOperation::UpdateCatchUpConfiguration,
         ControlOperation::WaitForCatchUpQuorum,
+        ControlOperation::WaitForCatchUpQuorum,
         ControlOperation::UpdateCurrentConfiguration,
     ];
     api.fail_after_durable_action_sequences([1, 2, 3, 100, 1000, 1001, 1002]);
@@ -5977,22 +5992,7 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
     .unwrap();
     let mut status = api.last_status().unwrap();
     api.reset_operations();
-    for _ in 0..160 {
-        reconcile_set(
-            &make_native_switchover_set("native-terminal-reload", 3, Some(status.clone())),
-            &api,
-            &state,
-        )
-        .await
-        .unwrap();
-        status = api.last_status().unwrap();
-        if native_checkpoint_ready_for_terminal(&store, &status).await {
-            break;
-        }
-    }
-    assert!(native_checkpoint_ready_for_terminal(&store, &status).await);
-    api.fail_next_status_patch();
-    for _ in 0..60 {
+    for _ in 0..220 {
         reconcile_set(
             &make_native_switchover_set("native-terminal-reload", 3, Some(status.clone())),
             &api,
@@ -6003,15 +6003,17 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
         status = api.last_status().unwrap();
         if status.conditions.iter().any(|condition| {
             condition.type_ == "FrameworkNativeSwitchover"
-                && condition.reason == "Blocked"
-                && condition
-                    .message
-                    .contains("injected status persistence failure")
+                && condition.reason == "AwaitingTerminalReload"
         }) {
             break;
         }
     }
     assert_eq!(status.phase, Phase::Switchover);
+    assert!(status.conditions.iter().any(|condition| {
+        condition.type_ == "FrameworkNativeSwitchover"
+            && condition.reason == "AwaitingTerminalReload"
+    }));
+
     api.fail_next_status_patch();
     let retry = reconcile_set(
         &make_native_switchover_set("native-terminal-reload", 3, Some(status.clone())),
@@ -6118,11 +6120,21 @@ async fn test_framework_native_switchover_reloads_after_terminal_cas_conflict() 
         matches!(action, kuberic_operator::reconciler::ReconcileAction::Requeue(delay) if delay == Duration::from_secs(1))
     );
     status = api.last_status().unwrap();
+    if !status.conditions.iter().any(|condition| {
+        condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "ReloadRequired"
+    }) {
+        reconcile_set(
+            &make_native_switchover_set("native-terminal-conflict", 3, Some(status.clone())),
+            &api,
+            &state,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
     assert!(
         status.conditions.iter().any(|condition| {
-            condition.type_ == "FrameworkNativeSwitchover"
-                && condition.reason == "ReloadRequired"
-                && condition.message.contains("ScheduleExposure")
+            condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "ReloadRequired"
         }),
         "unexpected terminal conflict conditions: {:?}",
         status.conditions
@@ -6523,10 +6535,10 @@ async fn test_framework_native_switchover_compatibility_fixtures_fail_closed() {
     assert!(
         malformed_status.conditions.iter().any(|condition| {
             condition.type_ == "FrameworkNativeSwitchover"
-                && condition.reason == "Isolated"
+                && condition.reason == "Rejected"
                 && condition
                     .message
-                    .contains("authenticated completion metadata")
+                    .contains("activity count is outside bounds")
         }),
         "unexpected malformed-terminal conditions: {:?}",
         malformed_status.conditions

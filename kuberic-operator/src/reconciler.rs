@@ -2770,7 +2770,7 @@ async fn reconcile_framework_native_switchover_with_fuel(
     let mut host = host.lock().await;
     let outcome = DurableRunner::new(runner_fuel)
         .map_err(|error| format!("construct framework-native switchover runner: {error}"))?
-        .run_effects(
+        .run_activities(
             &mut host,
             &DirectSwitchoverWorkflow,
             execution,

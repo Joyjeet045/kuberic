@@ -1,6 +1,6 @@
 use crate::{
-    ActivityRecord, ActivityState, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError,
-    CheckpointLimits, CheckpointPayload, CheckpointStore, CompletionMetadata,
+    ActivityFailure, ActivityRecord, ActivityState, AttemptId, CasOutcome, CheckpointEnvelope,
+    CheckpointError, CheckpointLimits, CheckpointPayload, CheckpointStore, CompletionMetadata,
     EffectObservationDisposition, Evaluation, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch,
     LogicalActivityId, Nondeterminism, PreparedActivityResolver, PreparedCommand,
     PreparedEffectResolver, StorageRevision, StoreError, TerminalOutcome, Workflow, evaluate,
@@ -15,6 +15,8 @@ pub enum PersistenceBoundary {
     ScheduleExposure,
     Observation,
     ObservationProgression,
+    Retry,
+    Wait,
     Completion,
 }
 
@@ -46,7 +48,7 @@ pub enum ObservationRejection {
     ActivityNotExposed,
     LogicalActivityMismatch {
         expected: LogicalActivityId,
-        observed: LogicalActivityId,
+        observed: Box<LogicalActivityId>,
     },
     ResultExceedsDeclaredBound {
         actual: u64,
@@ -81,10 +83,56 @@ pub struct EffectObservation {
     activity: LogicalActivityId,
     attempt_id: AttemptId,
     result: ExactBytes,
+    failure: Option<ActivityFailure>,
     disposition: EffectObservationDisposition,
 }
 
 impl EffectObservation {
+    /// Construct an authoritative completed observation from a result encoded
+    /// for the activity contract. The host still validates activity identity,
+    /// attempt identity, and result bounds against the persisted record.
+    pub fn completed(
+        activity: LogicalActivityId,
+        attempt_id: AttemptId,
+        result: ExactBytes,
+    ) -> Self {
+        Self {
+            activity,
+            attempt_id,
+            result,
+            failure: None,
+            disposition: EffectObservationDisposition::Completed,
+        }
+    }
+
+    pub fn completed_failure(
+        activity: LogicalActivityId,
+        attempt_id: AttemptId,
+        failure: ActivityFailure,
+    ) -> Self {
+        Self {
+            activity,
+            attempt_id,
+            result: ExactBytes::default(),
+            failure: Some(failure),
+            disposition: EffectObservationDisposition::Completed,
+        }
+    }
+
+    pub fn proven_no_admission(
+        activity: LogicalActivityId,
+        attempt_id: AttemptId,
+        failure: ActivityFailure,
+    ) -> Self {
+        Self {
+            activity,
+            attempt_id,
+            result: ExactBytes::default(),
+            failure: Some(failure),
+            disposition: EffectObservationDisposition::ProvenNoAdmission,
+        }
+    }
+
     pub fn from_outcome<E: crate::DurableEffect>(
         activity: LogicalActivityId,
         attempt_id: AttemptId,
@@ -106,6 +154,7 @@ impl EffectObservation {
             activity,
             attempt_id,
             result: crate::encode_activity_result::<crate::EffectActivity<E>>(outcome)?,
+            failure: None,
             disposition,
         })
     }
@@ -150,6 +199,8 @@ impl EffectObservation {
 pub struct DispatchPermit {
     activity: LogicalActivityId,
     attempt_id: AttemptId,
+    attempt_ordinal: u32,
+    retry_not_before_unix_millis: Option<i64>,
     prepared_command: Option<PreparedCommand>,
 }
 
@@ -157,11 +208,15 @@ impl DispatchPermit {
     fn new(
         activity: LogicalActivityId,
         attempt_id: AttemptId,
+        attempt_ordinal: u32,
+        retry_not_before_unix_millis: Option<i64>,
         prepared_command: Option<PreparedCommand>,
     ) -> Self {
         Self {
             activity,
             attempt_id,
+            attempt_ordinal,
+            retry_not_before_unix_millis,
             prepared_command,
         }
     }
@@ -172,6 +227,14 @@ impl DispatchPermit {
 
     pub const fn attempt_id(&self) -> AttemptId {
         self.attempt_id
+    }
+
+    pub const fn attempt_ordinal(&self) -> u32 {
+        self.attempt_ordinal
+    }
+
+    pub const fn retry_not_before_unix_millis(&self) -> Option<i64> {
+        self.retry_not_before_unix_millis
     }
 
     pub const fn prepared_command(&self) -> Option<&PreparedCommand> {
@@ -206,6 +269,15 @@ define_host_outcomes! {
         activity: LogicalActivityId,
         revision: StorageRevision,
     },
+    RetryScheduled {
+        activity: LogicalActivityId,
+        retry_not_before_unix_millis: i64,
+        revision: StorageRevision,
+    },
+    Waiting {
+        activity: LogicalActivityId,
+        wake_at_unix_millis: i64,
+    },
     WorkflowCompleted {
         outcome: TerminalOutcome,
         completed_activity_count: u64,
@@ -217,6 +289,8 @@ define_host_outcomes! {
     Quarantined {
         activity: LogicalActivityId,
         attempt_id: AttemptId,
+        attempt_ordinal: u32,
+        retry_not_before_unix_millis: Option<i64>,
         prepared_command: Option<PreparedCommand>,
         completion_class: Option<crate::CompletionClass>,
     },
@@ -302,6 +376,8 @@ impl<S: CheckpointStore> DurableHost<S> {
                 return HostOutcome::Quarantined {
                     activity: record.logical_id(execution_id),
                     attempt_id: *attempt_id,
+                    attempt_ordinal: record.attempt().ordinal(),
+                    retry_not_before_unix_millis: record.attempt().retry_not_before_unix_millis(),
                     prepared_command: record.prepared_command().cloned(),
                     completion_class: record.completion_class(),
                 };
@@ -343,12 +419,36 @@ impl<S: CheckpointStore> DurableHost<S> {
             Evaluation::Pending {
                 activity,
                 state: ActivityState::DispatchExposed { attempt_id },
-            } => HostOutcome::Quarantined {
-                activity,
-                attempt_id,
-                prepared_command: None,
-                completion_class: None,
-            },
+            } => {
+                let (attempt_ordinal, retry_not_before_unix_millis) = loaded
+                    .as_ref()
+                    .and_then(|stored| {
+                        stored
+                            .checkpoint()
+                            .decode_and_validate(&execution, self.limits)
+                            .ok()
+                    })
+                    .and_then(|payload| {
+                        payload
+                            .active_activities()
+                            .and_then(|activities| activities.last())
+                            .map(|record| {
+                                (
+                                    record.attempt().ordinal(),
+                                    record.attempt().retry_not_before_unix_millis(),
+                                )
+                            })
+                    })
+                    .expect("pending exposed evaluation requires persisted attempt metadata");
+                HostOutcome::Quarantined {
+                    activity,
+                    attempt_id,
+                    attempt_ordinal,
+                    retry_not_before_unix_millis,
+                    prepared_command: None,
+                    completion_class: None,
+                }
+            }
             Evaluation::Pending {
                 state: ActivityState::Completed { .. },
                 ..
@@ -407,6 +507,24 @@ impl<S: CheckpointStore> DurableHost<S> {
             .await
     }
 
+    /// Evaluate an ordinary activity while enforcing persisted retry
+    /// not-before and action-deadline wakeups against a caller-supplied
+    /// deterministic clock.
+    pub async fn turn_and_expose_at<W: Workflow>(
+        &mut self,
+        workflow: &W,
+        execution: ExecutionSpec,
+        now_unix_millis: i64,
+    ) -> HostOutcome {
+        self.turn_and_expose_resolved(
+            workflow,
+            execution,
+            ExposureResolver::Activity(&crate::IdentityActivityResolver),
+            Some(now_unix_millis),
+        )
+        .await
+    }
+
     /// Evaluate and atomically expose an activity resolved to an exact prepared
     /// specification.
     pub async fn turn_and_expose_with<W: Workflow>(
@@ -415,8 +533,13 @@ impl<S: CheckpointStore> DurableHost<S> {
         execution: ExecutionSpec,
         resolver: &dyn PreparedActivityResolver,
     ) -> HostOutcome {
-        self.turn_and_expose_resolved(workflow, execution, ExposureResolver::Activity(resolver))
-            .await
+        self.turn_and_expose_resolved(
+            workflow,
+            execution,
+            ExposureResolver::Activity(resolver),
+            None,
+        )
+        .await
     }
 
     /// Evaluate and atomically expose a typed effect whose exact command is
@@ -427,8 +550,13 @@ impl<S: CheckpointStore> DurableHost<S> {
         execution: ExecutionSpec,
         resolver: &dyn PreparedEffectResolver,
     ) -> HostOutcome {
-        self.turn_and_expose_resolved(workflow, execution, ExposureResolver::Effect(resolver))
-            .await
+        self.turn_and_expose_resolved(
+            workflow,
+            execution,
+            ExposureResolver::Effect(resolver),
+            None,
+        )
+        .await
     }
 
     async fn turn_and_expose_resolved<W: Workflow>(
@@ -436,6 +564,7 @@ impl<S: CheckpointStore> DurableHost<S> {
         workflow: &W,
         execution: ExecutionSpec,
         resolver: ExposureResolver<'_>,
+        now_unix_millis: Option<i64>,
     ) -> HostOutcome {
         let execution_id = execution.execution_id();
         let loaded = match self.store.load(execution_id).await {
@@ -474,12 +603,44 @@ impl<S: CheckpointStore> DurableHost<S> {
                 return HostOutcome::Quarantined {
                     activity: record.logical_id(execution_id),
                     attempt_id: *attempt_id,
+                    attempt_ordinal: record.attempt().ordinal(),
+                    retry_not_before_unix_millis: record.attempt().retry_not_before_unix_millis(),
                     prepared_command: record.prepared_command().cloned(),
                     completion_class: record.completion_class(),
                 };
             }
         }
         let checkpoint = loaded.as_ref().map(|stored| stored.checkpoint());
+        if let (Some(now), Some(stored)) = (now_unix_millis, loaded.as_ref())
+            && let Ok(payload) = stored
+                .checkpoint()
+                .decode_and_validate(&execution, self.limits)
+            && let Some(record) = payload
+                .active_activities()
+                .and_then(|activities| activities.last())
+            && matches!(record.state(), ActivityState::Scheduled)
+        {
+            let attempt = record.attempt();
+            let gated_wakeup = [
+                attempt.retry_not_before_unix_millis(),
+                attempt.handler_wait_until_unix_millis(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|wake| *wake > now)
+            .max();
+            if let Some(gated_wakeup) = gated_wakeup {
+                let wake_at_unix_millis = record
+                    .spec()
+                    .options()
+                    .action_deadline_unix_millis()
+                    .map_or(gated_wakeup, |deadline| deadline.min(gated_wakeup));
+                return HostOutcome::Waiting {
+                    activity: record.logical_id(execution_id),
+                    wake_at_unix_millis,
+                };
+            }
+        }
         let evaluation = match resolver {
             ExposureResolver::Activity(resolver) => {
                 evaluate_prepared(workflow, &execution, checkpoint, self.limits, resolver)
@@ -522,8 +683,13 @@ impl<S: CheckpointStore> DurableHost<S> {
             Evaluation::Pending {
                 activity,
                 state: ActivityState::DispatchExposed { attempt_id },
-            } => HostOutcome::Quarantined {
-                prepared_command: loaded
+            } => {
+                let (
+                    attempt_ordinal,
+                    retry_not_before_unix_millis,
+                    prepared_command,
+                    completion_class,
+                ) = loaded
                     .as_ref()
                     .and_then(|stored| {
                         stored
@@ -535,26 +701,25 @@ impl<S: CheckpointStore> DurableHost<S> {
                         payload
                             .active_activities()
                             .and_then(|activities| activities.last())
-                            .and_then(ActivityRecord::prepared_command)
-                            .cloned()
-                    }),
-                completion_class: loaded
-                    .as_ref()
-                    .and_then(|stored| {
-                        stored
-                            .checkpoint()
-                            .decode_and_validate(&execution, self.limits)
-                            .ok()
+                            .map(|record| {
+                                (
+                                    record.attempt().ordinal(),
+                                    record.attempt().retry_not_before_unix_millis(),
+                                    record.prepared_command().cloned(),
+                                    record.completion_class(),
+                                )
+                            })
                     })
-                    .and_then(|payload| {
-                        payload
-                            .active_activities()
-                            .and_then(|activities| activities.last())
-                            .and_then(ActivityRecord::completion_class)
-                    }),
-                activity,
-                attempt_id,
-            },
+                    .expect("pending exposed evaluation requires persisted activity metadata");
+                HostOutcome::Quarantined {
+                    activity,
+                    attempt_id,
+                    attempt_ordinal,
+                    retry_not_before_unix_millis,
+                    prepared_command,
+                    completion_class,
+                }
+            }
             Evaluation::Pending {
                 state: ActivityState::Completed { .. },
                 ..
@@ -636,7 +801,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::LogicalActivityMismatch {
                     expected: expected_activity,
-                    observed: observation.activity,
+                    observed: Box::new(observation.activity),
                 },
             );
         }
@@ -684,6 +849,236 @@ impl<S: CheckpointStore> DurableHost<S> {
             }
             Ok(other) => reload_outcome(PersistenceBoundary::Observation, other),
             Err(error) => store_failed(PersistenceBoundary::Observation, error),
+        }
+    }
+
+    /// Persist another physical attempt for an exposed ordinary activity.
+    ///
+    /// The caller may use this for a retryable application failure or a
+    /// crash/lost-result recovery decision. Codec, registration,
+    /// nondeterminism, storage, and timeout failures must not call this API.
+    pub async fn schedule_retry(
+        &self,
+        execution: &ExecutionSpec,
+        activity: &LogicalActivityId,
+        observed_at_unix_millis: i64,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let Some(stored) = loaded else {
+            return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
+        };
+        let mut payload = match stored
+            .checkpoint()
+            .decode_and_validate(execution, self.limits)
+        {
+            Ok(payload) => payload,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let Some(record) = payload
+            .active_activities()
+            .and_then(|activities| activities.last())
+            .cloned()
+        else {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        };
+        let expected = record.logical_id(execution_id);
+        if &expected != activity {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::LogicalActivityMismatch {
+                    expected,
+                    observed: Box::new(activity.clone()),
+                },
+            );
+        }
+        if !matches!(record.state(), ActivityState::DispatchExposed { .. }) {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        }
+        let Some(retry_not_before_unix_millis) = record
+            .spec()
+            .options()
+            .retry_not_before_unix_millis(record.attempt().ordinal(), observed_at_unix_millis)
+        else {
+            return HostOutcome::CheckpointRejected(
+                CheckpointError::ActivityAttemptLimitExceeded {
+                    sequence: record.sequence(),
+                    attempted: record.attempt().ordinal().saturating_add(1),
+                    maximum: record.spec().options().max_attempts(),
+                },
+            );
+        };
+        let retried = match record.schedule_retry(retry_not_before_unix_millis) {
+            Ok(record) => record,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        replace_final_record(&mut payload, retried);
+        let checkpoint = match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        match self
+            .store
+            .compare_and_swap(execution_id, Some(stored.revision().clone()), checkpoint)
+            .await
+        {
+            Ok(CasOutcome::Accepted(revision)) => HostOutcome::RetryScheduled {
+                activity: activity.clone(),
+                retry_not_before_unix_millis,
+                revision,
+            },
+            Ok(other) => reload_outcome(PersistenceBoundary::Retry, other),
+            Err(error) => store_failed(PersistenceBoundary::Retry, error),
+        }
+    }
+
+    /// Persist a terminal ordinary activity failure for replay through the
+    /// workflow's normal `Result` value.
+    pub async fn observe_failure(
+        &self,
+        execution: &ExecutionSpec,
+        activity: &LogicalActivityId,
+        failure: ActivityFailure,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let Some(stored) = loaded else {
+            return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
+        };
+        let mut payload = match stored
+            .checkpoint()
+            .decode_and_validate(execution, self.limits)
+        {
+            Ok(payload) => payload,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let Some(record) = payload
+            .active_activities()
+            .and_then(|activities| activities.last())
+            .cloned()
+        else {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        };
+        let expected = record.logical_id(execution_id);
+        if &expected != activity {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::LogicalActivityMismatch {
+                    expected,
+                    observed: Box::new(activity.clone()),
+                },
+            );
+        }
+        if !matches!(record.state(), ActivityState::DispatchExposed { .. }) {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        }
+        let actual = failure.payload().map_or(0, |payload| {
+            u64::try_from(payload.as_slice().len()).unwrap_or(u64::MAX)
+        });
+        if actual > record.max_result_bytes() {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::ResultExceedsDeclaredBound {
+                    actual,
+                    maximum: record.max_result_bytes(),
+                },
+            );
+        }
+        replace_final_record(&mut payload, record.with_failure(failure));
+        let checkpoint = match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        match self
+            .store
+            .compare_and_swap(execution_id, Some(stored.revision().clone()), checkpoint)
+            .await
+        {
+            Ok(CasOutcome::Accepted(revision)) => HostOutcome::ObservationAccepted {
+                activity: activity.clone(),
+                revision,
+            },
+            Ok(other) => reload_outcome(PersistenceBoundary::Observation, other),
+            Err(error) => store_failed(PersistenceBoundary::Observation, error),
+        }
+    }
+
+    /// Persist a handler-requested observation wait without consuming a retry.
+    pub async fn defer_wait(
+        &self,
+        execution: &ExecutionSpec,
+        activity: &LogicalActivityId,
+        wait_until_unix_millis: i64,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let Some(stored) = loaded else {
+            return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
+        };
+        let mut payload = match stored
+            .checkpoint()
+            .decode_and_validate(execution, self.limits)
+        {
+            Ok(payload) => payload,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let Some(record) = payload
+            .active_activities()
+            .and_then(|activities| activities.last())
+            .cloned()
+        else {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        };
+        let expected = record.logical_id(execution_id);
+        if &expected != activity {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::LogicalActivityMismatch {
+                    expected,
+                    observed: Box::new(activity.clone()),
+                },
+            );
+        }
+        let deferred = match record.defer_wait(wait_until_unix_millis) {
+            Ok(record) => record,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        replace_final_record(&mut payload, deferred);
+        let checkpoint = match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        match self
+            .store
+            .compare_and_swap(execution_id, Some(stored.revision().clone()), checkpoint)
+            .await
+        {
+            Ok(CasOutcome::Accepted(_)) => HostOutcome::Waiting {
+                activity: activity.clone(),
+                wake_at_unix_millis: wait_until_unix_millis,
+            },
+            Ok(other) => reload_outcome(PersistenceBoundary::Wait, other),
+            Err(error) => store_failed(PersistenceBoundary::Wait, error),
         }
     }
 
@@ -752,7 +1147,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::LogicalActivityMismatch {
                     expected: expected_activity,
-                    observed: observation.activity,
+                    observed: Box::new(observation.activity),
                 },
             );
         }
@@ -765,10 +1160,18 @@ impl<S: CheckpointStore> DurableHost<S> {
         }
         let actual_result_bytes =
             u64::try_from(observation.result.as_slice().len()).unwrap_or(u64::MAX);
-        if actual_result_bytes > record.max_result_bytes() {
+        let actual_failure_bytes = observation
+            .failure
+            .as_ref()
+            .and_then(ActivityFailure::payload)
+            .map_or(0, |payload| {
+                u64::try_from(payload.as_slice().len()).unwrap_or(u64::MAX)
+            });
+        let actual_bytes = actual_result_bytes.max(actual_failure_bytes);
+        if actual_bytes > record.max_result_bytes() {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::ResultExceedsDeclaredBound {
-                    actual: actual_result_bytes,
+                    actual: actual_bytes,
                     maximum: record.max_result_bytes(),
                 },
             );
@@ -778,6 +1181,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             observation.attempt_id,
             observation.disposition,
             observation.result,
+            observation.failure,
         ) {
             Ok(record) => record,
             Err(error) => return HostOutcome::CheckpointRejected(error),
@@ -862,7 +1266,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::LogicalActivityMismatch {
                     expected: expected_activity,
-                    observed: observation.activity,
+                    observed: Box::new(observation.activity),
                 },
             );
         }
@@ -880,6 +1284,8 @@ impl<S: CheckpointStore> DurableHost<S> {
             );
         }
 
+        let attempt_ordinal = record.attempt().ordinal();
+        let retry_not_before_unix_millis = record.attempt().retry_not_before_unix_millis();
         replace_final_record(
             &mut payload,
             record.with_state(ActivityState::Completed {
@@ -930,6 +1336,8 @@ impl<S: CheckpointStore> DurableHost<S> {
             } => HostOutcome::Quarantined {
                 activity,
                 attempt_id,
+                attempt_ordinal,
+                retry_not_before_unix_millis,
                 prepared_command: None,
                 completion_class: None,
             },
@@ -999,6 +1407,8 @@ impl<S: CheckpointStore> DurableHost<S> {
             });
         }
         let attempt_id = self.next_attempt();
+        let attempt_ordinal = record.attempt().ordinal();
+        let retry_not_before_unix_millis = record.attempt().retry_not_before_unix_millis();
         let prepared_command = record.prepared_command().cloned();
         replace_final_record(&mut payload, record.expose_attempt(attempt_id)?);
         Ok(PreparedExposure {
@@ -1007,6 +1417,8 @@ impl<S: CheckpointStore> DurableHost<S> {
             checkpoint: CheckpointEnvelope::encode_with_limits(&payload, self.limits)?,
             activity,
             attempt_id,
+            attempt_ordinal,
+            retry_not_before_unix_millis,
             prepared_command,
         })
     }
@@ -1029,6 +1441,8 @@ impl<S: CheckpointStore> DurableHost<S> {
                 permit: DispatchPermit::new(
                     proposal.activity,
                     proposal.attempt_id,
+                    proposal.attempt_ordinal,
+                    proposal.retry_not_before_unix_millis,
                     proposal.prepared_command,
                 ),
                 revision,
@@ -1115,6 +1529,8 @@ struct PreparedExposure {
     checkpoint: CheckpointEnvelope,
     activity: LogicalActivityId,
     attempt_id: AttemptId,
+    attempt_ordinal: u32,
+    retry_not_before_unix_millis: Option<i64>,
     prepared_command: Option<PreparedCommand>,
 }
 
@@ -1172,10 +1588,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActivityName, ActivitySequence, ActivitySpec, CheckpointLimits, CompletionClass,
-        DurableEffect, EffectMetadata, EffectOutcome, InMemoryCheckpointStore, InMemoryFault,
-        PreparedActivityError, PreparedActivityResolver, PreparedCommand, PreparedEffectResolver,
-        StoreErrorKind, WorkflowContext,
+        ActivityName, ActivityOptions, ActivitySequence, ActivitySpec, CheckpointLimits,
+        CompletionClass, DurableEffect, EffectActivity, EffectMetadata, EffectOutcome,
+        InMemoryCheckpointStore, InMemoryFault, PreparedActivityError, PreparedActivityResolver,
+        PreparedCommand, PreparedEffectResolver, StoreErrorKind, WorkflowContext,
     };
     use serde::{Deserialize, Serialize};
 
@@ -1214,8 +1630,20 @@ mod tests {
             context: &mut WorkflowContext<'_>,
             _input: ExactBytes,
         ) -> TerminalOutcome {
-            match context.call_effect::<OneEffect>(UnitRequest).await {
-                Ok(value) => TerminalOutcome::succeeded(value.into_bytes()),
+            match context
+                .schedule_activity_typed::<EffectActivity<OneEffect>>(
+                    OneEffect::NAME,
+                    &UnitRequest,
+                    ActivityOptions::default(),
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    match outcome.into_workflow_result(OneEffect::MAX_ERROR_MESSAGE_BYTES) {
+                        Ok(value) => TerminalOutcome::succeeded(value.into_bytes()),
+                        Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
+                    }
+                }
                 Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
             }
         }

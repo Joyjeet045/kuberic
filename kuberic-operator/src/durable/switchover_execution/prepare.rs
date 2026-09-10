@@ -6,8 +6,8 @@ use kuberic_core::types::{
     ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, Role,
 };
 use kuberic_durable_execution::{
-    BoundedEffectError, DurableEffect, EffectActivity, EffectErrorKind, EffectOutcome, ExactBytes,
-    PreparedActivityError, decode_activity_result, encode_activity_result,
+    BoundedEffectError, EffectErrorKind, EffectOutcome, ExactBytes, PreparedActivityError,
+    decode_activity_result, encode_activity_result,
 };
 
 use crate::crd::{
@@ -37,14 +37,14 @@ use super::{
         InstallCompensationCurrentConfigurationActivity,
         InstallCompensationCurrentConfigurationInput, InstallTargetCatchUpConfigurationActivity,
         InstallTargetCatchUpConfigurationInput, InstallTargetCurrentConfigurationActivity,
-        InstallTargetCurrentConfigurationInput, LabelEffectFamily, PassiveEffectFamily,
-        PromoteTargetActivity, PromoteTargetInput, PublishOldPrimarySecondaryLabelActivity,
-        PublishOldPrimarySecondaryLabelInput, PublishTargetPrimaryLabelActivity,
-        PublishTargetPrimaryLabelInput, ReplicaEffectFamily, RestoreOldPrimaryLabelActivity,
-        RestoreOldPrimaryLabelInput, RestorePreviousCurrentConfigurationActivity,
-        RestorePreviousCurrentConfigurationInput, RestoreTargetSecondaryLabelActivity,
-        RestoreTargetSecondaryLabelInput, RevokeWritesActivity, RevokeWritesInput,
-        SwitchoverEffect, WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput,
+        InstallTargetCurrentConfigurationInput, PromoteTargetActivity, PromoteTargetInput,
+        PublishOldPrimarySecondaryLabelActivity, PublishOldPrimarySecondaryLabelInput,
+        PublishTargetPrimaryLabelActivity, PublishTargetPrimaryLabelInput, ReplicaEffectFamily,
+        RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
+        RestorePreviousCurrentConfigurationActivity, RestorePreviousCurrentConfigurationInput,
+        RestoreTargetSecondaryLabelActivity, RestoreTargetSecondaryLabelInput,
+        RevokeWritesActivity, RevokeWritesInput, StrictSwitchoverActivityContract,
+        SwitchoverActivityContract, WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput,
         WaitTargetCaughtUpOutput, WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
     },
     model::DirectSwitchoverDefinition,
@@ -60,54 +60,82 @@ pub enum DirectEvaluation {
     DispatchLabel,
 }
 
+struct EncodedSwitchoverOutcome<A>(std::marker::PhantomData<A>);
+
+impl<A: SwitchoverActivityContract> kuberic_durable_execution::DurableActivity
+    for EncodedSwitchoverOutcome<A>
+{
+    type Input = A::Request;
+    type Output = EffectOutcome<A::Output>;
+
+    const NAME: &'static str = A::NAME;
+    const VERSION: u32 = A::VERSION;
+    const MAX_INPUT_BYTES: u64 = A::MAX_REQUEST_BYTES;
+    const MAX_RESULT_BYTES: u64 = A::MAX_RESULT_BYTES;
+}
+
 pub(crate) enum SwitchoverDispatch<'a> {
     Replica(&'a ReplicaEffectCommand),
-    Label(&'a LabelEffectCommand),
     ObservationOnly,
 }
 
-pub(crate) trait SwitchoverEffectFamily<E: DurableEffect> {
-    fn deadline_unix_seconds(
-        request: &E::Request,
-        definition: &DirectSwitchoverDefinition,
-    ) -> Result<i64, PreparedActivityError>;
-
+pub(crate) trait SwitchoverEffectFamily<E>
+where
+    E: kuberic_durable_execution::DurableEffect
+        + StrictSwitchoverActivityContract
+        + SwitchoverActivityContract<
+            Request = <E as kuberic_durable_execution::DurableEffect>::Request,
+            Output = <E as kuberic_durable_execution::DurableEffect>::Output,
+        >,
+{
     fn prepare_command(
-        request: &E::Request,
+        request: &<E as SwitchoverActivityContract>::Request,
         definition: &DirectSwitchoverDefinition,
         observations: &OperationObservations,
         addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
         now: i64,
-    ) -> Result<E::Command, PreparedActivityError>;
+        deadline_unix_seconds: i64,
+    ) -> Result<<E as kuberic_durable_execution::DurableEffect>::Command, PreparedActivityError>;
 
     fn validate_recorded_command(
-        request: &E::Request,
-        command: &E::Command,
+        request: &<E as SwitchoverActivityContract>::Request,
+        command: &<E as kuberic_durable_execution::DurableEffect>::Command,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<(), PreparedActivityError>;
 
     fn observe(
-        request: &E::Request,
-        command: &E::Command,
+        request: &<E as SwitchoverActivityContract>::Request,
+        command: &<E as kuberic_durable_execution::DurableEffect>::Command,
         definition: &DirectSwitchoverDefinition,
         observations: &OperationObservations,
         now: i64,
-    ) -> Result<Option<EffectOutcome<E::Output>>, String>;
+        deadline_unix_seconds: i64,
+    ) -> Result<
+        Option<EffectOutcome<<E as kuberic_durable_execution::DurableEffect>::Output>>,
+        String,
+    >;
 
     fn observe_quarantined(
-        request: &E::Request,
-        command: &E::Command,
+        request: &<E as SwitchoverActivityContract>::Request,
+        command: &<E as kuberic_durable_execution::DurableEffect>::Command,
         definition: &DirectSwitchoverDefinition,
         observations: &OperationObservations,
         now: i64,
-    ) -> Result<Option<EffectOutcome<E::Output>>, String>;
+        deadline_unix_seconds: i64,
+    ) -> Result<
+        Option<EffectOutcome<<E as kuberic_durable_execution::DurableEffect>::Output>>,
+        String,
+    >;
 
-    fn dispatch(command: &E::Command) -> SwitchoverDispatch<'_>;
+    fn dispatch(
+        command: &<E as kuberic_durable_execution::DurableEffect>::Command,
+    ) -> SwitchoverDispatch<'_>;
 }
 
-struct ReplicaRequest<'a> {
+pub(crate) struct ReplicaRequest<'a> {
     contract_version: u32,
-    execution_id: &'a str,
+    execution_id: String,
     sequence: u32,
     target_id: i64,
     target_instance_id: &'a str,
@@ -116,12 +144,13 @@ struct ReplicaRequest<'a> {
     deadline_unix_seconds: i64,
 }
 
-trait ReplicaOperation:
-    DurableEffect<Command = Option<ReplicaEffectCommand>, Output = EffectApplied>
+pub(crate) trait ReplicaOperation:
+    SwitchoverActivityContract<Output = EffectApplied>
 {
     fn request<'a>(
         input: &'a Self::Request,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String>;
 
     fn action(
@@ -150,7 +179,7 @@ trait ReplicaOperation:
 #[allow(clippy::too_many_arguments)]
 fn fixed_replica_request<'a>(
     contract_version: u32,
-    execution_id: &'a str,
+    execution_id: &str,
     sequence: u32,
     target_id: i64,
     target_instance_id: &'a str,
@@ -160,7 +189,7 @@ fn fixed_replica_request<'a>(
 ) -> ReplicaRequest<'a> {
     ReplicaRequest {
         contract_version,
-        execution_id,
+        execution_id: execution_id.to_string(),
         sequence,
         target_id,
         target_instance_id,
@@ -187,6 +216,7 @@ impl ReplicaOperation for RevokeWritesActivity {
     fn request<'a>(
         input: &'a RevokeWritesInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         validate_target(
             input.old_primary_id,
@@ -195,14 +225,14 @@ impl ReplicaOperation for RevokeWritesActivity {
             definition,
         )?;
         Ok(fixed_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             1,
             input.old_primary_id,
             &input.old_primary_instance_id,
             definition.previous_snapshot.epoch.clone(),
             definition.previous_snapshot.clone(),
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
         ))
     }
 
@@ -256,6 +286,7 @@ impl ReplicaOperation for DemoteOldPrimaryActivity {
     fn request<'a>(
         input: &'a DemoteOldPrimaryInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         validate_target(
             input.old_primary_id,
@@ -264,14 +295,14 @@ impl ReplicaOperation for DemoteOldPrimaryActivity {
             definition,
         )?;
         Ok(fixed_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             2,
             input.old_primary_id,
             &input.old_primary_instance_id,
             definition.target_snapshot.epoch.clone(),
             definition.target_snapshot.clone(),
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
         ))
     }
 
@@ -335,6 +366,7 @@ impl ReplicaOperation for PromoteTargetActivity {
     fn request<'a>(
         input: &'a PromoteTargetInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         validate_target(
             input.target_primary_id,
@@ -343,14 +375,14 @@ impl ReplicaOperation for PromoteTargetActivity {
             definition,
         )?;
         Ok(fixed_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             3,
             input.target_primary_id,
             &input.target_primary_instance_id,
             definition.previous_snapshot.epoch.clone(),
             definition.target_snapshot.clone(),
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
         ))
     }
 
@@ -412,6 +444,7 @@ impl ReplicaOperation for DistributeReplicaEpochActivity {
     fn request<'a>(
         input: &'a DistributeReplicaEpochInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         let index = usize::from(input.distribution_index);
         let target_id = *definition
@@ -425,14 +458,14 @@ impl ReplicaOperation for DistributeReplicaEpochActivity {
             definition,
         )?;
         Ok(fixed_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             100 + u32::from(input.distribution_index),
             input.replica_id,
             &input.replica_instance_id,
             definition.target_snapshot.epoch.clone(),
             definition.target_snapshot.clone(),
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
         ))
     }
 
@@ -482,14 +515,15 @@ impl ReplicaOperation for InstallTargetCatchUpConfigurationActivity {
     fn request<'a>(
         input: &'a InstallTargetCatchUpConfigurationInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         target_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             1000,
             input.target_primary_id,
             &input.target_primary_instance_id,
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
             definition,
         )
     }
@@ -545,14 +579,15 @@ impl ReplicaOperation for WaitTargetWriteQuorumActivity {
     fn request<'a>(
         input: &'a WaitTargetWriteQuorumInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         target_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             1001,
             input.target_primary_id,
             &input.target_primary_instance_id,
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
             definition,
         )
     }
@@ -606,14 +641,15 @@ impl ReplicaOperation for InstallTargetCurrentConfigurationActivity {
     fn request<'a>(
         input: &'a InstallTargetCurrentConfigurationInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         target_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             1002,
             input.target_primary_id,
             &input.target_primary_instance_id,
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
             definition,
         )
     }
@@ -669,16 +705,17 @@ impl ReplicaOperation for RestorePreviousCurrentConfigurationActivity {
     fn request<'a>(
         input: &'a RestorePreviousCurrentConfigurationInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         old_primary_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             1500,
             input.old_primary_id,
             &input.old_primary_instance_id,
             definition.previous_snapshot.epoch.clone(),
             definition.previous_snapshot.clone(),
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
             definition,
         )
     }
@@ -746,16 +783,17 @@ impl ReplicaOperation for CompensatePromoteOldPrimaryActivity {
     fn request<'a>(
         input: &'a CompensatePromoteOldPrimaryInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         old_primary_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             2000,
             input.old_primary_id,
             &input.old_primary_instance_id,
             definition.target_snapshot.epoch.clone(),
             definition.compensation_snapshot(),
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
             definition,
         )
     }
@@ -818,6 +856,7 @@ impl ReplicaOperation for CompensateDistributeReplicaEpochActivity {
     fn request<'a>(
         input: &'a CompensateDistributeReplicaEpochInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         let index = usize::from(input.distribution_index);
         let target_id = *definition
@@ -833,14 +872,14 @@ impl ReplicaOperation for CompensateDistributeReplicaEpochActivity {
             definition,
         )?;
         Ok(fixed_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             2100 + u32::from(input.distribution_index),
             input.replica_id,
             &input.replica_instance_id,
             definition.target_snapshot.epoch.clone(),
             definition.compensation_snapshot(),
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
         ))
     }
 
@@ -890,16 +929,17 @@ impl ReplicaOperation for InstallCompensationCatchUpConfigurationActivity {
     fn request<'a>(
         input: &'a InstallCompensationCatchUpConfigurationInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         old_primary_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             2001,
             input.old_primary_id,
             &input.old_primary_instance_id,
             definition.target_snapshot.epoch.clone(),
             definition.compensation_snapshot(),
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
             definition,
         )
     }
@@ -959,16 +999,17 @@ impl ReplicaOperation for InstallCompensationCurrentConfigurationActivity {
     fn request<'a>(
         input: &'a InstallCompensationCurrentConfigurationInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<ReplicaRequest<'a>, String> {
         old_primary_replica_request(
-            input.contract_version,
-            &input.execution_id,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
             2002,
             input.old_primary_id,
             &input.old_primary_instance_id,
             definition.target_snapshot.epoch.clone(),
             definition.compensation_snapshot(),
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
             definition,
         )
     }
@@ -1023,7 +1064,7 @@ impl ReplicaOperation for InstallCompensationCurrentConfigurationActivity {
 #[allow(clippy::too_many_arguments)]
 fn target_replica_request<'a>(
     contract_version: u32,
-    execution_id: &'a str,
+    execution_id: &str,
     sequence: u32,
     target_primary_id: i64,
     target_primary_instance_id: &'a str,
@@ -1051,7 +1092,7 @@ fn target_replica_request<'a>(
 #[allow(clippy::too_many_arguments)]
 fn old_primary_replica_request<'a>(
     contract_version: u32,
-    execution_id: &'a str,
+    execution_id: &str,
     sequence: u32,
     old_primary_id: i64,
     old_primary_instance_id: &'a str,
@@ -1078,9 +1119,9 @@ fn old_primary_replica_request<'a>(
     ))
 }
 
-struct LabelRequest<'a> {
+pub(crate) struct LabelRequest<'a> {
     contract_version: u32,
-    execution_id: &'a str,
+    execution_id: String,
     sequence: u32,
     target_id: i64,
     target_instance_id: &'a str,
@@ -1088,12 +1129,11 @@ struct LabelRequest<'a> {
     deadline_unix_seconds: i64,
 }
 
-trait LabelOperation:
-    DurableEffect<Command = Option<LabelEffectCommand>, Output = EffectApplied>
-{
+pub(crate) trait LabelOperation: SwitchoverActivityContract<Output = EffectApplied> {
     fn request<'a>(
         input: &'a Self::Request,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<LabelRequest<'a>, String>;
 }
 
@@ -1115,16 +1155,17 @@ impl LabelOperation for PublishTargetPrimaryLabelActivity {
     fn request<'a>(
         input: &'a PublishTargetPrimaryLabelInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<LabelRequest<'a>, String> {
         validate_label_request(
             LabelRequest {
-                contract_version: input.contract_version,
-                execution_id: &input.execution_id,
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
                 sequence: 1003,
                 target_id: input.target_primary_id,
                 target_instance_id: &input.target_primary_instance_id,
                 desired_role: "primary",
-                deadline_unix_seconds: input.deadline_unix_seconds,
+                deadline_unix_seconds,
             },
             definition.target_primary_id,
             definition,
@@ -1136,16 +1177,17 @@ impl LabelOperation for PublishOldPrimarySecondaryLabelActivity {
     fn request<'a>(
         input: &'a PublishOldPrimarySecondaryLabelInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<LabelRequest<'a>, String> {
         validate_label_request(
             LabelRequest {
-                contract_version: input.contract_version,
-                execution_id: &input.execution_id,
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
                 sequence: 1004,
                 target_id: input.old_primary_id,
                 target_instance_id: &input.old_primary_instance_id,
                 desired_role: "secondary",
-                deadline_unix_seconds: input.deadline_unix_seconds,
+                deadline_unix_seconds,
             },
             definition.old_primary_id,
             definition,
@@ -1157,16 +1199,17 @@ impl LabelOperation for RestoreOldPrimaryLabelActivity {
     fn request<'a>(
         input: &'a RestoreOldPrimaryLabelInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<LabelRequest<'a>, String> {
         validate_label_request(
             LabelRequest {
-                contract_version: input.contract_version,
-                execution_id: &input.execution_id,
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
                 sequence: 2003,
                 target_id: input.old_primary_id,
                 target_instance_id: &input.old_primary_instance_id,
                 desired_role: "primary",
-                deadline_unix_seconds: input.deadline_unix_seconds,
+                deadline_unix_seconds,
             },
             definition.old_primary_id,
             definition,
@@ -1178,16 +1221,17 @@ impl LabelOperation for RestoreTargetSecondaryLabelActivity {
     fn request<'a>(
         input: &'a RestoreTargetSecondaryLabelInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<LabelRequest<'a>, String> {
         validate_label_request(
             LabelRequest {
-                contract_version: input.contract_version,
-                execution_id: &input.execution_id,
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
                 sequence: 2004,
                 target_id: input.target_primary_id,
                 target_instance_id: &input.target_primary_instance_id,
                 desired_role: "secondary",
-                deadline_unix_seconds: input.deadline_unix_seconds,
+                deadline_unix_seconds,
             },
             definition.target_primary_id,
             definition,
@@ -1198,11 +1242,12 @@ impl LabelOperation for RestoreTargetSecondaryLabelActivity {
 fn validate_replica<A: ReplicaOperation>(
     input: &A::Request,
     definition: &DirectSwitchoverDefinition,
+    deadline_unix_seconds: i64,
 ) -> Result<(), String> {
-    let request = A::request(input, definition)?;
+    let request = A::request(input, definition, deadline_unix_seconds)?;
     validate_common(
         request.contract_version,
-        request.execution_id,
+        &request.execution_id,
         request.deadline_unix_seconds,
         definition,
     )
@@ -1212,9 +1257,10 @@ fn validate_replica_command<A: ReplicaOperation>(
     input: &A::Request,
     command: &ReplicaEffectCommand,
     definition: &DirectSwitchoverDefinition,
+    deadline_unix_seconds: i64,
 ) -> Result<(), String> {
-    validate_replica::<A>(input, definition)?;
-    let request = A::request(input, definition)?;
+    validate_replica::<A>(input, definition, deadline_unix_seconds)?;
+    let request = A::request(input, definition, deadline_unix_seconds)?;
     let pending = pending::<A>(&request, Some(command));
     if ReplicaEffectCommand::from_pending(&pending)? != *command
         || command.action_id != action_id(definition, request.sequence)
@@ -1245,8 +1291,9 @@ fn evaluate_replica<A: ReplicaOperation>(
     definition: &DirectSwitchoverDefinition,
     observations: &OperationObservations,
     now: i64,
+    deadline_unix_seconds: i64,
 ) -> Result<DirectEvaluation, String> {
-    let request = A::request(input, definition)?;
+    let request = A::request(input, definition, deadline_unix_seconds)?;
     let Some(observed) = observations.get(&request.target_id) else {
         return deadline_or_wait(request.deadline_unix_seconds, now, || {
             encode_effect_error::<A>(
@@ -1351,10 +1398,17 @@ fn evaluate_quarantined_replica<A: ReplicaOperation>(
     definition: &DirectSwitchoverDefinition,
     observations: &OperationObservations,
     now: i64,
+    deadline_unix_seconds: i64,
 ) -> Result<DirectEvaluation, String> {
-    let request = A::request(input, definition)?;
+    let request = A::request(input, definition, deadline_unix_seconds)?;
     let Some(command) = command.as_ref() else {
-        return match evaluate_replica::<A>(input, definition, observations, now)? {
+        return match evaluate_replica::<A>(
+            input,
+            definition,
+            observations,
+            now,
+            deadline_unix_seconds,
+        )? {
             observation @ DirectEvaluation::Observe(_) => Ok(observation),
             DirectEvaluation::AwaitEvidence
             | DirectEvaluation::DispatchReplica { .. }
@@ -1445,11 +1499,12 @@ fn action_id(definition: &DirectSwitchoverDefinition, sequence: u32) -> String {
 fn validate_label<A: LabelOperation>(
     input: &A::Request,
     definition: &DirectSwitchoverDefinition,
+    deadline_unix_seconds: i64,
 ) -> Result<(), String> {
-    let request = A::request(input, definition)?;
+    let request = A::request(input, definition, deadline_unix_seconds)?;
     validate_common(
         request.contract_version,
-        request.execution_id,
+        &request.execution_id,
         request.deadline_unix_seconds,
         definition,
     )
@@ -1459,9 +1514,10 @@ fn validate_label_command<A: LabelOperation>(
     input: &A::Request,
     command: &LabelEffectCommand,
     definition: &DirectSwitchoverDefinition,
+    deadline_unix_seconds: i64,
 ) -> Result<(), String> {
-    validate_label::<A>(input, definition)?;
-    let request = A::request(input, definition)?;
+    validate_label::<A>(input, definition, deadline_unix_seconds)?;
+    let request = A::request(input, definition, deadline_unix_seconds)?;
     if command.target_id != request.target_id
         || command.expected_uid != request.target_instance_id
         || command.role != request.desired_role
@@ -1478,8 +1534,9 @@ fn evaluate_label<A: LabelOperation>(
     definition: &DirectSwitchoverDefinition,
     observations: &OperationObservations,
     now: i64,
+    deadline_unix_seconds: i64,
 ) -> Result<DirectEvaluation, String> {
-    let request = A::request(input, definition)?;
+    let request = A::request(input, definition, deadline_unix_seconds)?;
     let Some(observed) = observations.get(&request.target_id) else {
         return deadline_or_wait(request.deadline_unix_seconds, now, || {
             encode_effect_error::<A>(
@@ -1528,35 +1585,6 @@ fn evaluate_label<A: LabelOperation>(
     }
 }
 
-fn evaluate_quarantined_label<A: LabelOperation>(
-    input: &A::Request,
-    command: &Option<LabelEffectCommand>,
-    definition: &DirectSwitchoverDefinition,
-    observations: &OperationObservations,
-    now: i64,
-) -> Result<DirectEvaluation, String> {
-    let request = A::request(input, definition)?;
-    if command.is_none() {
-        return match evaluate_label::<A>(input, definition, observations, now)? {
-            observation @ DirectEvaluation::Observe(_) => Ok(observation),
-            DirectEvaluation::AwaitEvidence
-            | DirectEvaluation::DispatchReplica { .. }
-            | DirectEvaluation::DispatchLabel => Ok(DirectEvaluation::AwaitEvidence),
-        };
-    }
-    let Some(observed) = observations.get(&request.target_id) else {
-        return Ok(DirectEvaluation::AwaitEvidence);
-    };
-    if observed.status.instance_id.as_str() == request.target_instance_id
-        && observed.status.epoch == epoch(&definition.target_snapshot.epoch)
-        && observed.status.role == label_role(request.desired_role)
-        && observed.pod_role_label.as_deref() == Some(request.desired_role)
-    {
-        return encode_effect_applied::<A>(now).map(DirectEvaluation::Observe);
-    }
-    Ok(DirectEvaluation::AwaitEvidence)
-}
-
 fn label_role(role: &str) -> Role {
     if role == "primary" {
         Role::Primary
@@ -1589,7 +1617,7 @@ fn epoch_distribution_relation(
     }
 }
 
-enum StatusRelation {
+pub(crate) enum StatusRelation {
     Precondition,
     Postcondition,
     Conflicting(String),
@@ -1618,15 +1646,19 @@ fn validate_common(
 
 fn encode_effect_outcome<A>(outcome: EffectOutcome<A::Output>) -> Result<ExactBytes, String>
 where
-    A: DurableEffect,
+    A: SwitchoverActivityContract,
 {
-    encode_activity_result::<EffectActivity<A>>(&outcome)
-        .map_err(|error| format!("encode {} result: {error}", <A as DurableEffect>::NAME))
+    encode_activity_result::<EncodedSwitchoverOutcome<A>>(&outcome).map_err(|error| {
+        format!(
+            "encode {} result: {error}",
+            <A as SwitchoverActivityContract>::NAME
+        )
+    })
 }
 
 fn encode_effect_applied<A>(observed_at_unix_seconds: i64) -> Result<ExactBytes, String>
 where
-    A: DurableEffect<Output = EffectApplied>,
+    A: SwitchoverActivityContract<Output = EffectApplied>,
 {
     encode_effect_outcome::<A>(EffectOutcome::Applied(EffectApplied {
         observed_at_unix_seconds,
@@ -1639,7 +1671,7 @@ fn encode_effect_error<A>(
     message: String,
 ) -> Result<ExactBytes, String>
 where
-    A: DurableEffect<Output = EffectApplied>,
+    A: SwitchoverActivityContract<Output = EffectApplied>,
 {
     let error = effect_error::<A>(kind, observed_at_unix_seconds, message)?;
     let outcome = match kind {
@@ -1652,7 +1684,7 @@ where
     encode_effect_outcome::<A>(outcome)
 }
 
-fn effect_error<A: DurableEffect>(
+fn effect_error<A: SwitchoverActivityContract>(
     kind: EffectErrorKind,
     observed_at_unix_seconds: i64,
     message: String,
@@ -1661,51 +1693,210 @@ fn effect_error<A: DurableEffect>(
         kind,
         super::bounded_utf8(&message, super::SWITCHOVER_MAX_ERROR_BYTES),
         observed_at_unix_seconds,
-        A::MAX_ERROR_MESSAGE_BYTES,
+        <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
     )
-    .map_err(|error| format!("bound {} effect error: {error}", A::NAME))
+    .map_err(|error| {
+        format!(
+            "bound {} activity error: {error}",
+            <A as SwitchoverActivityContract>::NAME
+        )
+    })
 }
 
 fn decode_evaluation<A>(
     evaluation: DirectEvaluation,
 ) -> Result<Option<EffectOutcome<A::Output>>, String>
 where
-    A: DurableEffect,
+    A: SwitchoverActivityContract,
 {
     match evaluation {
-        DirectEvaluation::Observe(result) => decode_activity_result::<EffectActivity<A>>(&result)
-            .map(Some)
-            .map_err(|error| format!("decode {} observation: {error}", A::NAME)),
+        DirectEvaluation::Observe(result) => {
+            decode_activity_result::<EncodedSwitchoverOutcome<A>>(&result)
+                .map(Some)
+                .map_err(|error| format!("decode {} observation: {error}", A::NAME))
+        }
         DirectEvaluation::AwaitEvidence
         | DirectEvaluation::DispatchReplica { .. }
         | DirectEvaluation::DispatchLabel => Ok(None),
     }
 }
 
-impl<A> SwitchoverEffectFamily<A> for ReplicaEffectFamily
+pub(crate) enum OrdinaryActivityStep<O> {
+    Complete(EffectOutcome<O>),
+    AwaitEvidence { authoritative_pending: bool },
+    DispatchReplica(ReplicaEffectCommand),
+    DispatchLabel(LabelEffectCommand),
+}
+
+pub(crate) fn evaluate_ordinary_replica<A>(
+    input: &A::Request,
+    activity: &kuberic_durable_execution::LogicalActivityId,
+    definition: &DirectSwitchoverDefinition,
+    observations: &OperationObservations,
+    addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
+    now: i64,
+    deadline_unix_seconds: i64,
+) -> Result<OrdinaryActivityStep<A::Output>, String>
 where
     A: ReplicaOperation,
 {
-    fn deadline_unix_seconds(
-        request: &A::Request,
-        definition: &DirectSwitchoverDefinition,
-    ) -> Result<i64, PreparedActivityError> {
-        A::request(request, definition)
-            .map(|request| request.deadline_unix_seconds)
-            .map_err(|_| PreparedActivityError::Validation)
+    validate_replica::<A>(input, definition, deadline_unix_seconds)?;
+    match evaluate_replica::<A>(input, definition, observations, now, deadline_unix_seconds)? {
+        DirectEvaluation::Observe(result) => {
+            decode_activity_result::<EncodedSwitchoverOutcome<A>>(&result)
+                .map(OrdinaryActivityStep::Complete)
+                .map_err(|error| format!("decode {} observation: {error}", A::NAME))
+        }
+        DirectEvaluation::AwaitEvidence => {
+            let request = A::request(input, definition, deadline_unix_seconds)?;
+            let operation_sequence = request.sequence.to_string();
+            let action_id = format!(
+                "{}:{}:{}",
+                super::encode_execution_id(activity.execution_id()),
+                activity.sequence(),
+                operation_sequence,
+            );
+            let authoritative_pending = observations
+                .get(&request.target_id)
+                .and_then(|observed| correlated_action_observation(&observed.status, &action_id))
+                .is_some_and(|recorded| {
+                    matches!(
+                        recorded.state,
+                        DurableActionState::Scheduled | DurableActionState::InProgress
+                    )
+                });
+            Ok(OrdinaryActivityStep::AwaitEvidence {
+                authoritative_pending,
+            })
+        }
+        DirectEvaluation::DispatchReplica { action, pending } => {
+            let observed = observations
+                .get(&pending.target_id)
+                .ok_or_else(|| "replica observation disappeared during invocation".to_string())?;
+            let addressed = addressed_instances
+                .get(&pending.target_id)
+                .ok_or_else(|| "replica address disappeared during invocation".to_string())?;
+            let (_, mut command) =
+                prepare_replica_effect_command(&pending, &observed.status, addressed, &action)
+                    .map_err(|error| format!("prepare ordinary replica action: {error:?}"))?;
+            validate_replica_command::<A>(input, &command, definition, deadline_unix_seconds)?;
+            let operation_sequence = command
+                .action_id
+                .rsplit(':')
+                .next()
+                .unwrap_or("0")
+                .to_string();
+            command.action_id = format!(
+                "{}:{}:{}",
+                super::encode_execution_id(activity.execution_id()),
+                activity.sequence(),
+                operation_sequence,
+            );
+            Ok(OrdinaryActivityStep::DispatchReplica(command))
+        }
+        DirectEvaluation::DispatchLabel => {
+            Err("replica activity produced a label dispatch".to_string())
+        }
     }
+}
 
+pub(crate) fn evaluate_ordinary_label<A>(
+    input: &A::Request,
+    definition: &DirectSwitchoverDefinition,
+    observations: &OperationObservations,
+    now: i64,
+    deadline_unix_seconds: i64,
+) -> Result<OrdinaryActivityStep<A::Output>, String>
+where
+    A: LabelOperation,
+{
+    validate_label::<A>(input, definition, deadline_unix_seconds)?;
+    match evaluate_label::<A>(input, definition, observations, now, deadline_unix_seconds)? {
+        DirectEvaluation::Observe(result) => {
+            decode_activity_result::<EncodedSwitchoverOutcome<A>>(&result)
+                .map(OrdinaryActivityStep::Complete)
+                .map_err(|error| format!("decode {} observation: {error}", A::NAME))
+        }
+        DirectEvaluation::AwaitEvidence => Ok(OrdinaryActivityStep::AwaitEvidence {
+            authoritative_pending: false,
+        }),
+        DirectEvaluation::DispatchLabel => {
+            let request = A::request(input, definition, deadline_unix_seconds)?;
+            let observed = observations
+                .get(&request.target_id)
+                .ok_or_else(|| "label observation disappeared during invocation".to_string())?;
+            if observed.status.instance_id.as_str() != request.target_instance_id {
+                return Err("label target incarnation changed during invocation".to_string());
+            }
+            let command = LabelEffectCommand::new(
+                request.target_id,
+                observed.pod_name.clone(),
+                request.target_instance_id.to_string(),
+                request.desired_role.to_string(),
+            );
+            validate_label_command::<A>(input, &command, definition, deadline_unix_seconds)?;
+            Ok(OrdinaryActivityStep::DispatchLabel(command))
+        }
+        DirectEvaluation::DispatchReplica { .. } => {
+            Err("label activity produced a replica dispatch".to_string())
+        }
+    }
+}
+
+pub(crate) fn evaluate_ordinary_passive<A>(
+    input: &A::Request,
+    definition: &DirectSwitchoverDefinition,
+    observations: &OperationObservations,
+    now: i64,
+    deadline_unix_seconds: i64,
+) -> Result<OrdinaryActivityStep<A::Output>, String>
+where
+    A: PassiveOperation,
+{
+    A::validate_request(input, definition, deadline_unix_seconds)?;
+    match A::evaluate_request(input, observations, now, deadline_unix_seconds)? {
+        DirectEvaluation::Observe(result) => {
+            decode_activity_result::<EncodedSwitchoverOutcome<A>>(&result)
+                .map(OrdinaryActivityStep::Complete)
+                .map_err(|error| format!("decode {} observation: {error}", A::NAME))
+        }
+        DirectEvaluation::AwaitEvidence => Ok(OrdinaryActivityStep::AwaitEvidence {
+            authoritative_pending: false,
+        }),
+        DirectEvaluation::DispatchReplica { .. } | DirectEvaluation::DispatchLabel => {
+            Err("passive activity attempted dispatch".to_string())
+        }
+    }
+}
+
+impl<A> SwitchoverEffectFamily<A> for ReplicaEffectFamily
+where
+    A: ReplicaOperation
+        + kuberic_durable_execution::DurableEffect<
+            Request = <A as SwitchoverActivityContract>::Request,
+            Command = Option<ReplicaEffectCommand>,
+            Output = <A as SwitchoverActivityContract>::Output,
+        > + StrictSwitchoverActivityContract<Family = ReplicaEffectFamily>,
+{
     fn prepare_command(
-        request: &A::Request,
+        request: &<A as SwitchoverActivityContract>::Request,
         definition: &DirectSwitchoverDefinition,
         observations: &OperationObservations,
         addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
         now: i64,
-    ) -> Result<A::Command, PreparedActivityError> {
-        validate_replica::<A>(request, definition)
+        deadline_unix_seconds: i64,
+    ) -> Result<<A as kuberic_durable_execution::DurableEffect>::Command, PreparedActivityError>
+    {
+        validate_replica::<A>(request, definition, deadline_unix_seconds)
             .map_err(|_| PreparedActivityError::Validation)?;
-        match evaluate_replica::<A>(request, definition, observations, now)
-            .map_err(|_| PreparedActivityError::Validation)?
+        match evaluate_replica::<A>(
+            request,
+            definition,
+            observations,
+            now,
+            deadline_unix_seconds,
+        )
+        .map_err(|_| PreparedActivityError::Validation)?
         {
             DirectEvaluation::Observe(_) => Ok(None),
             DirectEvaluation::AwaitEvidence => Err(PreparedActivityError::Derivation),
@@ -1719,7 +1910,7 @@ where
                 let (_, command) =
                     prepare_replica_effect_command(&pending, &observed.status, addressed, &action)
                         .map_err(preparation_error)?;
-                validate_replica_command::<A>(request, &command, definition)
+                validate_replica_command::<A>(request, &command, definition, deadline_unix_seconds)
                     .map_err(|_| PreparedActivityError::Validation)?;
                 Ok(Some(command))
             }
@@ -1728,150 +1919,67 @@ where
     }
 
     fn validate_recorded_command(
-        request: &A::Request,
-        command: &A::Command,
+        request: &<A as SwitchoverActivityContract>::Request,
+        command: &<A as kuberic_durable_execution::DurableEffect>::Command,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<(), PreparedActivityError> {
-        validate_replica::<A>(request, definition)
+        validate_replica::<A>(request, definition, deadline_unix_seconds)
             .map_err(|_| PreparedActivityError::Validation)?;
         if let Some(command) = command {
-            validate_replica_command::<A>(request, command, definition)
+            validate_replica_command::<A>(request, command, definition, deadline_unix_seconds)
                 .map_err(|_| PreparedActivityError::Validation)?;
         }
         Ok(())
     }
 
     fn observe(
-        request: &A::Request,
-        _command: &A::Command,
+        request: &<A as SwitchoverActivityContract>::Request,
+        _command: &<A as kuberic_durable_execution::DurableEffect>::Command,
         definition: &DirectSwitchoverDefinition,
         observations: &OperationObservations,
         now: i64,
-    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
+        deadline_unix_seconds: i64,
+    ) -> Result<
+        Option<EffectOutcome<<A as kuberic_durable_execution::DurableEffect>::Output>>,
+        String,
+    > {
         decode_evaluation::<A>(evaluate_replica::<A>(
             request,
             definition,
             observations,
             now,
+            deadline_unix_seconds,
         )?)
     }
 
     fn observe_quarantined(
-        request: &A::Request,
-        command: &A::Command,
+        request: &<A as SwitchoverActivityContract>::Request,
+        command: &<A as kuberic_durable_execution::DurableEffect>::Command,
         definition: &DirectSwitchoverDefinition,
         observations: &OperationObservations,
         now: i64,
-    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
+        deadline_unix_seconds: i64,
+    ) -> Result<
+        Option<EffectOutcome<<A as kuberic_durable_execution::DurableEffect>::Output>>,
+        String,
+    > {
         decode_evaluation::<A>(evaluate_quarantined_replica::<A>(
             request,
             command,
             definition,
             observations,
             now,
+            deadline_unix_seconds,
         )?)
     }
 
-    fn dispatch(command: &A::Command) -> SwitchoverDispatch<'_> {
+    fn dispatch(
+        command: &<A as kuberic_durable_execution::DurableEffect>::Command,
+    ) -> SwitchoverDispatch<'_> {
         command
             .as_ref()
             .map(SwitchoverDispatch::Replica)
-            .unwrap_or(SwitchoverDispatch::ObservationOnly)
-    }
-}
-
-impl<A> SwitchoverEffectFamily<A> for LabelEffectFamily
-where
-    A: LabelOperation,
-{
-    fn deadline_unix_seconds(
-        request: &A::Request,
-        definition: &DirectSwitchoverDefinition,
-    ) -> Result<i64, PreparedActivityError> {
-        A::request(request, definition)
-            .map(|request| request.deadline_unix_seconds)
-            .map_err(|_| PreparedActivityError::Validation)
-    }
-
-    fn prepare_command(
-        request: &A::Request,
-        definition: &DirectSwitchoverDefinition,
-        observations: &OperationObservations,
-        _addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
-        now: i64,
-    ) -> Result<A::Command, PreparedActivityError> {
-        validate_label::<A>(request, definition).map_err(|_| PreparedActivityError::Validation)?;
-        match evaluate_label::<A>(request, definition, observations, now)
-            .map_err(|_| PreparedActivityError::Validation)?
-        {
-            DirectEvaluation::Observe(_) => Ok(None),
-            DirectEvaluation::AwaitEvidence => Err(PreparedActivityError::Derivation),
-            DirectEvaluation::DispatchLabel => {
-                let label = A::request(request, definition)
-                    .map_err(|_| PreparedActivityError::Validation)?;
-                let observed = observations
-                    .get(&label.target_id)
-                    .ok_or(PreparedActivityError::Derivation)?;
-                if observed.status.instance_id.as_str() != label.target_instance_id {
-                    return Err(PreparedActivityError::Validation);
-                }
-                let command = LabelEffectCommand::new(
-                    label.target_id,
-                    observed.pod_name.clone(),
-                    label.target_instance_id.to_string(),
-                    label.desired_role.to_string(),
-                );
-                validate_label_command::<A>(request, &command, definition)
-                    .map_err(|_| PreparedActivityError::Validation)?;
-                Ok(Some(command))
-            }
-            DirectEvaluation::DispatchReplica { .. } => Err(PreparedActivityError::Validation),
-        }
-    }
-
-    fn validate_recorded_command(
-        request: &A::Request,
-        command: &A::Command,
-        definition: &DirectSwitchoverDefinition,
-    ) -> Result<(), PreparedActivityError> {
-        validate_label::<A>(request, definition).map_err(|_| PreparedActivityError::Validation)?;
-        if let Some(command) = command {
-            validate_label_command::<A>(request, command, definition)
-                .map_err(|_| PreparedActivityError::Validation)?;
-        }
-        Ok(())
-    }
-
-    fn observe(
-        request: &A::Request,
-        _command: &A::Command,
-        definition: &DirectSwitchoverDefinition,
-        observations: &OperationObservations,
-        now: i64,
-    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
-        decode_evaluation::<A>(evaluate_label::<A>(request, definition, observations, now)?)
-    }
-
-    fn observe_quarantined(
-        request: &A::Request,
-        command: &A::Command,
-        definition: &DirectSwitchoverDefinition,
-        observations: &OperationObservations,
-        now: i64,
-    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
-        decode_evaluation::<A>(evaluate_quarantined_label::<A>(
-            request,
-            command,
-            definition,
-            observations,
-            now,
-        )?)
-    }
-
-    fn dispatch(command: &A::Command) -> SwitchoverDispatch<'_> {
-        command
-            .as_ref()
-            .map(SwitchoverDispatch::Label)
             .unwrap_or(SwitchoverDispatch::ObservationOnly)
     }
 }
@@ -1890,9 +1998,10 @@ fn evaluate_capture(
     input: &CaptureFrozenLsnInput,
     observations: &OperationObservations,
     now: i64,
+    deadline_unix_seconds: i64,
 ) -> Result<DirectEvaluation, String> {
     let outcome = match observations.get(&input.old_primary_id) {
-        None if now < input.deadline_unix_seconds => return Ok(DirectEvaluation::AwaitEvidence),
+        None if now < deadline_unix_seconds => return Ok(DirectEvaluation::AwaitEvidence),
         None => EffectOutcome::UnavailableAtDeadline(effect_error::<CaptureFrozenLsnActivity>(
             EffectErrorKind::UnavailableAtDeadline,
             now,
@@ -1915,7 +2024,7 @@ fn evaluate_capture(
             observed_at_unix_seconds: now,
         }),
     };
-    encode_activity_result::<EffectActivity<CaptureFrozenLsnActivity>>(&outcome)
+    encode_activity_result::<EncodedSwitchoverOutcome<CaptureFrozenLsnActivity>>(&outcome)
         .map(DirectEvaluation::Observe)
         .map_err(|error| format!("encode capture-frozen-lsn result: {error}"))
 }
@@ -1924,9 +2033,10 @@ fn evaluate_target_catch_up(
     input: &WaitTargetCaughtUpInput,
     observations: &OperationObservations,
     now: i64,
+    deadline_unix_seconds: i64,
 ) -> Result<DirectEvaluation, String> {
     let outcome = match observations.get(&input.target_id) {
-        None if now < input.deadline_unix_seconds => return Ok(DirectEvaluation::AwaitEvidence),
+        None if now < deadline_unix_seconds => return Ok(DirectEvaluation::AwaitEvidence),
         None => EffectOutcome::UnavailableAtDeadline(effect_error::<WaitTargetCaughtUpActivity>(
             EffectErrorKind::UnavailableAtDeadline,
             now,
@@ -1948,7 +2058,7 @@ fn evaluate_target_catch_up(
                 observed_at_unix_seconds: now,
             })
         }
-        Some(_) if now < input.deadline_unix_seconds => {
+        Some(_) if now < deadline_unix_seconds => {
             return Ok(DirectEvaluation::AwaitEvidence);
         }
         Some(_) => EffectOutcome::DeadlineExceeded(effect_error::<WaitTargetCaughtUpActivity>(
@@ -1957,7 +2067,7 @@ fn evaluate_target_catch_up(
             "target did not reach the frozen LSN before deadline".to_string(),
         )?),
     };
-    encode_activity_result::<EffectActivity<WaitTargetCaughtUpActivity>>(&outcome)
+    encode_activity_result::<EncodedSwitchoverOutcome<WaitTargetCaughtUpActivity>>(&outcome)
         .map(DirectEvaluation::Observe)
         .map_err(|error| format!("encode wait-target-caught-up result: {error}"))
 }
@@ -1970,7 +2080,7 @@ fn evaluate_attestation<A, FAttested>(
     attested: FAttested,
 ) -> Result<DirectEvaluation, String>
 where
-    A: DurableEffect,
+    A: SwitchoverActivityContract,
     FAttested: FnOnce(i64, StablePartitionSnapshotStatus) -> A::Output,
 {
     let outcome = match attestation_error(snapshot, observations) {
@@ -1988,41 +2098,41 @@ where
             effect_error::<A>(EffectErrorKind::ConflictingEvidence, now, message)?,
         ),
     };
-    encode_activity_result::<EffectActivity<A>>(&outcome)
+    encode_activity_result::<EncodedSwitchoverOutcome<A>>(&outcome)
         .map(DirectEvaluation::Observe)
-        .map_err(|error| format!("encode {} result: {error}", <A as DurableEffect>::NAME))
+        .map_err(|error| {
+            format!(
+                "encode {} result: {error}",
+                <A as SwitchoverActivityContract>::NAME
+            )
+        })
 }
 
-trait PassiveOperation:
-    DurableEffect<Command = ()> + SwitchoverEffect<Family = PassiveEffectFamily>
-{
-    fn deadline_unix_seconds(request: &Self::Request) -> i64;
-
+pub(crate) trait PassiveOperation: SwitchoverActivityContract {
     fn validate_request(
         request: &Self::Request,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<(), String>;
 
     fn evaluate_request(
         request: &Self::Request,
         observations: &OperationObservations,
         now: i64,
+        deadline_unix_seconds: i64,
     ) -> Result<DirectEvaluation, String>;
 }
 
 impl PassiveOperation for CaptureFrozenLsnActivity {
-    fn deadline_unix_seconds(input: &CaptureFrozenLsnInput) -> i64 {
-        input.deadline_unix_seconds
-    }
-
     fn validate_request(
         input: &CaptureFrozenLsnInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<(), String> {
         validate_common(
-            input.contract_version,
-            &input.execution_id,
-            input.deadline_unix_seconds,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
+            deadline_unix_seconds,
             definition,
         )?;
         let old = definition.member(definition.old_primary_id)?;
@@ -2039,24 +2149,22 @@ impl PassiveOperation for CaptureFrozenLsnActivity {
         input: &CaptureFrozenLsnInput,
         observations: &OperationObservations,
         now: i64,
+        deadline_unix_seconds: i64,
     ) -> Result<DirectEvaluation, String> {
-        evaluate_capture(input, observations, now)
+        evaluate_capture(input, observations, now, deadline_unix_seconds)
     }
 }
 
 impl PassiveOperation for WaitTargetCaughtUpActivity {
-    fn deadline_unix_seconds(input: &WaitTargetCaughtUpInput) -> i64 {
-        input.deadline_unix_seconds
-    }
-
     fn validate_request(
         input: &WaitTargetCaughtUpInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<(), String> {
         validate_common(
-            input.contract_version,
-            &input.execution_id,
-            input.deadline_unix_seconds,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
+            deadline_unix_seconds,
             definition,
         )?;
         let target = definition.member(definition.target_primary_id)?;
@@ -2074,24 +2182,22 @@ impl PassiveOperation for WaitTargetCaughtUpActivity {
         input: &WaitTargetCaughtUpInput,
         observations: &OperationObservations,
         now: i64,
+        deadline_unix_seconds: i64,
     ) -> Result<DirectEvaluation, String> {
-        evaluate_target_catch_up(input, observations, now)
+        evaluate_target_catch_up(input, observations, now, deadline_unix_seconds)
     }
 }
 
 impl PassiveOperation for AttestTargetTopologyActivity {
-    fn deadline_unix_seconds(input: &AttestTargetTopologyInput) -> i64 {
-        input.deadline_unix_seconds
-    }
-
     fn validate_request(
         input: &AttestTargetTopologyInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<(), String> {
         validate_common(
-            input.contract_version,
-            &input.execution_id,
-            input.deadline_unix_seconds,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
+            deadline_unix_seconds,
             definition,
         )?;
         if input.expected_snapshot != definition.target_snapshot {
@@ -2104,10 +2210,11 @@ impl PassiveOperation for AttestTargetTopologyActivity {
         input: &AttestTargetTopologyInput,
         observations: &OperationObservations,
         now: i64,
+        deadline_unix_seconds: i64,
     ) -> Result<DirectEvaluation, String> {
         evaluate_attestation::<Self, _>(
             &input.expected_snapshot,
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
             observations,
             now,
             |observed_at_unix_seconds, snapshot| AttestTargetTopologyOutput {
@@ -2119,18 +2226,15 @@ impl PassiveOperation for AttestTargetTopologyActivity {
 }
 
 impl PassiveOperation for AttestCompensatedTopologyActivity {
-    fn deadline_unix_seconds(input: &AttestCompensatedTopologyInput) -> i64 {
-        input.deadline_unix_seconds
-    }
-
     fn validate_request(
         input: &AttestCompensatedTopologyInput,
         definition: &DirectSwitchoverDefinition,
+        deadline_unix_seconds: i64,
     ) -> Result<(), String> {
         validate_common(
-            input.contract_version,
-            &input.execution_id,
-            input.deadline_unix_seconds,
+            DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            &definition.execution_id,
+            deadline_unix_seconds,
             definition,
         )?;
         let compensation = definition.compensation_snapshot();
@@ -2146,10 +2250,11 @@ impl PassiveOperation for AttestCompensatedTopologyActivity {
         input: &AttestCompensatedTopologyInput,
         observations: &OperationObservations,
         now: i64,
+        deadline_unix_seconds: i64,
     ) -> Result<DirectEvaluation, String> {
         evaluate_attestation::<Self, _>(
             &input.expected_snapshot,
-            input.deadline_unix_seconds,
+            deadline_unix_seconds,
             observations,
             now,
             |observed_at_unix_seconds, snapshot| AttestCompensatedTopologyOutput {
@@ -2157,68 +2262,6 @@ impl PassiveOperation for AttestCompensatedTopologyActivity {
                 snapshot,
             },
         )
-    }
-}
-
-impl<A> SwitchoverEffectFamily<A> for PassiveEffectFamily
-where
-    A: PassiveOperation,
-{
-    fn deadline_unix_seconds(
-        request: &A::Request,
-        _definition: &DirectSwitchoverDefinition,
-    ) -> Result<i64, PreparedActivityError> {
-        Ok(A::deadline_unix_seconds(request))
-    }
-
-    fn prepare_command(
-        request: &A::Request,
-        definition: &DirectSwitchoverDefinition,
-        _observations: &OperationObservations,
-        _addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
-        _now: i64,
-    ) -> Result<A::Command, PreparedActivityError> {
-        A::validate_request(request, definition).map_err(|_| PreparedActivityError::Validation)?;
-        Ok(())
-    }
-
-    fn validate_recorded_command(
-        request: &A::Request,
-        _command: &A::Command,
-        definition: &DirectSwitchoverDefinition,
-    ) -> Result<(), PreparedActivityError> {
-        A::validate_request(request, definition).map_err(|_| PreparedActivityError::Validation)
-    }
-
-    fn observe(
-        request: &A::Request,
-        _command: &A::Command,
-        definition: &DirectSwitchoverDefinition,
-        observations: &OperationObservations,
-        now: i64,
-    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
-        A::validate_request(request, definition)?;
-        decode_evaluation::<A>(A::evaluate_request(request, observations, now)?)
-    }
-
-    fn observe_quarantined(
-        request: &A::Request,
-        command: &A::Command,
-        definition: &DirectSwitchoverDefinition,
-        observations: &OperationObservations,
-        now: i64,
-    ) -> Result<Option<EffectOutcome<A::Output>>, String> {
-        <Self as SwitchoverEffectFamily<A>>::observe(
-            request,
-            command,
-            definition,
-            observations,
-            now,
-        )
-    }
-
-    fn dispatch(_command: &A::Command) -> SwitchoverDispatch<'_> {
-        SwitchoverDispatch::ObservationOnly
     }
 }
 

@@ -494,7 +494,8 @@ pub(crate) async fn execute_planned_control_action(
             ),
             action,
         )
-        .await;
+        .await
+        .map(|_| ());
     }
 
     let command = ReplicaEffectCommand::from_pending(pending)
@@ -506,6 +507,15 @@ pub async fn execute_replica_command(
     handle: &dyn ReplicaHandle,
     command: &ReplicaEffectCommand,
 ) -> kuberic_core::Result<()> {
+    execute_replica_command_state(handle, command)
+        .await
+        .map(|_| ())
+}
+
+pub async fn execute_replica_command_state(
+    handle: &dyn ReplicaHandle,
+    command: &ReplicaEffectCommand,
+) -> kuberic_core::Result<DurableActionState> {
     let generation = AgentGeneration::parse(&command.expected_agent_generation)
         .map_err(|error| KubericError::Internal(error.into()))?;
     let action =
@@ -537,11 +547,18 @@ pub async fn execute_label_command(
     namespace: &str,
     command: &LabelEffectCommand,
 ) {
+    let _ = execute_label_command_checked(api, namespace, command).await;
+}
+
+pub async fn execute_label_command_checked(
+    api: &dyn ClusterApi,
+    namespace: &str,
+    command: &LabelEffectCommand,
+) -> Result<(), String> {
     let mut labels = BTreeMap::new();
     labels.insert("kuberic.io/role".to_string(), command.role.clone());
-    let _ = api
-        .patch_pod_labels_if_uid(namespace, &command.pod_name, &command.expected_uid, labels)
-        .await;
+    api.patch_pod_labels_if_uid(namespace, &command.pod_name, &command.expected_uid, labels)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -554,7 +571,7 @@ async fn execute_correlated_action(
     control_version: AgentControlVersion,
     observed_runtime_epoch: Epoch,
     action: DurableReplicaAction,
-) -> kuberic_core::Result<()> {
+) -> kuberic_core::Result<DurableActionState> {
     let input_signature = action.signature();
     handle
         .execute_correlated_control_action(CorrelatedControlActionRequest {
@@ -570,7 +587,7 @@ async fn execute_correlated_action(
         })
         .await
         .and_then(|acknowledgement| {
-            correlated_acknowledgement_result(
+            correlated_acknowledgement_state(
                 acknowledgement,
                 action_id,
                 &input_signature,
@@ -580,6 +597,7 @@ async fn execute_correlated_action(
         })
 }
 
+#[cfg(test)]
 pub(crate) fn correlated_acknowledgement_result(
     acknowledgement: CorrelatedControlActionAcknowledgement,
     expected_action_id: &str,
@@ -587,6 +605,23 @@ pub(crate) fn correlated_acknowledgement_result(
     expected_generation: &AgentGeneration,
     expected_control_version: AgentControlVersion,
 ) -> kuberic_core::Result<()> {
+    correlated_acknowledgement_state(
+        acknowledgement,
+        expected_action_id,
+        expected_signature,
+        expected_generation,
+        expected_control_version,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn correlated_acknowledgement_state(
+    acknowledgement: CorrelatedControlActionAcknowledgement,
+    expected_action_id: &str,
+    expected_signature: &str,
+    expected_generation: &AgentGeneration,
+    expected_control_version: AgentControlVersion,
+) -> kuberic_core::Result<DurableActionState> {
     let observation = &acknowledgement.observation;
     if observation.generation != *expected_generation
         || observation.control_version.value() == 0
@@ -599,7 +634,7 @@ pub(crate) fn correlated_acknowledgement_result(
         ));
     }
     if acknowledgement.observation.action.state != DurableActionState::Failed {
-        return Ok(());
+        return Ok(acknowledgement.observation.action.state);
     }
     let action = acknowledgement.observation.action;
     let class = action.error_class.ok_or_else(|| {
@@ -925,9 +960,48 @@ fn bounded(value: &str) -> String {
 mod tests {
     use super::*;
     use kuberic_core::types::{
-        AccessStatus, ReplicaAgentStatus, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+        AccessStatus, CorrelatedActionObservation, DurableActionObservation, ReplicaAgentStatus,
+        ReplicaSetConfig, ReplicaSetQuorumMode, Role,
     };
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn nonterminal_correlated_acknowledgements_remain_pending() {
+        let generation = AgentGeneration::parse("11111111111111111111111111111111").unwrap();
+        let control_version = AgentControlVersion::new(7);
+        for state in [
+            DurableActionState::Scheduled,
+            DurableActionState::InProgress,
+        ] {
+            let acknowledgement = CorrelatedControlActionAcknowledgement {
+                observation: CorrelatedActionObservation {
+                    generation: generation.clone(),
+                    control_version,
+                    action: DurableActionObservation {
+                        action_id: "execution:1:operation".to_string(),
+                        signature: "signature".to_string(),
+                        state,
+                        error_class: None,
+                        error: None,
+                        result: None,
+                        add_replica_progress: None,
+                        remove_replica_progress: None,
+                    },
+                },
+            };
+            assert_eq!(
+                correlated_acknowledgement_state(
+                    acknowledgement,
+                    "execution:1:operation",
+                    "signature",
+                    &generation,
+                    control_version,
+                )
+                .unwrap(),
+                state
+            );
+        }
+    }
 
     struct RecordingHandle {
         requests: Arc<Mutex<Vec<CorrelatedControlActionRequest>>>,

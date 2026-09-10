@@ -1074,25 +1074,25 @@ async fn framework_native_switchover_route_publishes_reachable_passive_effect_tr
         (
             "demotion-deadline",
             DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
-            (2_u64, 4_u64),
+            (3_u64, 3_u64),
             "set-0",
         ),
         (
             "promotion-deadline",
             DirectSwitchoverTerminalBranch::PostPromotionCompensated,
-            (7_u64, 6_u64),
+            (10_u64, 3_u64),
             "set-0",
         ),
         (
             "exact-replica-postcondition",
             DirectSwitchoverTerminalBranch::TargetSuccess,
-            (8_u64, 4_u64),
+            (9_u64, 3_u64),
             "set-1",
         ),
         (
             "already-exact-labels",
             DirectSwitchoverTerminalBranch::TargetSuccess,
-            (7_u64, 5_u64),
+            (9_u64, 3_u64),
             "set-1",
         ),
     ] {

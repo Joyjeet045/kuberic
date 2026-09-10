@@ -211,15 +211,39 @@ impl<'de> Deserialize<'de> for ActivityName {
 pub struct ActivitySpec {
     name: ActivityName,
     input: ExactBytes,
+    max_input_bytes: u64,
     max_result_bytes: u64,
+    options: ActivityOptions,
 }
 
 impl ActivitySpec {
     pub fn new(name: ActivityName, input: ExactBytes, max_result_bytes: u64) -> Self {
+        Self::with_options(name, input, max_result_bytes, ActivityOptions::default())
+    }
+
+    pub fn with_options(
+        name: ActivityName,
+        input: ExactBytes,
+        max_result_bytes: u64,
+        options: ActivityOptions,
+    ) -> Self {
+        let max_input_bytes = u64::try_from(input.as_slice().len()).unwrap_or(u64::MAX);
+        Self::with_bounds_and_options(name, input, max_input_bytes, max_result_bytes, options)
+    }
+
+    pub fn with_bounds_and_options(
+        name: ActivityName,
+        input: ExactBytes,
+        max_input_bytes: u64,
+        max_result_bytes: u64,
+        options: ActivityOptions,
+    ) -> Self {
         Self {
             name,
             input,
+            max_input_bytes,
             max_result_bytes,
+            options,
         }
     }
 
@@ -233,6 +257,84 @@ impl ActivitySpec {
 
     pub const fn max_result_bytes(&self) -> u64 {
         self.max_result_bytes
+    }
+
+    pub const fn max_input_bytes(&self) -> u64 {
+        self.max_input_bytes
+    }
+
+    pub const fn options(&self) -> &ActivityOptions {
+        &self.options
+    }
+}
+
+/// Replay-matched scheduling semantics for one logical activity.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivityOptions {
+    max_attempts: u32,
+    initial_backoff_millis: u64,
+    action_deadline_unix_millis: Option<i64>,
+    attempt_timeout_millis: Option<u64>,
+}
+
+impl ActivityOptions {
+    pub const fn new(
+        max_attempts: u32,
+        initial_backoff_millis: u64,
+        action_deadline_unix_millis: Option<i64>,
+        attempt_timeout_millis: Option<u64>,
+    ) -> Result<Self, IdentityError> {
+        if max_attempts == 0 {
+            return Err(IdentityError::ZeroActivityAttempts);
+        }
+        Ok(Self {
+            max_attempts,
+            initial_backoff_millis,
+            action_deadline_unix_millis,
+            attempt_timeout_millis,
+        })
+    }
+
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    pub const fn initial_backoff_millis(self) -> u64 {
+        self.initial_backoff_millis
+    }
+
+    pub const fn action_deadline_unix_millis(self) -> Option<i64> {
+        self.action_deadline_unix_millis
+    }
+
+    pub const fn attempt_timeout_millis(self) -> Option<u64> {
+        self.attempt_timeout_millis
+    }
+
+    pub fn retry_not_before_unix_millis(
+        self,
+        completed_attempt: u32,
+        observed_at_unix_millis: i64,
+    ) -> Option<i64> {
+        if completed_attempt >= self.max_attempts {
+            return None;
+        }
+        let shift = completed_attempt.saturating_sub(1).min(63);
+        let delay = self.initial_backoff_millis.checked_shl(shift)?;
+        let delay = i64::try_from(delay).ok()?;
+        observed_at_unix_millis.checked_add(delay)
+    }
+}
+
+impl Default for ActivityOptions {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_backoff_millis: 1_000,
+            action_deadline_unix_millis: None,
+            attempt_timeout_millis: None,
+        }
     }
 }
 
@@ -328,6 +430,10 @@ impl LogicalActivityId {
         &self.spec
     }
 
+    pub const fn options(&self) -> &ActivityOptions {
+        self.spec.options()
+    }
+
     /// Render every identity tuple member directly in an unambiguous form.
     pub fn to_external_id(&self) -> String {
         let mut rendered = String::from("logical:v2:");
@@ -362,6 +468,8 @@ pub enum IdentityError {
     EmptyActivityName,
     #[error("activity version must be greater than zero")]
     ZeroActivityVersion,
+    #[error("activity maximum attempts must be greater than zero")]
+    ZeroActivityAttempts,
     #[error("attempt counter must be greater than zero")]
     ZeroAttemptCounter,
 }

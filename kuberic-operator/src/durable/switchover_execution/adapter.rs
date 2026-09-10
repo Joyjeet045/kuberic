@@ -12,16 +12,20 @@ use kuberic_core::{
     error::KubericError,
     types::{ReplicaId, ReplicaInstanceId},
 };
-#[cfg(test)]
-use kuberic_durable_execution::ExecutionContract;
 use kuberic_durable_execution::{
-    ActivitySpec, BoundedEffectError, CheckpointError, CheckpointLimits, CompletionMetadata,
-    DispatchEffect, DurableEffectSet, EffectErrorKind, EffectHostStep, EffectMetadata,
-    EffectOutcome, EffectQuarantineContext, ExactBytes, ExecutionId, ExecutionSpec,
-    HostedEffectSet, LogicalActivityId, ObserveEffect, ObserveQuarantinedEffect, PrepareEffect,
-    PreparedActivityError, PreparedCommand, PreparedEffectResolver, PreparedEffectSet,
-    TerminalOutcome,
+    ActivityContext, ActivityFailure, ActivityHandlerError, ActivitySpec, BoundedEffectError,
+    CheckpointError, CheckpointLimits, CompletionMetadata, DurableEffect, EffectErrorKind,
+    EffectHostStep, EffectMetadata, EffectObservation, EffectOutcome, ExactBytes, ExecutionId,
+    ExecutionSpec, LogicalActivityId, PreparedActivityError, PreparedCommand,
+    PreparedEffectResolver, ScopedActivityRegistry, ScopedTypedHandlerFuture, TerminalOutcome,
+    decode_effect_command, decode_effect_request, encode_activity_result,
+    strict::{
+        DispatchEffect, EffectQuarantineContext, ObserveEffect, ObserveQuarantinedEffect,
+        PrepareEffect, resolve_prepared_effect,
+    },
 };
+#[cfg(test)]
+use kuberic_durable_execution::{ActivityObservation, ExecutionContract};
 
 use crate::{
     cluster_api::ClusterApi,
@@ -33,12 +37,12 @@ use crate::{
             MeasuredDurableCheckpointStore,
         },
         effects::{
-            DispatchFailureDisposition, classify_dispatch_failure, execute_label_command,
-            execute_replica_command,
+            DispatchFailureDisposition, classify_dispatch_failure, execute_label_command_checked,
+            execute_replica_command_state,
         },
         runner::{
             DurableAdapterWait, DurableCheckpointDisposition, DurableEffectQuarantine,
-            TypedDurableAdapterBoundary, TypedDurableOperationAdapter,
+            ReconcilerActivityAdapter, TypedDurableAdapterBoundary,
         },
         workflow_host::DurablePermitGuard,
     },
@@ -48,10 +52,27 @@ use crate::{
 use super::workflow::DirectSwitchoverWorkflow;
 use super::{
     SwitchoverExposureFault, SwitchoverRunnerContext, SwitchoverWorkflowInput,
-    activities::{DIRECT_SWITCHOVER_CONTRACT_VERSION, SwitchoverEffect, SwitchoverEffects},
+    activities::{
+        AttestCompensatedTopologyActivity, AttestTargetTopologyActivity, CaptureFrozenLsnActivity,
+        CompensateDistributeReplicaEpochActivity, CompensatePromoteOldPrimaryActivity,
+        DIRECT_SWITCHOVER_CONTRACT_VERSION, DemoteOldPrimaryActivity,
+        DistributeReplicaEpochActivity, InstallCompensationCatchUpConfigurationActivity,
+        InstallCompensationCurrentConfigurationActivity, InstallTargetCatchUpConfigurationActivity,
+        InstallTargetCurrentConfigurationActivity, OrdinarySwitchoverActivity,
+        PromoteTargetActivity, PublishOldPrimarySecondaryLabelActivity,
+        PublishTargetPrimaryLabelActivity, RestoreOldPrimaryLabelActivity,
+        RestorePreviousCurrentConfigurationActivity, RestoreTargetSecondaryLabelActivity,
+        RevokeWritesActivity, StrictSwitchoverActivityContract, SwitchoverActivityClass,
+        SwitchoverActivityContract, SwitchoverActivityInput, WaitTargetCaughtUpActivity,
+        WaitTargetWriteQuorumActivity, activity_class,
+    },
     collect_switchover_runner_context, encode_execution_id,
     model::{DirectSwitchoverDefinition, same_topology},
-    prepare::{SwitchoverDispatch, SwitchoverEffectFamily},
+    prepare::{
+        LabelOperation, OrdinaryActivityStep, PassiveOperation, ReplicaOperation,
+        SwitchoverDispatch, SwitchoverEffectFamily, evaluate_ordinary_label,
+        evaluate_ordinary_passive, evaluate_ordinary_replica,
+    },
     workflow::{DirectSwitchoverTerminalBranch, DirectSwitchoverTerminalRecord},
 };
 
@@ -94,16 +115,40 @@ impl PreparedEffectResolver for DirectSwitchoverPreparedActivityResolver {
         &self,
         _execution_id: ExecutionId,
         logical: &ActivitySpec,
-        _metadata: EffectMetadata,
+        metadata: EffectMetadata,
         recorded: Option<&PreparedCommand>,
     ) -> Result<PreparedCommand, PreparedActivityError> {
-        SwitchoverEffects::resolve_prepared(self, _execution_id, logical, _metadata, recorded)
+        let deadline = logical
+            .options()
+            .action_deadline_unix_millis()
+            .ok_or(PreparedActivityError::Validation)?
+            / 1_000;
+        self.deadline.store(deadline, Ordering::Relaxed);
+        macro_rules! route {
+            ($effect:ty) => {
+                if logical.name().name() == <$effect as DurableEffect>::NAME {
+                    return resolve_prepared_effect::<$effect, _>(
+                        self, logical, metadata, recorded,
+                    );
+                }
+            };
+        }
+        route!(RevokeWritesActivity);
+        route!(DemoteOldPrimaryActivity);
+        route!(PromoteTargetActivity);
+        route!(CompensatePromoteOldPrimaryActivity);
+        Err(PreparedActivityError::Validation)
     }
 }
 
 impl<E> PrepareEffect<E> for DirectSwitchoverPreparedActivityResolver
 where
-    E: SwitchoverEffect + 'static,
+    E: DurableEffect
+        + SwitchoverActivityContract<
+            Request = <E as DurableEffect>::Request,
+            Output = <E as DurableEffect>::Output,
+        > + StrictSwitchoverActivityContract
+        + 'static,
     E::Family: SwitchoverEffectFamily<E>,
 {
     type Evidence = ();
@@ -112,39 +157,33 @@ where
 
     fn prepare(
         &self,
-        request: &E::Request,
+        request: &<E as DurableEffect>::Request,
         _authority: &Self::Authority,
         _evidence: &Self::Evidence,
-    ) -> Result<E::Command, Self::Error> {
-        let deadline = <E::Family as SwitchoverEffectFamily<E>>::deadline_unix_seconds(
-            request,
-            &self.definition,
-        )?;
-        self.deadline.store(deadline, Ordering::Relaxed);
+    ) -> Result<<E as DurableEffect>::Command, Self::Error> {
+        let deadline = self.deadline.load(Ordering::Relaxed);
         <E::Family as SwitchoverEffectFamily<E>>::prepare_command(
             request,
             &self.definition,
             &self.observations,
             &self.addressed_instances,
             self.now,
+            deadline,
         )
     }
 
     fn validate_recorded(
         &self,
-        request: &E::Request,
-        command: &E::Command,
+        request: &<E as DurableEffect>::Request,
+        command: &<E as DurableEffect>::Command,
         _authority: &Self::Authority,
     ) -> Result<(), Self::Error> {
-        let deadline = <E::Family as SwitchoverEffectFamily<E>>::deadline_unix_seconds(
-            request,
-            &self.definition,
-        )?;
-        self.deadline.store(deadline, Ordering::Relaxed);
+        let deadline = self.deadline.load(Ordering::Relaxed);
         <E::Family as SwitchoverEffectFamily<E>>::validate_recorded_command(
             request,
             command,
             &self.definition,
+            deadline,
         )
     }
 }
@@ -161,6 +200,276 @@ pub struct DirectSwitchoverRunnerAdapter<'a> {
     now: i64,
     deadline: Arc<AtomicI64>,
     exposure_fault: Option<SwitchoverExposureFault>,
+    activity_completion_wait: Option<DurableAdapterWait>,
+}
+
+enum ActivityDispatch<O> {
+    Accepted,
+    Pending,
+    Outcome(EffectOutcome<O>),
+}
+
+fn passive_handler<'a, A>(
+    adapter: &'a mut DirectSwitchoverRunnerAdapter<'_>,
+    context: ActivityContext,
+    input: SwitchoverActivityInput<A>,
+) -> ScopedTypedHandlerFuture<'a, A::Output>
+where
+    A: PassiveOperation + Send + Sync + 'static,
+    A::Request: Send,
+    A::Output: Send,
+{
+    Box::pin(adapter.run_passive_activity::<A>(context, input.into_request()))
+}
+
+fn replica_handler<'a, A>(
+    adapter: &'a mut DirectSwitchoverRunnerAdapter<'_>,
+    context: ActivityContext,
+    input: SwitchoverActivityInput<A>,
+) -> ScopedTypedHandlerFuture<'a, A::Output>
+where
+    A: ReplicaOperation + Send + Sync + 'static,
+    A::Request: Send,
+{
+    Box::pin(adapter.run_replica_activity::<A>(context, input.into_request()))
+}
+
+fn label_handler<'a, A>(
+    adapter: &'a mut DirectSwitchoverRunnerAdapter<'_>,
+    context: ActivityContext,
+    input: SwitchoverActivityInput<A>,
+) -> ScopedTypedHandlerFuture<'a, A::Output>
+where
+    A: LabelOperation + Send + Sync + 'static,
+    A::Request: Send,
+{
+    Box::pin(adapter.run_label_activity::<A>(context, input.into_request()))
+}
+
+fn ordinary_activity_registry<'a>() -> ScopedActivityRegistry<DirectSwitchoverRunnerAdapter<'a>> {
+    ScopedActivityRegistry::builder()
+        .register::<OrdinarySwitchoverActivity<CaptureFrozenLsnActivity>, _>(
+            CaptureFrozenLsnActivity::NAME,
+            passive_handler::<CaptureFrozenLsnActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<WaitTargetCaughtUpActivity>, _>(
+            WaitTargetCaughtUpActivity::NAME,
+            passive_handler::<WaitTargetCaughtUpActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<AttestTargetTopologyActivity>, _>(
+            AttestTargetTopologyActivity::NAME,
+            passive_handler::<AttestTargetTopologyActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<AttestCompensatedTopologyActivity>, _>(
+            AttestCompensatedTopologyActivity::NAME,
+            passive_handler::<AttestCompensatedTopologyActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<DistributeReplicaEpochActivity>, _>(
+            DistributeReplicaEpochActivity::NAME,
+            replica_handler::<DistributeReplicaEpochActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<InstallTargetCatchUpConfigurationActivity>, _>(
+            InstallTargetCatchUpConfigurationActivity::NAME,
+            replica_handler::<InstallTargetCatchUpConfigurationActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<WaitTargetWriteQuorumActivity>, _>(
+            WaitTargetWriteQuorumActivity::NAME,
+            replica_handler::<WaitTargetWriteQuorumActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<InstallTargetCurrentConfigurationActivity>, _>(
+            InstallTargetCurrentConfigurationActivity::NAME,
+            replica_handler::<InstallTargetCurrentConfigurationActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<RestorePreviousCurrentConfigurationActivity>, _>(
+            RestorePreviousCurrentConfigurationActivity::NAME,
+            replica_handler::<RestorePreviousCurrentConfigurationActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<CompensateDistributeReplicaEpochActivity>, _>(
+            CompensateDistributeReplicaEpochActivity::NAME,
+            replica_handler::<CompensateDistributeReplicaEpochActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<InstallCompensationCatchUpConfigurationActivity>, _>(
+            InstallCompensationCatchUpConfigurationActivity::NAME,
+            replica_handler::<InstallCompensationCatchUpConfigurationActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<InstallCompensationCurrentConfigurationActivity>, _>(
+            InstallCompensationCurrentConfigurationActivity::NAME,
+            replica_handler::<InstallCompensationCurrentConfigurationActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<PublishTargetPrimaryLabelActivity>, _>(
+            PublishTargetPrimaryLabelActivity::NAME,
+            label_handler::<PublishTargetPrimaryLabelActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<PublishOldPrimarySecondaryLabelActivity>, _>(
+            PublishOldPrimarySecondaryLabelActivity::NAME,
+            label_handler::<PublishOldPrimarySecondaryLabelActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<RestoreOldPrimaryLabelActivity>, _>(
+            RestoreOldPrimaryLabelActivity::NAME,
+            label_handler::<RestoreOldPrimaryLabelActivity>,
+        )
+        .register::<OrdinarySwitchoverActivity<RestoreTargetSecondaryLabelActivity>, _>(
+            RestoreTargetSecondaryLabelActivity::NAME,
+            label_handler::<RestoreTargetSecondaryLabelActivity>,
+        )
+        .build()
+        .expect("ordinary switchover activity registry is statically valid")
+}
+
+fn strict_step_boundary(result: Result<EffectHostStep, String>) -> TypedDurableAdapterBoundary {
+    match result {
+        Ok(EffectHostStep::Observed(observation)) => {
+            if observation.is_proven_no_admission() {
+                TypedDurableAdapterBoundary::ObserveAndWait {
+                    observation,
+                    reason: "RefreshingReplicaObservation".to_string(),
+                    detail: "proven non-admission was persisted before the one allowed redelivery"
+                        .to_string(),
+                    requeue_after_seconds: 1,
+                }
+            } else {
+                TypedDurableAdapterBoundary::Observed(observation)
+            }
+        }
+        Ok(EffectHostStep::Pending) => TypedDurableAdapterBoundary::Wait {
+            reason: "AwaitingEffectObservation".to_string(),
+            detail: "typed switchover effect awaits exact authoritative evidence".to_string(),
+        },
+        Err(error) => TypedDurableAdapterBoundary::Isolated(error),
+    }
+}
+
+fn strict_quarantine_boundary(
+    result: Result<Option<kuberic_durable_execution::EffectObservation>, String>,
+) -> TypedDurableAdapterBoundary {
+    match result {
+        Ok(Some(observation)) => TypedDurableAdapterBoundary::Observed(Box::new(observation)),
+        Ok(None) => TypedDurableAdapterBoundary::Wait {
+            reason: "Quarantined".to_string(),
+            detail: "typed switchover effect remains observation-only until exact evidence arrives"
+                .to_string(),
+        },
+        Err(error) => TypedDurableAdapterBoundary::Isolated(error),
+    }
+}
+
+fn strict_observation<E>(
+    activity: &LogicalActivityId,
+    attempt_id: kuberic_durable_execution::AttemptId,
+    outcome: EffectOutcome<<E as DurableEffect>::Output>,
+) -> Result<EffectObservation, String>
+where
+    E: DurableEffect
+        + SwitchoverActivityContract<
+            Request = <E as DurableEffect>::Request,
+            Output = <E as DurableEffect>::Output,
+        >,
+{
+    match outcome {
+        EffectOutcome::Applied(output) => {
+            encode_activity_result::<OrdinarySwitchoverActivity<E>>(&output)
+                .map(|result| EffectObservation::completed(activity.clone(), attempt_id, result))
+                .map_err(|error| error.to_string())
+        }
+        EffectOutcome::ProvenNoAdmission => {
+            let error = BoundedEffectError::observed_at(
+                EffectErrorKind::ProvenNoAdmission,
+                "strict dispatch was proven not admitted",
+                0,
+                <E as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
+            )
+            .map_err(|error| error.to_string())?;
+            let failure = serde_json::to_vec(&error)
+                .map(ExactBytes::new)
+                .map(ActivityFailure::Application)
+                .map_err(|error| error.to_string())?;
+            Ok(EffectObservation::proven_no_admission(
+                activity.clone(),
+                attempt_id,
+                failure,
+            ))
+        }
+        EffectOutcome::DomainFailure(error)
+        | EffectOutcome::DeadlineExceeded(error)
+        | EffectOutcome::UnavailableAtDeadline(error)
+        | EffectOutcome::ConflictingEvidence(error) => {
+            let failure = serde_json::to_vec(&error)
+                .map(ExactBytes::new)
+                .map(ActivityFailure::Application)
+                .map_err(|error| error.to_string())?;
+            Ok(EffectObservation::completed_failure(
+                activity.clone(),
+                attempt_id,
+                failure,
+            ))
+        }
+    }
+}
+
+async fn invoke_strict_effect<E, H>(
+    handler: &mut H,
+    activity: &LogicalActivityId,
+    attempt_id: kuberic_durable_execution::AttemptId,
+    prepared: &PreparedCommand,
+) -> Result<EffectHostStep, String>
+where
+    E: DurableEffect
+        + SwitchoverActivityContract<
+            Request = <E as DurableEffect>::Request,
+            Output = <E as DurableEffect>::Output,
+        >,
+    H: Send + DispatchEffect<E> + ObserveEffect<E>,
+    <H as DispatchEffect<E>>::Error: std::fmt::Display,
+    <H as ObserveEffect<E>>::Error: std::fmt::Display,
+{
+    let request = decode_effect_request::<E>(activity.spec().input())
+        .map_err(|error| format!("decode strict activity request: {error}"))?;
+    let command = decode_effect_command::<E>(prepared)
+        .map_err(|error| format!("decode strict activity command: {error}"))?;
+    if let Some(outcome) = <H as ObserveEffect<E>>::observe(handler, &request, &command, attempt_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return strict_observation::<E>(activity, attempt_id, outcome)
+            .map(Box::new)
+            .map(EffectHostStep::Observed);
+    }
+    match <H as DispatchEffect<E>>::dispatch(handler, &request, &command, attempt_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        Some(outcome) => strict_observation::<E>(activity, attempt_id, outcome)
+            .map(Box::new)
+            .map(EffectHostStep::Observed),
+        None => Ok(EffectHostStep::Pending),
+    }
+}
+
+async fn observe_quarantined_strict_effect<E, H>(
+    handler: &mut H,
+    activity: &LogicalActivityId,
+    attempt_id: kuberic_durable_execution::AttemptId,
+    prepared: &PreparedCommand,
+) -> Result<Option<EffectObservation>, String>
+where
+    E: DurableEffect
+        + SwitchoverActivityContract<
+            Request = <E as DurableEffect>::Request,
+            Output = <E as DurableEffect>::Output,
+        >,
+    H: Send + ObserveQuarantinedEffect<E>,
+    <H as ObserveQuarantinedEffect<E>>::Error: std::fmt::Display,
+{
+    let request = decode_effect_request::<E>(activity.spec().input())
+        .map_err(|error| format!("decode strict activity request: {error}"))?;
+    let command = decode_effect_command::<E>(prepared)
+        .map_err(|error| format!("decode strict activity command: {error}"))?;
+    let context = EffectQuarantineContext::<E>::new(&request, &command, attempt_id);
+    <H as ObserveQuarantinedEffect<E>>::observe_quarantined(handler, context)
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|outcome| strict_observation::<E>(activity, attempt_id, outcome))
+        .transpose()
 }
 
 impl<'a> DirectSwitchoverRunnerAdapter<'a> {
@@ -192,6 +501,7 @@ impl<'a> DirectSwitchoverRunnerAdapter<'a> {
             now,
             deadline,
             exposure_fault: None,
+            activity_completion_wait: None,
         })
     }
 
@@ -208,86 +518,47 @@ impl<'a> DirectSwitchoverRunnerAdapter<'a> {
             .as_ref()
             .ok_or_else(|| "direct switchover adapter was not prepared".to_string())
     }
-}
 
-#[async_trait]
-impl<E> ObserveEffect<E> for DirectSwitchoverRunnerAdapter<'_>
-where
-    E: SwitchoverEffect,
-    E::Family: SwitchoverEffectFamily<E>,
-{
-    type Error = String;
-
-    async fn observe(
+    async fn dispatch_activity<E>(
         &mut self,
-        request: &E::Request,
-        command: &E::Command,
-        _attempt_id: kuberic_durable_execution::AttemptId,
-    ) -> Result<Option<EffectOutcome<E::Output>>, Self::Error> {
-        let observations = &self.context()?.observations;
-        <E::Family as SwitchoverEffectFamily<E>>::observe(
-            request,
-            command,
-            &self.definition,
-            observations,
-            self.now,
-        )
-    }
-}
-
-#[async_trait]
-impl<E> ObserveQuarantinedEffect<E> for DirectSwitchoverRunnerAdapter<'_>
-where
-    E: SwitchoverEffect + 'static,
-    E::Family: SwitchoverEffectFamily<E>,
-{
-    type Error = String;
-
-    async fn observe_quarantined(
-        &mut self,
-        context: EffectQuarantineContext<'_, E>,
-    ) -> Result<Option<EffectOutcome<E::Output>>, Self::Error> {
-        let observations = &self.context()?.observations;
-        <E::Family as SwitchoverEffectFamily<E>>::observe_quarantined(
-            context.request(),
-            context.command(),
-            &self.definition,
-            observations,
-            self.now,
-        )
-    }
-}
-
-#[async_trait]
-impl<E> DispatchEffect<E> for DirectSwitchoverRunnerAdapter<'_>
-where
-    E: SwitchoverEffect,
-    E::Family: SwitchoverEffectFamily<E>,
-{
-    type Error = String;
-
-    async fn dispatch(
-        &mut self,
-        _request: &E::Request,
-        command: &E::Command,
-        _attempt_id: kuberic_durable_execution::AttemptId,
-    ) -> Result<Option<EffectOutcome<E::Output>>, Self::Error> {
+        command: &<E as DurableEffect>::Command,
+    ) -> Result<ActivityDispatch<<E as DurableEffect>::Output>, String>
+    where
+        E: DurableEffect
+            + StrictSwitchoverActivityContract
+            + SwitchoverActivityContract<
+                Request = <E as DurableEffect>::Request,
+                Output = <E as DurableEffect>::Output,
+            >,
+        E::Family: SwitchoverEffectFamily<E>,
+    {
         match <E::Family as SwitchoverEffectFamily<E>>::dispatch(command) {
-            SwitchoverDispatch::ObservationOnly => Ok(None),
+            SwitchoverDispatch::ObservationOnly => Ok(ActivityDispatch::Pending),
             SwitchoverDispatch::Replica(command) => {
                 let context = self.context()?;
                 let Some(handle) = context.handles.get(&command.target_id) else {
-                    return Ok(None);
+                    return Ok(ActivityDispatch::Pending);
                 };
                 if handle.instance_id().as_str() != command.target_instance_id {
-                    return Ok(None);
+                    return Ok(ActivityDispatch::Pending);
                 }
-                match execute_replica_command(handle.as_ref(), command).await {
-                    Ok(()) => Ok(None),
+                match execute_replica_command_state(handle.as_ref(), command).await {
+                    Ok(kuberic_core::types::DurableActionState::Completed) => {
+                        Ok(ActivityDispatch::Accepted)
+                    }
+                    Ok(
+                        kuberic_core::types::DurableActionState::Scheduled
+                        | kuberic_core::types::DurableActionState::InProgress,
+                    ) => Ok(ActivityDispatch::Pending),
+                    Ok(kuberic_core::types::DurableActionState::Failed) => {
+                        unreachable!("failed acknowledgements are returned as typed errors")
+                    }
                     Err(error) => {
                         let kind = match classify_dispatch_failure(&error) {
                             DispatchFailureDisposition::ProvenNoAdmission => {
-                                return Ok(Some(EffectOutcome::ProvenNoAdmission));
+                                return Ok(ActivityDispatch::Outcome(
+                                    EffectOutcome::ProvenNoAdmission,
+                                ));
                             }
                             DispatchFailureDisposition::DefiniteFailure
                                 if matches!(error, KubericError::RemoteAgentConflict(_)) =>
@@ -297,7 +568,9 @@ where
                             DispatchFailureDisposition::DefiniteFailure => {
                                 EffectErrorKind::DomainFailure
                             }
-                            DispatchFailureDisposition::Unknown => return Ok(None),
+                            DispatchFailureDisposition::Unknown => {
+                                return Ok(ActivityDispatch::Pending);
+                            }
                         };
                         let bounded = BoundedEffectError::observed_at(
                             kind,
@@ -306,10 +579,10 @@ where
                                 super::SWITCHOVER_MAX_ERROR_BYTES,
                             ),
                             self.now,
-                            E::MAX_ERROR_MESSAGE_BYTES,
+                            <E as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
                         )
                         .map_err(|error| error.to_string())?;
-                        Ok(Some(match kind {
+                        Ok(ActivityDispatch::Outcome(match kind {
                             EffectErrorKind::DomainFailure => EffectOutcome::DomainFailure(bounded),
                             EffectErrorKind::ConflictingEvidence => {
                                 EffectOutcome::ConflictingEvidence(bounded)
@@ -319,18 +592,339 @@ where
                     }
                 }
             }
-            SwitchoverDispatch::Label(command) => {
-                execute_label_command(self.api, &self.namespace, command).await;
-                Ok(None)
+        }
+    }
+
+    fn wait_for_evidence(&self, context: &ActivityContext) -> ActivityHandlerError {
+        let next_observation = self.now.saturating_add(1).saturating_mul(1_000);
+        let wake_at = context
+            .action_deadline_unix_millis()
+            .map_or(next_observation, |deadline| deadline.min(next_observation));
+        ActivityHandlerError::WaitUntil(wake_at)
+    }
+
+    fn handler_outcome<O>(&self, outcome: EffectOutcome<O>) -> Result<O, ActivityHandlerError> {
+        match outcome {
+            EffectOutcome::Applied(output) => Ok(output),
+            EffectOutcome::ProvenNoAdmission => {
+                let error = BoundedEffectError::observed_at(
+                    EffectErrorKind::ProvenNoAdmission,
+                    "ordinary invocation was proven not admitted",
+                    self.now,
+                    super::SWITCHOVER_MAX_ERROR_BYTES as u64,
+                )
+                .expect("fixed ordinary retry error fits the configured bound");
+                Err(ActivityHandlerError::Retryable(ExactBytes::new(
+                    serde_json::to_vec(&error)
+                        .expect("bounded ordinary retry error is serializable"),
+                )))
             }
+            EffectOutcome::DomainFailure(error)
+            | EffectOutcome::DeadlineExceeded(error)
+            | EffectOutcome::UnavailableAtDeadline(error)
+            | EffectOutcome::ConflictingEvidence(error) => {
+                let encoded = serde_json::to_vec(&error).map_err(|_| {
+                    ActivityHandlerError::Codec(
+                        kuberic_durable_execution::ActivityCallError::ResultEncoding,
+                    )
+                })?;
+                Err(ActivityHandlerError::Terminal(ExactBytes::new(encoded)))
+            }
+        }
+    }
+
+    async fn run_passive_activity<E>(
+        &mut self,
+        context: ActivityContext,
+        input: E::Request,
+    ) -> Result<E::Output, ActivityHandlerError>
+    where
+        E: PassiveOperation,
+    {
+        let deadline = context
+            .action_deadline_unix_millis()
+            .map(|value| value / 1_000)
+            .unwrap_or_else(|| self.deadline.load(Ordering::Relaxed));
+        let observations = &self.context().map_err(terminal_handler_error)?.observations;
+        match evaluate_ordinary_passive::<E>(
+            &input,
+            &self.definition,
+            observations,
+            self.now,
+            deadline,
+        )
+        .map_err(terminal_handler_error)?
+        {
+            OrdinaryActivityStep::Complete(outcome) => self.handler_outcome(outcome),
+            OrdinaryActivityStep::AwaitEvidence { .. } => Err(self.wait_for_evidence(&context)),
+            OrdinaryActivityStep::DispatchReplica(_) | OrdinaryActivityStep::DispatchLabel(_) => {
+                Err(terminal_handler_error(
+                    "passive activity attempted external dispatch".to_string(),
+                ))
+            }
+        }
+    }
+
+    async fn run_replica_activity<E>(
+        &mut self,
+        context: ActivityContext,
+        input: E::Request,
+    ) -> Result<E::Output, ActivityHandlerError>
+    where
+        E: ReplicaOperation,
+    {
+        let deadline = context
+            .action_deadline_unix_millis()
+            .map(|value| value / 1_000)
+            .unwrap_or_else(|| self.deadline.load(Ordering::Relaxed));
+        let runner_context = self.context().map_err(terminal_handler_error)?;
+        let step = evaluate_ordinary_replica::<E>(
+            &input,
+            context.activity_instance_id(),
+            &self.definition,
+            &runner_context.observations,
+            &runner_context.addressed_instances,
+            self.now,
+            deadline,
+        )
+        .map_err(terminal_handler_error)?;
+        match step {
+            OrdinaryActivityStep::Complete(outcome) => self.handler_outcome(outcome),
+            OrdinaryActivityStep::AwaitEvidence {
+                authoritative_pending,
+            } => {
+                if context.dispatch_authorized() || authoritative_pending {
+                    Err(self.wait_for_evidence(&context))
+                } else {
+                    Err(retryable_handler_error(
+                        "ordinary replica activity result was lost".to_string(),
+                    ))
+                }
+            }
+            OrdinaryActivityStep::DispatchReplica(command) => {
+                if !context.dispatch_authorized() {
+                    return Err(retryable_handler_error(
+                        "ordinary replica activity requires a persisted retry attempt".to_string(),
+                    ));
+                }
+                let runner_context = self.context().map_err(terminal_handler_error)?;
+                let Some(handle) = runner_context.handles.get(&command.target_id) else {
+                    return Err(self.wait_for_evidence(&context));
+                };
+                if handle.instance_id().as_str() != command.target_instance_id {
+                    return Err(terminal_handler_error(
+                        "ordinary replica target incarnation changed".to_string(),
+                    ));
+                }
+                match execute_replica_command_state(handle.as_ref(), &command).await {
+                    Ok(kuberic_core::types::DurableActionState::Completed) => {
+                        self.activity_completion_wait = Some(DurableAdapterWait {
+                            reason: "ActivityDispatched".to_string(),
+                            detail: format!(
+                                "ordinary activity {} was accepted; reconciliation will refresh evidence",
+                                E::NAME
+                            ),
+                            requeue_after_seconds: Some(1),
+                        });
+                        Ok(super::activities::EffectApplied {
+                            observed_at_unix_seconds: self.now,
+                        })
+                    }
+                    Ok(
+                        kuberic_core::types::DurableActionState::Scheduled
+                        | kuberic_core::types::DurableActionState::InProgress,
+                    ) => Err(self.wait_for_evidence(&context)),
+                    Ok(kuberic_core::types::DurableActionState::Failed) => {
+                        unreachable!("failed acknowledgements are returned as typed errors")
+                    }
+                    Err(error) => {
+                        let bounded = BoundedEffectError::observed_at(
+                            match classify_dispatch_failure(&error) {
+                                DispatchFailureDisposition::ProvenNoAdmission => {
+                                    EffectErrorKind::ProvenNoAdmission
+                                }
+                                DispatchFailureDisposition::DefiniteFailure
+                                    if matches!(error, KubericError::RemoteAgentConflict(_)) =>
+                                {
+                                    EffectErrorKind::ConflictingEvidence
+                                }
+                                DispatchFailureDisposition::DefiniteFailure => {
+                                    EffectErrorKind::DomainFailure
+                                }
+                                DispatchFailureDisposition::Unknown => {
+                                    return Err(retryable_handler_error(error.to_string()));
+                                }
+                            },
+                            super::bounded_utf8(
+                                &error.to_string(),
+                                super::SWITCHOVER_MAX_ERROR_BYTES,
+                            ),
+                            self.now,
+                            E::MAX_ERROR_MESSAGE_BYTES,
+                        )
+                        .map_err(|error| terminal_handler_error(error.to_string()))?;
+                        self.handler_outcome(match bounded.kind() {
+                            EffectErrorKind::ProvenNoAdmission => EffectOutcome::ProvenNoAdmission,
+                            EffectErrorKind::DomainFailure => EffectOutcome::DomainFailure(bounded),
+                            EffectErrorKind::ConflictingEvidence => {
+                                EffectOutcome::ConflictingEvidence(bounded)
+                            }
+                            _ => unreachable!("dispatch failure classification is exhaustive"),
+                        })
+                    }
+                }
+            }
+            OrdinaryActivityStep::DispatchLabel(_) => Err(terminal_handler_error(
+                "replica activity attempted label dispatch".to_string(),
+            )),
+        }
+    }
+
+    async fn run_label_activity<E>(
+        &mut self,
+        context: ActivityContext,
+        input: E::Request,
+    ) -> Result<E::Output, ActivityHandlerError>
+    where
+        E: LabelOperation,
+    {
+        let deadline = context
+            .action_deadline_unix_millis()
+            .map(|value| value / 1_000)
+            .unwrap_or_else(|| self.deadline.load(Ordering::Relaxed));
+        let observations = &self.context().map_err(terminal_handler_error)?.observations;
+        match evaluate_ordinary_label::<E>(
+            &input,
+            &self.definition,
+            observations,
+            self.now,
+            deadline,
+        )
+        .map_err(terminal_handler_error)?
+        {
+            OrdinaryActivityStep::Complete(outcome) => self.handler_outcome(outcome),
+            OrdinaryActivityStep::AwaitEvidence { .. } => {
+                if context.dispatch_authorized() {
+                    Err(self.wait_for_evidence(&context))
+                } else {
+                    Err(retryable_handler_error(
+                        "ordinary label activity result was lost".to_string(),
+                    ))
+                }
+            }
+            OrdinaryActivityStep::DispatchLabel(command) => {
+                if !context.dispatch_authorized() {
+                    return Err(retryable_handler_error(
+                        "ordinary label activity requires a persisted retry attempt".to_string(),
+                    ));
+                }
+                execute_label_command_checked(self.api, &self.namespace, &command)
+                    .await
+                    .map_err(retryable_handler_error)?;
+                Err(self.wait_for_evidence(&context))
+            }
+            OrdinaryActivityStep::DispatchReplica(_) => Err(terminal_handler_error(
+                "label activity attempted replica dispatch".to_string(),
+            )),
+        }
+    }
+}
+
+fn terminal_handler_error(message: String) -> ActivityHandlerError {
+    ActivityHandlerError::Terminal(ExactBytes::new(message.into_bytes()))
+}
+
+fn retryable_handler_error(message: String) -> ActivityHandlerError {
+    ActivityHandlerError::Retryable(ExactBytes::new(message.into_bytes()))
+}
+
+#[async_trait]
+impl<E> ObserveEffect<E> for DirectSwitchoverRunnerAdapter<'_>
+where
+    E: DurableEffect
+        + SwitchoverActivityContract<
+            Request = <E as DurableEffect>::Request,
+            Output = <E as DurableEffect>::Output,
+        > + StrictSwitchoverActivityContract,
+    E::Family: SwitchoverEffectFamily<E>,
+{
+    type Error = String;
+
+    async fn observe(
+        &mut self,
+        request: &<E as DurableEffect>::Request,
+        command: &<E as DurableEffect>::Command,
+        _attempt_id: kuberic_durable_execution::AttemptId,
+    ) -> Result<Option<EffectOutcome<<E as DurableEffect>::Output>>, Self::Error> {
+        let observations = &self.context()?.observations;
+        <E::Family as SwitchoverEffectFamily<E>>::observe(
+            request,
+            command,
+            &self.definition,
+            observations,
+            self.now,
+            self.deadline.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[async_trait]
+impl<E> ObserveQuarantinedEffect<E> for DirectSwitchoverRunnerAdapter<'_>
+where
+    E: DurableEffect
+        + SwitchoverActivityContract<
+            Request = <E as DurableEffect>::Request,
+            Output = <E as DurableEffect>::Output,
+        > + StrictSwitchoverActivityContract
+        + 'static,
+    E::Family: SwitchoverEffectFamily<E>,
+{
+    type Error = String;
+
+    async fn observe_quarantined(
+        &mut self,
+        context: EffectQuarantineContext<'_, E>,
+    ) -> Result<Option<EffectOutcome<<E as DurableEffect>::Output>>, Self::Error> {
+        let observations = &self.context()?.observations;
+        <E::Family as SwitchoverEffectFamily<E>>::observe_quarantined(
+            context.request(),
+            context.command(),
+            &self.definition,
+            observations,
+            self.now,
+            self.deadline.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[async_trait]
+impl<E> DispatchEffect<E> for DirectSwitchoverRunnerAdapter<'_>
+where
+    E: DurableEffect
+        + SwitchoverActivityContract<
+            Request = <E as DurableEffect>::Request,
+            Output = <E as DurableEffect>::Output,
+        > + StrictSwitchoverActivityContract,
+    E::Family: SwitchoverEffectFamily<E>,
+{
+    type Error = String;
+
+    async fn dispatch(
+        &mut self,
+        _request: &<E as DurableEffect>::Request,
+        command: &<E as DurableEffect>::Command,
+        _attempt_id: kuberic_durable_execution::AttemptId,
+    ) -> Result<Option<EffectOutcome<<E as DurableEffect>::Output>>, Self::Error> {
+        match self.dispatch_activity::<E>(command).await? {
+            ActivityDispatch::Outcome(outcome) => Ok(Some(outcome)),
+            ActivityDispatch::Accepted | ActivityDispatch::Pending => Ok(None),
         }
     }
 }
 
 #[async_trait]
-impl TypedDurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
+impl ReconcilerActivityAdapter for DirectSwitchoverRunnerAdapter<'_> {
     type Resolver = DirectSwitchoverPreparedActivityResolver;
-    type Effects = SwitchoverEffects;
     type Terminal = DirectSwitchoverTerminalRecord;
     type Publication = DirectSwitchoverTerminalRecord;
 
@@ -354,65 +948,78 @@ impl TypedDurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
         Ok(())
     }
 
+    async fn invoke_activity(
+        &mut self,
+        context: ActivityContext,
+        input: ExactBytes,
+    ) -> Result<ExactBytes, ActivityHandlerError> {
+        self.activity_completion_wait = None;
+        ordinary_activity_registry()
+            .invoke_classified(self, context, input)
+            .await
+    }
+
+    fn take_activity_completion_wait(&mut self) -> Option<DurableAdapterWait> {
+        self.activity_completion_wait.take()
+    }
+
     async fn observe_or_dispatch(
         &mut self,
         activity_id: &LogicalActivityId,
         attempt_id: kuberic_durable_execution::AttemptId,
         permit: &mut DurablePermitGuard,
     ) -> TypedDurableAdapterBoundary {
-        let command = match permit.consume_effect_command::<SwitchoverEffects>(
-            activity_id,
-            attempt_id,
-            "switchover",
-        ) {
+        let command = match permit.consume_prepared_command(activity_id, attempt_id, "switchover") {
             Ok(command) => command,
             Err(error) => return TypedDurableAdapterBoundary::Isolated(error),
         };
-        match SwitchoverEffects::observe_or_dispatch(self, activity_id, attempt_id, &command).await
-        {
-            Ok(EffectHostStep::Observed(observation)) => {
-                if observation.is_proven_no_admission() {
-                    TypedDurableAdapterBoundary::ObserveAndWait {
-                        observation: Box::new(observation),
-                        reason: "RefreshingReplicaObservation".to_string(),
-                        detail:
-                            "proven non-admission was persisted before the one allowed redelivery"
-                                .to_string(),
-                        requeue_after_seconds: 1,
-                    }
-                } else {
-                    TypedDurableAdapterBoundary::Observed(Box::new(observation))
+        macro_rules! route {
+            ($effect:ty) => {
+                if activity_id.spec().name().name() == <$effect as DurableEffect>::NAME {
+                    return strict_step_boundary(
+                        invoke_strict_effect::<$effect, _>(self, activity_id, attempt_id, &command)
+                            .await,
+                    );
                 }
-            }
-            Ok(EffectHostStep::Pending) => TypedDurableAdapterBoundary::Wait {
-                reason: "AwaitingEffectObservation".to_string(),
-                detail: "typed switchover effect awaits exact authoritative evidence".to_string(),
-            },
-            Err(error) => TypedDurableAdapterBoundary::Isolated(error),
+            };
         }
+        route!(RevokeWritesActivity);
+        route!(DemoteOldPrimaryActivity);
+        route!(PromoteTargetActivity);
+        route!(CompensatePromoteOldPrimaryActivity);
+        TypedDurableAdapterBoundary::Isolated(format!(
+            "strict switchover activity {} is not registered",
+            activity_id.spec().name().name()
+        ))
     }
 
     async fn resolve_quarantine(
         &mut self,
         quarantine: DurableEffectQuarantine,
     ) -> TypedDurableAdapterBoundary {
-        match SwitchoverEffects::observe_quarantined(
-            self,
-            quarantine.activity(),
-            quarantine.attempt_id(),
-            quarantine.prepared_command(),
-        )
-        .await
-        {
-            Ok(Some(observation)) => TypedDurableAdapterBoundary::Observed(Box::new(observation)),
-            Ok(None) => TypedDurableAdapterBoundary::Wait {
-                reason: "Quarantined".to_string(),
-                detail:
-                    "typed switchover effect remains observation-only until exact evidence arrives"
-                        .to_string(),
-            },
-            Err(error) => TypedDurableAdapterBoundary::Isolated(error),
+        macro_rules! route {
+            ($effect:ty) => {
+                if quarantine.activity().spec().name().name() == <$effect as DurableEffect>::NAME {
+                    return strict_quarantine_boundary(
+                        observe_quarantined_strict_effect::<$effect, _>(
+                            self,
+                            quarantine.activity(),
+                            quarantine.attempt_id(),
+                            quarantine.prepared_command(),
+                        )
+                        .await,
+                    );
+                }
+            };
         }
+        route!(RevokeWritesActivity);
+        route!(DemoteOldPrimaryActivity);
+        route!(PromoteTargetActivity);
+        route!(CompensatePromoteOldPrimaryActivity);
+        TypedDurableAdapterBoundary::Isolated(format!(
+            "strict switchover activity {} is not registered",
+            quarantine.activity().spec().name().name()
+        ))
     }
 
     fn interrupt_after_accepted_exposure(
@@ -457,10 +1064,34 @@ impl TypedDurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
     fn validate_terminal(
         &mut self,
         outcome: TerminalOutcome,
-        completion_metadata: CompletionMetadata,
+        completed_activity_count: u64,
+        completion_metadata: Option<CompletionMetadata>,
     ) -> Result<Self::Terminal, TypedDurableAdapterBoundary> {
-        validate_direct_terminal(&self.definition, &outcome, completion_metadata)
-            .map_err(TypedDurableAdapterBoundary::Rejected)
+        let terminal =
+            validate_direct_terminal(&self.definition, &outcome, completed_activity_count)
+                .map_err(TypedDurableAdapterBoundary::Rejected)?;
+        let metadata = completion_metadata.ok_or_else(|| {
+            TypedDurableAdapterBoundary::Rejected(
+                "direct switchover terminal lacks authenticated activity classification"
+                    .to_string(),
+            )
+        })?;
+        if metadata.completed_activity_count() != completed_activity_count {
+            return Err(TypedDurableAdapterBoundary::Rejected(
+                "direct switchover terminal completion metadata count changed".to_string(),
+            ));
+        }
+        if let Some(expected) =
+            decode_direct_terminal_accounting(&outcome, completed_activity_count)
+            && (metadata.external_effect_count() != expected.external_effect_count
+                || metadata.passive_observation_count() != expected.passive_observation_count)
+        {
+            return Err(TypedDurableAdapterBoundary::Rejected(
+                "direct switchover terminal activity classification changed".to_string(),
+            ));
+        }
+
+        Ok(terminal)
     }
 
     fn publication_handoff(&mut self, terminal: Self::Terminal) -> Self::Publication {
@@ -509,32 +1140,43 @@ pub fn direct_checkpoint_measurement_decoder() -> CheckpointMeasurementDecoder {
 }
 
 fn classify_direct_checkpoint_activity(spec: &ActivitySpec) -> Option<DurableActivityClass> {
-    let registration = SwitchoverEffects::registrations()
-        .iter()
-        .find(|registration| registration.matches(spec))?;
-    Some(match registration.completion_class() {
-        kuberic_durable_execution::CompletionClass::ExternalEffect => {
-            DurableActivityClass::ExternalEffect
-        }
-        kuberic_durable_execution::CompletionClass::PassiveObservation => {
-            DurableActivityClass::PassiveObservation
-        }
+    if spec.name().version() != super::activities::DIRECT_ACTIVITY_VERSION {
+        return None;
+    }
+    activity_class(spec.name().name()).map(|class| match class {
+        SwitchoverActivityClass::PassiveReadOnly => DurableActivityClass::PassiveObservation,
+        SwitchoverActivityClass::NaturallyIdempotent
+        | SwitchoverActivityClass::IdentityFencedIdempotent
+        | SwitchoverActivityClass::StrictEffectRequired => DurableActivityClass::ExternalEffect,
     })
 }
 
 fn decode_direct_terminal_accounting(
-    _outcome: &TerminalOutcome,
-    _completed_activity_count: u64,
+    outcome: &TerminalOutcome,
+    completed_activity_count: u64,
 ) -> Option<DurableActivityAccounting> {
-    None
+    let terminal =
+        serde_json::from_slice::<DirectSwitchoverTerminalRecord>(outcome.payload().as_slice())
+            .ok()?;
+    let passive_observation_count = match terminal {
+        DirectSwitchoverTerminalRecord::Complete {
+            branch: DirectSwitchoverTerminalBranch::RevokeSafeFailure,
+            ..
+        } if completed_activity_count >= 1 => 1,
+        DirectSwitchoverTerminalRecord::Complete { .. } if completed_activity_count >= 3 => 3,
+        _ => return None,
+    };
+    Some(DurableActivityAccounting {
+        external_effect_count: completed_activity_count - passive_observation_count,
+        passive_observation_count,
+    })
 }
 
 fn validate_direct_terminal(
     definition: &DirectSwitchoverDefinition,
     outcome: &TerminalOutcome,
-    completion_metadata: CompletionMetadata,
+    completed_activity_count: u64,
 ) -> Result<DirectSwitchoverTerminalRecord, String> {
-    let completed_activity_count = completion_metadata.completed_activity_count();
     if completed_activity_count == 0
         || completed_activity_count > DIRECT_SWITCHOVER_MAX_ACTIVITY_RECORDS as u64
     {
@@ -684,9 +1326,8 @@ mod tests {
     };
     use kuberic_durable_execution::{
         ActivityName, ActivityRecord, ActivitySequence, CheckpointEnvelope, CheckpointError,
-        CheckpointPayload, CheckpointStore, DurableActivity, DurableEffect, DurableHost,
-        EffectActivity, EffectOutcome, HostEpoch, HostOutcome, InMemoryCheckpointStore,
-        InMemoryFault, StoreErrorKind,
+        CheckpointPayload, CheckpointStore, DurableActivity, DurableHost, HostEpoch, HostOutcome,
+        InMemoryCheckpointStore, InMemoryFault, StoreErrorKind,
     };
 
     use crate::{
@@ -720,6 +1361,48 @@ mod tests {
     };
     use super::*;
 
+    #[test]
+    fn direct_switchover_ordinary_registry_contains_exactly_non_strict_contracts() {
+        let registry = ordinary_activity_registry();
+        let ordinary = [
+            CaptureFrozenLsnActivity::NAME,
+            WaitTargetCaughtUpActivity::NAME,
+            DistributeReplicaEpochActivity::NAME,
+            InstallTargetCatchUpConfigurationActivity::NAME,
+            WaitTargetWriteQuorumActivity::NAME,
+            InstallTargetCurrentConfigurationActivity::NAME,
+            PublishTargetPrimaryLabelActivity::NAME,
+            PublishOldPrimarySecondaryLabelActivity::NAME,
+            AttestTargetTopologyActivity::NAME,
+            RestorePreviousCurrentConfigurationActivity::NAME,
+            CompensateDistributeReplicaEpochActivity::NAME,
+            InstallCompensationCatchUpConfigurationActivity::NAME,
+            InstallCompensationCurrentConfigurationActivity::NAME,
+            RestoreOldPrimaryLabelActivity::NAME,
+            RestoreTargetSecondaryLabelActivity::NAME,
+            AttestCompensatedTopologyActivity::NAME,
+        ];
+        assert_eq!(ordinary.len(), 16);
+        for name in ordinary {
+            assert!(
+                registry.contains(&ActivityName::new(name, 1).expect("valid activity identity")),
+                "ordinary contract {name} must be registered"
+            );
+        }
+
+        for name in [
+            <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
+            <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+            <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
+            <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+        ] {
+            assert!(
+                !registry.contains(&ActivityName::new(name, 1).expect("valid activity identity")),
+                "strict contract {name} must not be registered as ordinary"
+            );
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Scenario {
         Success,
@@ -738,15 +1421,27 @@ mod tests {
         scenario: Scenario,
         redeliver_replica_effects: bool,
     ) -> Vec<(String, u32)> {
-        fn push_replica<A: DurableEffect>(identities: &mut Vec<(String, u32)>, redeliver: bool) {
-            identities.push((A::NAME.to_string(), A::VERSION));
+        fn push_replica<A: SwitchoverActivityContract>(
+            identities: &mut Vec<(String, u32)>,
+            redeliver: bool,
+        ) {
+            identities.push((
+                <A as SwitchoverActivityContract>::NAME.to_string(),
+                <A as SwitchoverActivityContract>::VERSION,
+            ));
             if redeliver {
-                identities.push((A::NAME.to_string(), A::VERSION));
+                identities.push((
+                    <A as SwitchoverActivityContract>::NAME.to_string(),
+                    <A as SwitchoverActivityContract>::VERSION,
+                ));
             }
         }
 
-        fn push_once<A: DurableEffect>(identities: &mut Vec<(String, u32)>) {
-            identities.push((A::NAME.to_string(), A::VERSION));
+        fn push_once<A: SwitchoverActivityContract>(identities: &mut Vec<(String, u32)>) {
+            identities.push((
+                <A as SwitchoverActivityContract>::NAME.to_string(),
+                <A as SwitchoverActivityContract>::VERSION,
+            ));
         }
 
         let mut identities = Vec::new();
@@ -1130,6 +1825,7 @@ mod tests {
         measurements: DurableCheckpointMeasurementsSnapshot,
         requests: usize,
         request_sequences: Vec<u32>,
+        request_action_ids: Vec<String>,
         label_patches: usize,
         activity_identities: Vec<(String, u32)>,
     }
@@ -1184,7 +1880,7 @@ mod tests {
         )
     }
 
-    async fn persist_direct_result<A: DurableEffect>(
+    async fn persist_direct_result<A: SwitchoverActivityContract>(
         host: &mut DurableHost<MeasuredDurableCheckpointStore>,
         execution: &ExecutionSpec,
         resolver: &DirectSwitchoverPreparedActivityResolver,
@@ -1197,27 +1893,42 @@ mod tests {
             .turn_and_expose_effects(&DirectSwitchoverWorkflow, execution.clone(), resolver)
             .await
         else {
-            panic!("{} was not exposed", A::NAME);
+            panic!(
+                "{} was not exposed",
+                <A as SwitchoverActivityContract>::NAME
+            );
         };
-        assert_eq!(permit.activity().spec().name().name(), A::NAME);
+        assert_eq!(
+            permit.activity().spec().name().name(),
+            <A as SwitchoverActivityContract>::NAME
+        );
         assert_eq!(
             permit
                 .prepared_command()
                 .is_some_and(|command| command.bytes().as_slice() != b"null"),
             expect_prepared,
             "{} preparation classification",
-            A::NAME
+            <A as SwitchoverActivityContract>::NAME
         );
-        let observation = kuberic_durable_execution::EffectObservation::from_outcome::<A>(
-            permit.activity().clone(),
-            permit.attempt_id(),
-            &EffectOutcome::Applied(output.clone()),
-        )
-        .unwrap();
-        assert!(matches!(
-            host.observe_effect(execution, observation).await,
-            HostOutcome::ObservationAccepted { .. }
-        ));
+        let result = encode_activity_result::<OrdinarySwitchoverActivity<A>>(output).unwrap();
+        let observed = if matches!(
+            activity_class(<A as SwitchoverActivityContract>::NAME),
+            Some(SwitchoverActivityClass::StrictEffectRequired)
+        ) {
+            let observation = kuberic_durable_execution::EffectObservation::completed(
+                permit.activity().clone(),
+                permit.attempt_id(),
+                result,
+            );
+            host.observe_effect(execution, observation).await
+        } else {
+            host.observe(
+                execution,
+                ActivityObservation::new(permit.activity().clone(), result),
+            )
+            .await
+        };
+        assert!(matches!(observed, HostOutcome::ObservationAccepted { .. }));
     }
 
     async fn run_scenario(
@@ -1280,7 +1991,7 @@ mod tests {
             )
             .unwrap();
             let outcome = runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1301,6 +2012,11 @@ mod tests {
                             .requests
                             .iter()
                             .map(|request| action_sequence(&request.action_id))
+                            .collect(),
+                        request_action_ids: world
+                            .requests
+                            .iter()
+                            .map(|request| request.action_id.clone())
                             .collect(),
                         label_patches: world.label_patches.len(),
                         activity_identities,
@@ -1361,7 +2077,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1432,7 +2148,8 @@ mod tests {
                 );
                 assert_eq!(
                     result.measurements.accepted_writes,
-                    expected_activities as u64 * 2 + 1
+                    expected_activities as u64 * 2 + 1,
+                    "member_count={member_count}, scenario={scenario:?}"
                 );
                 assert!(result.requests > 0);
                 if scenario == Scenario::Success {
@@ -1460,11 +2177,14 @@ mod tests {
                 DirectSwitchoverTerminalBranch::PostPromotionCompensated,
             ),
         ] {
-            assert!(matches!(
-                run_scenario_restarting_every_turn(3, scenario).await,
-                DirectSwitchoverTerminalRecord::Complete { branch, .. }
-                    if branch == expected_branch
-            ));
+            assert!(
+                matches!(
+                    run_scenario_restarting_every_turn(3, scenario).await,
+                    DirectSwitchoverTerminalRecord::Complete { branch, .. }
+                        if branch == expected_branch
+                ),
+                "scenario={scenario:?}"
+            );
         }
     }
 
@@ -1587,9 +2307,9 @@ mod tests {
             assert_eq!(
                 permit.activity().spec().name().name(),
                 if deadline_operation == TestReplicaOperation::DemoteOldPrimary {
-                    DemoteOldPrimaryActivity::NAME
+                    <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME
                 } else {
-                    PromoteTargetActivity::NAME
+                    <PromoteTargetActivity as SwitchoverActivityContract>::NAME
                 }
             );
             drop(permit);
@@ -1625,7 +2345,7 @@ mod tests {
                     )
                     .unwrap();
                     match runner
-                        .run_effects(
+                        .run_activities(
                             &mut restarted,
                             &DirectSwitchoverWorkflow,
                             execution.clone(),
@@ -1773,6 +2493,23 @@ mod tests {
         assert_eq!(result.requests, 26);
         assert_eq!(result.label_patches, 2);
         assert_eq!(result.measurements.accepted_writes, 63);
+        let ordinary_prefix = format!("{}:", encode_execution_id(ExecutionId::from_bytes([9; 16])));
+        for sequence in result.request_sequences.iter().copied() {
+            if [1, 2, 3, 2000].contains(&sequence) {
+                continue;
+            }
+            let ids = result
+                .request_action_ids
+                .iter()
+                .filter(|action_id| action_sequence(action_id) == sequence)
+                .collect::<Vec<_>>();
+            assert!(!ids.is_empty());
+            assert!(
+                ids.iter()
+                    .all(|action_id| action_id.starts_with(&ordinary_prefix))
+            );
+            assert!(ids.iter().all(|action_id| *action_id == ids[0]));
+        }
         assert_eq!(
             result.activity_identities,
             expected_persisted_scenario_activity_prefix(9, Scenario::Success, false)
@@ -1873,7 +2610,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1935,7 +2672,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1960,7 +2697,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1986,7 +2723,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2053,7 +2790,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2079,7 +2816,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2142,7 +2879,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2174,7 +2911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_switchover_label_quarantine_never_redelivers() {
+    async fn direct_switchover_naturally_idempotent_label_reinvokes_until_observed() {
         let initial = direct_initial_operation("label-quarantine", snapshot(2), 2, 100).unwrap();
         let execution_id = ExecutionId::from_bytes([65; 16]);
         let execution = direct_execution_spec(execution_id, initial.clone()).unwrap();
@@ -2207,55 +2944,26 @@ mod tests {
                 now,
             )
             .unwrap();
-            match runner
-                .run_effects(
+            let outcome = runner
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
                     &mut adapter,
                     now,
                 )
-                .await
-            {
+                .await;
+            match outcome {
                 DurableRunnerOutcome::Active { .. }
                 | DurableRunnerOutcome::ReloadRequired { .. } => now += 1,
-                DurableRunnerOutcome::Terminal(_) => {
-                    panic!("non-applied label must remain quarantined")
-                }
-                other => panic!("unexpected label quarantine outcome: {other:?}"),
+                DurableRunnerOutcome::Terminal(_) => {}
+                other => panic!("unexpected label activity outcome: {other:?}"),
             }
-            if world.lock().unwrap().label_patches.len() == 1 {
-                for _ in 0..8 {
-                    let pods = world.lock().unwrap().pods();
-                    let current_pods = pod_references(&pods);
-                    let mut adapter = DirectSwitchoverRunnerAdapter::new(
-                        &initial,
-                        &set,
-                        &current_pods,
-                        &api,
-                        host.store().clone(),
-                        now,
-                    )
-                    .unwrap();
-                    assert!(matches!(
-                        runner
-                            .run_effects(
-                                &mut host,
-                                &DirectSwitchoverWorkflow,
-                                execution.clone(),
-                                &mut adapter,
-                                now,
-                            )
-                            .await,
-                        DurableRunnerOutcome::Active { .. }
-                    ));
-                    now += 1;
-                }
-                assert_eq!(world.lock().unwrap().label_patches.len(), 1);
+            if world.lock().unwrap().label_patches.len() >= 2 {
                 return;
             }
         }
-        panic!("direct switchover did not reach a label effect");
+        panic!("naturally idempotent label activity was not reinvoked");
     }
 
     #[derive(Clone, Copy)]
@@ -2315,7 +3023,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2387,8 +3095,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_switchover_unresolved_replica_effects_remain_quarantined_past_deadline() {
-        for sequence in [1, 2, 3, 1002] {
+    async fn direct_switchover_unresolved_strict_effects_remain_quarantined_past_deadline() {
+        for sequence in [1, 2, 3] {
             assert_replica_remains_quarantined_past_deadline(
                 sequence,
                 UnresolvedReplicaEvidence::NoLedger,
@@ -2403,7 +3111,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_switchover_unresolved_labels_remain_quarantined_past_deadline() {
+    async fn direct_switchover_unobserved_labels_are_safely_reinvoked() {
         for skipped_attempt in [1, 2] {
             let initial = direct_initial_operation(
                 &format!("label-quarantine-{skipped_attempt}"),
@@ -2436,6 +3144,7 @@ mod tests {
             );
             let runner = DurableRunner::new(DIRECT_SWITCHOVER_MAX_RUNNER_FUEL).unwrap();
             let mut exposed_at = None;
+            let mut terminal = None;
             for now in 100..228 {
                 let pods = world.lock().unwrap().pods();
                 let current_pods = pod_references(&pods);
@@ -2449,7 +3158,7 @@ mod tests {
                 )
                 .unwrap();
                 match runner
-                    .run_effects(
+                    .run_activities(
                         &mut host,
                         &DirectSwitchoverWorkflow,
                         execution.clone(),
@@ -2460,10 +3169,9 @@ mod tests {
                 {
                     DurableRunnerOutcome::Active { .. }
                     | DurableRunnerOutcome::ReloadRequired { .. } => {}
-                    DurableRunnerOutcome::Terminal(terminal) => {
-                        panic!(
-                            "unresolved label attempt {skipped_attempt} crossed its deadline into {terminal:?}"
-                        )
+                    DurableRunnerOutcome::Terminal(result) => {
+                        terminal = Some(result);
+                        break;
                     }
                     other => panic!("unexpected unresolved label outcome: {other:?}"),
                 }
@@ -2472,18 +3180,16 @@ mod tests {
                 {
                     exposed_at = Some(now);
                 }
-                if exposed_at.is_some_and(|exposed| {
-                    now > exposed + crate::durable::ACTION_DEADLINE_SECONDS + 2
-                }) {
-                    break;
-                }
             }
             assert!(exposed_at.is_some());
-            assert_eq!(
-                world.lock().unwrap().label_patches.len(),
-                skipped_attempt,
-                "UID-fenced labels must never redeliver while exposed outcome is unknown"
+            assert!(
+                world.lock().unwrap().label_patches.len() > skipped_attempt,
+                "exact-UID idempotent labels must be reinvoked when the prior result is unobserved"
             );
+            assert!(matches!(
+                terminal,
+                Some(DirectSwitchoverTerminalRecord::Complete { .. })
+            ));
         }
     }
 
@@ -2671,20 +3377,33 @@ mod tests {
 
     #[test]
     fn direct_switchover_declared_max_fault_payloads_fit_global_byte_bounds() {
-        fn push_records<A: DurableEffect>(records: &mut Vec<ActivityRecord>, count: usize) {
+        fn push_records<A: SwitchoverActivityContract>(
+            records: &mut Vec<ActivityRecord>,
+            count: usize,
+        ) {
             for _ in 0..count {
                 let sequence = ActivitySequence::new(records.len() as u64);
                 records.push(ActivityRecord::completed(
                     sequence,
                     ActivitySpec::new(
-                        ActivityName::new(A::NAME, A::VERSION).unwrap(),
-                        ExactBytes::new(vec![b'x'; usize::try_from(A::MAX_REQUEST_BYTES).unwrap()]),
-                        <EffectActivity<A> as DurableActivity>::MAX_RESULT_BYTES,
+                        ActivityName::new(
+                            <A as SwitchoverActivityContract>::NAME,
+                            <A as SwitchoverActivityContract>::VERSION,
+                        )
+                        .unwrap(),
+                        ExactBytes::new(vec![
+                            b'x';
+                            usize::try_from(
+                                <A as SwitchoverActivityContract>::MAX_REQUEST_BYTES
+                            )
+                            .unwrap()
+                        ]),
+                        <OrdinarySwitchoverActivity<A> as DurableActivity>::MAX_RESULT_BYTES,
                     ),
                     ExactBytes::new(vec![
                         b'x';
                         usize::try_from(
-                            <EffectActivity<A> as DurableActivity>::MAX_RESULT_BYTES
+                            <OrdinarySwitchoverActivity<A> as DurableActivity>::MAX_RESULT_BYTES
                         )
                         .unwrap()
                     ]),
@@ -2775,16 +3494,32 @@ mod tests {
         );
         let old_primary = definition.member(definition.old_primary_id).unwrap();
         let request = RevokeWritesInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: definition.execution_id.clone(),
             old_primary_id: definition.old_primary_id,
             old_primary_instance_id: old_primary.instance_id.clone(),
-            deadline_unix_seconds: 240,
         };
-
-        let _ = <DirectSwitchoverPreparedActivityResolver as PrepareEffect<
-            RevokeWritesActivity,
-        >>::prepare(&resolver, &request, &(), &());
+        let input = super::super::activities::SwitchoverActivityInput::<RevokeWritesActivity>::new(
+            request, 240,
+        );
+        let spec = ActivitySpec::with_bounds_and_options(
+            kuberic_durable_execution::ActivityName::new(
+                <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
+                1,
+            )
+            .unwrap(),
+            kuberic_durable_execution::encode_activity_input::<
+                OrdinarySwitchoverActivity<RevokeWritesActivity>,
+            >(&input)
+            .unwrap(),
+            <RevokeWritesActivity as SwitchoverActivityContract>::MAX_REQUEST_BYTES,
+            <RevokeWritesActivity as SwitchoverActivityContract>::MAX_RESULT_BYTES,
+            kuberic_durable_execution::ActivityOptions::new(3, 1_000, Some(240_000), None).unwrap(),
+        );
+        let _ = resolver.resolve(
+            ExecutionId::from_bytes([1; 16]),
+            &spec,
+            EffectMetadata::of::<RevokeWritesActivity>(),
+            None,
+        );
 
         assert_eq!(deadline.load(Ordering::Relaxed), 240);
     }

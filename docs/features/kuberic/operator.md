@@ -324,40 +324,47 @@ contract versions and histories are not migrated or resumed. The structural
 CRD contains only the current required shape; strict Kubernetes validation
 rejects removed, unknown, misspelled, or missing fields.
 
-The direct workflow is the protocol authority. The operation adapter is only
-the host boundary: it gathers current replica/Pod observations, validates the
-logical activity against immutable admission, prepares the exact correlated
-replica or UID-fenced label command, consumes the one-use permit, dispatches,
-interprets quarantine, and validates the terminal. The shared runner owns
-checkpoint load/reload, bounded-fuel progression, terminal short-circuit, and
-persistence outcome classification. Neither the adapter nor runner selects
-the next switchover step.
+The direct workflow is the protocol authority. A scoped immutable registry owns
+all 16 ordinary async handlers and invokes them with the current
+reconciliation state. The operation adapter gathers current replica/Pod
+observations, validates immutable admission, and provides operation-specific
+domain services, but it does not route activity names or select protocol
+progression. The shared runner owns checkpoint load/reload, bounded-fuel
+progression, ordinary retry/error handling, terminal short-circuit, and
+persistence outcome classification. Its ordinary path delegates invocation,
+action-deadline and attempt-timeout selection, retry exhaustion, waits, and
+failure classification to the same `ActivityInvocationRuntime` used by the
+standalone durable activity runner.
 
-Each named effect also has its own logical request, exact prepared command, and
-typed output shape. Fixed
+Each named activity has its own logical request and typed output shape. Fixed
 old-primary, target-primary, distribution, configuration, and label contracts
 contain only fields meaningful to that operation; production does not erase
-them into a cross-operation replica/label kind or request superset.
+them into a cross-operation replica/label kind or request superset. Only
+revoke-writes, demote-old-primary, promote-target, and
+compensate-promote-old-primary have an exact prepared command and strict
+effect family.
 
-The host persists the logical request separately from its exact prepared
-command and marks it `DispatchExposed`, returning a private permit only after
-the exact checkpoint CAS is accepted. An authoritative observation can advance
-the same logical record. Replica dispatch freezes exact agent
-generation, control version, runtime epoch, correlated action identity, and
-payload. Routing-label activities freeze the Pod UID.
+The host persists every logical request and marks its attempt
+`DispatchExposed`, returning invocation authority only after the exact
+checkpoint CAS is accepted. Strict activities additionally persist their exact
+prepared command and receive a private one-use permit. An authoritative
+observation can advance the same logical record. Strict replica dispatch
+freezes exact agent generation, control version, runtime epoch, correlated
+action identity, and payload. Ordinary routing-label handlers use the exact
+Pod UID from their typed request.
 
 An exposed effect is observation-only after restart. A matching terminal
 ledger or exact runtime postcondition advances a replica effect; a new agent
 generation may instead prove that the command was never admitted, allowing one
 redelivery of the same action identity. A second proof stops. Precondition,
 unavailable, scheduled, in-progress, mixed, or otherwise unknown evidence
-remains quarantined even after the activity deadline. UID-fenced label effects
-have no redelivery path and resolve only from the exact UID-bound label
-postcondition. If the exposed effect has no prepared command, quarantine
-re-runs its deterministic evaluator without dispatch capability: an
-observation is accepted, while a result that would require dispatch remains
-waiting. Missing command state alone is never treated as isolation. ConfigMap
-conflicts and unknown writes force authoritative reload before another permit.
+remains quarantined even after the activity deadline. Ordinary ReplicaAgent
+and UID-fenced label activities resolve through their registered handlers.
+Recovery first invokes the same handler without dispatch authority; absent
+authoritative evidence produces a bounded persisted retry before the same
+logical action or exact-UID patch is reinvoked. Missing strict command state
+alone is never treated as isolation. ConfigMap conflicts and unknown writes
+force authoritative reload before another permit.
 
 The terminal checkpoint is accepted and then reloaded before topology/status
 publication. Terminal reload is status-only and does not poll replicas or

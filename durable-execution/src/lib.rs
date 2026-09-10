@@ -21,6 +21,7 @@ mod identity;
 mod in_memory;
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
+mod registry;
 mod replay;
 mod store;
 mod typed;
@@ -28,27 +29,34 @@ mod workflow;
 
 pub use assessment::{FeasibilityClassification, FeasibilityInputs, classify_feasibility};
 pub use checkpoint::{
-    ActivityRecord, ActivityState, CHECKPOINT_FORMAT_VERSION, CheckpointEnvelope, CheckpointError,
-    CheckpointLimits, CheckpointPayload, CheckpointState, ExecutionContract,
+    ActivityAttemptState, ActivityFailure, ActivityRecord, ActivityState,
+    CHECKPOINT_FORMAT_VERSION, CheckpointEnvelope, CheckpointError, CheckpointLimits,
+    CheckpointPayload, CheckpointState, ExecutionContract,
 };
 pub use effect::{
-    BoundedEffectError, CompletionClass, CompletionMetadata, DispatchEffect, DurableEffect,
-    DurableEffectSet, EffectActivity, EffectAttempt, EffectAttemptState, EffectCallError,
-    EffectContractError, EffectErrorKind, EffectHostStep, EffectMetadata,
-    EffectObservationDisposition, EffectOutcome, EffectQuarantineContext, EffectRegistration,
-    EffectRoutingError, HostedEffectSet, ObserveEffect, ObserveQuarantinedEffect, PrepareEffect,
-    PreparedCommand, PreparedEffectResolver, PreparedEffectSet, RegisteredEffectResolver,
-    StaticEffectResolver, decode_effect_command, decode_effect_request, encode_effect_command,
-    encode_effect_request, validate_effect_attempts, validate_effect_registrations,
+    BoundedEffectError, CompletionClass, CompletionMetadata, DurableEffect, EffectActivity,
+    EffectAttempt, EffectAttemptState, EffectCallError, EffectContractError, EffectErrorKind,
+    EffectHostStep, EffectMetadata, EffectObservationDisposition, EffectOutcome, PreparedCommand,
+    PreparedEffectResolver, decode_effect_command, decode_effect_observation,
+    decode_effect_request, encode_effect_command, encode_effect_request, validate_effect_attempts,
 };
+/// Narrow integration surface for optional strict-effect activity handlers.
+#[doc(hidden)]
+pub mod strict {
+    pub use crate::effect::{
+        DispatchEffect, EffectQuarantineContext, ObserveEffect, ObserveQuarantinedEffect,
+        PrepareEffect, observe_or_dispatch_effect, observe_quarantined_effect,
+        resolve_prepared_effect,
+    };
+}
 pub use host::{
     ActivityObservation, DispatchPermit, DurableHost, EffectObservation, HOST_OUTCOME_VARIANTS,
     HostOutcome, ObservationRejection, PersistenceBoundary, ReloadReason, StoreOperation,
     TerminalCheckpointStatus,
 };
 pub use identity::{
-    ActivityName, ActivitySequence, ActivitySpec, AttemptId, ExactBytes, ExecutionId,
-    ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
+    ActivityName, ActivityOptions, ActivitySequence, ActivitySpec, AttemptId, ExactBytes,
+    ExecutionId, ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
 };
 pub use in_memory::{InMemoryCheckpointStore, InMemoryFault};
 #[cfg(feature = "kubernetes")]
@@ -57,13 +65,19 @@ pub use kubernetes::{
     KubernetesCheckpointMetricsSnapshot, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
     KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, MAX_CONFIG_MAP_DATA_BUDGET_BYTES,
 };
+pub use registry::{
+    ActivityContext, ActivityHandlerError, ActivityInvocationOutcome, ActivityInvocationRuntime,
+    ActivityRegistry, ActivityRegistryBuilder, ActivityRegistryError, ActivityRunner,
+    ActivityTimeoutRuntime, ActivityWakeups, ScopedActivityRegistry, ScopedActivityRegistryBuilder,
+    ScopedHandlerFuture, ScopedTypedHandlerFuture,
+};
 pub use replay::{Evaluation, Nondeterminism, evaluate, evaluate_effects, evaluate_prepared};
 pub use store::{
     CasOutcome, CheckpointStore, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
 };
 pub use typed::{
-    ActivityCallError, DurableActivity, IdentityActivityResolver, PreparedActivityError,
-    PreparedActivityResolver, decode_activity_input, decode_activity_result, encode_activity_input,
-    encode_activity_result,
+    ActivityCallError, ActivityInvocationError, DurableActivity, IdentityActivityResolver,
+    PreparedActivityError, PreparedActivityResolver, decode_activity_input, decode_activity_result,
+    encode_activity_input, encode_activity_result,
 };
 pub use workflow::{TerminalOutcome, Workflow, WorkflowContext};

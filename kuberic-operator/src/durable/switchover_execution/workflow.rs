@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    DurableEffect, EffectCallError, EffectErrorKind, ExactBytes, TerminalOutcome, Workflow,
-    WorkflowContext,
+    ActivityInvocationError, ActivityOptions, BoundedEffectError, EffectErrorKind, ExactBytes,
+    TerminalOutcome, Workflow, WorkflowContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,13 +20,15 @@ use super::activities::{
     InstallCompensationCurrentConfigurationActivity, InstallCompensationCurrentConfigurationInput,
     InstallTargetCatchUpConfigurationActivity, InstallTargetCatchUpConfigurationInput,
     InstallTargetCurrentConfigurationActivity, InstallTargetCurrentConfigurationInput,
-    PromoteTargetActivity, PromoteTargetInput, PublishOldPrimarySecondaryLabelActivity,
-    PublishOldPrimarySecondaryLabelInput, PublishTargetPrimaryLabelActivity,
-    PublishTargetPrimaryLabelInput, RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
+    OrdinarySwitchoverActivity, PromoteTargetActivity, PromoteTargetInput,
+    PublishOldPrimarySecondaryLabelActivity, PublishOldPrimarySecondaryLabelInput,
+    PublishTargetPrimaryLabelActivity, PublishTargetPrimaryLabelInput,
+    RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
     RestorePreviousCurrentConfigurationActivity, RestorePreviousCurrentConfigurationInput,
     RestoreTargetSecondaryLabelActivity, RestoreTargetSecondaryLabelInput, RevokeWritesActivity,
-    RevokeWritesInput, WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput,
-    WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
+    RevokeWritesInput, SwitchoverActivityContract, SwitchoverActivityInput,
+    WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput, WaitTargetWriteQuorumActivity,
+    WaitTargetWriteQuorumInput,
 };
 use super::model::{DirectSwitchoverDefinition, next_deadline};
 
@@ -108,12 +110,10 @@ impl Workflow for DirectSwitchoverWorkflow {
         let revoke = call_activity_branch::<RevokeWritesActivity>(
             context,
             &mut budget,
+            deadline,
             RevokeWritesInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 old_primary_id: definition.old_primary_id,
                 old_primary_instance_id: old_primary.instance_id.clone(),
-                deadline_unix_seconds: deadline,
             },
         )
         .await;
@@ -143,13 +143,11 @@ impl Workflow for DirectSwitchoverWorkflow {
         let captured = match call_activity::<CaptureFrozenLsnActivity>(
             context,
             &mut budget,
+            deadline,
             CaptureFrozenLsnInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 old_primary_id: definition.old_primary_id,
                 old_primary_instance_id: old_primary.instance_id.clone(),
                 expected_epoch: definition.previous_snapshot.epoch.clone(),
-                deadline_unix_seconds: deadline,
             },
         )
         .await
@@ -173,14 +171,12 @@ impl Workflow for DirectSwitchoverWorkflow {
         let caught_up = match call_activity_branch::<WaitTargetCaughtUpActivity>(
             context,
             &mut budget,
+            deadline,
             WaitTargetCaughtUpInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 target_id: definition.target_primary_id,
                 target_instance_id: target.instance_id.clone(),
                 expected_epoch: definition.previous_snapshot.epoch.clone(),
                 frozen_lsn,
-                deadline_unix_seconds: deadline,
             },
         )
         .await
@@ -209,12 +205,10 @@ impl Workflow for DirectSwitchoverWorkflow {
         let demote = call_activity_branch::<DemoteOldPrimaryActivity>(
             context,
             &mut budget,
+            deadline,
             DemoteOldPrimaryInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 old_primary_id: definition.old_primary_id,
                 old_primary_instance_id: old_primary.instance_id.clone(),
-                deadline_unix_seconds: deadline,
             },
         )
         .await;
@@ -242,12 +236,10 @@ impl Workflow for DirectSwitchoverWorkflow {
         let promote = call_activity_branch::<PromoteTargetActivity>(
             context,
             &mut budget,
+            deadline,
             PromoteTargetInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
-                deadline_unix_seconds: deadline,
             },
         )
         .await;
@@ -288,13 +280,11 @@ impl Workflow for DirectSwitchoverWorkflow {
             let result = match call_activity::<DistributeReplicaEpochActivity>(
                 context,
                 &mut budget,
+                deadline,
                 DistributeReplicaEpochInput {
-                    contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                    execution_id: definition.execution_id.clone(),
                     distribution_index,
                     replica_id,
                     replica_instance_id: replica.instance_id.clone(),
-                    deadline_unix_seconds: deadline,
                 },
             )
             .await
@@ -310,7 +300,14 @@ impl Workflow for DirectSwitchoverWorkflow {
 
         macro_rules! run_target_replica_step {
             ($activity:ty, $input:expr) => {{
-                let result = match call_activity::<$activity>(context, &mut budget, $input).await {
+                let result = match call_activity::<$activity>(
+                    context,
+                    &mut budget,
+                    deadline,
+                    $input,
+                )
+                .await
+                {
                     Ok(result) => result,
                     Err(error) => return stopped(error),
                 };
@@ -324,43 +321,32 @@ impl Workflow for DirectSwitchoverWorkflow {
         run_target_replica_step!(
             InstallTargetCatchUpConfigurationActivity,
             InstallTargetCatchUpConfigurationInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
-                deadline_unix_seconds: deadline,
             }
         );
         run_target_replica_step!(
             WaitTargetWriteQuorumActivity,
             WaitTargetWriteQuorumInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
-                deadline_unix_seconds: deadline,
             }
         );
         run_target_replica_step!(
             InstallTargetCurrentConfigurationActivity,
             InstallTargetCurrentConfigurationInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
-                deadline_unix_seconds: deadline,
             }
         );
 
         let target_label = match call_activity::<PublishTargetPrimaryLabelActivity>(
             context,
             &mut budget,
+            deadline,
             PublishTargetPrimaryLabelInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 target_primary_id: definition.target_primary_id,
                 target_primary_instance_id: target.instance_id.clone(),
-                deadline_unix_seconds: deadline,
             },
         )
         .await
@@ -376,12 +362,10 @@ impl Workflow for DirectSwitchoverWorkflow {
         let old_label = match call_activity::<PublishOldPrimarySecondaryLabelActivity>(
             context,
             &mut budget,
+            deadline,
             PublishOldPrimarySecondaryLabelInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 old_primary_id: definition.old_primary_id,
                 old_primary_instance_id: old_primary.instance_id.clone(),
-                deadline_unix_seconds: deadline,
             },
         )
         .await
@@ -397,11 +381,9 @@ impl Workflow for DirectSwitchoverWorkflow {
         match call_activity::<AttestTargetTopologyActivity>(
             context,
             &mut budget,
+            deadline,
             AttestTargetTopologyInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 expected_snapshot: definition.target_snapshot.clone(),
-                deadline_unix_seconds: deadline,
             },
         )
         .await
@@ -435,12 +417,10 @@ async fn restore_previous_configuration(
     let restore = call_activity_branch::<RestorePreviousCurrentConfigurationActivity>(
         context,
         budget,
+        deadline,
         RestorePreviousCurrentConfigurationInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: definition.execution_id.clone(),
             old_primary_id: definition.old_primary_id,
             old_primary_instance_id: old_primary.instance_id.clone(),
-            deadline_unix_seconds: deadline,
         },
     )
     .await;
@@ -482,12 +462,10 @@ async fn compensate_after_promotion_failure(
     let promote_old = match call_activity::<CompensatePromoteOldPrimaryActivity>(
         context,
         budget,
+        deadline,
         CompensatePromoteOldPrimaryInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: definition.execution_id.clone(),
             old_primary_id: definition.old_primary_id,
             old_primary_instance_id: old_primary.instance_id.clone(),
-            deadline_unix_seconds: deadline,
         },
     )
     .await
@@ -516,13 +494,11 @@ async fn compensate_after_promotion_failure(
         let result = match call_activity::<CompensateDistributeReplicaEpochActivity>(
             context,
             budget,
+            deadline,
             CompensateDistributeReplicaEpochInput {
-                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                execution_id: definition.execution_id.clone(),
                 distribution_index,
                 replica_id,
                 replica_instance_id: replica.instance_id.clone(),
-                deadline_unix_seconds: deadline,
             },
         )
         .await
@@ -545,12 +521,10 @@ async fn compensate_after_promotion_failure(
                 call_activity::<InstallCompensationCatchUpConfigurationActivity>(
                     context,
                     budget,
+                    deadline,
                     InstallCompensationCatchUpConfigurationInput {
-                        contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                        execution_id: definition.execution_id.clone(),
                         old_primary_id: definition.old_primary_id,
                         old_primary_instance_id: old_primary.instance_id.clone(),
-                        deadline_unix_seconds: deadline,
                     },
                 )
                 .await
@@ -559,12 +533,10 @@ async fn compensate_after_promotion_failure(
                 call_activity::<InstallCompensationCurrentConfigurationActivity>(
                     context,
                     budget,
+                    deadline,
                     InstallCompensationCurrentConfigurationInput {
-                        contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-                        execution_id: definition.execution_id.clone(),
                         old_primary_id: definition.old_primary_id,
                         old_primary_instance_id: old_primary.instance_id.clone(),
-                        deadline_unix_seconds: deadline,
                     },
                 )
                 .await
@@ -583,12 +555,10 @@ async fn compensate_after_promotion_failure(
     let restore_old_label = match call_activity::<RestoreOldPrimaryLabelActivity>(
         context,
         budget,
+        deadline,
         RestoreOldPrimaryLabelInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: definition.execution_id.clone(),
             old_primary_id: definition.old_primary_id,
             old_primary_instance_id: old_primary.instance_id.clone(),
-            deadline_unix_seconds: deadline,
         },
     )
     .await
@@ -604,15 +574,13 @@ async fn compensate_after_promotion_failure(
     let restore_target_label = match call_activity::<RestoreTargetSecondaryLabelActivity>(
         context,
         budget,
+        deadline,
         RestoreTargetSecondaryLabelInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: definition.execution_id.clone(),
             target_primary_id: definition.target_primary_id,
             target_primary_instance_id: definition
                 .member(definition.target_primary_id)
                 .map(|member| member.instance_id.clone())
                 .unwrap_or_default(),
-            deadline_unix_seconds: deadline,
         },
     )
     .await
@@ -637,7 +605,7 @@ async fn compensate_after_promotion_failure(
 async fn attest_compensated(
     context: &mut WorkflowContext<'_>,
     budget: &mut TransitionBudget,
-    definition: &DirectSwitchoverDefinition,
+    _definition: &DirectSwitchoverDefinition,
     snapshot: StablePartitionSnapshotStatus,
     observed_at_unix_seconds: i64,
     reason: String,
@@ -650,11 +618,9 @@ async fn attest_compensated(
     match call_activity::<AttestCompensatedTopologyActivity>(
         context,
         budget,
+        deadline,
         AttestCompensatedTopologyInput {
-            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-            execution_id: definition.execution_id.clone(),
             expected_snapshot: snapshot.clone(),
-            deadline_unix_seconds: deadline,
         },
     )
     .await
@@ -666,44 +632,82 @@ async fn attest_compensated(
     }
 }
 
-async fn call_activity<A: DurableEffect>(
+async fn call_activity<A: SwitchoverActivityContract>(
     context: &mut WorkflowContext<'_>,
     budget: &mut TransitionBudget,
+    action_deadline_unix_seconds: i64,
     input: A::Request,
 ) -> Result<A::Output, String> {
     budget.consume(A::NAME)?;
+    let input = SwitchoverActivityInput::<A>::new(input, action_deadline_unix_seconds);
+    let options = ActivityOptions::new(
+        3,
+        1_000,
+        input.action_deadline_unix_seconds().checked_mul(1_000),
+        None,
+    )
+    .map_err(|error| error.to_string())?;
     context
-        .call_effect::<A>(input)
+        .schedule_activity_typed::<OrdinarySwitchoverActivity<A>>(A::NAME, &input, options)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(activity_invocation_message)
 }
 
-async fn call_activity_branch<A: DurableEffect>(
+async fn call_activity_branch<A: SwitchoverActivityContract>(
     context: &mut WorkflowContext<'_>,
     budget: &mut TransitionBudget,
+    action_deadline_unix_seconds: i64,
     input: A::Request,
 ) -> Result<A::Output, EffectBranch> {
     budget.consume(A::NAME).map_err(EffectBranch::Stopped)?;
+    let input = SwitchoverActivityInput::<A>::new(input, action_deadline_unix_seconds);
+    let options = ActivityOptions::new(
+        3,
+        1_000,
+        input.action_deadline_unix_seconds().checked_mul(1_000),
+        None,
+    )
+    .map_err(|error| EffectBranch::Stopped(error.to_string()))?;
     context
-        .call_effect::<A>(input)
+        .schedule_activity_typed::<OrdinarySwitchoverActivity<A>>(A::NAME, &input, options)
         .await
-        .map_err(effect_call_branch)
+        .map_err(activity_invocation_branch)
 }
 
-fn effect_call_branch(error: EffectCallError) -> EffectBranch {
+fn activity_invocation_message(error: ActivityInvocationError) -> String {
     match error {
-        EffectCallError::Effect(error)
-            if matches!(
-                error.kind(),
-                EffectErrorKind::DomainFailure | EffectErrorKind::DeadlineExceeded
-            ) =>
-        {
+        ActivityInvocationError::Application(payload) => {
+            serde_json::from_slice::<BoundedEffectError>(payload.as_slice())
+                .map(|error| error.to_string())
+                .unwrap_or_else(|_| "activity returned an invalid application failure".to_string())
+        }
+        other => other.to_string(),
+    }
+}
+
+fn activity_invocation_branch(error: ActivityInvocationError) -> EffectBranch {
+    match error {
+        ActivityInvocationError::Application(payload) => {
+            match serde_json::from_slice::<BoundedEffectError>(payload.as_slice()) {
+                Ok(error) => effect_call_branch(error),
+                Err(_) => EffectBranch::Stopped(
+                    "activity returned an invalid application failure".to_string(),
+                ),
+            }
+        }
+        other => EffectBranch::Stopped(other.to_string()),
+    }
+}
+
+fn effect_call_branch(error: BoundedEffectError) -> EffectBranch {
+    match error.kind() {
+        EffectErrorKind::DomainFailure | EffectErrorKind::DeadlineExceeded => {
             EffectBranch::DomainFailure {
                 observed_at: error.observed_at_unix_seconds().unwrap_or_default(),
                 message: error.message().to_string(),
             }
         }
-        other => EffectBranch::Stopped(other.to_string()),
+        _ => EffectBranch::Stopped(error.to_string()),
     }
 }
 
@@ -750,9 +754,10 @@ fn terminal(record: DirectSwitchoverTerminalRecord) -> TerminalOutcome {
 mod tests {
     use super::*;
     use kuberic_durable_execution::{
-        ActivityObservation, CheckpointLimits, DurableActivity, DurableEffectSet, DurableHost,
-        EffectMetadata, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome,
-        InMemoryCheckpointStore, PreparedActivityError, PreparedCommand, PreparedEffectResolver,
+        ActivityFailure, ActivityObservation, CheckpointLimits, DurableActivity, DurableHost,
+        EffectMetadata, EffectObservation, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch,
+        HostOutcome, InMemoryCheckpointStore, PreparedActivityError, PreparedCommand,
+        PreparedEffectResolver,
     };
 
     use crate::crd::{EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus};
@@ -861,6 +866,16 @@ mod tests {
                         permit.activity().input().as_slice(),
                     )
                     .unwrap();
+                    assert!(activity_input.get("contractVersion").is_none());
+                    assert!(activity_input.get("executionId").is_none());
+                    assert!(activity_input.get("deadlineUnixSeconds").is_none());
+                    assert!(
+                        permit
+                            .activity()
+                            .options()
+                            .action_deadline_unix_millis()
+                            .is_some()
+                    );
                     let target_id = activity_input
                         .get("targetId")
                         .and_then(serde_json::Value::as_i64);
@@ -879,13 +894,63 @@ mod tests {
                     );
                     *occurrence += 1;
                     observed_at += 1;
-                    let observation = super::super::activities::SwitchoverEffects::observation(
-                        permit.activity().clone(),
-                        permit.attempt_id(),
-                        &result,
-                    )
-                    .unwrap();
-                    let outcome = host.observe_effect(&execution, observation).await;
+                    let strict = matches!(
+                        super::super::activities::activity_class(&name),
+                        Some(
+                            super::super::activities::SwitchoverActivityClass::StrictEffectRequired
+                        )
+                    );
+                    let outcome = match (strict, result) {
+                        (true, ScriptedResult::Success(result)) => {
+                            host.observe_effect(
+                                &execution,
+                                EffectObservation::completed(
+                                    permit.activity().clone(),
+                                    permit.attempt_id(),
+                                    result,
+                                ),
+                            )
+                            .await
+                        }
+                        (true, ScriptedResult::Failure(failure)) => {
+                            host.observe_effect(
+                                &execution,
+                                EffectObservation::completed_failure(
+                                    permit.activity().clone(),
+                                    permit.attempt_id(),
+                                    ActivityFailure::Application(failure),
+                                ),
+                            )
+                            .await
+                        }
+                        (true, ScriptedResult::ProvenNoAdmission(failure)) => {
+                            host.observe_effect(
+                                &execution,
+                                EffectObservation::proven_no_admission(
+                                    permit.activity().clone(),
+                                    permit.attempt_id(),
+                                    ActivityFailure::Application(failure),
+                                ),
+                            )
+                            .await
+                        }
+                        (false, ScriptedResult::Success(result)) => {
+                            host.observe(
+                                &execution,
+                                ActivityObservation::new(permit.activity().clone(), result),
+                            )
+                            .await
+                        }
+                        (false, ScriptedResult::Failure(failure))
+                        | (false, ScriptedResult::ProvenNoAdmission(failure)) => {
+                            host.observe_failure(
+                                &execution,
+                                permit.activity(),
+                                ActivityFailure::Application(failure),
+                            )
+                            .await
+                        }
+                    };
                     assert!(matches!(outcome, HostOutcome::ObservationAccepted { .. }));
                 }
                 HostOutcome::WorkflowCompleted { outcome, .. } => {
@@ -900,67 +965,61 @@ mod tests {
         }
     }
 
+    enum ScriptedResult {
+        Success(ExactBytes),
+        Failure(ExactBytes),
+        ProvenNoAdmission(ExactBytes),
+    }
+
     fn scripted_result(
         name: &str,
         observed_at: i64,
         failure: Option<ScriptedFailure>,
         proven_no_admission: bool,
         activity_input: &serde_json::Value,
-    ) -> ExactBytes {
-        let value = if proven_no_admission {
-            serde_json::json!({
-                "status": "proven_no_admission",
-            })
-        } else if let Some(failure) = failure {
-            let (status, kind) = match failure.kind {
-                ScriptedFailureKind::Failed => ("domain_failure", "domain_failure"),
-                ScriptedFailureKind::DeadlineExceeded => ("deadline_exceeded", "deadline_exceeded"),
+    ) -> ScriptedResult {
+        if proven_no_admission {
+            let error = BoundedEffectError::observed_at(
+                EffectErrorKind::ProvenNoAdmission,
+                "dispatch was proven not admitted",
+                observed_at,
+                512,
+            )
+            .unwrap();
+            return ScriptedResult::ProvenNoAdmission(ExactBytes::new(
+                serde_json::to_vec(&error).unwrap(),
+            ));
+        }
+        if let Some(failure) = failure {
+            let kind = match failure.kind {
+                ScriptedFailureKind::Failed => EffectErrorKind::DomainFailure,
+                ScriptedFailureKind::DeadlineExceeded => EffectErrorKind::DeadlineExceeded,
                 ScriptedFailureKind::UnavailableAtDeadline => {
-                    ("unavailable_at_deadline", "unavailable_at_deadline")
+                    EffectErrorKind::UnavailableAtDeadline
                 }
             };
+            let error =
+                BoundedEffectError::observed_at(kind, failure.message, observed_at, 512).unwrap();
+            return ScriptedResult::Failure(ExactBytes::new(serde_json::to_vec(&error).unwrap()));
+        }
+        let value = if name == CaptureFrozenLsnActivity::NAME {
             serde_json::json!({
-                "status": status,
-                "value": {
-                    "kind": kind,
-                    "message": failure.message,
-                    "observed_at_unix_seconds": observed_at,
-                }
-            })
-        } else if name == CaptureFrozenLsnActivity::NAME {
-            serde_json::json!({
-                "status": "applied",
-                "value": {
-                    "frozenLsn": 55,
-                    "observedAtUnixSeconds": observed_at,
-                }
-            })
-        } else if name == WaitTargetCaughtUpActivity::NAME {
-            serde_json::json!({
-                "status": "applied",
-                "value": {
-                    "observedAtUnixSeconds": observed_at,
-                }
+                "frozenLsn": 55,
+                "observedAtUnixSeconds": observed_at,
             })
         } else if name == AttestTargetTopologyActivity::NAME
             || name == AttestCompensatedTopologyActivity::NAME
         {
             serde_json::json!({
-                "status": "applied",
-                "value": {
-                    "observedAtUnixSeconds": observed_at,
-                    "snapshot": activity_input.get("expectedSnapshot").unwrap(),
-                }
+                "observedAtUnixSeconds": observed_at,
+                "snapshot": activity_input.get("expectedSnapshot").unwrap(),
             })
         } else {
             serde_json::json!({
-                "status": "applied",
-                "value": {
-                    "observedAtUnixSeconds": observed_at,
-                }
+                "observedAtUnixSeconds": observed_at,
             })
         };
-        ExactBytes::new(serde_json::to_vec(&value).unwrap())
+        ScriptedResult::Success(ExactBytes::new(serde_json::to_vec(&value).unwrap()))
     }
 
     #[tokio::test]
@@ -968,11 +1027,11 @@ mod tests {
         for replica_count in [2, 4, 9] {
             let (names, _targets, terminal) = run_script(replica_count, &[], None).await;
             let mut expected = vec![
-                RevokeWritesActivity::NAME,
+                <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
                 CaptureFrozenLsnActivity::NAME,
                 WaitTargetCaughtUpActivity::NAME,
-                DemoteOldPrimaryActivity::NAME,
-                PromoteTargetActivity::NAME,
+                <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+                <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
             ];
             expected.extend(std::iter::repeat_n(
                 DistributeReplicaEpochActivity::NAME,
@@ -1004,7 +1063,7 @@ mod tests {
             let (names, _targets, terminal) = run_script(
                 replica_count,
                 &[ScriptedFailure {
-                    name: PromoteTargetActivity::NAME,
+                    name: <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
                     kind: ScriptedFailureKind::Failed,
                     message: "promotion failed",
                 }],
@@ -1012,12 +1071,12 @@ mod tests {
             )
             .await;
             let mut expected = vec![
-                RevokeWritesActivity::NAME,
+                <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
                 CaptureFrozenLsnActivity::NAME,
                 WaitTargetCaughtUpActivity::NAME,
-                DemoteOldPrimaryActivity::NAME,
-                PromoteTargetActivity::NAME,
-                CompensatePromoteOldPrimaryActivity::NAME,
+                <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+                <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
+                <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
             ];
             expected.extend(std::iter::repeat_n(
                 CompensateDistributeReplicaEpochActivity::NAME,
@@ -1058,7 +1117,7 @@ mod tests {
             assert_eq!(
                 names,
                 vec![
-                    RevokeWritesActivity::NAME,
+                    <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
                     CaptureFrozenLsnActivity::NAME,
                     WaitTargetCaughtUpActivity::NAME,
                     RestorePreviousCurrentConfigurationActivity::NAME,
@@ -1078,12 +1137,17 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_records_one_same_operation_redelivery() {
-        let (names, _targets, terminal) =
-            run_script(3, &[], Some(DemoteOldPrimaryActivity::NAME)).await;
+        let (names, _targets, terminal) = run_script(
+            3,
+            &[],
+            Some(<DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME),
+        )
+        .await;
         assert_eq!(
             names
                 .iter()
-                .filter(|name| name.as_str() == DemoteOldPrimaryActivity::NAME)
+                .filter(|name| name.as_str()
+                    == <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME)
                 .count(),
             2
         );
@@ -1110,7 +1174,9 @@ mod tests {
         .await;
         assert!(names.contains(&InstallTargetCurrentConfigurationActivity::NAME.to_string()));
         assert!(!names.contains(&RestorePreviousCurrentConfigurationActivity::NAME.to_string()));
-        assert!(!names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+        assert!(!names.contains(
+            &<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string()
+        ));
         assert!(matches!(
             terminal,
             DirectSwitchoverTerminalRecord::Stopped { .. }
@@ -1120,9 +1186,9 @@ mod tests {
     #[tokio::test]
     async fn direct_switchover_expired_actions_preserve_prior_compensation_boundaries() {
         for activity_name in [
-            RevokeWritesActivity::NAME,
-            DemoteOldPrimaryActivity::NAME,
-            PromoteTargetActivity::NAME,
+            <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
+            <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+            <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
         ] {
             let (names, _targets, terminal) = run_script(
                 3,
@@ -1141,11 +1207,11 @@ mod tests {
                     branch,
                     ..
                 } if branch == match activity_name {
-                    RevokeWritesActivity::NAME =>
+                    <RevokeWritesActivity as SwitchoverActivityContract>::NAME =>
                         DirectSwitchoverTerminalBranch::RevokeSafeFailure,
-                    DemoteOldPrimaryActivity::NAME =>
+                    <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME =>
                         DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
-                    PromoteTargetActivity::NAME =>
+                    <PromoteTargetActivity as SwitchoverActivityContract>::NAME =>
                         DirectSwitchoverTerminalBranch::PostPromotionCompensated,
                     _ => unreachable!(),
                 }
@@ -1155,28 +1221,28 @@ mod tests {
                 "{activity_name}"
             );
             match activity_name {
-                RevokeWritesActivity::NAME => {
+                <RevokeWritesActivity as SwitchoverActivityContract>::NAME => {
                     assert!(
                         !names.contains(
                             &RestorePreviousCurrentConfigurationActivity::NAME.to_string()
                         )
                     );
                     assert!(
-                        !names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string())
+                        !names.contains(&<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string())
                     );
                 }
-                DemoteOldPrimaryActivity::NAME => {
+                <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME => {
                     assert!(
                         names.contains(
                             &RestorePreviousCurrentConfigurationActivity::NAME.to_string()
                         )
                     );
                     assert!(
-                        !names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string())
+                        !names.contains(&<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string())
                     );
                 }
-                PromoteTargetActivity::NAME => {
-                    assert!(names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+                <PromoteTargetActivity as SwitchoverActivityContract>::NAME => {
+                    assert!(names.contains(&<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string()));
                 }
                 _ => unreachable!(),
             }
@@ -1186,9 +1252,9 @@ mod tests {
     #[tokio::test]
     async fn direct_switchover_unavailable_at_action_deadline_stops_without_compensation() {
         for activity_name in [
-            RevokeWritesActivity::NAME,
-            DemoteOldPrimaryActivity::NAME,
-            PromoteTargetActivity::NAME,
+            <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
+            <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+            <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
         ] {
             let (names, _targets, terminal) = run_script(
                 3,
@@ -1207,7 +1273,12 @@ mod tests {
             assert!(
                 !names.contains(&RestorePreviousCurrentConfigurationActivity::NAME.to_string())
             );
-            assert!(!names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+            assert!(
+                !names.contains(
+                    &<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME
+                        .to_string()
+                )
+            );
             assert!(!names.contains(&AttestCompensatedTopologyActivity::NAME.to_string()));
         }
     }
@@ -1236,19 +1307,24 @@ mod tests {
             assert!(
                 !names.contains(&RestorePreviousCurrentConfigurationActivity::NAME.to_string())
             );
-            assert!(!names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+            assert!(
+                !names.contains(
+                    &<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME
+                        .to_string()
+                )
+            );
         }
 
         let (names, _targets, terminal) = run_script(
             3,
             &[
                 ScriptedFailure {
-                    name: PromoteTargetActivity::NAME,
+                    name: <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
                     kind: ScriptedFailureKind::Failed,
                     message: "promotion failed",
                 },
                 ScriptedFailure {
-                    name: CompensatePromoteOldPrimaryActivity::NAME,
+                    name: <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
                     kind: ScriptedFailureKind::DeadlineExceeded,
                     message: "compensation action reached its exact deadline",
                 },
@@ -1260,7 +1336,9 @@ mod tests {
             terminal,
             DirectSwitchoverTerminalRecord::Stopped { .. }
         ));
-        assert!(names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+        assert!(names.contains(
+            &<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string()
+        ));
         assert!(!names.contains(&CompensateDistributeReplicaEpochActivity::NAME.to_string()));
         assert!(!names.contains(&AttestCompensatedTopologyActivity::NAME.to_string()));
     }

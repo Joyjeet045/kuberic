@@ -71,10 +71,11 @@ restore-target-secondary-label, attest-compensated-topology
 
 Each name is prefixed by `kuberic.switchover.`. The workflow source directly
 expresses normal ordering, sorted replica loops, waits, the pre-promotion
-restore path, and the post-promotion compensation path. The host adapter
-collects authoritative observations, prepares exact commands, dispatches only
-under a consumed one-use permit, resolves quarantine, and validates terminal
-state; it does not choose protocol progression.
+restore path, and the post-promotion compensation path. The immutable framework registry validates typed identity, bounds, and input
+before invoking class-specific handlers that borrow current reconciliation
+state. The adapter collects authoritative observations, invokes activity
+handlers under a consumed one-use permit, and validates terminal state; it
+does not choose protocol progression.
 
 The durable inputs are genuinely operation-specific. Fixed old-primary,
 target-primary, distribution, configuration, and label activities expose only
@@ -88,7 +89,7 @@ Strict Kubernetes field validation rejects removed or unknown fields, missing
 required fields fail schema admission, and a resource in `Switchover` without
 the current reference fails closed.
 
-Format-3 checkpoints are stored in same-namespace ConfigMaps named
+Format-4 checkpoints are stored in same-namespace ConfigMaps named
 `kuberic-checkpoint-<execution-id>`. They have a non-controlling owner
 reference to the exact `KubericSet` UID, remain through terminal reload, and
 are garbage collected with that owner. The operator needs ConfigMap `get`,
@@ -99,17 +100,26 @@ primary because there is no distinct target; direct switchover accepts stable
 topologies with 2–9 members and rejects an invalid or identical target before
 any effect.
 
-Fused checkpoint compare-and-swap persists an exact prepared command before a
-permit exists and combines authoritative observation with the next exposure or
-terminal state. Unknown replica effects remain observation-only quarantined
-past their activity deadline. Only a matching terminal ledger record, the
-exact live postcondition, or generation-change proof of non-admission resolves
-an exposed replica command. Precondition, unavailable, and scheduled/in-progress
-evidence continue waiting. A new agent generation can permit one redelivery of
-the same action identity; a second proof stops. UID-fenced label effects are
-never redelivered and resolve only from the exact UID-bound label
-postcondition. Conflict or unknown checkpoint writes reload before any later
-permit.
+The 20 handlers have an exhaustive implementation classification:
+
+- passive/read-only: `capture-frozen-lsn`, `wait-target-caught-up`,
+  `attest-target-topology`, and `attest-compensated-topology`;
+- naturally idempotent: the four publish/restore label activities;
+- identity-fenced idempotent: the eight epoch, configuration, and quorum
+  activities; and
+- strict-effect-required: `revoke-writes`, `demote-old-primary`,
+  `promote-target`, and `compensate-promote-old-primary`.
+
+Ordinary handlers may be invoked again after a crash or lost result.
+ReplicaAgent activities preserve one logical action ID across physical
+attempts, while UID-fenced label activities converge on their exact
+postcondition. Only the four strict handlers persist an exact prepared command
+before a permit exists and retain observe-before-dispatch and
+observation-only quarantine. For those handlers, only a matching terminal
+ledger record, exact live postcondition, or generation-change proof of
+non-admission resolves ambiguity; a deadline alone never authorizes duplicate
+dispatch. Conflict or unknown checkpoint writes reload before any later
+invocation.
 
 Terminal state is compacted, reloaded, and validated before stable
 topology/status publication. The compact terminal records its immutable branch
@@ -123,10 +133,12 @@ bounded to 512 UTF-8 bytes before activity or terminal persistence. Use
 `FrameworkNativeSwitchover` condition to inspect admission, named history,
 reloads, quarantine, incompatibility, completion, or safe compensation.
 
-The canonical three-member no-fault sample records nine external effects,
-three passive observations, 12 logical boundaries, and 25 accepted writes.
+The canonical three-member no-fault sample records 12 logical activity
+boundaries and 25 accepted writes. Each ordinary retry, lost-result retry, or
+proof-backed strict redelivery adds at most two accepted writes.
 The nine-member maximum-fault production sample records 19 logical boundaries,
-16 external effects, three passive observations, and 67 accepted writes.
+with a 39-write base, ten ordinary extra attempts, four strict redeliveries,
+and exactly `39 + (10 × 2) + (4 × 2) = 67` accepted writes.
 The contract limits are 19 logical records, 4,096 workflow-input bytes,
 8,192 maximum activity-input/result bytes, 524,288 active bytes, 16,384
 terminal bytes, 4,096 terminal-payload bytes, 512 error bytes, 64 workflow
@@ -136,7 +148,7 @@ redelivery. Measurements are validation snapshots, not compatibility
 constants.
 
 The runtime topology is unchanged: one Kubernetes operator process and the
-existing Set/Pod watches schedule the in-process runner; replica mutations
+existing Set/Pod watches and requeues schedule the in-process runner; replica mutations
 still cross `ReplicaAgent`, and label mutations still cross the Kubernetes
 API. No worker, queue, lease, watcher, service, or remote activity host was
 added. Creation, add/build/rejoin, failover, and remove-replica keep their

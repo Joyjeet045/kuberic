@@ -390,27 +390,22 @@ post-recovery pod logical/incarnation drift, and unordered pod listing.
 
 **Pattern 7: Framework-native durable switchover** ✅
 `test_framework_native_switchover_*` drives the only production path through
-the format-3 checkpoint kernel and contract-v4 direct workflow. Persisted
+the format-4 checkpoint kernel and contract-v4 direct workflow. Persisted
 history contains only the 20 operation-specific version-1 names. The matrix
 covers normal, pre-promotion-compensation, and
 post-promotion-compensation paths at two, four, and nine members; every-turn
 operator restart across all three terminal families; unknown outcomes with and
 without apply; checkpoint and terminal CAS conflicts; failed status
 publication followed by terminal reload without Pods; stale target
-incarnation; one proof-backed redelivery; and lost replies for every normal
-and compensation replica mutation plus both label positions. An accepted-
-exposure fault hook stops the production runner before adapter evaluation and
-then recreates `ReconcilerState`. It covers a prepared unknown replica,
-prepared UID-fenced labels, an evidence-only exact replica postcondition, and
-both naturally passive compensation labels. Prepared effects remain
-`Quarantined` with no duplicate or later effect and no `Healthy` publication
-until exact evidence appears; evidence-only exposures are safely re-observed
-without gaining dispatch authority. Production adapter tests also hold
-unknown-before-apply and matching in-progress effects past deadline at revoke,
-demote, promotion, a late replica step, and both normal label positions. The
-matrix asserts the exact named sequence, one admitted unsafe effect per
-correlation identity, terminal-before-status recovery, and fail-closed
-missing-reference, malformed-current-contract, and previous-version state.
+incarnation; ordinary lost-result retries; and proof-backed strict
+redelivery. Accepted-exposure fault hooks stop the runner before handler
+evaluation and recreate `ReconcilerState`. Passive handlers reread evidence,
+label handlers converge on exact UID-fenced postconditions, and
+identity-fenced ReplicaAgent handlers retain the same action ID across
+physical attempts. Separate strict fixtures hold unknown-before-apply and
+matching in-progress write-authority operations past deadline. The matrix
+asserts exact named sequence, terminal-before-status recovery, and fail-closed
+missing-reference, malformed-current-contract, and previous-format state.
 
 Run the targeted matrix:
 
@@ -419,9 +414,10 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
   --test reconciler test_framework_native_switchover_ -- --nocapture
 ```
 
-The authoritative three-member happy-path gate expects exactly nine external
-effects plus three passive observations, giving 12 completed durable
-boundaries and 25 accepted checkpoint writes including terminal persistence.
+The authoritative three-member happy-path gate expects 12 completed logical
+activities and 25 accepted checkpoint writes including terminal persistence:
+two accepted writes per activity plus one terminal-compaction write
+(`2 × 12 + 1`).
 Checkpoint byte measurements are run-specific snapshots because
 runtime-generated values affect serialized length; no exact byte value is a
 compatibility contract.
@@ -442,24 +438,23 @@ encoded bytes, 16,384 terminal encoded bytes, 4,096 terminal-payload bytes,
 reconcile. The transition limit is enforced by one workflow-wide budget used
 by normal calls, compensation, attestation, and redelivery. Persisted activity
 and terminal errors enforce the 512-byte UTF-8 limit with ASCII and multibyte
-exact/one-over cases. The nine-member maximum-fault production run uses all 19
-logical records, with 16 external effects, three passive observations, and 67
-accepted writes. Exact-bound and one-byte-over tests cover every effect
+exact/one-over cases. The nine-member maximum-fault production run uses all 19 logical records. Its
+base is 39 accepted writes; ten ordinary identity-fenced activities each
+consume one extra same-logical-identity attempt and four strict
+write-authority activities each consume one proof-backed redelivery:
+`39 + (10 × 2) + (4 × 2) = 67`. Exact-bound and one-byte-over tests cover every activity
 declaration and each global limit independently.
 
 The kernel terminal metadata authenticates exact logical completion and
-external-effect/passive-observation counts from immutable registered effect
-metadata. The terminal payload carries only the operation-specific branch and
-topology. For the canonical three-member success path the target is 9/3, 12
+classification counts from immutable registered contracts. The terminal
+payload carries only the operation-specific branch and topology. For the canonical three-member success path the target is 9/3, 12
 logical boundaries, and 25 accepted writes. Exact postconditions and
 already-exact labels do not change immutable effect classification. Revoke-safe
 failure, previous-configuration restore, and post-promotion compensation have
 distinct terminal branches and topology validation. Missing or inconsistent
 kernel metadata and illegal branch/topology combinations are rejected before
 `Healthy` publication.
-`external_effects` counts ReplicaAgent commands and
-UID-fenced label patches; `passive_observations` counts evidence-only
-activities; `durable_boundaries` is their completed total.
+`durable_boundaries` is the completed logical activity total.
 `checkpoint_write_attempts` counts checkpoint CAS calls, while
 `checkpoint_accepted_writes` counts only responses with a confirmed
 authoritative revision. Latest/maximum authoritative, active, and terminal
@@ -487,13 +482,11 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
   direct_switchover_adapter_is_deterministic_for_one_hundred_runs -- --nocapture
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_unprepared_effect_exposures_recover_without_dispatch_authority
+  direct_switchover_unprepared_exact_replica_exposure_recovers_after_restart
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
   direct_switchover_deadline_effects_reach_measured_terminal_reload
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_unresolved_replica_effects_remain_quarantined_past_deadline
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_unresolved_labels_remain_quarantined_past_deadline
+  direct_switchover_unresolved_strict_effects_remain_quarantined_past_deadline
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
   direct_switchover_transition_budget_is_enforced_at_execution_boundary
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
@@ -503,20 +496,15 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
 
 The ambiguity matrix distinguishes exposure conflicts, definite storage
 failures, unknown outcomes without application, and unknown outcomes after
-application. None returns a permit on the uncertain reconcile. Reload after an
-applied unknown finds the complete prepared exposure and quarantines it;
-reload after an unapplied checkpoint write finds the predecessor and may
-prepare the first attempt. A prepared exposure retains the strict rules: a
+application. None returns invocation authority on the uncertain reconcile.
+Ordinary activities resume from the authoritative predecessor or persisted
+attempt and apply their bounded retry policy. A strict prepared exposure
+retains stricter rules: a
 precondition, unavailability, or scheduled/in-progress ledger record remains
 quarantined past deadline; only matching terminal ledger evidence, the exact
 postcondition, or generation-change non-admission resolves a replica command.
 That proof is persisted before the one allowed same-action redelivery, and a
-second proof stops. Prepared UID-fenced labels are never redelivered and
-require their exact postcondition. An exposed effect with no prepared command
-is instead re-evaluated with dispatch disabled: deterministic evidence is
-accepted, while an evaluation that would dispatch remains `Quarantined`.
-Absence of a command alone never isolates the workflow. The durable kernel's
-45-scenario conformance matrix also covers fused schedule/exposure,
+second proof stops. The durable kernel's conformance matrix also covers fused schedule/exposure,
 observation/next exposure, observation/terminal, exact permit/attempt identity,
 and capacity reservation.
 

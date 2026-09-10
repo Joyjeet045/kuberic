@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::{
     ActivityCallError, ActivitySpec, AttemptId, DurableActivity, ExactBytes, ExecutionId,
-    LogicalActivityId, PreparedActivityError,
+    PreparedActivityError,
 };
 
 /// Immutable framework classification authenticated with completed history.
@@ -398,467 +398,162 @@ pub struct EffectMetadata {
     completion_class: CompletionClass,
 }
 
-/// Immutable registration for one member of a statically declared effect set.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EffectRegistration {
-    name: &'static str,
-    version: u32,
-    max_request_bytes: u64,
-    max_command_bytes: u64,
-    max_result_bytes: u64,
-    completion_class: CompletionClass,
-}
-
-impl EffectRegistration {
-    pub const fn of<E: DurableEffect>() -> Self {
-        Self {
-            name: E::NAME,
-            version: E::VERSION,
-            max_request_bytes: E::MAX_REQUEST_BYTES,
-            max_command_bytes: E::MAX_COMMAND_BYTES,
-            max_result_bytes: E::MAX_RESULT_BYTES,
-            completion_class: E::COMPLETION_CLASS,
-        }
-    }
-
-    pub const fn name(self) -> &'static str {
-        self.name
-    }
-
-    pub const fn version(self) -> u32 {
-        self.version
-    }
-
-    pub const fn max_request_bytes(self) -> u64 {
-        self.max_request_bytes
-    }
-
-    pub const fn max_command_bytes(self) -> u64 {
-        self.max_command_bytes
-    }
-
-    pub const fn max_result_bytes(self) -> u64 {
-        self.max_result_bytes
-    }
-
-    pub const fn completion_class(self) -> CompletionClass {
-        self.completion_class
-    }
-
-    pub fn matches(&self, activity: &ActivitySpec) -> bool {
-        activity.name().name() == self.name
-            && activity.name().version() == self.version
-            && activity.max_result_bytes() == self.max_result_bytes
-    }
-}
-
-/// A closed, statically generated set of typed durable effects.
-pub trait DurableEffectSet {
-    type Route;
-
-    fn registrations() -> &'static [EffectRegistration];
-
-    fn route(
-        activity: &ActivitySpec,
-        command: &PreparedCommand,
-    ) -> Result<Self::Route, EffectRoutingError>;
-
-    fn observation(
-        activity: LogicalActivityId,
-        attempt_id: AttemptId,
-        result: &ExactBytes,
-    ) -> Result<crate::EffectObservation, EffectRoutingError>;
-
-    fn validate() -> Result<(), EffectRoutingError> {
-        validate_effect_registrations(Self::registrations())
-    }
-
-    fn registration(activity: &ActivitySpec) -> Result<EffectRegistration, EffectRoutingError> {
-        Self::validate()?;
-        let registration = Self::registrations()
-            .iter()
-            .copied()
-            .find(|registration| registration.matches(activity))
-            .ok_or_else(|| EffectRoutingError::Unregistered {
-                name: activity.name().name().to_owned(),
-                version: activity.name().version(),
-            })?;
-        let actual_request_bytes =
-            u64::try_from(activity.input().as_slice().len()).unwrap_or(u64::MAX);
-        if actual_request_bytes > registration.max_request_bytes {
-            return Err(EffectRoutingError::RequestTooLarge {
-                actual_bytes: actual_request_bytes,
-                max_bytes: registration.max_request_bytes,
-            });
-        }
-        Ok(registration)
-    }
-}
-
 /// Result of one framework-owned typed lifecycle evaluation.
 #[derive(Debug, Eq, PartialEq)]
 pub enum EffectHostStep {
-    Observed(crate::EffectObservation),
+    Observed(Box<crate::EffectObservation>),
     Pending,
 }
 
-/// Static routing plus the shared observe-before-dispatch lifecycle.
-#[async_trait]
-pub trait HostedEffectSet<H>: DurableEffectSet {
-    async fn observe_or_dispatch(
-        handler: &mut H,
-        activity: &crate::LogicalActivityId,
-        attempt_id: AttemptId,
-        command: &PreparedCommand,
-    ) -> Result<EffectHostStep, String>;
-
-    async fn observe_quarantined(
-        handler: &mut H,
-        activity: &crate::LogicalActivityId,
-        attempt_id: AttemptId,
-        command: &PreparedCommand,
-    ) -> Result<Option<crate::EffectObservation>, String>;
-}
-
-/// Static preparation routing for a closed effect set.
-pub trait PreparedEffectSet<H>: DurableEffectSet {
-    fn resolve_prepared(
-        handler: &H,
-        execution_id: ExecutionId,
-        logical: &ActivitySpec,
-        metadata: EffectMetadata,
-        recorded: Option<&PreparedCommand>,
-    ) -> Result<PreparedCommand, PreparedActivityError>;
-}
-
-pub struct StaticEffectResolver<'a, S, H> {
-    handler: &'a H,
-    marker: PhantomData<S>,
-}
-
-impl<'a, S, H> StaticEffectResolver<'a, S, H>
-where
-    S: PreparedEffectSet<H>,
-{
-    pub const fn new(handler: &'a H) -> Self {
-        Self {
-            handler,
-            marker: PhantomData,
-        }
+fn validate_effect_activity<E: DurableEffect>(
+    activity: &ActivitySpec,
+) -> Result<E::Request, PreparedActivityError> {
+    if activity.name().name() != E::NAME
+        || activity.name().version() != E::VERSION
+        || activity.max_input_bytes() != E::MAX_REQUEST_BYTES
+        || activity.max_result_bytes() != E::MAX_RESULT_BYTES
+    {
+        return Err(PreparedActivityError::Validation);
     }
+    decode_effect_request::<E>(activity.input()).map_err(|_| PreparedActivityError::Encoding)
 }
 
-impl<S, H> PreparedEffectResolver for StaticEffectResolver<'_, S, H>
-where
-    S: PreparedEffectSet<H> + Sync,
-    H: Sync,
-{
-    fn resolve(
-        &self,
-        execution_id: ExecutionId,
-        logical: &ActivitySpec,
-        metadata: EffectMetadata,
-        recorded: Option<&PreparedCommand>,
-    ) -> Result<PreparedCommand, PreparedActivityError> {
-        S::resolve_prepared(self.handler, execution_id, logical, metadata, recorded)
-    }
-}
-
-pub fn validate_effect_registrations(
-    registrations: &[EffectRegistration],
-) -> Result<(), EffectRoutingError> {
-    let mut identities = BTreeMap::new();
-    for registration in registrations {
-        if registration.name.is_empty() {
-            return Err(EffectRoutingError::InvalidIdentity);
-        }
-        if registration.version == 0 {
-            return Err(EffectRoutingError::InvalidIdentity);
-        }
-        if identities
-            .insert((registration.name, registration.version), ())
-            .is_some()
-        {
-            return Err(EffectRoutingError::DuplicateIdentity {
-                name: registration.name.to_owned(),
-                version: registration.version,
-            });
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum EffectRoutingError {
-    #[error("an effect registration has an empty name or zero version")]
-    InvalidIdentity,
-    #[error("duplicate durable effect registration for {name} version {version}")]
-    DuplicateIdentity { name: String, version: u32 },
-    #[error("unregistered durable effect {name} version {version}")]
-    Unregistered { name: String, version: u32 },
-    #[error("effect request is {actual_bytes} bytes, exceeding the {max_bytes}-byte bound")]
-    RequestTooLarge { actual_bytes: u64, max_bytes: u64 },
-    #[error(
-        "effect command bound {actual_bytes} differs from the registered {max_bytes}-byte bound"
-    )]
-    CommandBoundMismatch { actual_bytes: u64, max_bytes: u64 },
-    #[error("effect request could not be decoded")]
-    RequestDecoding,
-    #[error("effect command could not be decoded")]
-    CommandDecoding,
-    #[error("effect result could not be decoded")]
-    ResultDecoding,
-}
-
-/// Declare a closed effect set and its statically typed route enum.
+/// Resolve one explicitly routed strict-effect command.
 ///
-/// The declaration contains effect types only. Generated code performs
-/// identity selection and typed request/command decoding; lifecycle policy
-/// remains in the shared host.
-#[macro_export]
-macro_rules! durable_effect_set {
-    ($visibility:vis $set:ident => $route:ident { $($effect:ident),+ $(,)? }) => {
-        $visibility struct $set;
-
-        #[allow(dead_code)]
-        $visibility enum $route {
-            $(
-                $effect {
-                    request: <$effect as $crate::DurableEffect>::Request,
-                    command: <$effect as $crate::DurableEffect>::Command,
-                },
-            )+
+/// Callers own the small operation-specific route table; the durable crate
+/// owns codec, bound, replay-validation, and prepared-command invariants.
+pub fn resolve_prepared_effect<E, H>(
+    handler: &H,
+    logical: &ActivitySpec,
+    metadata: EffectMetadata,
+    recorded: Option<&PreparedCommand>,
+) -> Result<PreparedCommand, PreparedActivityError>
+where
+    E: DurableEffect,
+    H: PrepareEffect<E, Evidence = (), Authority = ()>,
+{
+    if metadata != EffectMetadata::of::<E>() {
+        return Err(PreparedActivityError::Validation);
+    }
+    let request = validate_effect_activity::<E>(logical)?;
+    let command = if let Some(recorded) = recorded {
+        if recorded.max_bytes() != E::MAX_COMMAND_BYTES {
+            return Err(PreparedActivityError::Validation);
         }
-
-        impl $crate::DurableEffectSet for $set {
-            type Route = $route;
-
-            fn registrations() -> &'static [$crate::EffectRegistration] {
-                const REGISTRATIONS: &[$crate::EffectRegistration] = &[
-                    $($crate::EffectRegistration::of::<$effect>()),+
-                ];
-                REGISTRATIONS
-            }
-
-            fn route(
-                activity: &$crate::ActivitySpec,
-                command: &$crate::PreparedCommand,
-            ) -> Result<Self::Route, $crate::EffectRoutingError> {
-                let registration = Self::registration(activity)?;
-                if command.max_bytes() != registration.max_command_bytes() {
-                    return Err($crate::EffectRoutingError::CommandBoundMismatch {
-                        actual_bytes: command.max_bytes(),
-                        max_bytes: registration.max_command_bytes(),
-                    });
-                }
-                $(
-                    if registration.name() == <$effect as $crate::DurableEffect>::NAME
-                        && registration.version() == <$effect as $crate::DurableEffect>::VERSION
-                    {
-                        let request = $crate::decode_effect_request::<$effect>(activity.input())
-                            .map_err(|_| $crate::EffectRoutingError::RequestDecoding)?;
-                        let command = $crate::decode_effect_command::<$effect>(command)
-                            .map_err(|_| $crate::EffectRoutingError::CommandDecoding)?;
-                        return Ok($route::$effect { request, command });
-                    }
-                )+
-                unreachable!("registration was selected from the generated effect list")
-            }
-
-            fn observation(
-                activity: $crate::LogicalActivityId,
-                attempt_id: $crate::AttemptId,
-                result: &$crate::ExactBytes,
-            ) -> Result<$crate::EffectObservation, $crate::EffectRoutingError> {
-                let registration = Self::registration(activity.spec())?;
-                $(
-                    if registration.name() == <$effect as $crate::DurableEffect>::NAME
-                        && registration.version() == <$effect as $crate::DurableEffect>::VERSION
-                    {
-                        let outcome = $crate::decode_activity_result::<
-                            $crate::EffectActivity<$effect>
-                        >(result)
-                        .map_err(|_| $crate::EffectRoutingError::ResultDecoding)?;
-                        return $crate::EffectObservation::from_outcome::<$effect>(
-                            activity,
-                            attempt_id,
-                            &outcome,
-                        )
-                        .map_err(|_| $crate::EffectRoutingError::ResultDecoding);
-                    }
-                )+
-                unreachable!("registration was selected from the generated effect list")
-            }
-        }
-
-        #[async_trait::async_trait]
-        impl<H> $crate::HostedEffectSet<H> for $set
-        where
-            H: Send $(+ $crate::DispatchEffect<$effect>
-                + $crate::ObserveEffect<$effect>
-                + $crate::ObserveQuarantinedEffect<$effect>)+,
-            $(<H as $crate::DispatchEffect<$effect>>::Error: std::fmt::Display,
-              <H as $crate::ObserveEffect<$effect>>::Error: std::fmt::Display,
-              <H as $crate::ObserveQuarantinedEffect<$effect>>::Error: std::fmt::Display,)+
-        {
-            async fn observe_or_dispatch(
-                handler: &mut H,
-                activity: &$crate::LogicalActivityId,
-                attempt_id: $crate::AttemptId,
-                command: &$crate::PreparedCommand,
-            ) -> Result<$crate::EffectHostStep, String> {
-                match <Self as $crate::DurableEffectSet>::route(activity.spec(), command)
-                    .map_err(|error| error.to_string())?
-                {
-                    $(
-                        $route::$effect { request, command } => {
-                            if let Some(outcome) =
-                                <H as $crate::ObserveEffect<$effect>>::observe(
-                                    handler,
-                                    &request,
-                                    &command,
-                                    attempt_id,
-                                )
-                                .await
-                                .map_err(|error| error.to_string())?
-                            {
-                                return $crate::EffectObservation::from_outcome::<$effect>(
-                                    activity.clone(),
-                                    attempt_id,
-                                    &outcome,
-                                )
-                                .map($crate::EffectHostStep::Observed)
-                                .map_err(|error| error.to_string());
-                            }
-                            match <H as $crate::DispatchEffect<$effect>>::dispatch(
-                                handler,
-                                &request,
-                                &command,
-                                attempt_id,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())?
-                            {
-                                Some(outcome) => $crate::EffectObservation::from_outcome::<$effect>(
-                                    activity.clone(),
-                                    attempt_id,
-                                    &outcome,
-                                )
-                                .map($crate::EffectHostStep::Observed)
-                                .map_err(|error| error.to_string()),
-                                None => Ok($crate::EffectHostStep::Pending),
-                            }
-                        }
-                    )+
-                }
-            }
-
-            async fn observe_quarantined(
-                handler: &mut H,
-                activity: &$crate::LogicalActivityId,
-                attempt_id: $crate::AttemptId,
-                command: &$crate::PreparedCommand,
-            ) -> Result<Option<$crate::EffectObservation>, String> {
-                match <Self as $crate::DurableEffectSet>::route(activity.spec(), command)
-                    .map_err(|error| error.to_string())?
-                {
-                    $(
-                        $route::$effect { request, command } => {
-                            let context = $crate::EffectQuarantineContext::<$effect>::new(
-                                &request,
-                                &command,
-                                attempt_id,
-                            );
-                            <H as $crate::ObserveQuarantinedEffect<$effect>>::observe_quarantined(
-                                handler,
-                                context,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())?
-                            .map(|outcome| {
-                                $crate::EffectObservation::from_outcome::<$effect>(
-                                    activity.clone(),
-                                    attempt_id,
-                                    &outcome,
-                                )
-                                .map_err(|error| error.to_string())
-                            })
-                            .transpose()
-                        }
-                    )+
-                }
-            }
-        }
-
-        impl<H> $crate::PreparedEffectSet<H> for $set
-        where
-            H: Sync $(+ $crate::PrepareEffect<
-                $effect,
-                Evidence = (),
-                Authority = (),
-            >)+,
-        {
-            fn resolve_prepared(
-                handler: &H,
-                _execution_id: $crate::ExecutionId,
-                logical: &$crate::ActivitySpec,
-                metadata: $crate::EffectMetadata,
-                recorded: Option<&$crate::PreparedCommand>,
-            ) -> Result<$crate::PreparedCommand, $crate::PreparedActivityError> {
-                let registration =
-                    <Self as $crate::DurableEffectSet>::registration(logical)
-                        .map_err(|_| $crate::PreparedActivityError::Validation)?;
-                if registration.max_command_bytes() != metadata.max_command_bytes()
-                    || registration.completion_class() != metadata.completion_class()
-                {
-                    return Err($crate::PreparedActivityError::Validation);
-                }
-                $(
-                    if registration.name() == <$effect as $crate::DurableEffect>::NAME
-                        && registration.version() == <$effect as $crate::DurableEffect>::VERSION
-                    {
-                        let request = $crate::decode_effect_request::<$effect>(logical.input())
-                            .map_err(|_| $crate::PreparedActivityError::Encoding)?;
-                        let command = if let Some(recorded) = recorded {
-                            let command = $crate::decode_effect_command::<$effect>(recorded)
-                                .map_err(|_| $crate::PreparedActivityError::Validation)?;
-                            <H as $crate::PrepareEffect<$effect>>::validate_recorded(
-                                handler,
-                                &request,
-                                &command,
-                                &(),
-                            )
-                            .map_err(|_| $crate::PreparedActivityError::Validation)?;
-                            command
-                        } else {
-                            <H as $crate::PrepareEffect<$effect>>::prepare(
-                                handler,
-                                &request,
-                                &(),
-                                &(),
-                            )
-                            .map_err(|_| $crate::PreparedActivityError::Derivation)?
-                        };
-                        return $crate::encode_effect_command::<$effect>(&command)
-                            .map_err(|error| match error {
-                                $crate::EffectContractError::CommandTooLarge {
-                                    actual_bytes,
-                                    max_bytes,
-                                } => $crate::PreparedActivityError::CommandTooLarge {
-                                    actual_bytes,
-                                    max_bytes,
-                                },
-                                _ => $crate::PreparedActivityError::Encoding,
-                            });
-                    }
-                )+
-                unreachable!("registration was selected from the generated effect list")
-            }
-        }
+        let command =
+            decode_effect_command::<E>(recorded).map_err(|_| PreparedActivityError::Validation)?;
+        handler
+            .validate_recorded(&request, &command, &())
+            .map_err(|_| PreparedActivityError::Validation)?;
+        command
+    } else {
+        handler
+            .prepare(&request, &(), &())
+            .map_err(|_| PreparedActivityError::Derivation)?
     };
+    encode_effect_command::<E>(&command).map_err(|error| match error {
+        EffectContractError::CommandTooLarge {
+            actual_bytes,
+            max_bytes,
+        } => PreparedActivityError::CommandTooLarge {
+            actual_bytes,
+            max_bytes,
+        },
+        _ => PreparedActivityError::Encoding,
+    })
+}
+
+/// Execute observe-before-dispatch for one explicitly routed strict effect.
+pub async fn observe_or_dispatch_effect<E, H>(
+    handler: &mut H,
+    activity: &crate::LogicalActivityId,
+    attempt_id: AttemptId,
+    prepared: &PreparedCommand,
+) -> Result<EffectHostStep, String>
+where
+    E: DurableEffect,
+    H: Send + DispatchEffect<E> + ObserveEffect<E>,
+    <H as DispatchEffect<E>>::Error: std::fmt::Display,
+    <H as ObserveEffect<E>>::Error: std::fmt::Display,
+{
+    let request =
+        validate_effect_activity::<E>(activity.spec()).map_err(|error| error.to_string())?;
+    if prepared.max_bytes() != E::MAX_COMMAND_BYTES {
+        return Err("prepared command bound differs from the effect contract".to_string());
+    }
+    let command =
+        decode_effect_command::<E>(prepared).map_err(|error| format!("decode command: {error}"))?;
+    if let Some(outcome) = <H as ObserveEffect<E>>::observe(handler, &request, &command, attempt_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return crate::EffectObservation::from_outcome::<E>(activity.clone(), attempt_id, &outcome)
+            .map(Box::new)
+            .map(EffectHostStep::Observed)
+            .map_err(|error| error.to_string());
+    }
+    match <H as DispatchEffect<E>>::dispatch(handler, &request, &command, attempt_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        Some(outcome) => {
+            crate::EffectObservation::from_outcome::<E>(activity.clone(), attempt_id, &outcome)
+                .map(Box::new)
+                .map(EffectHostStep::Observed)
+                .map_err(|error| error.to_string())
+        }
+        None => Ok(EffectHostStep::Pending),
+    }
+}
+
+/// Observe one quarantined explicitly routed strict effect without dispatch.
+pub async fn observe_quarantined_effect<E, H>(
+    handler: &mut H,
+    activity: &crate::LogicalActivityId,
+    attempt_id: AttemptId,
+    prepared: &PreparedCommand,
+) -> Result<Option<crate::EffectObservation>, String>
+where
+    E: DurableEffect,
+    H: Send + ObserveQuarantinedEffect<E>,
+    <H as ObserveQuarantinedEffect<E>>::Error: std::fmt::Display,
+{
+    let request =
+        validate_effect_activity::<E>(activity.spec()).map_err(|error| error.to_string())?;
+    if prepared.max_bytes() != E::MAX_COMMAND_BYTES {
+        return Err("prepared command bound differs from the effect contract".to_string());
+    }
+    let command =
+        decode_effect_command::<E>(prepared).map_err(|error| format!("decode command: {error}"))?;
+    let context = EffectQuarantineContext::<E>::new(&request, &command, attempt_id);
+    <H as ObserveQuarantinedEffect<E>>::observe_quarantined(handler, context)
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|outcome| {
+            crate::EffectObservation::from_outcome::<E>(activity.clone(), attempt_id, &outcome)
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+/// Decode a persisted typed result into an authenticated strict observation.
+pub fn decode_effect_observation<E: DurableEffect>(
+    activity: crate::LogicalActivityId,
+    attempt_id: AttemptId,
+    result: &ExactBytes,
+) -> Result<crate::EffectObservation, crate::ActivityCallError> {
+    let outcome = crate::decode_activity_result::<EffectActivity<E>>(result)?;
+    crate::EffectObservation::from_outcome::<E>(activity, attempt_id, &outcome)
 }
 
 impl EffectMetadata {
+    pub const fn new(max_command_bytes: u64, completion_class: CompletionClass) -> Self {
+        Self {
+            max_command_bytes,
+            completion_class,
+        }
+    }
+
     pub const fn of<E: DurableEffect>() -> Self {
         Self {
             max_command_bytes: E::MAX_COMMAND_BYTES,
@@ -890,56 +585,6 @@ pub trait PreparedEffectResolver: Sync {
     ) -> Result<PreparedCommand, PreparedActivityError>;
 }
 
-/// Resolver guard that admits only members of one validated static effect set.
-pub struct RegisteredEffectResolver<'a, S, R> {
-    delegate: &'a R,
-    marker: PhantomData<S>,
-}
-
-impl<'a, S, R> RegisteredEffectResolver<'a, S, R>
-where
-    S: DurableEffectSet + Sync,
-    R: PreparedEffectResolver,
-{
-    pub fn new(delegate: &'a R) -> Result<Self, EffectRoutingError> {
-        S::validate()?;
-        Ok(Self {
-            delegate,
-            marker: PhantomData,
-        })
-    }
-}
-
-impl<S, R> PreparedEffectResolver for RegisteredEffectResolver<'_, S, R>
-where
-    S: DurableEffectSet + Sync,
-    R: PreparedEffectResolver,
-{
-    fn resolve(
-        &self,
-        execution_id: ExecutionId,
-        logical: &ActivitySpec,
-        metadata: EffectMetadata,
-        recorded: Option<&PreparedCommand>,
-    ) -> Result<PreparedCommand, PreparedActivityError> {
-        let registration =
-            S::registration(logical).map_err(|_| PreparedActivityError::Validation)?;
-        if registration.max_command_bytes() != metadata.max_command_bytes()
-            || registration.completion_class() != metadata.completion_class()
-        {
-            return Err(PreparedActivityError::Validation);
-        }
-        if let Some(recorded) = recorded {
-            S::route(logical, recorded).map_err(|_| PreparedActivityError::Validation)?;
-        }
-        let prepared = self
-            .delegate
-            .resolve(execution_id, logical, metadata, recorded)?;
-        S::route(logical, &prepared).map_err(|_| PreparedActivityError::Validation)?;
-        Ok(prepared)
-    }
-}
-
 /// How an authoritative typed observation advances an exposed attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectObservationDisposition {
@@ -959,6 +604,10 @@ impl<E: DurableEffect> DurableActivity for EffectActivity<E> {
     const VERSION: u32 = E::VERSION;
     const MAX_INPUT_BYTES: u64 = E::MAX_REQUEST_BYTES;
     const MAX_RESULT_BYTES: u64 = E::MAX_RESULT_BYTES;
+
+    fn strict_effect_metadata() -> Option<EffectMetadata> {
+        Some(EffectMetadata::of::<E>())
+    }
 }
 
 /// Persistable exact prepared command, independent of the logical request.
@@ -1026,7 +675,7 @@ pub enum EffectContractError {
     Activity(#[from] ActivityCallError),
 }
 
-/// Deterministic typed failure returned by [`crate::WorkflowContext::call_effect`].
+/// Deterministic typed failure returned by a strict activity implementation.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum EffectCallError {
     #[error(transparent)]
@@ -1157,52 +806,6 @@ mod tests {
         const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
     }
 
-    struct PassiveEffect;
-
-    impl DurableEffect for PassiveEffect {
-        type Request = Request;
-        type Command = Command;
-        type Output = String;
-
-        const NAME: &'static str = "test.passive";
-        const VERSION: u32 = 2;
-        const MAX_REQUEST_BYTES: u64 = 15;
-        const MAX_COMMAND_BYTES: u64 = 15;
-        const MAX_RESULT_BYTES: u64 = 64;
-        const MAX_ERROR_MESSAGE_BYTES: u64 = 8;
-        const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
-    }
-
-    durable_effect_set! {
-        TestEffects => TestEffectRoute {
-            Effect,
-            PassiveEffect,
-        }
-    }
-
-    struct DuplicateEffect;
-
-    impl DurableEffect for DuplicateEffect {
-        type Request = Request;
-        type Command = Command;
-        type Output = String;
-
-        const NAME: &'static str = Effect::NAME;
-        const VERSION: u32 = Effect::VERSION;
-        const MAX_REQUEST_BYTES: u64 = 14;
-        const MAX_COMMAND_BYTES: u64 = 14;
-        const MAX_RESULT_BYTES: u64 = 32;
-        const MAX_ERROR_MESSAGE_BYTES: u64 = 8;
-        const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
-    }
-
-    durable_effect_set! {
-        DuplicateEffects => DuplicateEffectRoute {
-            Effect,
-            DuplicateEffect,
-        }
-    }
-
     #[test]
     fn request_and_command_bounds_are_independent_and_exact() {
         let exact = Request { value: "xx".into() };
@@ -1308,44 +911,5 @@ mod tests {
             ]),
             Err(EffectContractError::InvalidRedelivery)
         ));
-    }
-
-    #[test]
-    fn static_effect_set_routes_typed_payloads_and_rejects_unknown_or_duplicate_identities() {
-        TestEffects::validate().unwrap();
-        let request = Request {
-            value: "one".into(),
-        };
-        let command = Command {
-            value: "two".into(),
-        };
-        let activity =
-            crate::typed::activity_spec::<EffectActivity<PassiveEffect>>(&request).unwrap();
-        let command = encode_effect_command::<PassiveEffect>(&command).unwrap();
-        let TestEffectRoute::PassiveEffect { request, command } =
-            TestEffects::route(&activity, &command).unwrap()
-        else {
-            panic!("passive effect routed to the wrong static type");
-        };
-        assert_eq!(request.value, "one");
-        assert_eq!(command.value, "two");
-
-        let unknown = ActivitySpec::new(
-            crate::ActivityName::new("unknown", 1).unwrap(),
-            ExactBytes::new(b"{}"),
-            1,
-        );
-        assert!(matches!(
-            TestEffects::route(&unknown, &command_for_test()),
-            Err(EffectRoutingError::Unregistered { .. })
-        ));
-        assert!(matches!(
-            DuplicateEffects::validate(),
-            Err(EffectRoutingError::DuplicateIdentity { .. })
-        ));
-    }
-
-    fn command_for_test() -> PreparedCommand {
-        PreparedCommand::new(ExactBytes::new(b"{}"), 2).unwrap()
     }
 }
