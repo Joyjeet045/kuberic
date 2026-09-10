@@ -46,48 +46,101 @@ metadata:
 spec:
   replicas: 3
   image: my-app:latest
-  switchoverExecutionMode: explicit
   controlPort: 50051
   dataPort: 50052
   clientPort: 50053
 ```
 
-## Optional Durable Switchover Pilot
+## Framework-Native Switchover
 
-The existing explicit switchover state machine is the default. A `KubericSet`
-with at most three stable members can opt into the comparison pilot only when
-the operator binary is built with `--features durable-switchover-pilot` and
-the resource sets:
+Switchover has one production path: the direct deterministic async workflow.
+Its history uses 20 operation-specific version-1 activity names:
 
-```yaml
-spec:
-  switchoverExecutionMode: durablePilot
+```text
+revoke-writes, capture-frozen-lsn, wait-target-caught-up,
+demote-old-primary, promote-target, distribute-replica-epoch,
+install-target-catch-up-configuration, wait-target-write-quorum,
+install-target-current-configuration, publish-target-primary-label,
+publish-old-primary-secondary-label, attest-target-topology,
+restore-previous-current-configuration, compensate-promote-old-primary,
+compensate-distribute-replica-epoch,
+install-compensation-catch-up-configuration,
+install-compensation-current-configuration, restore-old-primary-label,
+restore-target-secondary-label, attest-compensated-topology
 ```
 
-The pilot stores format-3 checkpoints in same-namespace ConfigMaps named
+Each name is prefixed by `kuberic.switchover.`. The workflow source directly
+expresses normal ordering, sorted replica loops, waits, the pre-promotion
+restore path, and the post-promotion compensation path. The host adapter
+collects authoritative observations, prepares exact commands, dispatches only
+under a consumed one-use permit, resolves quarantine, and validates terminal
+state; it does not choose protocol progression.
+
+The durable inputs are genuinely operation-specific. Fixed old-primary,
+target-primary, distribution, configuration, and label activities expose only
+their own target and attempt fields; there is no persisted cross-operation
+kind enum or shared replica/label request superset behind the named history.
+
+The public `status.switchoverExecution` contract is version 4. This is an
+intentional clean break: previous switchover contract versions and histories
+are not migrated or resumed. The CRD exposes only the required current shape.
+Strict Kubernetes field validation rejects removed or unknown fields, missing
+required fields fail schema admission, and a resource in `Switchover` without
+the current reference fails closed.
+
+Format-3 checkpoints are stored in same-namespace ConfigMaps named
 `kuberic-checkpoint-<execution-id>`. They have a non-controlling owner
-reference to the `KubericSet`, remain through terminal reload, and are garbage
-collected with that owner. The operator needs ConfigMap `get`, `create`, and
-`update`; it does not need checkpoint delete permission. Reconciliation
-remains the scheduler and all replica mutations continue through
-`ReplicaAgent`.
+reference to the exact `KubericSet` UID, remain through terminal reload, and
+are garbage collected with that owner. The operator needs ConfigMap `get`,
+`create`, and `update`; it does not need checkpoint delete permission.
 
-The pilot workflow uses typed activity calls and compact effect/observation
-records. Deterministic switchover transitions replay in memory; fused
-checkpoint CAS operations durably expose an exact command before returning a
-permit and combine authoritative observation with the next command or terminal
-state. Unknown replica or UID-fenced label outcomes remain quarantined and are
-not automatically retried. Set/Pod watches provide normal wakeups, with
-bounded deadline requeues as a fallback.
+Kuberic supports 1–9 replicas. A one-replica set is valid but cannot switch
+primary because there is no distinct target; direct switchover accepts stable
+topologies with 2–9 members and rejects an invalid or identical target before
+any effect.
 
-Use `status.durableSwitchoverPilot` and the `DurableSwitchoverPilot` condition
-to inspect execution identity, storage reloads, exposed/quarantined work, and
-completion. The switchover selector does not apply to creation, add/build,
-removal, or failover; removal already uses the production framework-native
-path.
+Fused checkpoint compare-and-swap persists an exact prepared command before a
+permit exists and combines authoritative observation with the next exposure or
+terminal state. Unknown replica effects remain observation-only quarantined
+past their activity deadline. Only a matching terminal ledger record, the
+exact live postcondition, or generation-change proof of non-admission resolves
+an exposed replica command. Precondition, unavailable, and scheduled/in-progress
+evidence continue waiting. A new agent generation can permit one redelivery of
+the same action identity; a second proof stops. UID-fenced label effects are
+never redelivered and resolve only from the exact UID-bound label
+postcondition. Conflict or unknown checkpoint writes reload before any later
+permit.
 
-The representative integration test reports checkpoint, status, effect,
-label, and Pod-list measurements.
+Terminal state is compacted, reloaded, and validated before stable
+topology/status publication. The compact terminal records its immutable branch
+(`target_success`, `revoke_safe_failure`,
+`previous_configuration_restored`, or
+`post_promotion_compensated`). Kernel-authenticated completion metadata supplies
+the exact logical, external-effect, and passive-observation counts; the adapter
+continues to validate the legal branch and topology. Error strings are
+bounded to 512 UTF-8 bytes before activity or terminal persistence. Use
+`status.switchoverExecution`, its referenced ConfigMap, and the
+`FrameworkNativeSwitchover` condition to inspect admission, named history,
+reloads, quarantine, incompatibility, completion, or safe compensation.
+
+The canonical three-member no-fault sample records nine external effects,
+three passive observations, 12 logical boundaries, and 25 accepted writes.
+The nine-member maximum-fault production sample records 19 logical boundaries,
+16 external effects, three passive observations, and 67 accepted writes.
+The contract limits are 19 logical records, 4,096 workflow-input bytes,
+8,192 maximum activity-input/result bytes, 524,288 active bytes, 16,384
+terminal bytes, 4,096 terminal-payload bytes, 512 error bytes, 64 workflow
+transitions, and 32 runner outcomes per reconcile. The single 64-transition
+budget covers normal calls, compensation, attestation, and proof-backed
+redelivery. Measurements are validation snapshots, not compatibility
+constants.
+
+The runtime topology is unchanged: one Kubernetes operator process and the
+existing Set/Pod watches schedule the in-process runner; replica mutations
+still cross `ReplicaAgent`, and label mutations still cross the Kubernetes
+API. No worker, queue, lease, watcher, service, or remote activity host was
+added. Creation, add/build/rejoin, failover, and remove-replica keep their
+existing contracts and behavior.
 
 ## Deployment
 

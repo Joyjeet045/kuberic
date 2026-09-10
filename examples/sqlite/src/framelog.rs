@@ -136,25 +136,34 @@ impl FrameLog {
     pub async fn truncate_to(data_dir: &Path, max_lsn: Lsn) -> io::Result<()> {
         let entries = Self::read_all(data_dir).await?;
         let kept: Vec<_> = entries.into_iter().filter(|e| e.lsn <= max_lsn).collect();
+        let kept_len = kept.len();
 
-        let path = data_dir.join("frames.log");
-        let tmp_path = data_dir.join("frames.log.tmp");
-
-        let mut file = tokio::fs::File::create(&tmp_path).await?;
+        let mut buf = Vec::new();
         for entry in &kept {
             let payload = serde_json::to_vec(entry).map_err(io::Error::other)?;
             let len = payload.len() as u32;
             let crc = crc32fast::hash(&payload);
-            file.write_all(&len.to_le_bytes()).await?;
-            file.write_all(&payload).await?;
-            file.write_all(&crc.to_le_bytes()).await?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&payload);
+            buf.extend_from_slice(&crc.to_le_bytes());
         }
-        file.flush().await?;
-        file.sync_data().await?;
-        drop(file);
-        tokio::fs::rename(&tmp_path, &path).await?;
 
-        info!(max_lsn, kept = kept.len(), "frame log truncated");
+        let path = data_dir.join("frames.log");
+        let tmp_path = data_dir.join("frames.log.tmp");
+
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            use std::io::Write;
+            {
+                let mut file = std::fs::File::create(&tmp_path)?;
+                file.write_all(&buf)?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&tmp_path, &path)
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        info!(max_lsn, kept = kept_len, "frame log truncated");
         Ok(())
     }
 
@@ -180,13 +189,39 @@ impl FrameLog {
     pub async fn save_meta(data_dir: &Path, meta: &FrameLogMeta) -> io::Result<()> {
         let path = data_dir.join("meta.json");
         let tmp = data_dir.join("meta.json.tmp");
+        let dir = data_dir.to_path_buf();
         let json = serde_json::to_string(meta).map_err(io::Error::other)?;
-        tokio::fs::write(&tmp, &json).await?;
-        let f = tokio::fs::File::open(&tmp).await?;
-        f.sync_data().await?;
-        drop(f);
-        tokio::fs::rename(&tmp, &path).await?;
-        debug!(committed_lsn = meta.committed_lsn, "saved meta.json");
+        let committed_lsn = meta.committed_lsn;
+
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            use std::io::Write;
+            {
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(json.as_bytes())?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&tmp, &path)?;
+            sync_directory(&dir)
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        debug!(committed_lsn, "saved meta.json");
         Ok(())
     }
+}
+
+/// Flush the directory entry so a rename survives power loss.
+///
+/// Syncing the replacement file is not enough on filesystems that journal the
+/// directory separately. Windows has no directory handle to sync, and NTFS
+/// commits the rename with the file, so this is a no-op there.
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }

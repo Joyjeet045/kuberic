@@ -16,10 +16,10 @@ async fn test_kvstore_k8s_write_read() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Connect via NodePort
-    let mut client =
-        kvstore::proto::kv_store_client::KvStoreClient::connect("http://127.0.0.1:30090")
-            .await
-            .expect("failed to connect via NodePort 30090");
+    let endpoint = crate::test_utils::isolated_kvstore_endpoint();
+    let mut client = kvstore::proto::kv_store_client::KvStoreClient::connect(endpoint)
+        .await
+        .expect("failed to connect through the dedicated KinD port mapping");
 
     // Put a key
     let put_resp = client
@@ -51,7 +51,7 @@ async fn test_kvstore_k8s_write_read() {
 async fn test_kvstore_k8s_status_healthy() {
     crate::test_utils::ensure_kvstore_deployed().await;
 
-    let client = kube::Client::try_default().await.unwrap();
+    let client = crate::test_utils::isolated_kube_client().await;
     let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
         client,
         "xedio",
@@ -84,9 +84,156 @@ async fn test_kvstore_k8s_status_healthy() {
 #[tokio::test]
 #[test_log::test]
 #[serial_test::serial]
+async fn test_kvstore_k8s_direct_switchover_checkpoint_owner_gc() {
+    crate::test_utils::ensure_kvstore_deployed().await;
+    let client = crate::test_utils::isolated_kube_client().await;
+    let resource = kube::discovery::ApiResource {
+        group: "kuberic.io".into(),
+        version: "v1".into(),
+        kind: "KubericSet".into(),
+        api_version: "kuberic.io/v1".into(),
+        plural: "kubericsets".into(),
+    };
+    let sets: kube::Api<kube::api::DynamicObject> =
+        kube::Api::namespaced_with(client.clone(), "xedio", &resource);
+    let source = sets.get("kvstore").await.expect("failed to get source set");
+    let name = format!("kvstore-switchover-gc-{}", std::process::id());
+    let mut candidate = kube::api::DynamicObject::new(&name, &resource);
+    candidate.data = serde_json::json!({
+        "spec": source.data.get("spec").cloned().expect("source spec"),
+    });
+    sets.create(&kube::api::PostParams::default(), &candidate)
+        .await
+        .expect("failed to create switchover GC fixture");
+
+    crate::test_utils::wait_pods_ready("xedio", &format!("kuberic.io/set={name}"), 3, 180)
+        .await
+        .expect("switchover GC fixture pods failed to become ready");
+    crate::test_utils::wait_kubericset_healthy("xedio", &name, 3, 180)
+        .await
+        .expect("switchover GC fixture failed to become Healthy");
+
+    let healthy = sets.get(&name).await.expect("failed to reload fixture");
+    let status = healthy.data.get("status").expect("fixture status");
+    let current_primary = status
+        .get("currentPrimary")
+        .and_then(|value| value.as_str())
+        .expect("current primary");
+    let target = status
+        .get("members")
+        .and_then(|value| value.as_array())
+        .and_then(|members| {
+            members
+                .iter()
+                .filter_map(|member| member.get("name").and_then(|value| value.as_str()))
+                .find(|name| *name != current_primary)
+        })
+        .expect("secondary switchover target")
+        .to_string();
+    sets.patch_status(
+        &name,
+        &kube::api::PatchParams::default(),
+        &kube::api::Patch::Merge(serde_json::json!({
+            "status": {
+                "targetPrimary": target.clone(),
+            }
+        })),
+    )
+    .await
+    .expect("failed to request live direct switchover");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let terminal = loop {
+        let object = sets.get(&name).await.expect("failed to poll switchover");
+        let status = object.data.get("status");
+        let complete = status
+            .and_then(|status| status.get("phase"))
+            .and_then(|value| value.as_str())
+            == Some("Healthy")
+            && status
+                .and_then(|status| status.get("currentPrimary"))
+                .and_then(|value| value.as_str())
+                == Some(target.as_str())
+            && status
+                .and_then(|status| status.get("switchoverExecution"))
+                .is_some_and(|value| !value.is_null());
+        if complete {
+            break object;
+        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "live direct switchover did not complete"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    };
+
+    let owner_uid = terminal.metadata.uid.clone().expect("fixture UID");
+    let checkpoint_name = terminal
+        .data
+        .get("status")
+        .and_then(|status| status.get("switchoverExecution"))
+        .and_then(|execution| execution.get("checkpointName"))
+        .and_then(|value| value.as_str())
+        .expect("direct switchover checkpoint name")
+        .to_string();
+    let checkpoints: kube::Api<k8s_openapi::api::core::v1::ConfigMap> =
+        kube::Api::namespaced(client, "xedio");
+    let checkpoint = checkpoints
+        .get(&checkpoint_name)
+        .await
+        .expect("direct switchover terminal checkpoint");
+    let owners = checkpoint
+        .metadata
+        .owner_references
+        .as_deref()
+        .expect("direct switchover checkpoint owner");
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].uid, owner_uid);
+    assert_eq!(owners[0].controller, Some(false));
+    assert_eq!(owners[0].block_owner_deletion, Some(false));
+    let envelope: kuberic_durable_execution::CheckpointEnvelope = serde_json::from_str(
+        checkpoint
+            .data
+            .as_ref()
+            .and_then(|data| data.get("checkpoint.json"))
+            .expect("direct switchover checkpoint payload"),
+    )
+    .expect("valid direct switchover checkpoint envelope");
+    let payload: kuberic_durable_execution::CheckpointPayload =
+        serde_json::from_slice(envelope.payload().as_slice())
+            .expect("valid direct switchover checkpoint payload");
+    assert!(matches!(
+        payload.state(),
+        kuberic_durable_execution::CheckpointState::Terminal { .. }
+    ));
+
+    sets.delete(&name, &kube::api::DeleteParams::default())
+        .await
+        .expect("failed to delete switchover GC fixture");
+    let gc_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match checkpoints.get(&checkpoint_name).await {
+            Err(kube::Error::Api(error)) if error.code == 404 => break,
+            Ok(_) => {}
+            Err(error) => panic!("failed to poll checkpoint garbage collection: {error}"),
+        }
+        assert!(
+            std::time::Instant::now() <= gc_deadline,
+            "direct switchover checkpoint was not garbage collected"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    println!(
+        "KUBERIC_LIVE_DIRECT_SWITCHOVER owner_uid={owner_uid} checkpoint={checkpoint_name} target={target} owner_gc=complete"
+    );
+}
+
+#[tokio::test]
+#[test_log::test]
+#[serial_test::serial]
 async fn test_kvstore_k8s_framework_native_remove_replica() {
     crate::test_utils::ensure_kvstore_deployed().await;
-    let client = kube::Client::try_default().await.unwrap();
+    let client = crate::test_utils::isolated_kube_client().await;
     let sets: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
         client.clone(),
         "xedio",

@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 kuberic-core = { path = "../../kuberic-core" }
+sqlite-commit-barrier = { path = "../../sqlite-commit-barrier" }
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-stream.workspace = true
@@ -36,6 +37,7 @@ k8s-openapi.workspace = true
 kube.workspace = true
 async-trait.workspace = true
 serial_test.workspace = true
+tempfile = "3"
 
 [build-dependencies]
 tonic-prost-build.workspace = true

@@ -280,6 +280,8 @@ reconfiguration framework, or exactly-once ledger.
   that recovery protocol is not implemented.
 - Primary removal remains out of scope.
 
-Coarse agent-owned switchover is the next candidate. Its local
-reconfiguration sequence is still operator-sequenced and should move behind a
-separate coarse intent rather than being folded into removal.
+Follow-up switchover graduation retained individually correlated local
+mutations. Code research showed that switchover spans multiple replica agents
+and Kubernetes routing effects, while the existing exact per-command fences
+already provide the required durable recovery boundary; a separate coarse
+intent was therefore not introduced.

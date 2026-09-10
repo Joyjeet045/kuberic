@@ -69,6 +69,8 @@ spec:
                 description: Minimum replica set size. Operator won't reduce below
                   this.
                 format: int32
+                maximum: 9.0
+                minimum: 1.0
                 type: integer
               port:
                 default: 8080
@@ -87,6 +89,8 @@ spec:
                 default: 3
                 description: Total number of replicas (1 primary + N-1 secondaries).
                 format: int32
+                maximum: 9.0
+                minimum: 1.0
                 type: integer
               storage:
                 default: 256Mi
@@ -97,21 +101,6 @@ spec:
                 description: Max seconds for graceful primary demotion during switchover.
                 format: int32
                 type: integer
-              switchoverExecutionMode:
-                default: explicit
-                description: 'Execution engine for newly accepted primary switchovers.
-
-
-                  The durable pilot also requires an operator binary built with the
-
-                  matching compile-time feature. Existing and omitted values remain
-                  on
-
-                  the explicit CRD-backed state machine.'
-                enum:
-                - explicit
-                - durablePilot
-                type: string
             required:
             - image
             type: object
@@ -146,34 +135,6 @@ spec:
                 description: Pod name of the current primary.
                 nullable: true
                 type: string
-              durableSwitchoverPilot:
-                description: 'Immutable reference for the current or most recent durable-execution
-
-                  switchover pilot. Per-phase progress lives only in its checkpoint.'
-                nullable: true
-                properties:
-                  checkpointName:
-                    description: Deterministic provider object name derived from `execution_id`.
-                    type: string
-                  executionId:
-                    description: Lowercase hexadecimal kernel execution identity.
-                    type: string
-                  initialOperationJson:
-                    description: 'Exact JSON encoding of the initial operation accepted
-                      before checkpoint
-
-                      creation or effect dispatch.'
-                    type: string
-                  version:
-                    format: uint32
-                    minimum: 0.0
-                    type: integer
-                required:
-                - checkpointName
-                - executionId
-                - initialOperationJson
-                - version
-                type: object
               epoch:
                 default:
                   configurationNumber: 0
@@ -2251,6 +2212,126 @@ spec:
                 - members
                 - primaryId
                 - writeQuorum
+                type: object
+              switchoverExecution:
+                description: |-
+                  Structured immutable admission and checkpoint authority for the
+                  framework-native switchover execution.
+                nullable: true
+                properties:
+                  checkpointName:
+                    type: string
+                  contractVersion:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  executionId:
+                    type: string
+                  input:
+                    properties:
+                      acceptedUnixSeconds:
+                        format: int64
+                        type: integer
+                      operationAuthority:
+                        type: string
+                      previousSnapshot:
+                        description: Schema-safe persisted form of the core stable
+                          partition snapshot.
+                        properties:
+                          epoch:
+                            properties:
+                              configurationNumber:
+                                format: int64
+                                type: integer
+                              dataLossNumber:
+                                format: int64
+                                type: integer
+                            required:
+                            - configurationNumber
+                            - dataLossNumber
+                            type: object
+                          members:
+                            items:
+                              description: Schema-safe persisted identity and stable
+                                role of one replica.
+                              properties:
+                                electionMetadata:
+                                  nullable: true
+                                  properties:
+                                    committedLsn:
+                                      format: int64
+                                      type: integer
+                                    currentLsn:
+                                      format: int64
+                                      type: integer
+                                    deactivationCatchUpLsn:
+                                      format: int64
+                                      type: integer
+                                    deactivationEpoch:
+                                      properties:
+                                        configurationNumber:
+                                          format: int64
+                                          type: integer
+                                        dataLossNumber:
+                                          format: int64
+                                          type: integer
+                                      required:
+                                      - configurationNumber
+                                      - dataLossNumber
+                                      type: object
+                                    firstRetainedLsn:
+                                      format: int64
+                                      type: integer
+                                  required:
+                                  - committedLsn
+                                  - currentLsn
+                                  - deactivationCatchUpLsn
+                                  - deactivationEpoch
+                                  - firstRetainedLsn
+                                  type: object
+                                id:
+                                  format: int64
+                                  type: integer
+                                instanceId:
+                                  type: string
+                                role:
+                                  enum:
+                                  - primary
+                                  - activeSecondary
+                                  type: string
+                              required:
+                              - id
+                              - instanceId
+                              - role
+                              type: object
+                            type: array
+                          primaryId:
+                            format: int64
+                            type: integer
+                          writeQuorum:
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                        required:
+                        - epoch
+                        - members
+                        - primaryId
+                        - writeQuorum
+                        type: object
+                      targetPrimaryId:
+                        format: int64
+                        type: integer
+                    required:
+                    - acceptedUnixSeconds
+                    - operationAuthority
+                    - previousSnapshot
+                    - targetPrimaryId
+                    type: object
+                required:
+                - checkpointName
+                - contractVersion
+                - executionId
+                - input
                 type: object
               targetPrimary:
                 description: Pod name that should be primary. "pending" during failover.

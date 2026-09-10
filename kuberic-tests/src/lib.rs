@@ -15,6 +15,68 @@ pub mod test_utils {
         dir.parent().unwrap().to_path_buf()
     }
 
+    fn isolated_kube_coordinates() -> (String, String) {
+        let kubeconfig =
+            std::env::var("KUBECONFIG").expect("KinD tests require an isolated KUBECONFIG");
+        let context =
+            std::env::var("KUBE_CONTEXT").expect("KinD tests require an explicit KUBE_CONTEXT");
+        let cluster_name = std::env::var("KIND_CLUSTER_NAME")
+            .expect("KinD tests require an explicit KIND_CLUSTER_NAME");
+        assert_ne!(cluster_name, "kind", "default KinD cluster is forbidden");
+        assert_eq!(
+            context,
+            format!("kind-{cluster_name}"),
+            "KUBE_CONTEXT must match the dedicated KinD cluster"
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            assert_ne!(
+                std::path::Path::new(&kubeconfig),
+                std::path::Path::new(&home).join(".kube/config"),
+                "default user kubeconfig is forbidden"
+            );
+        }
+        (kubeconfig, context)
+    }
+
+    pub async fn isolated_kube_client() -> kube::Client {
+        let (kubeconfig_path, context) = isolated_kube_coordinates();
+        let kubeconfig = kube::config::Kubeconfig::read_from(kubeconfig_path)
+            .expect("Failed to read isolated kubeconfig");
+        let config = kube::Config::from_custom_kubeconfig(
+            kubeconfig,
+            &kube::config::KubeConfigOptions {
+                context: Some(context),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to load isolated Kubernetes context");
+        kube::Client::try_from(config).expect("Failed to create isolated Kubernetes client")
+    }
+
+    pub fn isolated_kvstore_endpoint() -> String {
+        let cluster_name = std::env::var("KIND_CLUSTER_NAME")
+            .expect("KinD tests require an explicit KIND_CLUSTER_NAME");
+        let container_name = format!("{cluster_name}-control-plane");
+        let output = std::process::Command::new("docker")
+            .args(["port", &container_name, "30090/tcp"])
+            .output()
+            .expect("Failed to resolve dedicated KinD NodePort mapping");
+        assert!(
+            output.status.success(),
+            "Failed to resolve dedicated KinD NodePort mapping: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mapping = String::from_utf8(output.stdout).expect("Docker port output is not UTF-8");
+        let port = mapping
+            .trim()
+            .rsplit_once(':')
+            .map(|(_, port)| port)
+            .filter(|port| !port.is_empty())
+            .expect("Dedicated KinD NodePort mapping has no host port");
+        format!("http://127.0.0.1:{port}")
+    }
+
     pub async fn kubectl_apply(path: &std::path::Path) {
         run_kubectl_cmd(&["apply", "-f", path.to_str().unwrap()])
             .await
@@ -22,8 +84,14 @@ pub mod test_utils {
     }
 
     pub async fn run_kubectl_cmd(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-        tracing::info!("Running kubectl command: kubectl {:?}", args.join(" "));
+        let (kubeconfig, context) = isolated_kube_coordinates();
+        tracing::info!(
+            "Running kubectl command against isolated context {}: kubectl {:?}",
+            context,
+            args.join(" ")
+        );
         let output = tokio::process::Command::new("kubectl")
+            .args(["--kubeconfig", &kubeconfig, "--context", &context])
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -80,9 +148,7 @@ pub mod test_utils {
     }
 
     async fn ensure_kuberic_operator_deployed_internal() {
-        let client = kube::Client::try_default()
-            .await
-            .expect("Failed to create k8s client");
+        let client = isolated_kube_client().await;
         let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
             kube::Api::namespaced(client.clone(), NS_XEDIO);
         let name = "kuberic-operator";
@@ -143,7 +209,7 @@ pub mod test_utils {
         expected_replicas: i64,
         timeout_seconds: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = kube::Client::try_default().await?;
+        let client = isolated_kube_client().await;
         let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
             client,
             namespace,
@@ -210,7 +276,7 @@ pub mod test_utils {
         name: &str,
         replicas: i32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = kube::Client::try_default().await?;
+        let client = isolated_kube_client().await;
         let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
             client,
             namespace,
@@ -239,7 +305,7 @@ pub mod test_utils {
         expected_replicas: i64,
         timeout_seconds: u64,
     ) -> Result<kube::api::DynamicObject, Box<dyn std::error::Error>> {
-        let client = kube::Client::try_default().await?;
+        let client = isolated_kube_client().await;
         let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
             client,
             namespace,
@@ -295,7 +361,7 @@ pub mod test_utils {
         expected: usize,
         timeout_seconds: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = kube::Client::try_default().await?;
+        let client = isolated_kube_client().await;
         let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
             kube::Api::namespaced(client, namespace);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);

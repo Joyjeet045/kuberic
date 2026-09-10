@@ -2409,8 +2409,16 @@ fn decode_workflow_input(bytes: &[u8]) -> Result<RemoveReplicaWorkflowInput, Wor
     })
 }
 
-fn classify_checkpoint_activity(input: &ExactBytes) -> Option<DurableActivityClass> {
-    decode_boundary_input(input).ok().map(|input| input.class())
+fn classify_checkpoint_activity(activity: &ActivitySpec) -> Option<DurableActivityClass> {
+    if activity.name().name() != REMOVE_REPLICA_ACTIVITY_NAME
+        || activity.name().version() != REMOVE_REPLICA_ACTIVITY_VERSION
+        || activity.max_result_bytes() != REMOVE_REPLICA_MAX_BOUNDARY_RESULT_BYTES
+    {
+        return None;
+    }
+    decode_boundary_input(activity.input())
+        .ok()
+        .map(|input| input.class())
 }
 
 fn decode_checkpoint_terminal_accounting(
@@ -3540,7 +3548,6 @@ mod remove_replica_execution_tests {
                 image: "test:latest".to_string(),
                 failover_delay: 0,
                 switchover_delay: 30,
-                switchover_execution_mode: Default::default(),
                 port: 8080,
                 control_port: 9090,
                 data_port: 9091,
@@ -3742,6 +3749,7 @@ mod remove_replica_execution_tests {
         let HostOutcome::Quarantined {
             activity,
             attempt_id,
+            ..
         } = restarted
             .turn(&RemoveReplicaWorkflow, execution.clone())
             .await

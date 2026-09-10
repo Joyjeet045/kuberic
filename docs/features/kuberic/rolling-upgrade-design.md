@@ -764,11 +764,12 @@ intent and cannot inflate the stable failover denominator.
 `Healthy` state is now recoverable from the authoritative CRD
 `stableSnapshot`, current pod identities, and read-only runtime status.
 
-Durable create/add/explicit-switchover/failover transitions live in
-`status.operation`. Remove recovery starts from immutable
-`status.removeReplicaExecution` admission and reloads compact progress from its
-same-namespace ConfigMap. Interrupted workflow recovery observes those
-Kubernetes records rather than reconstructing mutation from driver memory.
+Durable create/add/failover transitions live in `status.operation`.
+Switchover and remove recovery start from immutable
+`status.switchoverExecution` and `status.removeReplicaExecution` admission and
+reload compact progress from same-namespace ConfigMaps. Interrupted workflow
+recovery observes those Kubernetes records rather than reconstructing mutation
+from driver memory.
 
 ### Should-Fix
 

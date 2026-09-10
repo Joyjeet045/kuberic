@@ -9,10 +9,6 @@ description = "Kubernetes operator for kuberic — manages KubericSet CRDs, pod 
 readme = "README.md"
 publish = false
 
-[features]
-default = []
-durable-switchover-pilot = []
-
 [[bin]]
 name = "kuberic-operator"
 path = "src/main.rs"
@@ -36,3 +32,4 @@ rand.workspace = true
 
 [dev-dependencies]
 kuberic-core = { path = "../kuberic-core", features = ["testing"] }
+serde_yaml_ng = "=0.10.0"

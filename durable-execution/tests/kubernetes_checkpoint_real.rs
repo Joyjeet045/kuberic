@@ -24,6 +24,7 @@ use k8s_openapi::{
 use kube::{
     Api, Client, ResourceExt,
     api::{DeleteParams, PostParams, WatchEvent, WatchParams},
+    config::{KubeConfigOptions, Kubeconfig},
 };
 
 use kuberic_durable_execution::{
@@ -144,7 +145,31 @@ impl Workflow for OneActivityWorkflow {
 
 #[tokio::test]
 async fn validates_real_api_cas_watch_compaction_and_ambiguous_recovery() -> TestResult<()> {
-    let client = match Client::try_default().await {
+    let kubeconfig_path =
+        std::env::var("KUBECONFIG").expect("real-API tests require an isolated KUBECONFIG");
+    let context =
+        std::env::var("KUBE_CONTEXT").expect("real-API tests require an explicit KUBE_CONTEXT");
+    let cluster_name = std::env::var("KIND_CLUSTER_NAME")
+        .expect("real-API tests require an explicit KIND_CLUSTER_NAME");
+    assert_ne!(cluster_name, "kind", "default KinD cluster is forbidden");
+    assert_eq!(context, format!("kind-{cluster_name}"));
+    if let Ok(home) = std::env::var("HOME") {
+        assert_ne!(
+            std::path::Path::new(&kubeconfig_path),
+            std::path::Path::new(&home).join(".kube/config"),
+            "default user kubeconfig is forbidden"
+        );
+    }
+    let kubeconfig = Kubeconfig::read_from(&kubeconfig_path)?;
+    let config = kube::Config::from_custom_kubeconfig(
+        kubeconfig,
+        &KubeConfigOptions {
+            context: Some(context.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let client = match Client::try_from(config) {
         Ok(client) => client,
         Err(error) => {
             eprintln!("KUBERNETES_PREFLIGHT endpoint=failed error={error}");
@@ -159,8 +184,8 @@ async fn validates_real_api_cas_watch_compaction_and_ambiguous_recovery() -> Tes
         }
     };
     println!(
-        "KUBERNETES_PREFLIGHT endpoint=passed server_version={}",
-        version.git_version
+        "KUBERNETES_PREFLIGHT endpoint=passed context={} server_version={}",
+        context, version.git_version
     );
 
     let suffix = SystemTime::now()

@@ -3,7 +3,7 @@
 This document tracks deferred work for the
 `kuberic-durable-execution` crate. The crate is a replay and persistence safety
 kernel, not an end-user orchestration runtime. Production remove-replica and
-optional switchover consume it through an in-process operator runner. Items
+switchover consume it through an in-process operator runner. Items
 below are ordered possibilities, not commitments.
 
 The ordering is informed by the broader user and provider surfaces in
@@ -16,8 +16,10 @@ compatibility with either project.
 The implemented kernel provides:
 
 - deterministic linear replay;
-- typed, versioned, bounded activity declarations and ordinary async calls
-  over the compatible exact-byte API;
+- typed, versioned durable effects with separate bounded logical requests,
+  exact prepared commands, typed outputs, and ordinary async calls;
+- static effect-set registration and reusable preparation, dispatch,
+  observation, bounded redelivery, and observation-only quarantine hosting;
 - exact activity matching and stable logical identity;
 - asynchronous load and compare-and-swap persistence;
 - opaque provider revision tokens and conservative unknown outcomes;
@@ -27,7 +29,8 @@ The implemented kernel provides:
   checkpoint sizes;
 - maximum-result capacity reservation before dispatch;
 - immutable execution-level terminal payload and admitted capacity;
-- completion-only active-to-terminal checkpoint compaction;
+- completion-only active-to-terminal checkpoint compaction with authenticated
+  completed, external-effect, and passive-observation counts;
 - direct terminal outcome reload without workflow polling;
 - ambiguity quarantine and authoritative observation recovery;
 - opt-in atomic observation/replay/next-exposure or terminal progression;
@@ -44,7 +47,7 @@ The implemented kernel provides:
 - real-API spike measurements for checkpoint/object size, accepted writes,
   canonical typed watch-event bytes, and unknown-outcome recovery;
 - a shared bounded operator runner used by production framework-native
-  remove-replica and the optional switchover workflow while preserving the
+  remove-replica and switchover workflows while preserving the
   `ReplicaAgent` mutation boundary;
 - direct kube-controller integration through Send workflow/store futures,
   without another executor or scheduler;
@@ -114,13 +117,14 @@ need. Short topology workflows should complete and use terminal compaction.
 
 ### Kernel Ergonomics
 
-1. **Implemented:** typed serde activity declarations and calls retaining exact
-   canonical encoded-byte matching, immutable version identity, declared
-   bounds, and portable deterministic codec/call failures.
-2. Keep domain rejection/failure in each typed bounded activity output; add a
-   generic activity-failure lifecycle only if a broader workflow demonstrates
-   that need.
-3. Add an activity registry only if a non-operator host needs runtime lookup.
+1. **Implemented:** typed effect declarations and calls retaining exact
+   canonical request matching, immutable version identity, independent
+   request/command/result bounds, shared bounded outcomes, and portable
+   deterministic codec/call failures.
+2. **Implemented:** compile-time effect-set registration for operator-hosted
+   workflows. Runtime discovery remains deferred.
+3. Add a runtime activity registry only if a non-operator host needs dynamic
+   lookup.
 4. Generalize passive convergence resolution only after another workflow
    demonstrates reusable policy beyond the in-process operator adapters.
 5. Add replay-aware tracing and checkpoint inspection.
@@ -177,14 +181,72 @@ preparation, effect/quarantine handling, deadlines, terminal validation, and
 publication. The Kubernetes reconciler remains the scheduler; no worker,
 queue, lease, watcher, distributed owner, or retry scheduler was added.
 
-Switchover remains optional and retains its existing public selection model.
-Its representative no-redelivery path remains nine external effects, three
-passive observations, 12 boundaries, and 13 accepted writes. Its byte
+Switchover is now a production framework-native consumer with no public
+selection model or optional build feature. Its representative no-redelivery
+path has nine external effects, three passive observations, 12 logical
+boundaries, and 25 accepted writes: exposure and observation are separate
+accepted writes, followed by terminal compaction. It is also the reference
+direct-style authoring slice:
+the workflow source names each protocol boundary and owns normal and
+compensating control flow, while the adapter owns observations, exact command
+preparation/dispatch, quarantine, and terminal validation. Its byte
 measurements and lifecycle limits remain operation-specific.
+
+### Graduated: Framework-Native Switchover
+
+`status.switchoverExecution` owns immutable admission and checkpoint identity.
+A resource in the `Switchover` phase without a current native reference fails
+closed; removed historical formats are neither migrated nor converted.
+
+The operation reuses the shared runner and ConfigMap provider through 20
+operation-specific version-1 typed effects in one static effect set. Logical
+requests and exact prepared replica/label commands are persisted separately.
+The direct async workflow
+visibly spells out ordered normal, pre-promotion restore, and post-promotion
+compensation paths. The adapter prepares individually correlated
+`ReplicaAgent` and exact-UID label commands but does not select protocol
+progression. A coarse agent-owned switchover intent was not introduced: unlike
+add and remove, the sequence spans multiple replicas and Kubernetes routing
+objects, and the existing per-command fences already supply authoritative
+ambiguity recovery.
+
+The effect requests are operation-local rather than aliases of a shared
+replica/label request and contain no host redelivery or prepared-command
+fields. Prepared exposed commands use a stricter recovery mode
+than undispatched requests: replica quarantine accepts only matching terminal
+ledger evidence, an exact postcondition, or generation-change non-admission;
+labels accept only their exact UID-fenced postcondition. Evidence-only exposed
+effects are re-evaluated without dispatch authority and wait rather than
+isolate if a command would be required. Compact terminals record the completed
+branch; the kernel authenticates exact completion and classification totals
+while the operator validates the legal branch and topology before publication.
+
+The product supports 1–9 replicas. A one-member set has no distinct switchover
+target; direct switchover accepts valid stable topologies with 2–9 members.
+The upper bound is enforced by the CRD and reconciler. The nine-member
+maximum-fault rollback uses 19 logical activity records; redelivery attempts
+remain inside those records. The status schema has one
+contract-version-4 execution-reference shape with required immutable input;
+there is no compatibility variant or migration. Missing fields fail schema
+admission, while strict Kubernetes field validation rejects removed or unknown
+fields before persistence.
+
+The independent limits are 19 logical activity records, 4,096 workflow-input bytes,
+8,192 maximum activity-input and activity-result bytes, 524,288 active bytes,
+16,384 terminal bytes, 4,096 terminal-payload bytes, 512 error bytes, 64
+workflow transitions, and 32 runner outcomes per reconcile. Declared-maximum
+fixtures remain below the 524,288-byte active and 16,384-byte terminal limits.
+Run-specific tests report exact active and terminal measurements. The
+nine-member maximum-fault production case completes 19 logical activities
+(16 external effects and three passive observations) with 67 accepted writes.
+
+The 64-transition limit is one workflow-wide budget consumed by normal,
+compensation, attestation, and redelivery calls. Activity and terminal error
+strings are enforced at 512 UTF-8 bytes on both write and reload paths.
 
 ### Graduated: Framework-Native Remove Replica
 
-Remove-replica is the first production framework-native consumer. It has one
+Remove-replica is a production framework-native consumer. It has one
 default execution path and no build or resource mode selector. Legacy pilot
 and explicit remove records are converted to durable incompatibility markers;
 they are never resumed, migrated, cleared as absent, or used to admit a new
@@ -201,8 +263,7 @@ The version-3 compact contract stores immutable admission once and records only
 tagged observations, exact prepared commands, compact effect results, or
 bounded proven-no-admission evidence at durable boundaries. The version bump
 stores the already encoded protobuf action as binary exact bytes rather than
-hexadecimal text. A public reducer and mid-operation compaction remain
-unnecessary.
+hexadecimal text. Mid-operation compaction remains unnecessary.
 
 The canonical three-member no-fault `ScaleDown` path is exactly three external
 effects, two passive observations, five completed durable boundaries, and six
@@ -224,13 +285,21 @@ active record, terminal record, and terminal payload are deliberately separate
 measurements. A write is accepted only when persistence returns an
 authoritative revision.
 
-### Next Operation Extension
+### Future Direct-Style Operation Migrations
 
-Add-replica was not migrated. A future framework-native add adapter can reuse
-the runner outcomes and supply its own observation, authority/preparation,
-exact effect and quarantine, deadline, terminal-validation, and publication
-rules. It must declare an independent compact versioned contract and limits.
-No additional service is required by that extension point.
+Direct-style switchover does not migrate or reinterpret the other production
+operations. Remove-replica remains on its existing framework-native compact
+workflow with one coarse primary-agent intent. Add/build/rejoin, failover, and
+creation retain their current operation-specific CRD-status checkpoints and
+behavior.
+
+A future direct-style remove- or add-replica migration may reuse the runner
+outcomes while supplying its own named activity catalog, observations,
+authority/preparation, exact effects, quarantine, deadlines, terminal
+validation, publication rules, versioned contract, and independent limits.
+That work requires separate design and compatibility review; it is not implied
+by the switchover reference slice. No additional service is required by the
+extension point.
 
 ## Explicitly Deferred
 
@@ -241,4 +310,5 @@ The roadmap does not currently commit to:
 - generic automatic compensation;
 - worker queues, leases, or a distributed scheduler;
 - a public orchestration platform;
-- additional Kuberic workflow ports, including add-replica.
+- direct-style ports of remove-replica, add/build/rejoin, failover, or
+  creation.

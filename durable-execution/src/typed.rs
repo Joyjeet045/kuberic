@@ -22,6 +22,14 @@ pub enum PreparedActivityError {
         "prepared activity result bound is {actual_bytes} bytes, exceeding the {max_bytes}-byte bound"
     )]
     ResultBoundTooLarge { actual_bytes: u64, max_bytes: u64 },
+    #[error(
+        "prepared activity command is {actual_bytes} bytes, exceeding the {max_bytes}-byte bound"
+    )]
+    CommandTooLarge { actual_bytes: u64, max_bytes: u64 },
+    #[error(
+        "prepared activity command bound {actual_bytes} differs from the declared {max_bytes}-byte bound"
+    )]
+    CommandBoundMismatch { actual_bytes: u64, max_bytes: u64 },
 }
 
 /// Opt-in resolver for replacing a logical request with its exact bounded

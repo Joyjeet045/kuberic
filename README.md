@@ -8,7 +8,8 @@ A stateful replication framework for Kubernetes. Provides quorum-based replicati
 
 - **Quorum replication** — primary replicates to secondaries, blocks until write quorum ACKs
 - **Automatic failover** — operator detects primary failure, promotes best secondary
-- **Graceful switchover** — write revocation → demotion → promotion with rollback on failure
+- **Graceful switchover** — typed durable effects with visible
+  write-revocation, promotion, and compensation paths
 - **Copy protocol** — new replicas built from full snapshot + incremental replay
 - **Epoch fencing** — stale primaries rejected via monotonic epoch numbers
 - **Kubernetes native** — custom operator with `KubericSet` CRD, bare pod management
@@ -17,6 +18,7 @@ A stateful replication framework for Kubernetes. Provides quorum-based replicati
 
 ```
 kuberic-core/          Core replication framework (replicator, driver, runtime)
+durable-execution/     Deterministic replay and checkpoint safety kernel
 kuberic-operator/      K8s operator (reconciler, CRD, pod management)
 examples/kvstore/      Replicated key-value store (HashMap + WAL)
 examples/sqlite/       Replicated SQLite database (WAL frame shipping)
@@ -66,6 +68,7 @@ The operator watches `KubericSet` resources and manages the full lifecycle: pod 
 
 - [Core protocols](docs/features/kuberic/protocols.md) — replication, copy, failover, switchover
 - [Operator design](docs/features/kuberic/operator.md) — reconciler, CRD, pod management
+- [Durable execution roadmap](docs/features/kuberic/durable-execution-roadmap.md) — kernel boundary and operation adoption
 - [User API](docs/features/kuberic/user-api.md) — PodRuntime, lifecycle events, StateProvider
 - [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations

@@ -3,66 +3,99 @@
 `kuberic-durable-execution` is a focused kernel for deterministic, linear
 workflow replay. It has no dependency on `kuberic-core` or
 `kuberic-operator`; the operator uses it for production framework-native
-remove-replica and can also use it for the optional switchover workflow. It is
-not an end-user runtime.
+remove-replica and switchover workflows. It is not an end-user runtime.
 
-## Selected authoring surface
+## Typed effect authoring
 
-The feasibility evaluation selected an ordinary async surface. A typed
-activity declares its input, output, immutable versioned identity, and encoded
-bounds once through `DurableActivity`. Workflow bodies use
-`WorkflowContext::call::<A>(input).await`; activity names, exact byte wrappers,
-JSON calls, and result bounds stay out of the workflow body. Workflow and
-store futures are `Send` so a host turn can run directly inside an asynchronous
-controller without a second executor.
+`DurableEffect` is the reusable authoring contract for operations that may
+change external state. An effect declares separate logical request, exact
+prepared command, and typed output types; immutable versioned identity;
+independent encoded bounds; bounded errors; and immutable completion
+classification. Workflow and store futures are `Send`, so a host turn can run
+directly inside an asynchronous controller without a second executor.
 
 ```rust
-use async_trait::async_trait;
 use kuberic_durable_execution::{
-    DurableActivity, ExactBytes, TerminalOutcome, Workflow, WorkflowContext,
+    CompletionClass, DurableEffect,
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
-struct GreetingInput {
-    name: String,
+struct GreetingRequest {
+    recipient: String,
 }
 
 #[derive(Deserialize, Serialize)]
-enum GreetingResult {
-    Greeted(String),
-    Rejected { code: u16 },
+struct GreetingCommand {
+    endpoint: String,
+    recipient: String,
 }
 
-struct Greet;
+#[derive(Deserialize, Serialize)]
+struct GreetingOutput {
+    message_id: String,
+}
 
-impl DurableActivity for Greet {
-    type Input = GreetingInput;
-    type Output = GreetingResult;
+struct SendGreeting;
+
+impl DurableEffect for SendGreeting {
+    type Request = GreetingRequest;
+    type Command = GreetingCommand;
+    type Output = GreetingOutput;
     const NAME: &'static str = "greeting";
     const VERSION: u32 = 1;
-    const MAX_INPUT_BYTES: u64 = 1024;
+    const MAX_REQUEST_BYTES: u64 = 1024;
+    const MAX_COMMAND_BYTES: u64 = 2048;
     const MAX_RESULT_BYTES: u64 = 4096;
+    const MAX_ERROR_MESSAGE_BYTES: u64 = 512;
+    const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
 }
 ```
 
-Inside `Workflow::run`, an ordinary call is:
+Inside `Workflow::run`, an ordinary typed call is:
 
 ```rust
-let result = context
-    .call::<Greet>(GreetingInput {
-        name: "Ada".to_owned(),
+let sent = context
+    .call_effect::<SendGreeting>(GreetingRequest {
+        recipient: "Ada".to_owned(),
     })
-    .await;
+    .await?;
 ```
 
-`ActivityCallError` reports deterministic identity, encoding, decoding, and
-bound failures in a portable bounded form. Domain rejection or failure belongs
-in the declared output enum, as shown above, and is stored through the same
-completed-result lifecycle as success. The low-level
-`WorkflowContext::activity(ActivitySpec)` API remains available for justified
-advanced and compatibility uses. No explicit poll/replay authoring surface is
-exported.
+`EffectCallError` distinguishes contract/call failures from a bounded
+`BoundedEffectError`. The common persisted `EffectOutcome<T>` represents
+applied typed data, proven non-admission, domain failure, deadline expiry,
+unavailability, and conflicting evidence. Workflows can use ordinary `?`
+propagation while explicitly matching the domain failures that lead to
+compensation.
+
+Hosts implement `PrepareEffect`, `ObserveEffect`, `DispatchEffect`, and
+`ObserveQuarantinedEffect`. A declarative `durable_effect_set!` lists the
+allowed effect types and generates static identity, metadata, preparation,
+observation, and quarantine routing. It does not generate lifecycle policy or
+inspect conventionally named request fields.
+
+The logical request and prepared command are persisted separately. The command
+is derived from authoritative evidence, bounded, validated against immutable
+execution authority, and accepted before a one-use permit exposes it to
+dispatch. Replay validates the recorded command rather than deriving a
+replacement from mutable evidence.
+
+One logical record has a bounded attempt ledger. A proven-no-admission
+observation may authorize one more exposure with a new attempt identity and
+the same logical request and command. An unknown exposed outcome enters
+observation-only quarantine and can never regain dispatch authority. Terminal
+compaction authenticates completed, external-effect, and passive-observation
+counts from registered effect metadata.
+
+`DurableActivity`, `WorkflowContext::call`, and the low-level
+`WorkflowContext::activity(ActivitySpec)` API remain available for compatible
+non-effect boundaries and advanced uses.
+
+This surface is inspired by Duroxide/Durable Task-style ordinary async
+authoring; it is not Duroxide API or runtime compatibility. The crate does not
+provide workers, queues, leases, timers, generic retries, external events,
+parallel orchestration, child workflows, or cancellation.
 
 ## Replay and checkpoint semantics
 
@@ -361,12 +394,11 @@ CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes
 ```
 
 The repository's existing [CI workflow](../.github/workflows/CI.yml) enables
-all crate features on its workspace-wide test command after the existing
-`helm/kind-action` step has provisioned the shared one-control-plane KinD
-environment. There is no separate provider test step, second cluster, or
-second cleanup owner. Cluster lifecycle remains owned by the existing KinD
-action. Ordinary local and default Cargo test runs without the Kubernetes
-feature do not select this test.
+all crate features on its workspace-wide test command after
+`helm/kind-action` has provisioned a uniquely named, one-control-plane KinD
+environment with a dedicated kubeconfig/context, dynamic loopback port, and
+ownership receipt. There is no second provider cluster or cleanup owner.
+Ordinary local and default Cargo test runs without the Kubernetes feature do not select this test.
 
 The test reports a failed endpoint or authorization precondition rather than
 claiming real-API coverage. Its apply-then-unknown and no-apply-unknown cases
@@ -383,14 +415,20 @@ library `[dependencies]` table rather than test-only dependencies and retains a
 negative fixture for a real library runtime dependency. The mechanically
 derived result is **feasible** within this kernel's stated boundary.
 
-## Production operator consumer
+## Production operator consumers
 
-Framework-native remove-replica is the production consumer of the shared
-operator runner. Its compact contract version 3 stores immutable admission once
-and records tagged passive observations, exact prepared replica/label/delete
-commands, compact results, and bounded redelivery evidence. Legacy pilot and
-explicit remove records, unsupported versions, and changed lifecycle limits
-are incompatible rather than migrated or restarted.
+Framework-native remove-replica and direct-style switchover are production
+consumers of the shared operator runner. Both use the same load/reload,
+single-use permit, fused progression, quarantine, terminal compaction, and
+ConfigMap provider mechanisms, but each adapter retains its own contract,
+activity/result shapes, limits, observations, effects, deadlines, terminal
+validation, and publication rules.
+
+Remove-replica's compact contract version 3 stores immutable admission once
+and records tagged passive observations, exact prepared
+replica/label/delete commands, compact results, and bounded redelivery
+evidence. Legacy pilot and explicit remove records, unsupported versions, and
+changed lifecycle limits are incompatible rather than migrated or restarted.
 
 `status.removeReplicaExecution` owns the immutable execution reference,
 admission authority, and incompatibility marker. The referenced same-namespace
@@ -415,12 +453,31 @@ collection. Independently retained orphan cleanup remains a separately
 authorized lifecycle responsibility. No worker, queue, lease, watcher, or
 separate execution service is introduced.
 
+Direct-style switchover uses 20 operation-specific version-1 typed effects in
+one static effect set.
+Its workflow source, rather than the kernel or host adapter, visibly owns the
+normal and compensating sequence. The adapter resolves logical calls to exact
+prepared `ReplicaAgent` or UID-fenced label commands, persisted separately
+from domain requests before exposure, and supplies authoritative observations
+afterward. This demonstrates the reusable direct authoring pattern without
+adding runtime discovery, a generic compensation engine, or a distributed
+runtime.
+
+Those effect requests remain operation-local; the adapter does not persist a
+cross-operation kind/request union behind the typed names. Once an effect is
+exposed, its deadline is not evidence of failure: replica quarantine resolves
+only from a matching terminal ledger record, the exact live postcondition, or
+generation-change proof of non-admission, while labels resolve only from the
+exact UID-fenced label postcondition. The workflow applies one checked
+transition budget across normal calls, compensation, attestation, and
+redelivery.
+
 ## Deferred usability roadmap
 
 The crate intentionally stops at the durable-execution kernel.
 Completion-only compaction and an isolated Kubernetes checkpoint-provider spike
-are implemented. Production framework-native remove-replica and optional
-switchover adopt the kernel through a shared in-process operator runner without
+are implemented. Production framework-native remove-replica and switchover
+adopt the kernel through a shared in-process operator runner without
 moving effect ownership into it. Generic active-history compaction and
 continuation remain excluded. The remaining ordered deferred work is tracked in
 [Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
@@ -429,10 +486,10 @@ continuation remain excluded. The remaining ordered deferred work is tracked in
 
 The kernel remains experimental as a general-purpose orchestration framework.
 The ConfigMap provider is production-required, not opt-in, for
-framework-native remove-replica: `kuberic-operator` enables it unconditionally
-and owns the provider contract described above. The earlier isolated
-real-API evaluation does not establish generic persistence fitness for other
-consumers, distributed execution ownership, a worker, queue, lease, activity
+framework-native remove-replica and switchover: `kuberic-operator` enables it unconditionally
+and owns the provider contract described above. The earlier isolated real-API
+evaluation does not establish generic persistence fitness for other consumers,
+distributed execution ownership, a worker, queue, lease, activity
 handler, automatic observation polling, or passive-observation transport. The
 kernel does not establish a canonical exact-byte representation across
 versions.
@@ -450,5 +507,6 @@ lifecycle APIs, queries, external events, child workflows, workers, queues,
 leases, and distributed runtime ownership are excluded. So are migrations,
 upgrade guarantees, broad rollout of other operations, and production
 diagnostics. Framework-native remove-replica integrates typed calls and
-operator-owned effect adapters by default, while switchover remains optional.
-Neither changes `ReplicaAgent` or the gRPC protocol.
+operator-owned effect adapters through its existing compact workflow;
+switchover is the direct-style named-activity reference. Neither changes
+`ReplicaAgent` or the gRPC protocol.
