@@ -1,9 +1,9 @@
-# Kuberic Durable Execution Kernel
+# Kuberic DEX
 
-`kuberic-durable-execution` is a focused kernel for deterministic, linear
-workflow replay. It has no dependency on `kuberic-core` or
-`kuberic-operator` and is not currently integrated into the operator. It is
-not an end-user runtime.
+Kuberic DEX (`kuberic-dex`) is the project's durable execution kernel. It
+provides deterministic, linear workflow replay, has no dependency on
+`kuberic-core` or `kuberic-operator`. It is not currently integrated into the
+operator and is not an end-user runtime.
 
 ## Ordinary typed activity authoring
 
@@ -13,7 +13,7 @@ encoded bounds. Workflow and store futures are `Send`, so a host turn runs
 directly inside an asynchronous controller without a second executor.
 
 ```rust
-use kuberic_durable_execution::{
+use kuberic_dex::{
     ActivityOptions, DurableActivity,
 };
 use serde::{Deserialize, Serialize};
@@ -182,7 +182,7 @@ effects:
 
 ```rust,no_run
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-use kuberic_durable_execution::KubernetesCheckpointStore;
+use kuberic_dex::KubernetesCheckpointStore;
 
 let client = kube::Client::try_default().await?;
 let store = KubernetesCheckpointStore::new(client, "durable-checkpoints")?;
@@ -361,21 +361,21 @@ observation's trust source or transport.
 Run the bounded feasibility evidence and the complete crate/workspace gates:
 
 ```console
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --test feasibility -- --nocapture
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --all-targets
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --doc
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --test feasibility -- --nocapture
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --all-targets
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --doc
 cargo fmt --all -- --check
 CARGO_BUILD_JOBS=2 cargo check --workspace
-CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --all-targets -- -D warnings
+CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-dex --all-targets -- -D warnings
 ```
 
 The standalone kernel exposes the Kubernetes provider behind its optional
 `kubernetes` feature:
 
 ```console
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint -- --nocapture
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --all-targets
-CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --features kubernetes --all-targets -- -D warnings
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --features kubernetes --test kubernetes_checkpoint -- --nocapture
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --features kubernetes --all-targets
+CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-dex --features kubernetes --all-targets -- -D warnings
 ```
 
 A feature-gated test performs authorization preflight, creates a temporary
@@ -383,7 +383,7 @@ namespace, validates the provider against the configured real Kubernetes API,
 prints its measurement report, and waits for namespace deletion:
 
 ```console
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --features kubernetes --test kubernetes_checkpoint_real
 ```
 
 The repository's existing [CI workflow](../.github/workflows/CI.yml) enables
@@ -419,11 +419,11 @@ state or traffic.
 
 ## Deferred usability roadmap
 
-The crate intentionally stops at the durable-execution kernel.
+The crate intentionally stops at the kuberic-dex kernel.
 Completion-only compaction and an isolated Kubernetes checkpoint-provider spike
 are implemented. Operator integration, generic active-history compaction, and
 continuation remain excluded. The remaining ordered deferred work is tracked in
-[Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
+[Kuberic DEX Roadmap](../docs/features/kuberic/kuberic-dex-roadmap.md).
 
 ## Limitations and exclusions
 

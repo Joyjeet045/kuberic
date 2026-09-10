@@ -75,7 +75,7 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 /// codec canonicalizes JSON object-key order before exact-byte matching.
 ///
 /// ```compile_fail
-/// use kuberic_durable_execution::DurableActivity;
+/// use kuberic_dex::DurableActivity;
 ///
 /// struct NotSerializable;
 /// struct InvalidActivity;
@@ -91,7 +91,7 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 /// ```
 ///
 /// ```compile_fail
-/// use kuberic_durable_execution::DurableActivity;
+/// use kuberic_dex::DurableActivity;
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Deserialize, Serialize)]
@@ -110,7 +110,7 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 /// ```
 ///
 /// ```compile_fail
-/// use kuberic_durable_execution::{DurableActivity, WorkflowContext};
+/// use kuberic_dex::{DurableActivity, WorkflowContext};
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Deserialize, Serialize)]

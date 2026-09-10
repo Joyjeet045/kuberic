@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use kuberic_durable_execution::{
+use kuberic_dex::{
     ActivityCallError, ActivityName, ActivityOptions, ActivityRecord, ActivitySequence,
     ActivitySpec, ActivityState, AttemptId, CheckpointEnvelope, CheckpointError, CheckpointLimits,
     CheckpointPayload, CompletionClass, DurableActivity, DurableEffect, EffectActivity,
@@ -625,12 +625,9 @@ fn active_and_terminal_encoded_limits_are_enforced_independently() {
             continue;
         }
         let external = 10_000_000_000_000_000_000_u64;
-        let metadata = kuberic_durable_execution::CompletionMetadata::from_counts(
-            u64::MAX,
-            external,
-            u64::MAX - external,
-        )
-        .unwrap();
+        let metadata =
+            kuberic_dex::CompletionMetadata::from_counts(u64::MAX, external, u64::MAX - external)
+                .unwrap();
         let terminals = [
             CheckpointPayload::terminal(
                 contract.clone(),

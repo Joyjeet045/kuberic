@@ -1,4 +1,4 @@
-//! Experimental durable-execution kernel primitives.
+//! Kuberic DEX durable execution kernel primitives.
 //!
 //! This crate is isolated from Kuberic production components. Its current
 //! ordinary-async authoring API is paired with a runtime-neutral asynchronous

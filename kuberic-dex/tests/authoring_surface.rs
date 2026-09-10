@@ -2,7 +2,7 @@ mod support;
 
 use async_trait::async_trait;
 use futures::executor::block_on;
-use kuberic_durable_execution::{
+use kuberic_dex::{
     CheckpointLimits, DurableActivity, DurableHost, ExactBytes, ExecutionId, ExecutionSpec,
     HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome, InMemoryCheckpointStore, TerminalOutcome,
     Workflow, WorkflowContext,

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-  "durable-execution",
+  "kuberic-dex",
   "examples/kvstore",
   "examples/postgres",
   "examples/sqlite",

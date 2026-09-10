@@ -1,10 +1,10 @@
-# Durable Execution Framework Roadmap
+# Kuberic DEX Roadmap
 
 This document tracks deferred work for the
-`kuberic-durable-execution` crate. The crate is a replay and persistence safety
-kernel, not an end-user orchestration runtime. It is not currently integrated
-into the Kuberic operator. Items below are ordered possibilities, not
-commitments.
+Kuberic DEX (`kuberic-dex`) durable execution crate. The crate is a replay and
+persistence safety kernel, not an end-user orchestration runtime.
+It is not currently integrated into the Kuberic operator. Items below are
+ordered possibilities, not commitments.
 
 The ordering is informed by the broader user and provider surfaces in
 [Azure Durable Task Framework](https://github.com/Azure/durabletask) and

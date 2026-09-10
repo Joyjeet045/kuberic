@@ -1,11 +1,11 @@
 [package]
-name = "kuberic-durable-execution"
+name = "kuberic-dex"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Experimental deterministic replay framework for Kuberic feasibility evaluation"
+description = "Kuberic DEX durable execution and deterministic replay framework"
 readme = "README.md"
 publish = false
 

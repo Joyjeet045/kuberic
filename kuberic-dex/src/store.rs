@@ -11,7 +11,7 @@ use crate::{CheckpointEnvelope, ExecutionId};
 /// supports equality but deliberately exposes no ordering or increment API.
 ///
 /// ```compile_fail
-/// use kuberic_durable_execution::StorageRevision;
+/// use kuberic_dex::StorageRevision;
 ///
 /// let earlier = StorageRevision::new("provider-token-a").unwrap();
 /// let later = StorageRevision::new("provider-token-b").unwrap();

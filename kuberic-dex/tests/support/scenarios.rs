@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures::{FutureExt, future::poll_fn, join, task::AtomicWaker};
-use kuberic_durable_execution::{
+use kuberic_dex::{
     ActivityName, ActivityObservation, ActivitySequence, ActivitySpec, ActivityState, AttemptId,
     CHECKPOINT_FORMAT_VERSION, CasOutcome, CheckpointEnvelope, CheckpointError, CheckpointLimits,
     CheckpointPayload, CheckpointState, CheckpointStore, DispatchPermit, DurableHost, ExactBytes,
@@ -610,7 +610,7 @@ async fn restart_before_schedule(id: ScenarioId) -> ScenarioEvidence {
                 matches!(
                     rejected,
                     HostOutcome::StoreFailed {
-                        operation: kuberic_durable_execution::StoreOperation::CompareAndSwap(
+                        operation: kuberic_dex::StoreOperation::CompareAndSwap(
                             PersistenceBoundary::Schedule
                         ),
                         ..
@@ -1007,7 +1007,7 @@ async fn refreshed_attempt(id: ScenarioId) -> ScenarioEvidence {
                 matches!(
                     rejected,
                     HostOutcome::StoreFailed {
-                        operation: kuberic_durable_execution::StoreOperation::CompareAndSwap(
+                        operation: kuberic_dex::StoreOperation::CompareAndSwap(
                             PersistenceBoundary::Exposure
                         ),
                         ..
@@ -1591,7 +1591,7 @@ async fn load_absence_and_provider_failures(id: ScenarioId) -> ScenarioEvidence 
         kinds_preserved &= matches!(
             &outcome,
             HostOutcome::StoreFailed {
-                operation: kuberic_durable_execution::StoreOperation::Load,
+                operation: kuberic_dex::StoreOperation::Load,
                 error
             } if error.kind() == kind
         );
@@ -1638,7 +1638,7 @@ async fn load_absence_and_provider_failures(id: ScenarioId) -> ScenarioEvidence 
                 matches!(
                     observation_failure,
                     HostOutcome::StoreFailed {
-                        operation: kuberic_durable_execution::StoreOperation::Load,
+                        operation: kuberic_dex::StoreOperation::Load,
                         error
                     } if error.kind() == StoreErrorKind::Timeout
                 ),
@@ -2020,7 +2020,7 @@ async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
                 exact_completed,
                 terminal_capacity,
             ),
-            vec![kuberic_durable_execution::ActivityRecord::scheduled(
+            vec![kuberic_dex::ActivityRecord::scheduled(
                 ActivitySequence::new(0),
                 activity.clone(),
             )],
@@ -2821,7 +2821,7 @@ async fn completion_store_failures(id: ScenarioId) -> ScenarioEvidence {
                 matches!(
                     failed_write,
                     HostOutcome::StoreFailed {
-                        operation: kuberic_durable_execution::StoreOperation::CompareAndSwap(
+                        operation: kuberic_dex::StoreOperation::CompareAndSwap(
                             PersistenceBoundary::Completion
                         ),
                         ..
@@ -2838,7 +2838,7 @@ async fn completion_store_failures(id: ScenarioId) -> ScenarioEvidence {
                 matches!(
                     failed_load,
                     HostOutcome::StoreFailed {
-                        operation: kuberic_durable_execution::StoreOperation::Load,
+                        operation: kuberic_dex::StoreOperation::Load,
                         ..
                     }
                 ) && matches!(recovered, HostOutcome::WorkflowCompleted { .. }),

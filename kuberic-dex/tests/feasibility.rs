@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use futures::executor::block_on;
-use kuberic_durable_execution::{
+use kuberic_dex::{
     ActivityName, ActivitySpec, CheckpointLimits, DurableHost, ExactBytes, ExecutionId,
     ExecutionSpec, FeasibilityClassification, FeasibilityInputs, HOST_OUTCOME_VARIANTS, HostEpoch,
     HostOutcome, InMemoryCheckpointStore, TerminalOutcome, Workflow, WorkflowContext,
@@ -591,7 +591,7 @@ fn checkpoint_rbac_examples_are_structural_and_lifecycle_specific() {
 #[test]
 fn checkpoint_provider_readiness_contract_is_user_visible() {
     let readme = include_str!("../README.md");
-    let roadmap = include_str!("../../docs/features/kuberic/durable-execution-roadmap.md");
+    let roadmap = include_str!("../../docs/features/kuberic/kuberic-dex-roadmap.md");
     let workflow = include_str!("../../.github/workflows/CI.yml");
     let real_test = include_str!("kubernetes_checkpoint_real.rs");
 
@@ -646,7 +646,7 @@ fn documentation_matches_the_standalone_framework_boundary() {
         ),
         (
             "durable roadmap",
-            include_str!("../../docs/features/kuberic/durable-execution-roadmap.md"),
+            include_str!("../../docs/features/kuberic/kuberic-dex-roadmap.md"),
         ),
         (
             "operator design",
@@ -714,7 +714,7 @@ fn documentation_matches_the_standalone_framework_boundary() {
         ),
         (
             "durable roadmap",
-            include_str!("../../docs/features/kuberic/durable-execution-roadmap.md"),
+            include_str!("../../docs/features/kuberic/kuberic-dex-roadmap.md"),
         ),
         (
             "operator design",
@@ -784,7 +784,7 @@ fn documentation_matches_the_standalone_framework_boundary() {
     }
 
     let readme = include_str!("../README.md");
-    assert!(readme.contains("not currently integrated into the operator"));
+    assert!(readme.contains("not currently integrated"));
     assert!(readme.contains("ConfigMap provider remains optional"));
     assert!(!readme.contains("production-required, not opt-in"));
     assert!(!readme.contains("`kuberic-operator` enables it unconditionally"));

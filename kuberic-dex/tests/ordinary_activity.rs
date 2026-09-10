@@ -8,7 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use kuberic_durable_execution::{
+use kuberic_dex::{
     ActivityContext, ActivityFailure, ActivityHandlerError, ActivityInvocationOutcome,
     ActivityInvocationRuntime, ActivityName, ActivityOptions, ActivityRegistry,
     ActivityRegistryError, ActivityRunner, ActivitySequence, ActivitySpec, ActivityTimeoutRuntime,
@@ -382,7 +382,7 @@ async fn retry_is_persisted_under_one_logical_activity_and_gates_reexposure() {
     let workflow = TypedWorkflow {
         options: ActivityOptions::new(3, 1_000, Some(9_000), None).unwrap(),
     };
-    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let store = kuberic_dex::InMemoryCheckpointStore::new();
     let mut host = DurableHost::new(store.clone(), HostEpoch::from_bytes([9; 16]), limits());
 
     let HostOutcome::DispatchPermitted { permit, .. } =
@@ -445,7 +445,7 @@ async fn integrated_runner_retries_twice_then_replays_success() {
         })
         .build()
         .unwrap();
-    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let store = kuberic_dex::InMemoryCheckpointStore::new();
     let host = DurableHost::new(store, HostEpoch::from_bytes([10; 16]), limits());
     let mut runner = ActivityRunner::new(host, registry);
     let workflow = TypedWorkflow {
@@ -541,7 +541,7 @@ async fn exhausted_retry_replays_the_final_application_error() {
         })
         .build()
         .unwrap();
-    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let store = kuberic_dex::InMemoryCheckpointStore::new();
     let host = DurableHost::new(store, HostEpoch::from_bytes([11; 16]), limits());
     let mut runner = ActivityRunner::new(host, registry);
     let workflow = TypedWorkflow {
@@ -584,7 +584,7 @@ async fn timeout_is_terminal_and_does_not_consume_a_retry() {
         })
         .build()
         .unwrap();
-    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let store = kuberic_dex::InMemoryCheckpointStore::new();
     let host = DurableHost::new(store, HostEpoch::from_bytes([13; 16]), limits());
     let mut runner = ActivityRunner::new(host, registry).with_timeout_runtime(TokioTimeoutRuntime);
     let workflow = TypedWorkflow {
@@ -616,7 +616,7 @@ async fn elapsed_action_deadline_fails_without_invoking_handler() {
         })
         .build()
         .unwrap();
-    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let store = kuberic_dex::InMemoryCheckpointStore::new();
     let host = DurableHost::new(store, HostEpoch::from_bytes([15; 16]), limits());
     let mut runner = ActivityRunner::new(host, registry);
     let workflow = TypedWorkflow {
@@ -699,7 +699,7 @@ async fn unknown_result_cas_reloads_without_duplicate_after_apply() {
         })
         .build()
         .unwrap();
-    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let store = kuberic_dex::InMemoryCheckpointStore::new();
     store.fail_compare_and_swap_after(1, InMemoryFault::OutcomeUnknownAfterApply);
     let host = DurableHost::new(store, HostEpoch::from_bytes([14; 16]), limits());
     let mut runner = ActivityRunner::new(host, registry);
@@ -742,7 +742,7 @@ async fn unknown_retry_cas_after_apply_reloads_persisted_next_attempt() {
         })
         .build()
         .unwrap();
-    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let store = kuberic_dex::InMemoryCheckpointStore::new();
     store.fail_compare_and_swap_after(1, InMemoryFault::OutcomeUnknownAfterApply);
     let host = DurableHost::new(store, HostEpoch::from_bytes([17; 16]), limits());
     let mut runner = ActivityRunner::new(host, registry);
@@ -780,7 +780,7 @@ async fn lost_result_is_retried_with_the_same_logical_identity() {
         })
         .build()
         .unwrap();
-    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let store = kuberic_dex::InMemoryCheckpointStore::new();
     let mut host = DurableHost::new(store, HostEpoch::from_bytes([12; 16]), limits());
     let workflow = TypedWorkflow {
         options: ActivityOptions::new(3, 10, None, None).unwrap(),
@@ -814,7 +814,7 @@ async fn lost_result_at_attempt_limit_becomes_a_replayed_application_failure() {
         .register::<Echo, _, _>("Echo", |_context, input| async move { Ok(input.value) })
         .build()
         .unwrap();
-    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let store = kuberic_dex::InMemoryCheckpointStore::new();
     let mut host = DurableHost::new(store, HostEpoch::from_bytes([16; 16]), limits());
     let workflow = TypedWorkflow {
         options: ActivityOptions::new(1, 10, None, None).unwrap(),

@@ -18,11 +18,13 @@ A stateful replication framework for Kubernetes. Provides quorum-based replicati
 ```
 kuberic-core/          Core replication framework (replicator, driver, runtime)
 kuberic-operator/      K8s operator (reconciler, CRD, pod management)
+kuberic-dex/           Durable execution and deterministic replay kernel
 examples/kvstore/      Replicated key-value store (HashMap + WAL)
 examples/sqlite/       Replicated SQLite database (WAL frame shipping)
 ```
 
-See [kuberic-core](kuberic-core/) and [kuberic-operator](kuberic-operator/) for crate-level documentation.
+See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/), and
+[Kuberic DEX](kuberic-dex/) for crate-level documentation.
 
 The framework provides `PodRuntime` and `WalReplicator` — your service implements lifecycle event handlers and a gRPC API. See the [kvstore](examples/kvstore/) and [sqlite](examples/sqlite/) examples.
 
@@ -70,6 +72,7 @@ The operator watches `KubericSet` resources and manages the full lifecycle: pod 
 - [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
+- [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
 
 ## License
 

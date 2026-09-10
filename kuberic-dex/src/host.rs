@@ -174,7 +174,7 @@ impl EffectObservation {
 /// External callers can inspect a permit but cannot construct one:
 ///
 /// ```compile_fail
-/// use kuberic_durable_execution::{
+/// use kuberic_dex::{
 ///     ActivityName, ActivitySequence, ActivitySpec, AttemptId, DispatchPermit, ExactBytes,
 ///     ExecutionId, HostEpoch, LogicalActivityId,
 /// };

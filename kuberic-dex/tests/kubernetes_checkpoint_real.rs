@@ -27,7 +27,7 @@ use kube::{
     config::{KubeConfigOptions, Kubeconfig},
 };
 
-use kuberic_durable_execution::{
+use kuberic_dex::{
     ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome, CheckpointEnvelope,
     CheckpointLimits, CheckpointPayload, CheckpointStore, DurableHost, ExactBytes,
     ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome,

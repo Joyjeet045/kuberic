@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use kuberic_durable_execution::{
+use kuberic_dex::{
     CheckpointLimits, DurableActivity, Evaluation, ExactBytes, ExecutionId, ExecutionSpec,
     TerminalOutcome, Workflow, WorkflowContext, evaluate,
 };

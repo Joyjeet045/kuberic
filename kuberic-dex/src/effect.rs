@@ -352,7 +352,7 @@ pub trait ObserveQuarantinedEffect<E: DurableEffect>: Send {
 /// Evidence available to quarantine resolution without dispatch authority.
 ///
 /// ```compile_fail
-/// use kuberic_durable_execution::{DurableEffect, EffectQuarantineContext};
+/// use kuberic_dex::{DurableEffect, EffectQuarantineContext};
 ///
 /// fn cannot_redispatch<E: DurableEffect>(context: EffectQuarantineContext<'_, E>) {
 ///     let _permit = context.dispatch_permit();

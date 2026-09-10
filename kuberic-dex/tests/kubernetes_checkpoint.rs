@@ -13,7 +13,7 @@ use kube::{Client, client::Body};
 use serde_json::{Value, json};
 use tower::service_fn;
 
-use kuberic_durable_execution::{
+use kuberic_dex::{
     CasOutcome, CheckpointEnvelope, CheckpointLimits, CheckpointStore,
     DEFAULT_CONFIG_MAP_DATA_BUDGET_BYTES, DurableHost, ExactBytes, ExecutionId, ExecutionSpec,
     HostEpoch, HostOutcome, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
