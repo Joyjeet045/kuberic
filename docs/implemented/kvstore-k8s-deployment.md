@@ -16,8 +16,7 @@ Components:
 - **xdata-app**: StatefulSet (3 replicas) managed by the operator
 - **kuberic-operator**: Deployment (1 replica) watching `KubericSet` CRD
 - **kvstore**: 3 bare Pods managed by kuberic-operator
-- **kind-isolated-config.yaml**: loopback-only kvstore NodePort with a dynamic
-  host port for workflow-owned test clusters
+- **kind-config.yaml**: NodePort mappings 30081–30083 (xdata), 30090 (kvstore)
 
 The kuberic-operator creates bare Pods (not StatefulSets) and manages
 three ports per pod: app (8080), control (9090), data (9091).
@@ -96,54 +95,51 @@ spec:
   failoverDelay: 5
 ```
 
-### 3. KinD config — `deploy/kind-isolated-config.yaml` (repo root)
+### 3. KinD config — `deploy/kind-config.yaml` (repo root)
 
-The default `just` workflow requires a unique `KIND_CLUSTER_NAME`, isolated
-`KUBECONFIG`, and this loopback-only config. KinD allocates the kvstore host
-port dynamically so concurrent or unrelated clusters are not reused or
-reconfigured. `deploy/kind-config.yaml` remains an older fixed-port
-development example and is not the default test configuration.
+Single canonical config for the whole repo. Includes NodePort
+`extraPortMappings` for xdata-app (30081–30083) and kvstore (30090).
 
 ```yaml
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
-- role: control-plane
-  extraPortMappings:
-  - containerPort: 30090
-    hostPort: 0
-    listenAddress: 127.0.0.1
-    protocol: TCP
+  - role: control-plane
+    extraPortMappings:
+      # xdata-app pods
+      - containerPort: 30081
+        hostPort: 30081
+      - containerPort: 30082
+        hostPort: 30082
+      - containerPort: 30083
+        hostPort: 30083
+      # kvstore-rw client port
+      - containerPort: 30090
+        hostPort: 30090
 ```
 
 ### 4. Just recipes — `justfile`
 
 ```just
-cluster_name := env_var("KIND_CLUSTER_NAME")
-kubeconfig := env_var("KUBECONFIG")
-cluster_context := "kind-" + cluster_name
-
 kvstore-image: build-rust-bins
     docker build -t localhost/kvstore \
         -f examples/kvstore/deploy/Dockerfile .
-    kind load docker-image localhost/kvstore:latest --name {{ cluster_name }}
+    kind load docker-image localhost/kvstore:latest --name kind
 
-kvstore-deploy: verify-kind-context
-    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        apply -f examples/kvstore/deploy/kubericset.yaml
+kvstore-deploy:
+    kubectl apply -f examples/kvstore/deploy/kubericset.yaml
 
-kvstore-delete: verify-kind-context
-    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        delete -f examples/kvstore/deploy/kubericset.yaml
+kvstore-delete:
+    kubectl delete -f examples/kvstore/deploy/kubericset.yaml
 ```
 
 The root `justfile` also defines the Kind cluster and operator image recipes.
 
 ### 5. CI changes — `.github/workflows/CI.yml`
 
-CI creates a run-unique cluster with `deploy/kind-isolated-config.yaml`, uses
-an isolated run/attempt-specific kubeconfig, builds and loads the kvstore and
-operator images, and cleans up only that job's dedicated resources.
+Update the kind config path (or keep shared). Add kvstore image build
+alongside xdata images. The kuberic-tests crate can use the same
+`ensure_*_deployed()` pattern for kvstore.
 
 ## kvstore Binary Configuration
 
@@ -203,20 +199,17 @@ All are ClusterIP services (no NodePort). Port mappings:
 ### Dev/Test Access via NodePort
 
 A separate `nodeport-svc.yaml` overlay converts `kvstore-rw` to a
-NodePort service (container port 30090) for dev/test access from the host.
+NodePort service (port 30090) for dev/test access from the host.
 This is applied by the integration tests automatically. The KinD
-isolated config requests a dynamic host port, which the test resolves from the
-exact dedicated control-plane container.
+config includes `extraPortMappings` so NodePort 30090 is reachable
+at `localhost:30090`.
 
 ```bash
 # Apply NodePort overlay (done automatically by tests)
-kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
-  apply -f examples/kvstore/deploy/nodeport-svc.yaml
+kubectl apply -f examples/kvstore/deploy/nodeport-svc.yaml
 
-# Resolve the dedicated dynamic host port, then connect via gRPC
-HOST_PORT="$(docker port "${KIND_CLUSTER_NAME}-control-plane" 30090/tcp \
-  | sed -n 's/.*://p')"
-grpcurl -plaintext "localhost:${HOST_PORT}" kvstore.v1.KvStore/Get
+# Connect via gRPC
+grpcurl -plaintext localhost:30090 kvstore.v1.KvStore/Get
 ```
 
 > **Note**: `kubectl port-forward` is unreliable in WSL2/KinD due to
@@ -299,10 +292,6 @@ TCP probes on the control port (9090):
 
 ```
 # One-time setup
-export KIND_CLUSTER_NAME="kuberic-kvstore-$(date +%s)"
-export KUBECONFIG="$HOME/.kube/${KIND_CLUSTER_NAME}.config"
-export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
-export KIND_CONFIG="deploy/kind-isolated-config.yaml"
 just create-kind-cluster
 
 # Build and load images
@@ -317,13 +306,8 @@ just kuberic-operator-deploy
 just kvstore-deploy
 
 # Verify
-kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
-  get kubericsets -n xedio
-kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
-  get pods -n xedio
-
-# Clean up only this dedicated cluster and kubeconfig
-just delete-kind-cluster
+kubectl get kubericsets -n xedio
+kubectl get pods -n xedio
 ```
 
 ## Implementation Summary
@@ -345,9 +329,8 @@ Implemented in two PRs:
 - kvstore Dockerfile + Just recipes
 - kuberic-operator Dockerfile + manifests (CRD, RBAC, Deployment)
 - Binary env var support via clap `env` attribute
-- Dedicated KinD test config at `deploy/kind-isolated-config.yaml` with a
-  dynamically allocated loopback host port
-- NodePort service overlay for dev/test access (container port 30090)
+- KinD config consolidated at `deploy/kind-config.yaml` with NodePort mappings
+- NodePort service overlay for dev/test access (port 30090)
 - K8s integration tests: status check + gRPC Put/Get round-trip
 
 ## Open Questions
@@ -366,6 +349,5 @@ Implemented in two PRs:
 5. ~~**`build_pod()` typed builders**~~: Resolved — implemented with
    `k8s_openapi` typed builders.
 
-6. ~~**KinD test isolation**~~: Resolved — the default local and CI workflows
-   use `kind-isolated-config.yaml`, a unique cluster/kubeconfig, and a dynamic
-   loopback host port. The fixed-port config is not the canonical test path.
+6. ~~**KinD config consolidation**~~: Resolved — single canonical
+   config with NodePort mappings for all workloads.

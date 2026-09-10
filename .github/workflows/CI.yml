@@ -10,14 +10,11 @@ env:
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     env:
       KIND_CLUSTER_NAME: kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
       KUBECONFIG: /tmp/kuberic-kind-kubeconfig-${{ github.run_id }}-${{ github.run_attempt }}
       KUBE_CONTEXT: kind-kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
-    strategy:
-      matrix:
-        os: [ ubuntu-latest ]
     steps:
     - uses: actions/checkout@v7
 
@@ -44,112 +41,30 @@ jobs:
         sudo systemctl stop postgresql.service || true
         pg_config --version
 
-    - name: Run cargo check
-      run: cargo check --all-targets
-
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
 
     - name: Run cargo clippy
-      run: cargo clippy --all-targets -- -D warnings
-
-    - name: Run direct switchover contract, replay, and measurement gates
-      env:
-        RUST_MIN_STACK: 4194304
-      run: |
-        cargo test -p kuberic-operator direct_switchover_activity_identities_are_unique_positive_and_operation_specific
-        cargo test -p kuberic-operator direct_switchover_every_activity_accepts_exact_bounds_and_rejects_one_over
-        cargo test -p kuberic-operator direct_switchover_global_exact_bounds_and_one_over_are_enforced
-        cargo test -p kuberic-operator direct_switchover_declared_max_fault_payloads_fit_global_byte_bounds -- --nocapture
-        cargo test -p kuberic-operator direct_switchover_adapter_runs_success_and_both_compensation_families_at_scale -- --nocapture
-        cargo test -p kuberic-operator direct_switchover_nine_member_max_fault_measurement_fits_exact_limits -- --nocapture
-        cargo test -p kuberic-operator direct_switchover_adapter_is_deterministic_for_one_hundred_runs -- --nocapture
-        cargo test -p kuberic-operator direct_switchover_terminal_only_reload_recovers_named_activity_accounting
-        cargo test -p kuberic-operator direct_switchover_terminal_rejects_unreachable_branch_accounting
-        cargo test -p kuberic-operator direct_switchover_transition_budget_is_enforced_at_execution_boundary
-        cargo test -p kuberic-operator direct_switchover_unprepared_effect_exposures_recover_without_dispatch_authority
-        cargo test -p kuberic-operator direct_switchover_deadline_effects_reach_measured_terminal_reload
-        cargo test -p kuberic-operator direct_switchover_unresolved_replica_effects_remain_quarantined_past_deadline
-        cargo test -p kuberic-operator direct_switchover_unresolved_labels_remain_quarantined_past_deadline
-        cargo test -p kuberic-operator production_event_history_is_bounded
-
-    - name: Run direct switchover schema, deployment, and owner gates
-      run: |
-        cargo test -p kuberic-operator framework_native_switchover_schema_defines_only_the_current_native_shape
-        cargo test -p kuberic-operator crd_enforces_product_replica_bounds
-        cargo test -p kuberic-operator deployment_grants_only_checkpoint_writer_verbs
-        cargo test -p kuberic-operator direct_switchover_deployment_and_example_keep_the_single_process_status_owned_contract
-        cargo test -p kuberic-operator direct_switchover_checkpoint_owner_is_exact_noncontrolling_and_namespaced
-
-    - name: Run production-path switchover recovery and topology gates
-      env:
-        RUST_MIN_STACK: 4194304
-      run: |
-        cargo test -p kuberic-operator framework_native_switchover_route_ -- --nocapture
-        cargo test -p kvstore --test reconciler test_framework_native_switchover_ -- --nocapture
-
-    - name: Run unchanged create, add-build-rejoin, and failover gates
-      env:
-        RUST_MIN_STACK: 4194304
-      run: |
-        cargo test -p kvstore --test reconciler test_durable_create_
-        cargo test -p kvstore --test reconciler test_durable_add_
-        cargo test -p kvstore --test reconciler test_durable_rejoin_
-        cargo test -p kvstore --test reconciler test_reconciler_scale_up
-        cargo test -p kvstore --test reconciler test_scale_up_replays_writes_buffered_during_copy
-        cargo test -p kvstore --test reconciler test_reconciler_secondary_crash_and_rejoin
-        cargo test -p kvstore --test reconciler test_add_target_same_pod_process_restart_invalidates_build_proof
-        cargo test -p kvstore --test reconciler test_durable_failover_
-
-    - name: Run framework-native remove-replica gates
-      env:
-        RUST_MIN_STACK: 4194304
-      run: |
-        cargo test -p kuberic-operator framework_native_remove_replica
-        cargo test -p kuberic-operator durable_runner_tests
-        cargo test -p kuberic-operator checkpoint_store
-        cargo test -p kuberic-operator remove_replica_execution_rejects_all_six_one_byte_over_bounds
-        cargo test -p kuberic-operator remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds -- --nocapture
-        cargo test -p kvstore --test reconciler test_framework_native_remove_replica_
-        cargo test -p kvstore --test reconciler test_framework_native_remove_replica_three_no_fault_measurement_samples -- --nocapture
-
-    - name: Build all targets
-      run: cargo build --all-targets
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
     - name: Kubernetes KinD Cluster
-      id: kind
       uses: helm/kind-action@v1
       with:
         cluster_name: ${{ env.KIND_CLUSTER_NAME }}
         config: deploy/kind-isolated-config.yaml
         kubeconfig: ${{ env.KUBECONFIG }}
-        registry: true
-        registry_name: kuberic-registry-${{ github.run_id }}-${{ github.run_attempt }}
 
-    - name: Record isolated KinD ownership
+    - name: Record and verify isolated KinD ownership
       run: |
         printf '%s\n' \
           "cluster=${KIND_CLUSTER_NAME}" \
           "context=${KUBE_CONTEXT}" \
           "kubeconfig=${KUBECONFIG}" \
           | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
-
-    - name: Verify isolated KinD context
-      run: just verify-kind-context
-
-    - name: Resolve isolated kvstore endpoint
-      run: |
-        port="$(docker port "${KIND_CLUSTER_NAME}-control-plane" 30090/tcp | sed -n 's/.*://p')"
-        test -n "$port"
-        echo "KUBERIC_KVSTORE_ENDPOINT=http://127.0.0.1:${port}" >> "$GITHUB_ENV"
+        just verify-kind-context
 
     - name: Build and load Docker images
       run: just images
 
-    - name: Run isolated provider owner-GC and full workspace suite
-      env:
-        RUST_MIN_STACK: 4194304
-      run: |
-        cargo test -p kuberic-durable-execution --all-features -- --nocapture
-        cargo test -p kuberic-tests test_kvstore_k8s_direct_switchover_checkpoint_owner_gc -- --nocapture
-        cargo test --workspace --all-features --exclude kuberic-durable-execution
+    - name: Run workspace tests
+      run: cargo test --workspace --all-features -- --nocapture

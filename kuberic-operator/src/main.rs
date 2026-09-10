@@ -34,13 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sets: Api<KubericSet> = Api::all(client.clone());
     let pods: Api<Pod> = Api::all(client.clone());
 
-    let state = ReconcilerState::with_durable_client(client.clone());
-
     let ctx = Arc::new(Context {
         api: KubeClusterApi {
             client: client.clone(),
         },
-        state,
+        state: ReconcilerState::default(),
     });
 
     info!("Watching KubericSets");

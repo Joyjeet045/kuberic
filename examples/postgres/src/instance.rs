@@ -57,35 +57,26 @@ impl PgInstanceManager {
         &self.data_dir
     }
 
-    /// Connection string for local TCP access.
+    /// Connection string for local UDS access.
     /// Uses the current OS user (initdb creates a superuser matching the OS user).
     pub fn connection_string(&self) -> String {
         format!(
             "host={} port={} dbname=postgres",
-            self.listen_host(),
+            self.data_dir.display(),
             self.port,
         )
     }
 
     /// Initialize a new PG cluster with data checksums.
     pub async fn init_db(&self) -> Result<(), PgError> {
-        let mut command = Command::new(self.pg_bin.join("initdb"));
-        command.args([
-            "--data-checksums",
-            "-D",
-            &self.data_dir.to_string_lossy(),
-            "--auth=trust",
-            "--no-instructions",
-        ]);
-        if let Some(version) = self.pg_bin.parent().and_then(|path| path.file_name())
-            && let Some(usr_dir) = self.pg_bin.ancestors().nth(4)
-        {
-            let share_dir = usr_dir.join("share").join("postgresql").join(version);
-            if share_dir.is_dir() {
-                command.arg("-L").arg(share_dir);
-            }
-        }
-        let output = command
+        let output = Command::new(self.pg_bin.join("initdb"))
+            .args([
+                "--data-checksums",
+                "-D",
+                &self.data_dir.to_string_lossy(),
+                "--auth=trust",
+                "--no-instructions",
+            ])
             .env("LC_ALL", "C")
             .output()
             .await
@@ -211,7 +202,7 @@ impl PgInstanceManager {
         // (complements the exit monitor above). Exits quietly on shutdown.
         let port = self.port;
         let ft = fault_tx;
-        let host = self.listen_host().to_string();
+        let data_dir = self.data_dir.clone();
         let pg_bin = self.pg_bin.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -222,7 +213,14 @@ impl PgInstanceManager {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
                 }
                 let status = Command::new(pg_bin.join("pg_isready"))
-                    .args(["-h", &host, "-p", &port.to_string(), "-d", "postgres"])
+                    .args([
+                        "-h",
+                        &data_dir.to_string_lossy(),
+                        "-p",
+                        &port.to_string(),
+                        "-d",
+                        "postgres",
+                    ])
                     .output()
                     .await;
                 match status {
@@ -256,7 +254,7 @@ impl PgInstanceManager {
             let output = Command::new(self.pg_bin.join("pg_isready"))
                 .args([
                     "-h",
-                    self.listen_host(),
+                    &self.data_dir.to_string_lossy(),
                     "-p",
                     &self.port.to_string(),
                     "-d",
@@ -391,7 +389,7 @@ impl PgInstanceManager {
         Ok(())
     }
 
-    /// Connect to the local PG instance via TCP.
+    /// Connect to the local PG instance via UDS.
     pub async fn connect(
         &self,
     ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), PgError> {

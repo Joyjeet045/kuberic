@@ -8,16 +8,11 @@ use crate::crd::{
 };
 
 mod add_replica;
-pub mod checkpoint_store;
 mod create_partition;
-pub mod effects;
 mod failover;
 pub mod failover_election;
 mod remove_replica;
-pub mod remove_replica_execution;
-pub mod runner;
-pub mod switchover_execution;
-pub mod workflow_host;
+mod switchover;
 
 pub(crate) use add_replica::final_attestation as attest_add_replica;
 pub use add_replica::{decide_add_replica, start_add_replica};
@@ -29,13 +24,14 @@ pub use failover::{
     pending_label as failover_pending_label, record_observation, start_failover,
 };
 pub use remove_replica::{RemoveReplicaTarget, decide_remove_replica, start_remove_replica};
+pub use switchover::{decide, start_switchover};
 
 // Includes authorization, dispatch-fence persistence, activity, and
 // observation-first retry reconciles.
 pub const ACTION_DEADLINE_SECONDS: i64 = 10;
 const MAX_ERROR_LENGTH: usize = 512;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ReplicaObservation {
     pub status: ReplicaStatusInfo,
     pub control_address: String,

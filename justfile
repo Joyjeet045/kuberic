@@ -1,5 +1,5 @@
-cluster_name := env_var("KIND_CLUSTER_NAME")
-kubeconfig := env_var("KUBECONFIG")
+cluster_name := env_var_or_default("KIND_CLUSTER_NAME", "")
+kubeconfig := env_var_or_default("KUBECONFIG", "")
 cluster_context := "kind-" + cluster_name
 kind_config := env_var_or_default("KIND_CONFIG", "deploy/kind-isolated-config.yaml")
 ownership_receipt := kubeconfig + ".kuberic-owner"
@@ -9,6 +9,8 @@ default: images
 
 # Create the local Kind cluster and write its kubeconfig.
 create-kind-cluster:
+    test -n "{{ cluster_name }}"
+    test -n "{{ kubeconfig }}"
     test "{{ cluster_name }}" != "kind"
     test "{{ kubeconfig }}" != "$HOME/.kube/config"
     test "$(printf %s "{{ cluster_name }}" | wc -c)" -le 40
@@ -25,6 +27,8 @@ create-kind-cluster:
 
 # Verify the exact cluster/kubeconfig pair was created by this workflow.
 verify-kind-ownership:
+    test -n "{{ cluster_name }}"
+    test -n "{{ kubeconfig }}"
     test -f "{{ ownership_receipt }}"
     grep -Fx "cluster={{ cluster_name }}" "{{ ownership_receipt }}"
     grep -Fx "context={{ cluster_context }}" "{{ ownership_receipt }}"
@@ -45,10 +49,10 @@ build-rust-bins:
     cargo build --bins --workspace
 
 # Build and load all container images.
-images: verify-kind-context kuberic-operator-image kvstore-image
+images: kuberic-operator-image kvstore-image
 
 # Build and load the kuberic-operator image.
-kuberic-operator-image: build-rust-bins
+kuberic-operator-image: verify-kind-context build-rust-bins
     docker build -t localhost/kuberic-operator \
         -f kuberic-operator/deploy/Dockerfile .
     kind load docker-image localhost/kuberic-operator:latest --name {{ cluster_name }}
@@ -64,7 +68,7 @@ kuberic-operator-delete: verify-kind-context
         delete -f kuberic-operator/deploy/deployment.yaml
 
 # Build and load the kvstore image.
-kvstore-image: build-rust-bins
+kvstore-image: verify-kind-context build-rust-bins
     docker build -t localhost/kvstore \
         -f examples/kvstore/deploy/Dockerfile .
     kind load docker-image localhost/kvstore:latest --name {{ cluster_name }}

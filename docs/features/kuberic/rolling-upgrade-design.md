@@ -239,7 +239,7 @@ application.
 ### What Exists
 
 The kuberic operator (`kuberic-operator/src/reconciler.rs`) manages pods
-through Kubernetes-backed durable workflows:
+through CRD-backed durable workflows:
 
 | Operation | Description |
 |-----------|-------------|
@@ -358,13 +358,10 @@ every step, never proceed if the partition would lose quorum.
 ```
 
 Durable exact-incarnation removal followed by durable add/rebuild preserves
-the logical replica ID while making every partial state explicit in
-Kubernetes control-plane records. Remove admission and checkpoint identity
-live in `status.removeReplicaExecution`; compact progress and terminal evidence
-live in its owner-bound ConfigMap. Add/rebuild continues in
-`status.operation`. The reduced membership is committed before any serving pod
-deletion. Removal's workflow-scoped committed snapshot protects post-commit
-restart recovery until UID cleanup and final stable publication finish.
+the logical replica ID while making every partial state explicit in CRD
+status. The reduced membership is committed before any serving pod deletion.
+Removal's workflow-scoped committed snapshot protects post-commit restart
+recovery until UID cleanup and final stable publication finish.
 
 ### Pod Spec Drift Detection
 
@@ -414,8 +411,8 @@ human decision. The user can:
 
 ### Interaction with Existing Primitives
 
-Upgrade orchestration composes the existing Kubernetes-backed remove/rebuild
-and switchover state machines. Each runtime mutation crosses
+Upgrade orchestration composes the existing CRD-backed remove/rebuild and
+switchover state machines. Each runtime mutation crosses
 `ExecuteCorrelatedControlAction`; the read-only `PartitionDriver` is used only
 for stable recovery. Upgrade orchestration remains in the operator reconcile
 loop.
@@ -764,12 +761,9 @@ intent and cannot inflate the stable failover denominator.
 `Healthy` state is now recoverable from the authoritative CRD
 `stableSnapshot`, current pod identities, and read-only runtime status.
 
-Durable create/add/failover transitions live in `status.operation`.
-Switchover and remove recovery start from immutable
-`status.switchoverExecution` and `status.removeReplicaExecution` admission and
-reload compact progress from same-namespace ConfigMaps. Interrupted workflow
-recovery observes those Kubernetes records rather than reconstructing mutation
-from driver memory.
+Durable create/add/remove/switchover/failover transitions live in
+`status.operation`; interrupted workflow recovery observes those checkpoints
+rather than reconstructing mutation from driver memory.
 
 ### Should-Fix
 

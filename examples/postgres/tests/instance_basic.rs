@@ -72,7 +72,7 @@ async fn test_instance_restart() {
     let data_dir = temp_data_dir("restart");
     let (fault_tx, _fault_rx) = mpsc::channel(1);
 
-    let instance = PgInstanceManager::new(data_dir.clone(), pg_bin, allocate_port().await);
+    let instance = PgInstanceManager::new(data_dir.clone(), pg_bin, 15433);
     instance.init_db().await.unwrap();
     instance.start(fault_tx.clone()).await.unwrap();
 

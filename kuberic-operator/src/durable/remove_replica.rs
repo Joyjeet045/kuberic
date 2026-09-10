@@ -1230,7 +1230,6 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
             operation.version, REMOVE_REPLICA_OPERATION_VERSION
         ));
     }
-
     if operation.kind != DurableOperationKind::RemoveReplica {
         return Err("remove decision received another operation kind".to_string());
     }
@@ -1334,12 +1333,6 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
         return Err("remove disposition is not pinned in Poisoned".to_string());
     }
     Ok(())
-}
-
-pub(crate) fn validate_remove_replica_operation(
-    operation: &DurableOperationStatus,
-) -> Result<(), String> {
-    validate_operation(operation)
 }
 
 fn validate_snapshot(snapshot: &StablePartitionSnapshotStatus) -> Result<(), String> {
@@ -1533,10 +1526,7 @@ fn failed_precommit(operation: &DurableOperationStatus, reason: &str) -> Durable
     poison(&next, reason)
 }
 
-pub(crate) fn invalid_removal(
-    operation: &DurableOperationStatus,
-    reason: &str,
-) -> DurableOperationStatus {
+fn invalid_removal(operation: &DurableOperationStatus, reason: &str) -> DurableOperationStatus {
     let mut next = operation.clone();
     let intent = next.remove_intent.as_ref();
     next.removal_disposition = Some(RemoveReplicaDispositionStatus::InvalidRemovalState {
@@ -1933,6 +1923,31 @@ mod tests {
     }
 
     #[test]
+    fn remove_v1_is_rejected_without_compatibility() {
+        let mut operation = start_remove_replica(
+            "set",
+            snapshot(),
+            target(3, "three"),
+            DurableRemoveMode::Force,
+            2,
+            10,
+        )
+        .unwrap();
+        operation.version = 1;
+        assert!(
+            decide_remove_replica(
+                &operation,
+                &OperationObservations::new(),
+                &OperationPodIdentities::new(),
+                None,
+                10,
+            )
+            .unwrap_err()
+            .contains("unsupported")
+        );
+    }
+
+    #[test]
     fn commit_evidence_without_a_frozen_intent_is_rejected_before_postcommit_cleanup() {
         let mut operation = start_remove_replica(
             "set",
@@ -2010,14 +2025,6 @@ mod tests {
             operation.pending_action.as_ref().unwrap().kind,
             DurableActionKind::RemoveReplicaIntent
         );
-        assert!(
-            operation
-                .pending_action
-                .as_ref()
-                .unwrap()
-                .dispatch_action_payload
-                .is_empty()
-        );
         let Decision::Execute {
             target_id,
             action_id,
@@ -2036,12 +2043,9 @@ mod tests {
         assert_eq!(target_id, 1);
         assert_eq!(action_id, intent.action_id);
         assert!(matches!(
-            &action,
+            action,
             DurableReplicaAction::RemoveReplicaIntent { .. }
         ));
-        assert!(
-            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(&action).is_err()
-        );
     }
 
     #[test]

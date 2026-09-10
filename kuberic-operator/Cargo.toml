@@ -15,7 +15,6 @@ path = "src/main.rs"
 
 [dependencies]
 kuberic-core = { path = "../kuberic-core" }
-kuberic-durable-execution = { path = "../durable-execution", features = ["kubernetes"] }
 kube.workspace = true
 k8s-openapi.workspace = true
 schemars.workspace = true
@@ -28,8 +27,6 @@ tracing-subscriber.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
-rand.workspace = true
 
 [dev-dependencies]
 kuberic-core = { path = "../kuberic-core", features = ["testing"] }
-serde_yaml_ng = "=0.10.0"

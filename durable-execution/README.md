@@ -2,8 +2,8 @@
 
 `kuberic-durable-execution` is a focused kernel for deterministic, linear
 workflow replay. It has no dependency on `kuberic-core` or
-`kuberic-operator`; the operator uses it for production framework-native
-remove-replica and switchover workflows. It is not an end-user runtime.
+`kuberic-operator` and is not currently integrated into the operator. It is
+not an end-user runtime.
 
 ## Ordinary typed activity authoring
 
@@ -369,11 +369,8 @@ CARGO_BUILD_JOBS=2 cargo check --workspace
 CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --all-targets -- -D warnings
 ```
 
-The standalone kernel exposes the Kubernetes provider behind its
-`kubernetes` feature. The production operator enables that feature
-unconditionally because framework-native remove-replica requires ConfigMap
-checkpoints; the explicit feature flag below is only for crate-local provider
-validation:
+The standalone kernel exposes the Kubernetes provider behind its optional
+`kubernetes` feature:
 
 ```console
 CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint -- --nocapture
@@ -392,8 +389,8 @@ CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes
 The repository's existing [CI workflow](../.github/workflows/CI.yml) enables
 all crate features on its workspace-wide test command after
 `helm/kind-action` has provisioned a uniquely named, one-control-plane KinD
-environment with a dedicated kubeconfig/context, dynamic loopback port, and
-ownership receipt. There is no second provider cluster or cleanup owner.
+environment with a dedicated kubeconfig/context and dynamic loopback port.
+There is no second provider cluster or cleanup owner.
 Ordinary local and default Cargo test runs without the Kubernetes feature do not select this test.
 
 The test reports a failed endpoint or authorization precondition rather than
@@ -411,83 +408,30 @@ library `[dependencies]` table rather than test-only dependencies and retains a
 negative fixture for a real library runtime dependency. The mechanically
 derived result is **feasible** within this kernel's stated boundary.
 
-## Production operator consumers
+## Embedding status
 
-Framework-native remove-replica and direct-style switchover are production
-consumers of the shared operator runner. Both use the same load/reload,
-single-use permit, fused progression, quarantine, terminal compaction, and
-ConfigMap provider mechanisms, but each adapter retains its own contract,
-activity/result shapes, limits, observations, effects, deadlines, terminal
-validation, and publication rules.
-
-Remove-replica's compact contract version 3 stores immutable admission once
-and records tagged passive observations, exact prepared
-replica/label/delete commands, compact results, and bounded redelivery
-evidence. Legacy pilot and explicit remove records, unsupported versions, and
-changed lifecycle limits are incompatible rather than migrated or restarted.
-
-`status.removeReplicaExecution` owns the immutable execution reference,
-admission authority, and incompatibility marker. The referenced same-namespace
-ConfigMap owns active boundary history and the compact terminal record. Other
-explicit operator workflows continue to use their operation-specific CRD
-status checkpoints.
-
-The no-fault three-member path is exactly three external effects, two passive
-observations, five completed durable boundaries, and six accepted writes. The
-final three-sample run observed active records from 3,373 to 18,693 bytes, a
-4,245-byte terminal record, and a 683-byte terminal payload. These are
-run-specific measurements; the representative active gate is 49,152 bytes.
-The immutable lifecycle limits are 16 records, 4,096-byte inputs, 2,048-byte
-results, 262,144 active encoded bytes, 12,288 terminal encoded bytes, and a
-4,096-byte terminal payload.
-
-The runner reloads terminal state before the remove adapter can hand it to
-topology publication. Same-namespace checkpoint ConfigMaps use a
-non-controlling, non-blocking `KubericSet` owner reference, remain through
-terminal reload, and are deleted with the owner by Kubernetes garbage
-collection. Independently retained orphan cleanup remains a separately
-authorized lifecycle responsibility. No worker, queue, lease, watcher, or
-separate execution service is introduced.
-
-Direct-style switchover uses 20 operation-specific version-1 typed activities
-in one immutable registry.
-Its workflow source, rather than the kernel or host adapter, visibly owns the
-normal and compensating sequence. The adapter resolves logical calls to exact
-read-only, convergent label, identity-fenced ReplicaAgent, or strict handlers
-and supplies authoritative observations afterward. Exactly four
-write-authority operations retain separately persisted prepared commands
-before exposure. This demonstrates the reusable direct authoring pattern
-without adding runtime discovery, a generic compensation engine, or a
-distributed runtime.
-
-Those activity requests remain operation-local; the adapter does not persist a
-cross-operation kind/request union behind the typed names. Once a strict
-activity is exposed, its deadline is not evidence of failure: quarantine resolves
-only from a matching terminal ledger record, the exact live postcondition, or
-generation-change proof of non-admission, while labels resolve only from the
-exact UID-fenced label postcondition. The workflow applies one checked
-transition budget across normal calls, compensation, attestation, and
-redelivery.
+The framework currently has no production operator consumer. Previous
+remove-replica and switchover integrations were removed after they failed to
+meet the intended framework-level authoring and ownership goals. A future
+embedding must be designed independently and must preserve the existing
+operator safety properties without adding excessive Kubernetes API-server
+state or traffic.
 
 ## Deferred usability roadmap
 
 The crate intentionally stops at the durable-execution kernel.
 Completion-only compaction and an isolated Kubernetes checkpoint-provider spike
-are implemented. Production framework-native remove-replica and switchover
-adopt the kernel through a shared in-process operator runner without
-moving activity ownership into it. Generic active-history compaction and
+are implemented. Operator integration, generic active-history compaction, and
 continuation remain excluded. The remaining ordered deferred work is tracked in
 [Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
 
 ## Limitations and exclusions
 
 The kernel remains experimental as a general-purpose orchestration framework.
-The ConfigMap provider is production-required, not opt-in, for
-framework-native remove-replica and switchover: `kuberic-operator` enables it unconditionally
-and owns the provider contract described above. The earlier isolated real-API
-evaluation does not establish generic persistence fitness for other consumers,
-distributed execution ownership, a worker, queue, lease, automatic
-observation polling, or passive-observation transport. The
+The ConfigMap provider remains optional and independently validated. The
+isolated real-API evaluation does not establish generic persistence fitness,
+distributed execution ownership, a worker, queue, lease, automatic observation
+polling, or passive-observation transport. The
 kernel does not establish a canonical exact-byte representation across
 versions.
 
@@ -502,8 +446,4 @@ Dynamic runtime discovery, passive convergence policy shared across products,
 tracing/inspection, durable timers, parallelism, generic lifecycle APIs,
 queries, external events, child workflows, workers, queues, leases, and
 distributed runtime ownership are excluded. So are migrations,
-upgrade guarantees, broad rollout of other operations, and production
-diagnostics. Framework-native remove-replica integrates typed calls and
-operator-owned effect adapters through its existing compact workflow;
-switchover is the direct-style named-activity reference. Neither changes
-`ReplicaAgent` or the gRPC protocol.
+upgrade guarantees, operator adoption, and production diagnostics.

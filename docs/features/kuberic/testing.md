@@ -200,36 +200,27 @@ impl ClusterApi for KvClusterApi {
 ## How to Run Tests
 
 ```bash
-# Workspace quality gates
-cargo fmt --all -- --check
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo build --all-targets
+# Meaningful non-cluster suites
+cargo test -p kuberic-core -p kuberic-operator -p kvstore -p sqlite-replicated
 
-# Shared runner/provider and unchanged remove-replica gates
-cargo test -p kuberic-operator framework_native_remove_replica
-cargo test -p kuberic-operator durable_runner_tests
-cargo test -p kuberic-operator checkpoint_store
+# Documentation tests
+cargo test --doc --workspace
 
-# Unchanged create/add/failover and remove-replica production paths
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 \
-  cargo test -p kvstore --test reconciler test_durable_create_
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 \
-  cargo test -p kvstore --test reconciler test_durable_add_
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 \
-  cargo test -p kvstore --test reconciler test_durable_failover_
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 \
-  cargo test -p kvstore --test reconciler test_framework_native_remove_replica_
+# Core crate only
+cargo test -p kuberic-core
 
-# Direct switchover production matrix
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 \
-  cargo test -p kvstore --test reconciler \
-  test_framework_native_switchover_ -- --nocapture
+# High-fidelity reconciler
+cargo test -p kvstore --test reconciler
+
+# Specific durable workflow test
+cargo test -p kvstore --test reconciler test_durable_remove_coarse_activation
+
+# With logging (requires test-log crate)
+RUST_LOG=info cargo test -p kvstore --test reconciler test_durable_remove_coarse_activation -- --nocapture
 ```
 
-`cargo test --all --all-features` includes the real Kubernetes checkpoint and
-`kuberic-tests` suites. Run it only after provisioning the isolated KinD
-environment described below.
+`kuberic-tests` requires an existing Kubernetes cluster and is not part of the
+normal local documentation or workflow gate.
 
 ---
 
@@ -273,9 +264,8 @@ environment described below.
 
 ### Intentionally Not Tested
 
-- **Existing or shared Kubernetes/CAPI environments** — live coverage runs
-  only against a newly created, workflow-owned KinD cluster. Tests never use or
-  inspect unrelated Cluster API resources.
+- **Real Kubernetes integration** — requires a cluster. Future work:
+  kind/minikube-based integration tests.
 - **mTLS** — deferred to post-MVP.
 - **Large dataset copy** — in-memory state, no multi-GB test fixtures.
 - **Performance/latency** — no benchmarks yet. The atomic status reads
@@ -377,8 +367,8 @@ both ACK paths through correlated Close actions and bounds new/in-flight
 writes.
 
 **Pattern 5: Failure during switchover compensation** ✅
-`test_framework_native_switchover_publication_compensates_failed_promotion`
-exercises the real correlated path and verifies old-primary restoration.
+`test_durable_switchover_compensates_failed_target_promotion` exercises the
+real correlated path and verifies old-primary restoration.
 
 **Pattern 6: Operator process restart recovery** ✅
 `test_operator_restart_recovers_read_only_then_switches_and_scales` replaces
@@ -388,243 +378,14 @@ verifies continued writes, switchover, and scale-up. Companion tests cover
 recovered unhealthy-primary failover, legacy/mismatched snapshot rejection,
 post-recovery pod logical/incarnation drift, and unordered pod listing.
 
-**Pattern 7: Framework-native durable switchover** ✅
-`test_framework_native_switchover_*` drives the only production path through
-the format-4 checkpoint kernel and contract-v4 direct workflow. Persisted
-history contains only the 20 operation-specific version-1 names. The matrix
-covers normal, pre-promotion-compensation, and
-post-promotion-compensation paths at two, four, and nine members; every-turn
-operator restart across all three terminal families; unknown outcomes with and
-without apply; checkpoint and terminal CAS conflicts; failed status
-publication followed by terminal reload without Pods; stale target
-incarnation; ordinary lost-result retries; and proof-backed strict
-redelivery. Accepted-exposure fault hooks stop the runner before handler
-evaluation and recreate `ReconcilerState`. Passive handlers reread evidence,
-label handlers converge on exact UID-fenced postconditions, and
-identity-fenced ReplicaAgent handlers retain the same action ID across
-physical attempts. Separate strict fixtures hold unknown-before-apply and
-matching in-progress write-authority operations past deadline. The matrix
-asserts exact named sequence, terminal-before-status recovery, and fail-closed
-missing-reference, malformed-current-contract, and previous-format state.
-
-Run the targeted matrix:
-
-```console
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
-  --test reconciler test_framework_native_switchover_ -- --nocapture
-```
-
-The authoritative three-member happy-path gate expects 12 completed logical
-activities and 25 accepted checkpoint writes including terminal persistence:
-two accepted writes per activity plus one terminal-compaction write
-(`2 × 12 + 1`).
-Checkpoint byte measurements are run-specific snapshots because
-runtime-generated values affect serialized length; no exact byte value is a
-compatibility contract.
-
-The product-wide replica range is 1–9 and is enforced by both the CRD schema
-and reconciliation. A one-member set has no distinct switchover target.
-Direct workflow and production-path matrices cover valid two-, four-, and
-nine-member success and compensation behavior; admission rejects an identical
-target or a tenth member before effects. Generated-schema tests assert the
-exact current native property set and required fields. Isolated KinD
-all-features validation exercises the checked-in CRD and provider without
-touching an existing CAPI environment.
-
-The independent contract limits are 19 logical activity records, 4,096 workflow-input
-bytes, 8,192 maximum activity-input and activity-result bytes, 524,288 active
-encoded bytes, 16,384 terminal encoded bytes, 4,096 terminal-payload bytes,
-512 error bytes, 64 workflow transitions, and 32 runner outcomes per
-reconcile. The transition limit is enforced by one workflow-wide budget used
-by normal calls, compensation, attestation, and redelivery. Persisted activity
-and terminal errors enforce the 512-byte UTF-8 limit with ASCII and multibyte
-exact/one-over cases. The nine-member maximum-fault production run uses all 19 logical records. Its
-base is 39 accepted writes; ten ordinary identity-fenced activities each
-consume one extra same-logical-identity attempt and four strict
-write-authority activities each consume one proof-backed redelivery:
-`39 + (10 × 2) + (4 × 2) = 67`. Exact-bound and one-byte-over tests cover every activity
-declaration and each global limit independently.
-
-The kernel terminal metadata authenticates exact logical completion and
-classification counts from immutable registered contracts. The terminal
-payload carries only the operation-specific branch and topology. For the canonical three-member success path the target is 9/3, 12
-logical boundaries, and 25 accepted writes. Exact postconditions and
-already-exact labels do not change immutable effect classification. Revoke-safe
-failure, previous-configuration restore, and post-promotion compensation have
-distinct terminal branches and topology validation. Missing or inconsistent
-kernel metadata and illegal branch/topology combinations are rejected before
-`Healthy` publication.
-`durable_boundaries` is the completed logical activity total.
-`checkpoint_write_attempts` counts checkpoint CAS calls, while
-`checkpoint_accepted_writes` counts only responses with a confirmed
-authoritative revision. Latest/maximum authoritative, active, and terminal
-checkpoint byte fields identify the lifecycle state instead of conflating
-their sizes. The output also reports persistence outcomes, status
-attempts/outcomes, UID-label calls, Pod-list calls, and an explicit reason
-requeues are unavailable in the direct-reconcile harness.
-
-Run the named-history, exact-bound, operational measurement, and projection
-gates with:
-
-```console
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_activity_identities_are_unique_positive_and_operation_specific
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_every_activity_accepts_exact_bounds_and_rejects_one_over
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_global_exact_bounds_and_one_over_are_enforced
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_declared_max_fault_payloads_fit_global_byte_bounds -- --nocapture
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_adapter_runs_success_and_both_compensation_families_at_scale -- --nocapture
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_nine_member_max_fault_measurement_fits_exact_limits -- --nocapture
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_adapter_is_deterministic_for_one_hundred_runs -- --nocapture
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_unprepared_exact_replica_exposure_recovers_after_restart
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_deadline_effects_reach_measured_terminal_reload
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_unresolved_strict_effects_remain_quarantined_past_deadline
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  direct_switchover_transition_budget_is_enforced_at_execution_boundary
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
-  -p kvstore --test reconciler \
-  test_framework_native_switchover_ -- --nocapture
-```
-
-The ambiguity matrix distinguishes exposure conflicts, definite storage
-failures, unknown outcomes without application, and unknown outcomes after
-application. None returns invocation authority on the uncertain reconcile.
-Ordinary activities resume from the authoritative predecessor or persisted
-attempt and apply their bounded retry policy. A strict prepared exposure
-retains stricter rules: a
-precondition, unavailability, or scheduled/in-progress ledger record remains
-quarantined past deadline; only matching terminal ledger evidence, the exact
-postcondition, or generation-change non-admission resolves a replica command.
-That proof is persisted before the one allowed same-action redelivery, and a
-second proof stops. The durable kernel's conformance matrix also covers fused schedule/exposure,
-observation/next exposure, observation/terminal, exact permit/attempt identity,
-and capacity reservation.
-
-Switchover/operator tests run with a 4 MiB test-thread stack in CI-constrained
-environments:
-
-```console
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
-  -p kvstore --test reconciler test_framework_native_switchover_
-```
-
-The all-features suite selects both the generic Kubernetes checkpoint-provider
-test and `test_kvstore_k8s_direct_switchover_checkpoint_owner_gc`. The latter
-creates a temporary live `KubericSet`, completes a direct switchover, verifies
-the terminal checkpoint's exact non-controlling owner UID, deletes only that
-fixture, and proves Kubernetes garbage collection removes the checkpoint. Run
-these only against a newly created isolated cluster whose
-namespace/ConfigMap authorization preflight succeeds:
-
-```console
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test \
-  -p kuberic-durable-execution --features kubernetes \
-  --test kubernetes_checkpoint_real -- --nocapture
-CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test \
-  -p kuberic-tests test_kvstore_k8s_direct_switchover_checkpoint_owner_gc -- --nocapture
-```
-
-Local measurement, fault, replay, and bounds gates do not substitute for this
-real-API coverage.
-
-**Pattern 7b: Framework-native remove-replica** ✅
-`test_framework_native_remove_replica_*` exercises the only production remove
-path through the shared bounded runner, an exact prepared
-`RemoveReplicaIntent`, exact-UID label fencing, and exact-UID deletion. No
-remove execution-mode selector or remove-specific Cargo feature is required.
-The matrix includes default routing, legacy and unsupported-contract
-incompatibility, every-boundary restart, uncertain effect recovery, terminal
-reload before publication, status-gap waits without churn, malformed agent
-isolation, and live data preservation.
-
-Run the durable remove-replica operator and reconciler gates with:
-
-```console
-cargo test -p kuberic-operator framework_native_remove_replica
-cargo test -p kuberic-operator durable_runner_tests
-cargo test -p kuberic-operator checkpoint_store
-cargo test -p kvstore --test reconciler test_framework_native_remove_replica_
-```
-
-The no-fault measurement is exact: three external effects, two passive
-observations, five completed durable boundaries, and six accepted writes. The
-three final samples observed an active-record lifecycle range of
-3,373–18,693 bytes, per-run maxima of 18,685, 18,685, and 18,693 bytes, a
-4,245-byte terminal record, and a 683-byte terminal payload. These bytes are
-run-specific measurements; the active acceptance gate is 49,152 bytes
-(48 KiB).
-
-```console
-cargo test -p kvstore --test reconciler \
-  test_framework_native_remove_replica_three_no_fault_measurement_samples -- --nocapture
-```
-
-The independent contract bounds are 16 records, 4,096-byte boundary input,
-2,048-byte boundary result, 262,144-byte active record, 12,288-byte terminal
-record, and 4,096-byte terminal payload. The maximum-fault projection measures
-182,589 active bytes and 11,453 terminal bytes at the full 4,096-byte payload
-ceiling. The one-byte-over matrix rejects 17, 4,097, 2,049, 262,145, 12,289,
-and 4,097 respectively:
-
-```console
-cargo test -p kuberic-operator \
-  remove_replica_execution_rejects_all_six_one_byte_over_bounds
-cargo test -p kuberic-operator \
-  remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds -- --nocapture
-```
-
-The deletion safety inventory is retained by named native workflow,
-shared-runner/kernel, reconciler, Kubernetes-provider, authorization, and
-live-cluster tests in the committed source tree. The six operation-adapter
-responsibilities have dedicated `framework_native_remove_replica_fr019_*`
-tests.
-
-For isolated live validation, create a new workflow-specific Kind cluster and
-use only its dedicated kubeconfig. Never reuse or inspect unrelated clusters:
-
-```console
-export KIND_CLUSTER_NAME="kuberic-<workflow>-$(date +%s)"
-export KUBECONFIG="$HOME/.kube/${KIND_CLUSTER_NAME}.config"
-export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
-export KIND_CONFIG="deploy/kind-isolated-config.yaml"
-just create-kind-cluster
-test "$(kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
-  config current-context)" = "$KUBE_CONTEXT"
-kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" cluster-info
-just images
-cargo test \
-  -p kuberic-durable-execution --features kubernetes \
-  --test kubernetes_checkpoint_real -- --nocapture
-cargo test -p kuberic-tests \
-  test_kvstore_k8s_status_healthy -- --nocapture
-cargo test -p kuberic-tests \
-  test_kvstore_k8s_write_read -- --nocapture
-cargo test -p kuberic-tests \
-  test_kvstore_k8s_framework_native_remove_replica -- --nocapture
-cargo test --all --all-features
-just delete-kind-cluster
-```
-
-The exported `KUBECONFIG` points every kube client and real-API test at the
-dedicated cluster. The `just` recipes also require `KIND_CLUSTER_NAME`, verify
-the exact `kind-<name>` context before Kubernetes mutations, and delete only
-that named cluster and kubeconfig after validating a workflow-created ownership
-receipt. The isolated config uses a dynamically allocated host port; the
-kvstore test resolves it from only the exact
-`<KIND_CLUSTER_NAME>-control-plane` container.
-
-The live removal test verifies selector-free admission, the owner-bound
-terminal checkpoint, exact removal of one pod, preservation of the two
-admitted surviving UIDs, and restoration of the shared fixture to three
-healthy replicas.
+**Pattern 7: Durable switchover boundary and ambiguity recovery** ✅
+`test_durable_switchover_survives_state_loss_at_every_boundary` discards
+`ReconcilerState` after every checkpoint/activity window. Companion tests
+inject a lost target-promotion reply, force target-promotion compensation,
+reject a stale pod incarnation, and reject a status resource-version conflict
+before mutation. Assertions cover deterministic single dispatch of unsafe role
+changes, terminal stable snapshot recovery, and unsupported checkpoint
+versions with no mutating RPC.
 
 **Pattern 8: Durable add/rejoin boundary and ambiguity recovery** ✅
 `test_durable_add_survives_state_loss_and_every_lost_runtime_reply` loses the
@@ -677,8 +438,8 @@ protection, 10/30/60/600-second budgets, and bounded terminal retention.
 Commit/publication resource-version conflicts are refetched without duplicate
 mutation. Exact-UID label/delete tests prove a same-name replacement is not
 relabelled or deleted. Schema and source searches require remove operation v2,
-framework-native remove contract v3, control v3, lifecycle peer v2, add
-operation v3, and no superseded removal cursor or peer alias.
+control v3, lifecycle peer v2, add operation v3, and no superseded removal
+cursor or peer alias.
 
 **Pattern 10: Durable Phase-1 failover and data loss** ✅
 

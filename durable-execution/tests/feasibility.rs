@@ -614,10 +614,9 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
         "retention contract",
         "separately authorized",
         "configurable 786,432-byte default",
-        "shared bounded operator runner",
-        "production framework-native",
-        "switchover",
-        "without another executor or scheduler",
+        "not currently integrated",
+        "future embedding",
+        "Switchover, remove-replica",
     ] {
         assert!(
             roadmap.contains(required),
@@ -628,26 +627,19 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
         .find("uses: helm/kind-action@v1")
         .expect("existing KinD action");
     let checkpoint_step = workflow
-        .find("name: Run isolated provider owner-GC and full workspace suite")
-        .expect("isolated provider and workspace test step");
+        .find("name: Run workspace tests")
+        .expect("workspace test step");
     assert!(kind_step < checkpoint_step);
     assert_eq!(workflow.matches("uses: helm/kind-action@v1").count(), 1);
     assert!(!workflow.contains("name: Run real Kubernetes checkpoint test"));
-    assert!(
-        workflow.contains("cargo test -p kuberic-durable-execution --all-features -- --nocapture")
-    );
-    assert!(
-        workflow
-            .contains("cargo test --workspace --all-features --exclude kuberic-durable-execution")
-    );
+    assert!(workflow.contains("cargo test --workspace --all-features -- --nocapture"));
     assert!(!workflow.contains("kubernetes_checkpoint_real -- --nocapture"));
     assert!(!real_test.contains("#[ignore"));
 }
 
 #[test]
-fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() {
-    let ownership_docs = [
-        ("kernel README", include_str!("../README.md")),
+fn documentation_matches_the_standalone_framework_boundary() {
+    let operator_docs = [
         (
             "operator README",
             include_str!("../../kuberic-operator/README.md"),
@@ -702,14 +694,14 @@ fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() 
         ),
     ];
 
-    for (name, document) in ownership_docs {
+    for (name, document) in operator_docs {
         assert!(
-            document.contains("status.removeReplicaExecution"),
-            "{name} must name native remove admission ownership"
+            !document.contains("status.removeReplicaExecution"),
+            "{name} must not claim framework-native remove admission ownership"
         );
         assert!(
-            document.contains("ConfigMap"),
-            "{name} must name native remove checkpoint ownership"
+            !document.contains("production framework-native"),
+            "{name} must not claim a production framework-native operator workflow"
         );
     }
 
@@ -774,22 +766,11 @@ fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() 
         ),
     ];
     let forbidden = [
-        concat!("remove", "replicaexecutionmode"),
-        concat!("durable", "removereplicapilot"),
-        concat!("durable-remove-", "replica-pilot"),
-        concat!("remove-replica ", "pilot"),
-        concat!("operation.remove", "intent"),
-        concat!("removecommit", "evidence"),
-        concat!("crd status remains the durable ", "authority"),
-        concat!("crd status remains the only durable ", "global store"),
-        concat!("crd status remains the sole durable ", "global store"),
-        concat!(
-            "durable create/add/remove/",
-            "switchover/failover transitions live in"
-        ),
-        concat!("every partial state explicit ", "in crd"),
-        concat!("its opt-in configmap ", "provider"),
-        concat!("enable the optional ", "provider"),
+        "status.removereplicaexecution",
+        "framework-native remove-replica",
+        "production framework-native",
+        "shared bounded operator runner",
+        "`kuberic-operator` enables it unconditionally",
     ];
 
     for (name, document) in current_docs {
@@ -797,14 +778,16 @@ fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() 
         for stale_claim in forbidden {
             assert!(
                 !document.contains(stale_claim),
-                "{name} retained stale remove ownership or pilot claim {stale_claim:?}"
+                "{name} retained stale framework-operator integration claim {stale_claim:?}"
             );
         }
     }
 
     let readme = include_str!("../README.md");
-    assert!(readme.contains("production-required, not opt-in"));
-    assert!(readme.contains("`kuberic-operator` enables it unconditionally"));
+    assert!(readme.contains("not currently integrated into the operator"));
+    assert!(readme.contains("ConfigMap provider remains optional"));
+    assert!(!readme.contains("production-required, not opt-in"));
+    assert!(!readme.contains("`kuberic-operator` enables it unconditionally"));
 }
 
 const fn status(passed: bool) -> &'static str {

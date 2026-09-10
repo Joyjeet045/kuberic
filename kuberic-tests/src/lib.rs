@@ -55,6 +55,10 @@ pub mod test_utils {
     }
 
     pub fn isolated_kvstore_endpoint() -> String {
+        if let Ok(endpoint) = std::env::var("KUBERIC_KVSTORE_ENDPOINT") {
+            return endpoint;
+        }
+
         let cluster_name = std::env::var("KIND_CLUSTER_NAME")
             .expect("KinD tests require an explicit KIND_CLUSTER_NAME");
         let container_name = format!("{cluster_name}-control-plane");
@@ -267,90 +271,6 @@ pub mod test_utils {
                 expected_replicas,
                 "waiting for converged Healthy status"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        }
-    }
-
-    pub async fn patch_kubericset_replicas(
-        namespace: &str,
-        name: &str,
-        replicas: i32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = isolated_kube_client().await;
-        let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
-            client,
-            namespace,
-            &kube::discovery::ApiResource {
-                group: "kuberic.io".into(),
-                version: "v1".into(),
-                kind: "KubericSet".into(),
-                api_version: "kuberic.io/v1".into(),
-                plural: "kubericsets".into(),
-            },
-        );
-        api.patch(
-            name,
-            &kube::api::PatchParams::default(),
-            &kube::api::Patch::Merge(serde_json::json!({
-                "spec": { "replicas": replicas }
-            })),
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn wait_kubericset_native_remove_terminal(
-        namespace: &str,
-        name: &str,
-        expected_replicas: i64,
-        timeout_seconds: u64,
-    ) -> Result<kube::api::DynamicObject, Box<dyn std::error::Error>> {
-        let client = isolated_kube_client().await;
-        let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
-            client,
-            namespace,
-            &kube::discovery::ApiResource {
-                group: "kuberic.io".into(),
-                version: "v1".into(),
-                kind: "KubericSet".into(),
-                api_version: "kuberic.io/v1".into(),
-                plural: "kubericsets".into(),
-            },
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
-        loop {
-            let obj = api.get(name).await?;
-            let status = obj.data.get("status");
-            let healthy = status
-                .and_then(|status| status.get("phase"))
-                .and_then(|value| value.as_str())
-                == Some("Healthy");
-            let replicas = status
-                .and_then(|status| status.get("replicas"))
-                .and_then(|value| value.as_i64());
-            let native = status
-                .and_then(|status| status.get("removeReplicaExecution"))
-                .is_some_and(|value| !value.is_null());
-            let completed = status
-                .and_then(|status| status.get("conditions"))
-                .and_then(|value| value.as_array())
-                .is_some_and(|conditions| {
-                    conditions.iter().any(|condition| {
-                        condition.get("type").and_then(|value| value.as_str())
-                            == Some("FrameworkNativeRemoveReplica")
-                            && condition.get("reason").and_then(|value| value.as_str())
-                                == Some("Completed")
-                    })
-                });
-            if healthy && replicas == Some(expected_replicas) && native && completed {
-                return Ok(obj);
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(format!(
-                    "timeout waiting for native remove terminal on {namespace}/{name}"
-                )
-                .into());
-            }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     }

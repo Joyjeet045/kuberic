@@ -15,7 +15,7 @@ replica add/rebuild and removal use separate coarse primary-agent-owned
 actions:
 
 ```
-persist the operation-specific pending boundary in CRD status or checkpoint
+persist pending action in CRD status
 observe target Pod UID + runtime epoch + agent generation/control version
 persist generation/control-version/runtime-epoch fences
   + exact payload for direct non-coarse actions
@@ -36,10 +36,8 @@ Prepare/Activate/Cleanup, while removal uses Retire. The primary's
 `PodRuntime` performs ordered local copy, configuration, quorum, or exact
 connection effects. The operator does not mutate either target runtime.
 Coarse payloads are constructed directly from structured
-`status.operation.addIntent` for add/rebuild. Remove-replica reconstructs the
-same structured intent from immutable `status.removeReplicaExecution`
-admission and persists the exact compact prepared command in its framework
-checkpoint; there is no second mutable-state projection.
+`status.operation.addIntent` or `status.operation.removeIntent`; there is no
+second encoded payload projection.
 
 `ReplicaInstanceId` remains the Pod UID. `AgentGeneration` identifies one
 process inside that Pod, and changes after a container restart.
@@ -117,148 +115,37 @@ fail closed and never restore the failed primary.
 
 ## Protocol: Switchover
 
-Planned primary change uses the versioned `status.switchoverExecution`
-admission reference and an owner-bound ConfigMap checkpoint. Contract version
-4 is the only accepted switchover execution shape; prior contract versions and
-histories are not migrated or resumed.
+Planned primary change uses a versioned compact checkpoint in
+`status.operation`.
 
-### Direct activity catalog
-
-The production checkpoint history contains these 20 operation-specific names,
-all at version 1:
-
-| Activity | Class | Safety rationale |
-|---|---|---|
-| `kuberic.switchover.revoke-writes` | Strict-effect-required | Changes write authority; ambiguity requires prepared-command proof. |
-| `kuberic.switchover.capture-frozen-lsn` | Passive/read-only | Reads authoritative frozen progress. |
-| `kuberic.switchover.wait-target-caught-up` | Passive/read-only | Observes target catch-up through the frozen LSN. |
-| `kuberic.switchover.demote-old-primary` | Strict-effect-required | Changes primary authority; ambiguity requires prepared-command proof. |
-| `kuberic.switchover.promote-target` | Strict-effect-required | Grants primary authority; ambiguity requires prepared-command proof. |
-| `kuberic.switchover.distribute-replica-epoch` | Identity-fenced idempotent | Stable logical action ID fences a duplicate ReplicaAgent request. |
-| `kuberic.switchover.install-target-catch-up-configuration` | Identity-fenced idempotent | Stable action ID and exact configuration signature fence duplicates. |
-| `kuberic.switchover.wait-target-write-quorum` | Identity-fenced idempotent | Stable action ID and authoritative quorum evidence permit safe reinvocation. |
-| `kuberic.switchover.install-target-current-configuration` | Identity-fenced idempotent | Stable action ID and exact configuration signature fence duplicates. |
-| `kuberic.switchover.publish-target-primary-label` | Naturally idempotent | Exact UID-fenced label application converges. |
-| `kuberic.switchover.publish-old-primary-secondary-label` | Naturally idempotent | Exact UID-fenced label application converges. |
-| `kuberic.switchover.attest-target-topology` | Passive/read-only | Validates the completed target topology. |
-| `kuberic.switchover.restore-previous-current-configuration` | Identity-fenced idempotent | Stable action ID identifies the exact restoration. |
-| `kuberic.switchover.compensate-promote-old-primary` | Strict-effect-required | Restores primary authority; ambiguity requires prepared-command proof. |
-| `kuberic.switchover.compensate-distribute-replica-epoch` | Identity-fenced idempotent | Stable action ID fences a compensation duplicate. |
-| `kuberic.switchover.install-compensation-catch-up-configuration` | Identity-fenced idempotent | Stable action ID and exact configuration signature fence duplicates. |
-| `kuberic.switchover.install-compensation-current-configuration` | Identity-fenced idempotent | Stable action ID and exact configuration signature fence duplicates. |
-| `kuberic.switchover.restore-old-primary-label` | Naturally idempotent | Exact UID-fenced label application converges. |
-| `kuberic.switchover.restore-target-secondary-label` | Naturally idempotent | Exact UID-fenced label application converges. |
-| `kuberic.switchover.attest-compensated-topology` | Passive/read-only | Validates the safely restored topology. |
-
-The direct async workflow visibly owns the following normal sequence:
-
-```text
-kuberic.switchover.revoke-writes@v1
-→ kuberic.switchover.capture-frozen-lsn@v1
-→ kuberic.switchover.wait-target-caught-up@v1
-→ kuberic.switchover.demote-old-primary@v1
-→ kuberic.switchover.promote-target@v1
-→ kuberic.switchover.distribute-replica-epoch@v1
-    for each sorted retained member except the old primary and target
-→ kuberic.switchover.install-target-catch-up-configuration@v1
-→ kuberic.switchover.wait-target-write-quorum@v1
-→ kuberic.switchover.install-target-current-configuration@v1
-→ kuberic.switchover.publish-target-primary-label@v1
-→ kuberic.switchover.publish-old-primary-secondary-label@v1
-→ kuberic.switchover.attest-target-topology@v1
-→ terminal checkpoint reload
-→ stable snapshot publication
+```
+persist revoke intent → revoke writes
+observe frozen LSN → wait for target catch-up
+persist demote intent → demote old primary
+persist promote intent → promote target
+converge retained member epochs
+install catch-up config → wait write quorum → install current config
+converge routing labels
+publish stable snapshot
 ```
 
-Before target promotion, a catch-up or demotion failure restores the previous
-configuration and attests it:
+Every external activity has a deterministic action ID and is persisted before
+dispatch. A resumed reconcile observes first: a matching postcondition
+advances, a matching precondition permits dispatch/retry, and any impossible
+observation fails closed. The controller performs one status transition or one
+activity dispatch per reconcile and uses Kubernetes `resourceVersion` to
+exclude stale advancement.
 
-```text
-normal prefix through the failed pre-promotion boundary
-→ kuberic.switchover.restore-previous-current-configuration@v1
-→ kuberic.switchover.attest-compensated-topology@v1
-```
-
-A revoke failure can attest the still-safe previous topology directly. If
-target promotion fails after old-primary demotion, compensation instead uses
-the target epoch:
-
-```text
-normal prefix through kuberic.switchover.promote-target@v1 failure
-→ kuberic.switchover.compensate-promote-old-primary@v1
-→ kuberic.switchover.compensate-distribute-replica-epoch@v1
-    for every sorted retained member except the restored old primary
-→ kuberic.switchover.install-compensation-catch-up-configuration@v1
-→ kuberic.switchover.install-compensation-current-configuration@v1
-→ kuberic.switchover.restore-old-primary-label@v1
-→ kuberic.switchover.restore-target-secondary-label@v1
-→ kuberic.switchover.attest-compensated-topology@v1
-→ terminal checkpoint reload
-→ compensated stable snapshot publication
-```
-
-Ordinary activities have at-least-once semantics: a crash can occur after the
-side effect but before its result is persisted. Passive handlers reread
-evidence, label handlers converge on an exact UID-fenced postcondition, and
-ReplicaAgent handlers reuse the same logical action ID across physical retry
-attempts. A retry never changes operation identity.
-
-Only the four strict write-authority activities persist an exact prepared
-command before dispatch. After exposure, only a matching terminal agent-ledger
-record, exact live postcondition, or generation-change proof of non-admission
-can resolve them. A precondition, unavailable replica, or
-scheduled/in-progress ledger record remains quarantined even after the
-activity deadline. Proof of non-admission authorizes at most one same-command
-strict redelivery.
-
-The shared runner uses fused checkpoint compare-and-swap, one-use dispatch
-permits, one end-to-end 64-transition workflow budget, and authoritative
-reload before any later effect. The budget includes normal, compensation,
-attestation, and redelivery calls. ConfigMap conflicts and unknown write
-outcomes reload before a later permit.
+If target promotion cannot be confirmed after old-primary demotion, the same
+checkpoint durably restores the old primary at the new epoch, converges member
+epochs/configuration and labels, then publishes the compensated stable
+snapshot. Unverifiable post-promotion convergence becomes `poisoned`; it never
+publishes a snapshot containing an old-epoch retained member.
 
 The pod-local agent records the active action and 16 most recent terminal
 observations. These fields are the only local correlation ledger. The bounded
 records correlate a lost reply within one agent generation without becoming
 distributed workflow history or an exactly-once claim.
-
-### Framework-native durable replay
-
-The protocol decisions are recorded as the named linear format-4 history
-above:
-
-```
-persist native execution reference
-  → direct workflow requests one named typed activity
-  → immutable registry validates identity, exact bounds, and typed input
-  → host persists one physical attempt and grants one-use invocation authority
-  → class-specific handler rereads evidence or invokes ReplicaAgent/Kubernetes
-  → host persists result/retry plus next exposure or terminal
-  → runner reloads and validates terminal
-  → reconciler publishes stable topology/status
-```
-
-Invocation authority is not an exactly-once claim. Ordinary handlers can be
-reinvoked after a lost result according to persisted retry policy. Strict
-handlers resolve a lost reply from the exact correlation record or live
-postcondition; new-process generation plus exact precondition can prove that
-the old request was not admitted and allow one bounded redelivery of the same
-command. All other strict ambiguity remains quarantined. ConfigMap conflicts
-and unknown write outcomes reload before any later invocation.
-
-A resource already in the `Switchover` phase must contain the current native
-execution reference. If it does not, reconciliation fails closed and does not
-authorize a replacement execution.
-
-Switchover deliberately retains individually correlated local mutations. A
-coarse primary-agent intent would require a new coordinator across multiple
-replicas plus Kubernetes routing effects; the existing exact per-command
-fences already preserve the required recovery boundary.
-
-The product-wide replica range remains 1–9. A one-replica set has no distinct
-switchover target; direct switchover accepts valid stable topologies with 2–9
-members. Creation, add/build/rejoin, failover, and remove-replica keep their
-existing protocol and execution models.
 
 ---
 
@@ -350,26 +237,19 @@ label and repaired by existing Healthy/failover/rebuild behavior.
 
 ## Protocol: Remove Secondary
 
-Healthy scale-down and permanent stale/dead-secondary eviction use one
-production framework-native `RemovingReplica` workflow. There is no remove
-build feature or resource execution-mode selector. `ScaleDown` and `Force` are
-immutable domain safety modes chosen at admission, not alternative execution
-engines.
+Healthy scale-down and permanent stale/dead-secondary eviction use one durable
+`RemovingReplica` operation with `ScaleDown` or `Force` mode.
 
 ```
 1. Validate one stable non-primary target, minReplicas, retained previous
    write quorum, and exact historical runtime/pod UID
 2. For ScaleDown, prove exact target lifecycle-peer v2 reachability before
    persisting an operation; Force may freeze no target peer authority
-3. Persist remove execution contract v3 with immutable admission: previous
-   snapshot, mode, exact target identity/UID/authority, minimum, and deadlines;
-   derive the reduced topology and domain remove operation v2 deterministically
-4. Through the shared runner, durably expose compact tagged observation or
-   exact-command boundaries; an accepted exact command yields one private,
-   one-use dispatch permit
-5. Freeze and dispatch one RemoveReplicaIntent v1 to the exact current
+3. Persist remove operation v2 with previous/reduced snapshots, mode, exact
+   identities, deadlines, and attempt bound
+4. Freeze and dispatch one RemoveReplicaIntent v1 to the exact current
    primary through correlated control v3
-6. Primary coordinator:
+5. Primary coordinator:
    a. observe previous Current / reduced CatchUp / reduced Current
    b. install reduced CatchUp with the frozen previous configuration
    c. run tracked WaitForCatchUpQuorum(Write)
@@ -378,29 +258,11 @@ engines.
    f. remove only the exact old-incarnation primary connection
    g. after commit, send ReplicaLifecyclePeer Retire stage v1 when authorized
    h. attest CommittedClean or CommittedDegraded
-7. Operator persists commit evidence plus the reduced workflow-scoped
+6. Operator persists commit evidence plus the reduced workflow-scoped
    committedSnapshot; stableSnapshot remains previous
-8. Operator observes cleanup and durably records exact-UID label and delete
-   effects
-9. Persist and reload a compact terminal checkpoint, validate it against
-   immutable admission and boundary accounting, then publish the reduced
-   stableSnapshot
+7. Operator observes cleanup, exact-UID labels the old pod role=retired,
+   exact-UID deletes it, then publishes the reduced stableSnapshot
 ```
-
-The compact boundary contract stores only passive observation requests, exact
-prepared replica/label/delete commands, compact evidence/effect results, or
-bounded proven-no-admission redelivery evidence. It does not repeat the
-complete mutable operation or full multi-configuration state at every
-boundary. A compare-and-swap conflict or unknown write outcome always reloads
-before a later permit; an unresolved exposed command remains quarantined until
-authoritative evidence resolves it.
-
-Contract versions other than native remove v3 are incompatible. Legacy pilot
-and explicit remove status is converted to a durable incompatibility marker
-and is never resumed, migrated, cleared as absent, or treated as permission for
-fresh admission. This is an execution-contract clean break only: correlated
-control v3, `RemoveReplicaIntent` v1, lifecycle-peer v2/Retire v1, intent
-signatures, and `ReplicaAgent` ownership are unchanged.
 
 Exact reduced Current is the irreversible commit. Before current-install
 dispatch, failure can restore exact previous Current. After dispatch, a
@@ -816,9 +678,8 @@ Step 3: update_current_configuration(new_config)
 ```
 
 For add and removal, the primary-agent coordinator issues these runtime
-effects behind one coarse operator action. Failover uses its explicit
-operation checkpoint, while switchover issues its ordered correlated
-activities from the framework-native ConfigMap checkpoint.
+effects behind one coarse operator action. Failover and switchover still issue
+their ordered correlated activities from the operator checkpoint.
 
 ### QuorumTracker Internals
 

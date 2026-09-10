@@ -60,11 +60,7 @@ and update the operator and replica runtimes together.
 
 ## Recovery and Replay
 
-Kubernetes control-plane records remain the only durable global state. CRD
-status retains stable topology and the explicit-operation checkpoints; native
-remove admission and checkpoint identity live in
-`status.removeReplicaExecution`, while its owner-bound ConfigMap retains
-compact boundary history and terminal evidence. The operator preserves
+CRD status remains the only durable global store. The operator retains
 write-ahead intent, deterministic signatures, resource-version fencing,
 observation-first recovery, one transition or one activity per reconcile, and
 all existing commit, compensation, and roll-forward boundaries.
@@ -100,7 +96,5 @@ evaluates durable postconditions before any at-least-once redrive.
 
 The ownership split follows the useful SF RA/RAProxy distinction: the local RA
 accepts and fences commands while the runtime proxy executes ordered effects.
-Kuberic deliberately does not copy RA's local durable failover-unit store.
-The operator remains the global progression owner; CRD status is authoritative
-for topology and admission, and the native remove ConfigMap is authoritative
-for that execution's boundary history and terminal evidence.
+Kuberic deliberately does not copy RA's local durable failover-unit store;
+Kubernetes CRD status and the operator remain globally authoritative.

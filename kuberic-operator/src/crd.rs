@@ -5,10 +5,7 @@ use kuberic_core::types::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::ops::Deref;
-
-pub const KUBERIC_MAX_REPLICAS: i32 = 9;
 
 /// KubericSet is the primary CRD for managing a stateful replica set.
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -31,12 +28,10 @@ pub const KUBERIC_MAX_REPLICAS: i32 = 9;
 pub struct KubericSetSpec {
     /// Total number of replicas (1 primary + N-1 secondaries).
     #[serde(default = "default_replicas")]
-    #[schemars(range(min = 1, max = 9))]
     pub replicas: i32,
 
     /// Minimum replica set size. Operator won't reduce below this.
     #[serde(default = "default_min_replicas")]
-    #[schemars(range(min = 1, max = 9))]
     pub min_replicas: i32,
 
     /// Container image for the application pods.
@@ -75,7 +70,6 @@ pub struct KubericSetSpec {
 /// Status of the KubericSet.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
-#[schemars(extend("x-kubernetes-preserve-unknown-fields" = true))]
 pub struct KubericSetStatus {
     /// Current epoch.
     #[serde(default)]
@@ -118,22 +112,6 @@ pub struct KubericSetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<DurableOperationStatus>,
 
-    /// Structured immutable admission and checkpoint authority for the
-    /// framework-native switchover execution.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub switchover_execution: Option<SwitchoverExecutionStatus>,
-
-    /// Unknown legacy status fields are accepted for one reconciliation and
-    /// omitted from every replacement status.
-    #[serde(flatten, default, skip_serializing)]
-    #[schemars(skip)]
-    pub legacy_status_fields: BTreeMap<String, serde_json::Value>,
-
-    /// Structured immutable authority or incompatibility marker for the
-    /// framework-native remove execution.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remove_replica_execution: Option<RemoveReplicaExecutionStatus>,
-
     /// Kubernetes-style conditions describing durable operation state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<StatusCondition>,
@@ -159,7 +137,7 @@ pub struct StableElectionMetadataRefreshStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct EpochStatus {
     pub data_loss_number: i64,
     pub configuration_number: i64,
@@ -187,80 +165,9 @@ pub struct MemberStatus {
     pub data_address: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SwitchoverExecutionStatus {
-    pub contract_version: u32,
-    pub execution_id: String,
-    pub checkpoint_name: String,
-    pub input: SwitchoverAdmissionInputStatus,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SwitchoverAdmissionInputStatus {
-    pub operation_authority: String,
-    pub previous_snapshot: StablePartitionSnapshotStatus,
-    pub target_primary_id: i64,
-    pub accepted_unix_seconds: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RemoveReplicaExecutionStatus {
-    pub contract_version: u32,
-    pub execution_id: String,
-    pub checkpoint_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<RemoveReplicaAdmissionInputStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incompatibility: Option<RemoveReplicaIncompatibilityStatus>,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RemoveReplicaIncompatibilityStatus {
-    pub source: RemoveReplicaIncompatibilitySource,
-    pub legacy_contract_version: u32,
-    pub legacy_execution_id: String,
-    pub fingerprint: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub enum RemoveReplicaIncompatibilitySource {
-    LegacyPilot,
-    LegacyExplicit,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RemoveReplicaAdmissionInputStatus {
-    pub operation_authority: String,
-    pub operation_id: String,
-    pub mode: DurableRemoveMode,
-    pub previous_snapshot: StablePartitionSnapshotStatus,
-    pub target: RemoveReplicaAdmissionTargetStatus,
-    pub minimum_committed_replicas: u32,
-    pub accepted_unix_seconds: i64,
-    pub overall_deadline_unix_seconds: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RemoveReplicaAdmissionTargetStatus {
-    pub replica_id: i64,
-    pub instance_id: String,
-    pub pod_name: String,
-    pub pod_uid: String,
-    pub replicator_address: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_generation: Option<String>,
-}
-
 /// Schema-safe persisted form of the core stable partition snapshot.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct StablePartitionSnapshotStatus {
     pub epoch: EpochStatus,
     pub primary_id: i64,
@@ -270,7 +177,7 @@ pub struct StablePartitionSnapshotStatus {
 
 /// Schema-safe persisted identity and stable role of one replica.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct StableReplicaSnapshotStatus {
     pub id: i64,
     pub instance_id: String,
@@ -280,7 +187,7 @@ pub struct StableReplicaSnapshotStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct StableReplicaElectionMetadataStatus {
     pub current_lsn: i64,
     pub committed_lsn: i64,
@@ -473,7 +380,7 @@ pub struct RemoveReplicaIntentStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoveReplicaCommitEvidenceStatus {
     pub attempt_id: String,
     pub action_id: String,
@@ -483,7 +390,7 @@ pub struct RemoveReplicaCommitEvidenceStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoveReplicaCleanupStatus {
     #[serde(default)]
     pub connection_absent: bool,
@@ -529,7 +436,7 @@ pub enum RemoveReplicaTerminalResultStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub enum RemoveReplicaDispositionStatus {
     FailedPreCommitIncomplete {
         attempt: u32,
@@ -1010,6 +917,7 @@ impl TryFrom<&StableReplicaSnapshot> for StableReplicaSnapshotStatus {
 mod tests {
     use super::*;
     use kube::CustomResourceExt;
+
     #[test]
     fn stable_snapshot_round_trips_without_changing_incarnations() {
         let core = StablePartitionSnapshot {
@@ -1057,9 +965,6 @@ mod tests {
             serde_json::from_value(serde_json::json!({"phase": "Healthy"})).unwrap();
         assert!(status.stable_snapshot.is_none());
         assert!(status.operation.is_none());
-        assert!(status.switchover_execution.is_none());
-        assert!(status.legacy_status_fields.is_empty());
-        assert!(status.remove_replica_execution.is_none());
         assert!(status.conditions.is_empty());
         assert!(
             serde_json::to_value(status)
@@ -1067,386 +972,6 @@ mod tests {
                 .get("stableSnapshot")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn framework_native_remove_schema_has_no_selector_or_pilot_status() {
-        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
-        let deployment = include_str!("../deploy/deployment.yaml");
-        for removed in [
-            ["remove", "Replica", "Execution", "Mode"].concat(),
-            ["durable", "Remove", "Replica", "Pilot"].concat(),
-        ] {
-            assert!(
-                !generated.contains(&removed),
-                "generated schema retained legacy remove surface {removed}"
-            );
-            assert!(
-                !deployment.contains(&removed),
-                "deployed schema retained legacy remove surface {removed}"
-            );
-        }
-        assert!(generated.contains("removeReplicaExecution"));
-        assert!(deployment.contains("removeReplicaExecution"));
-    }
-
-    #[test]
-    fn framework_native_remove_reference_has_structured_immutable_input_schema() {
-        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
-        for required in [
-            "removeReplicaExecution",
-            "contractVersion",
-            "operationAuthority",
-            "operationId",
-            "previousSnapshot",
-            "minimumCommittedReplicas",
-            "overallDeadlineUnixSeconds",
-        ] {
-            assert!(
-                generated.contains(required),
-                "missing native remove schema {required}"
-            );
-        }
-    }
-
-    #[test]
-    fn framework_native_switchover_schema_defines_only_the_current_native_shape() {
-        let generated_value = serde_json::to_value(KubericSet::crd()).unwrap();
-        let generated = serde_json::to_string(&generated_value).unwrap();
-        let deployment = include_str!("../deploy/deployment.yaml");
-
-        for required in [
-            "switchoverExecution",
-            "contractVersion",
-            "operationAuthority",
-            "previousSnapshot",
-            "targetPrimaryId",
-            "acceptedUnixSeconds",
-        ] {
-            assert!(
-                generated.contains(required),
-                "missing native switchover schema {required}"
-            );
-            assert!(
-                deployment.contains(required),
-                "missing deployed native switchover schema {required}"
-            );
-        }
-
-        let admitted = SwitchoverExecutionStatus {
-            contract_version: crate::durable::switchover_execution::SWITCHOVER_CONTRACT_VERSION,
-            execution_id: "0123456789abcdef0123456789abcdef".to_string(),
-            checkpoint_name: "kuberic-checkpoint-0123456789abcdef0123456789abcdef".to_string(),
-            input: SwitchoverAdmissionInputStatus {
-                operation_authority: "set-uid".to_string(),
-                previous_snapshot: StablePartitionSnapshotStatus {
-                    epoch: EpochStatus {
-                        data_loss_number: 1,
-                        configuration_number: 2,
-                    },
-                    primary_id: 1,
-                    members: vec![
-                        StableReplicaSnapshotStatus {
-                            id: 1,
-                            instance_id: "pod-1-uid".to_string(),
-                            role: StableReplicaRoleStatus::Primary,
-                            election_metadata: None,
-                        },
-                        StableReplicaSnapshotStatus {
-                            id: 2,
-                            instance_id: "pod-2-uid".to_string(),
-                            role: StableReplicaRoleStatus::ActiveSecondary,
-                            election_metadata: None,
-                        },
-                    ],
-                    write_quorum: 2,
-                },
-                target_primary_id: 2,
-                accepted_unix_seconds: 100,
-            },
-        };
-        let encoded = serde_json::to_value(&admitted).unwrap();
-        assert!(encoded.get("input").is_some());
-        assert!(crate::durable::switchover_execution::native_execution_spec(&admitted).is_ok());
-
-        let schema = generated_value
-            .pointer(
-                "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/switchoverExecution",
-            )
-            .unwrap();
-        assert!(schema.pointer("/properties/input").is_some());
-        assert!(schema.pointer("/properties/state").is_none());
-        assert!(schema.pointer("/properties/incompatibility").is_none());
-        let mut top_level_properties = schema
-            .pointer("/properties")
-            .and_then(serde_json::Value::as_object)
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        top_level_properties.sort_unstable();
-        assert_eq!(
-            top_level_properties,
-            ["checkpointName", "contractVersion", "executionId", "input"]
-        );
-        let input_schema = schema.pointer("/properties/input").unwrap();
-        let mut input_properties = input_schema
-            .pointer("/properties")
-            .and_then(serde_json::Value::as_object)
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        input_properties.sort_unstable();
-        assert_eq!(
-            input_properties,
-            [
-                "acceptedUnixSeconds",
-                "operationAuthority",
-                "previousSnapshot",
-                "targetPrimaryId"
-            ]
-        );
-        assert_eq!(
-            schema.pointer("/x-kubernetes-preserve-unknown-fields"),
-            None
-        );
-        assert_eq!(
-            schema.pointer("/properties/input/x-kubernetes-preserve-unknown-fields"),
-            None
-        );
-        assert_eq!(schema.pointer("/additionalProperties"), None);
-        assert_eq!(
-            schema.pointer("/properties/input/additionalProperties"),
-            None
-        );
-        assert_eq!(
-            schema.pointer("/required"),
-            Some(&serde_json::json!([
-                "checkpointName",
-                "contractVersion",
-                "executionId",
-                "input"
-            ]))
-        );
-        assert_eq!(
-            input_schema.pointer("/required"),
-            Some(&serde_json::json!([
-                "acceptedUnixSeconds",
-                "operationAuthority",
-                "previousSnapshot",
-                "targetPrimaryId"
-            ]))
-        );
-        let description = schema
-            .pointer("/description")
-            .and_then(serde_json::Value::as_str)
-            .unwrap()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(
-            description,
-            "Structured immutable admission and checkpoint authority for the framework-native switchover execution."
-        );
-
-        let deployed = deployment
-            .split_once("              switchoverExecution:\n")
-            .unwrap()
-            .1
-            .split_once("              targetPrimary:\n")
-            .unwrap()
-            .0;
-        assert!(deployed.contains("                  input:"));
-        assert!(!deployed.contains("                  state:"));
-        assert!(!deployed.contains("                  incompatibility:"));
-        assert!(!deployed.contains("switchoverExecution contains an unsupported field"));
-        assert!(!deployed.contains("x-kubernetes-preserve-unknown-fields"));
-        assert!(deployed.contains("Structured immutable admission and checkpoint authority"));
-
-        let deployed_documents = serde_yaml_ng::Deserializer::from_str(deployment)
-            .map(|document| {
-                serde_json::Value::deserialize(document).expect("valid deployment YAML document")
-            })
-            .collect::<Vec<_>>();
-        let deployed_crd = deployed_documents
-            .iter()
-            .find(|document| {
-                document
-                    .pointer("/kind")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("CustomResourceDefinition")
-                    && document
-                        .pointer("/metadata/name")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("kubericsets.kuberic.io")
-            })
-            .expect("deployment contains the KubericSet CRD");
-        let deployed_schema = deployed_crd
-            .pointer(
-                "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/switchoverExecution",
-            )
-            .expect("deployed CRD contains the switchover execution schema");
-        assert_eq!(
-            deployed_schema, schema,
-            "generated and deployed switchover execution schemas must be exactly equal"
-        );
-
-        let mut missing_input = encoded.clone();
-        missing_input.as_object_mut().unwrap().remove("input");
-        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(missing_input).is_err());
-
-        let mut extra_top_level = encoded.clone();
-        extra_top_level
-            .as_object_mut()
-            .unwrap()
-            .insert("state".to_string(), serde_json::json!({}));
-        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(extra_top_level).is_err());
-
-        let mut missing_target = encoded.clone();
-        missing_target["input"]
-            .as_object_mut()
-            .unwrap()
-            .remove("targetPrimaryId");
-        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(missing_target).is_err());
-
-        let mut extra_input = encoded;
-        extra_input["input"]
-            .as_object_mut()
-            .unwrap()
-            .insert("unknown".to_string(), serde_json::json!(true));
-        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(extra_input).is_err());
-
-        let mut previous_version = admitted;
-        previous_version.contract_version =
-            crate::durable::switchover_execution::SWITCHOVER_CONTRACT_VERSION - 1;
-        assert!(
-            crate::durable::switchover_execution::native_execution_id(&previous_version).is_err()
-        );
-    }
-
-    #[test]
-    fn crd_enforces_product_replica_bounds() {
-        let generated = serde_json::to_value(KubericSet::crd()).unwrap();
-        for property in ["replicas", "minReplicas"] {
-            let schema = generated
-                .pointer(&format!(
-                    "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/{property}"
-                ))
-                .unwrap();
-            assert_eq!(schema.pointer("/minimum"), Some(&serde_json::json!(1.0)));
-            assert_eq!(
-                schema.pointer("/maximum"),
-                Some(&serde_json::json!(KUBERIC_MAX_REPLICAS as f64))
-            );
-        }
-        let deployment = include_str!("../deploy/deployment.yaml");
-        assert!(deployment.contains("                maximum: 9.0"));
-        assert!(deployment.contains("                minimum: 1.0"));
-    }
-
-    #[test]
-    fn legacy_remove_status_is_deserialized_but_never_serialized() {
-        let legacy_name = ["durable", "Remove", "Replica", "Pilot"].concat();
-        let mut value = serde_json::json!({"phase": "RemovingReplica"});
-        value.as_object_mut().unwrap().insert(
-            legacy_name.clone(),
-            serde_json::json!({
-                "version": 1,
-                "executionId": "legacy-execution",
-                "checkpointName": "legacy-checkpoint",
-                "initialOperationJson": "{}"
-            }),
-        );
-        let status: KubericSetStatus = serde_json::from_value(value).unwrap();
-        assert!(status.legacy_status_fields.contains_key(&legacy_name));
-        let serialized = serde_json::to_value(status).unwrap();
-        assert!(serialized.get(&legacy_name).is_none());
-    }
-
-    #[test]
-    fn status_schema_preserves_unknown_fields_for_remove_compatibility() {
-        let generated = serde_json::to_value(KubericSet::crd()).unwrap();
-        assert_eq!(
-            generated.pointer(
-                "/spec/versions/0/schema/openAPIV3Schema/properties/status/x-kubernetes-preserve-unknown-fields"
-            ),
-            Some(&serde_json::json!(true))
-        );
-        let deployment = include_str!("../deploy/deployment.yaml");
-        assert!(deployment.contains("x-kubernetes-preserve-unknown-fields: true"));
-    }
-
-    #[test]
-    fn deployment_grants_only_checkpoint_writer_verbs() {
-        let deployment = include_str!("../deploy/deployment.yaml");
-        let rule = r#"- apiGroups: [""]
-  resources: ["configmaps"]
-  verbs: ["get", "create", "update"]"#;
-        assert!(deployment.contains(rule));
-        assert!(!deployment.contains(
-            r#"resources: ["configmaps"]
-  verbs: ["get", "list""#
-        ));
-        assert!(!deployment.contains(
-            r#"resources: ["configmaps"]
-  verbs: ["get", "create", "update", "delete"]"#
-        ));
-    }
-
-    #[test]
-    fn direct_switchover_deployment_and_example_keep_the_single_process_status_owned_contract() {
-        let deployment = include_str!("../deploy/deployment.yaml");
-        let documents = serde_yaml_ng::Deserializer::from_str(deployment)
-            .map(|document| {
-                serde_json::Value::deserialize(document).expect("valid deployment YAML document")
-            })
-            .collect::<Vec<_>>();
-        let operator_deployments = documents
-            .iter()
-            .filter(|document| {
-                document
-                    .pointer("/kind")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("Deployment")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            operator_deployments.len(),
-            1,
-            "durable switchover must not introduce a worker deployment"
-        );
-        let operator = operator_deployments[0];
-        assert_eq!(
-            operator
-                .pointer("/metadata/name")
-                .and_then(serde_json::Value::as_str),
-            Some("kuberic-operator")
-        );
-        assert_eq!(
-            operator
-                .pointer("/spec/replicas")
-                .and_then(serde_json::Value::as_i64),
-            Some(1)
-        );
-        assert_eq!(
-            operator
-                .pointer("/spec/template/spec/containers")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len),
-            Some(1)
-        );
-
-        let example = include_str!("../../examples/kvstore/deploy/kubericset.yaml");
-        assert!(!example.contains("switchoverExecution"));
-        assert!(!example.contains("checkpoint"));
-        assert!(!example.contains("activity"));
-        assert!(!example.contains("\nstatus:"));
-        let example_set: KubericSet =
-            serde_yaml_ng::from_str(example).expect("current kvstore example must deserialize");
-        assert_eq!(example_set.spec.replicas, 3);
-        assert!((1..=KUBERIC_MAX_REPLICAS).contains(&example_set.spec.replicas));
-        assert!(example_set.status.is_none());
     }
 
     #[test]
