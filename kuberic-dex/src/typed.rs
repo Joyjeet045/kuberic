@@ -72,7 +72,7 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 
 /// A typed durable activity contract.
 ///
-/// Orchestration bodies invoke an activity with
+/// Typed orchestration handlers invoke an activity with
 /// [`crate::OrchestrationContext::schedule_activity`].
 /// DEX supplies the activity version and encoded payload limits.
 ///
@@ -124,7 +124,7 @@ pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = Identit
 ///     const NAME: &'static str = "typed-input";
 /// }
 ///
-/// async fn invalid_call(context: &mut OrchestrationContext<'_>) {
+/// async fn invalid_call(context: OrchestrationContext) {
 ///     context.schedule_activity::<Activity>(&"wrong input").await;
 /// }
 /// ```

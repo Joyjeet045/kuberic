@@ -32,17 +32,12 @@ struct ReconcileResult {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let orchestrations = OrchestrationRegistry::builder()
-        .register_typed::<ReconcileInput, ReconcileResult, ActivityInvocationError, _>(
+        .register_typed::<ReconcileInput, ReconcileResult, ActivityInvocationError, _, _>(
             "ReconcileResource",
-            |context: &mut OrchestrationContext<'_>, input| {
-                Box::pin(async move {
-                    context
-                        .schedule_activity_typed::<ReconcileInput, ReconcileResult>(
-                            "MarkReady",
-                            &input,
-                        )
-                        .await
-                })
+            |context: OrchestrationContext, input| async move {
+                context
+                    .schedule_activity_typed::<ReconcileInput, ReconcileResult>("MarkReady", &input)
+                    .await
             },
         )
         .build()?;

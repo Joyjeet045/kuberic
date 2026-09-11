@@ -30,17 +30,15 @@ use kuberic_dex::{
 };
 
 let orchestrations = OrchestrationRegistry::builder()
-    .register_typed::<GreetingInput, GreetingResult, ActivityInvocationError, _>(
+    .register_typed::<GreetingInput, GreetingResult, ActivityInvocationError, _, _>(
         "GreetingWorkflow",
-        |context: &mut OrchestrationContext<'_>, input| {
-            Box::pin(async move {
-                context
-                    .schedule_activity_typed::<GreetingInput, GreetingResult>(
-                        "greeting",
-                        &input,
-                    )
-                    .await
-            })
+        |context: OrchestrationContext, input| async move {
+            context
+                .schedule_activity_typed::<GreetingInput, GreetingResult>(
+                    "greeting",
+                    &input,
+                )
+                .await
         },
     )
     .build()?;

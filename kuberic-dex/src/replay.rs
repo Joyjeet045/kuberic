@@ -179,7 +179,9 @@ fn evaluate_internal<W: Workflow + ?Sized>(
             let mut task_context = Context::from_waker(noop_waker_ref());
             future.as_mut().poll(&mut task_context)
         };
-        (poll, context.cursor(), context.decision)
+        let cursor = context.cursor();
+        let decision = context.take_decision();
+        (poll, cursor, decision)
     };
 
     match decision {

@@ -1,5 +1,9 @@
 use std::{
-    collections::BTreeMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc, task::Poll,
+    collections::BTreeMap,
+    future::Future,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+    task::Poll,
 };
 
 use async_trait::async_trait;
@@ -12,9 +16,9 @@ use crate::{
     ActivityState, CompletionClass, EffectMetadata, ExactBytes, ExecutionId, LogicalActivityId,
     Nondeterminism, PreparedCommand, PreparedEffectResolver,
     typed::{
-        ActivityCallError, ActivityInvocationError, DurableActivity, PreparedActivityError,
-        PreparedActivityResolver, activity_spec, activity_spec_named, canonical_json,
-        decode_activity_result, decode_typed_result, typed_activity_spec,
+        ActivityCallError, ActivityInvocationError, DurableActivity, IDENTITY_ACTIVITY_RESOLVER,
+        PreparedActivityError, PreparedActivityResolver, activity_spec, activity_spec_named,
+        canonical_json, decode_activity_result, decode_typed_result, typed_activity_spec,
     },
 };
 
@@ -65,28 +69,6 @@ pub enum WorkflowCodecError {
     ErrorDecoding,
 }
 
-/// Typed ordinary-async orchestration contract.
-///
-/// Implementations receive decoded input and return an ordinary [`Result`], so
-/// activity failures can be propagated with `?`. The replay kernel encodes the
-/// success or error value into the terminal checkpoint.
-#[async_trait]
-#[doc(hidden)]
-pub trait Orchestration: Sync {
-    type Input: Serialize + DeserializeOwned + Send;
-    type Output: Serialize + DeserializeOwned + Send;
-    type Error: Serialize + DeserializeOwned + Send;
-
-    async fn run(
-        &self,
-        context: &mut OrchestrationContext<'_>,
-        input: Self::Input,
-    ) -> Result<Self::Output, Self::Error>;
-}
-
-/// Boxed future returned by a typed orchestration registry handler.
-pub type OrchestrationFuture<'a, O, E> = Pin<Box<dyn Future<Output = Result<O, E>> + Send + 'a>>;
-
 /// Immutable registry of named orchestration handlers.
 pub struct OrchestrationRegistry {
     handlers: BTreeMap<String, Arc<dyn Workflow>>,
@@ -112,18 +94,13 @@ pub struct OrchestrationRegistryBuilder {
 }
 
 impl OrchestrationRegistryBuilder {
-    pub fn register_typed<In, Out, E, H>(mut self, name: &str, handler: H) -> Self
+    pub fn register_typed<In, Out, E, H, F>(mut self, name: &str, handler: H) -> Self
     where
         In: Serialize + DeserializeOwned + Send + 'static,
         Out: Serialize + DeserializeOwned + Send + 'static,
         E: Serialize + DeserializeOwned + Send + 'static,
-        H: for<'a, 'history> Fn(
-                &'a mut OrchestrationContext<'history>,
-                In,
-            ) -> OrchestrationFuture<'a, Out, E>
-            + Send
-            + Sync
-            + 'static,
+        H: Fn(OrchestrationContext, In) -> F + Send + Sync + 'static,
+        F: Future<Output = Result<Out, E>> + Send + 'static,
     {
         if self.error.is_some() {
             return self;
@@ -140,9 +117,10 @@ impl OrchestrationRegistryBuilder {
         }
         self.handlers.insert(
             name.to_owned(),
-            Arc::new(TypedOrchestration::<In, Out, E, H> {
+            Arc::new(TypedOrchestration::<In, Out, E, H, F> {
                 handler,
                 types: PhantomData,
+                future: PhantomData,
             }),
         );
         self
@@ -168,31 +146,27 @@ pub enum OrchestrationRegistryError {
     Unregistered(String),
 }
 
-struct TypedOrchestration<In, Out, E, H> {
+struct TypedOrchestration<In, Out, E, H, F> {
     handler: H,
     types: PhantomData<fn(In) -> (Out, E)>,
+    future: PhantomData<fn() -> F>,
 }
 
 #[async_trait]
-impl<In, Out, E, H> Workflow for TypedOrchestration<In, Out, E, H>
+impl<In, Out, E, H, F> Workflow for TypedOrchestration<In, Out, E, H, F>
 where
     In: Serialize + DeserializeOwned + Send + 'static,
     Out: Serialize + DeserializeOwned + Send + 'static,
     E: Serialize + DeserializeOwned + Send + 'static,
-    H: for<'a, 'history> Fn(
-            &'a mut OrchestrationContext<'history>,
-            In,
-        ) -> OrchestrationFuture<'a, Out, E>
-        + Send
-        + Sync
-        + 'static,
+    H: Fn(OrchestrationContext, In) -> F + Send + Sync + 'static,
+    F: Future<Output = Result<Out, E>> + Send + 'static,
 {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
         let input = match serde_json::from_slice::<In>(input.as_slice()) {
             Ok(input) => input,
             Err(_) => return codec_failure(WorkflowCodecError::InputDecoding),
         };
-        match (self.handler)(context, input).await {
+        match (self.handler)(context.orchestration_context(), input).await {
             Ok(output) => match canonical_json(&output) {
                 Ok(output) => TerminalOutcome::succeeded(output),
                 Err(_) => codec_failure(WorkflowCodecError::OutputEncoding),
@@ -231,14 +205,6 @@ pub fn decode_workflow_result<O: DeserializeOwned, E: DeserializeOwned>(
     }
 }
 
-/// Decode the terminal result using an orchestration's associated types.
-#[doc(hidden)]
-pub fn decode_orchestration_result<O: Orchestration>(
-    outcome: &TerminalOutcome,
-) -> Result<Result<O::Output, O::Error>, WorkflowCodecError> {
-    decode_workflow_result(outcome)
-}
-
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 enum WorkflowFailure<E> {
@@ -248,36 +214,10 @@ enum WorkflowFailure<E> {
 
 /// Low-level exact-byte workflow contract used by the replay kernel.
 ///
-/// Application code should normally implement [`Orchestration`] instead.
+/// Application code should normally use [`OrchestrationRegistry`] instead.
 #[async_trait]
 pub trait Workflow: Sync {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome;
-}
-
-/// Duroxide-style name for the workflow replay context.
-pub type OrchestrationContext<'history> = WorkflowContext<'history>;
-
-#[async_trait]
-impl<T> Workflow for T
-where
-    T: Orchestration,
-{
-    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
-        let input = match serde_json::from_slice::<T::Input>(input.as_slice()) {
-            Ok(input) => input,
-            Err(_) => return codec_failure(WorkflowCodecError::InputDecoding),
-        };
-        match Orchestration::run(self, context, input).await {
-            Ok(output) => match canonical_json(&output) {
-                Ok(output) => TerminalOutcome::succeeded(output),
-                Err(_) => codec_failure(WorkflowCodecError::OutputEncoding),
-            },
-            Err(error) => match canonical_json(&WorkflowFailure::Application(error)) {
-                Ok(error) => TerminalOutcome::failed(error),
-                Err(_) => codec_failure(WorkflowCodecError::ErrorEncoding),
-            },
-        }
-    }
 }
 
 fn codec_failure(error: WorkflowCodecError) -> TerminalOutcome {
@@ -287,6 +227,135 @@ fn codec_failure(error: WorkflowCodecError) -> TerminalOutcome {
 }
 
 /// Linear replay context. `activity` is its only workflow-body operation.
+#[derive(Clone)]
+pub struct OrchestrationContext {
+    state: Arc<Mutex<OwnedContextState>>,
+}
+
+struct OwnedContextState {
+    execution_id: ExecutionId,
+    history: Arc<[ActivityRecord]>,
+    cursor: usize,
+    decision: Option<ContextDecision>,
+}
+
+impl OrchestrationContext {
+    /// Schedule a named typed activity with default options.
+    pub async fn schedule_activity_typed<In, Out>(
+        &self,
+        name: &str,
+        input: &In,
+    ) -> Result<Out, ActivityInvocationError>
+    where
+        In: Serialize,
+        Out: DeserializeOwned,
+    {
+        self.schedule_activity_typed_with_options(name, input, ActivityOptions::default())
+            .await
+    }
+
+    /// Schedule a named typed activity with replay-matched options.
+    pub async fn schedule_activity_typed_with_options<In, Out>(
+        &self,
+        name: &str,
+        input: &In,
+        options: ActivityOptions,
+    ) -> Result<Out, ActivityInvocationError>
+    where
+        In: Serialize,
+        Out: DeserializeOwned,
+    {
+        let spec = typed_activity_spec(name, input, options)?;
+        let result = poll_fn(|_| self.poll_activity(&spec))
+            .await
+            .map_err(WorkflowContext::activity_invocation_error)?;
+        decode_typed_result(&result, crate::MAX_ACTIVITY_RESULT_BYTES)
+            .map_err(ActivityInvocationError::Call)
+    }
+
+    /// Return the immutable execution identity being replayed.
+    pub fn execution_id(&self) -> ExecutionId {
+        self.state
+            .lock()
+            .expect("orchestration context lock must not be poisoned")
+            .execution_id
+    }
+
+    fn poll_activity(&self, spec: &ActivitySpec) -> Poll<Result<ExactBytes, ActivityFailure>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("orchestration context lock must not be poisoned");
+        if state.decision.is_some() {
+            return Poll::Pending;
+        }
+
+        let sequence = ActivitySequence::new(
+            u64::try_from(state.cursor).expect("validated history length fits in u64"),
+        );
+        let record = state.history.get(state.cursor).cloned();
+        let prepared = match IDENTITY_ACTIVITY_RESOLVER
+            .resolve(spec, record.as_ref().map(ActivityRecord::spec))
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                state.decision = Some(ContextDecision::PreparationRejected(error));
+                return Poll::Pending;
+            }
+        };
+        let requested_id = LogicalActivityId::new(state.execution_id, sequence, prepared.clone());
+
+        let Some(record) = record else {
+            state.decision = Some(ContextDecision::Schedule {
+                sequence,
+                spec: prepared,
+                logical_id: requested_id,
+                completion_class: None,
+            });
+            return Poll::Pending;
+        };
+
+        if record.spec() != &prepared {
+            state.decision = Some(ContextDecision::Nondeterminism(
+                Nondeterminism::ActivityMismatch {
+                    sequence,
+                    recorded: record.spec().clone(),
+                    requested: prepared,
+                },
+            ));
+            return Poll::Pending;
+        }
+        if record.completion_class().is_some() {
+            state.decision = Some(ContextDecision::Nondeterminism(
+                Nondeterminism::CompletionClassMismatch {
+                    sequence,
+                    recorded: record.completion_class(),
+                    requested: CompletionClass::ExternalEffect,
+                },
+            ));
+            return Poll::Pending;
+        }
+
+        match record.state() {
+            ActivityState::Completed { result } => {
+                state.cursor += 1;
+                Poll::Ready(match record.failure() {
+                    Some(failure) => Err(failure.clone()),
+                    None => Ok(result.clone()),
+                })
+            }
+            state_value @ (ActivityState::Scheduled | ActivityState::DispatchExposed { .. }) => {
+                state.decision = Some(ContextDecision::ExistingPending {
+                    logical_id: requested_id,
+                    state: state_value.clone(),
+                });
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// Low-level replay context for strict effects and kernel tests.
 pub struct WorkflowContext<'history> {
     execution_id: ExecutionId,
     history: &'history [ActivityRecord],
@@ -294,6 +363,7 @@ pub struct WorkflowContext<'history> {
     effect_resolver: Option<&'history dyn PreparedEffectResolver>,
     cursor: usize,
     pub(crate) decision: Option<ContextDecision>,
+    owned_state: Arc<Mutex<OwnedContextState>>,
 }
 
 impl<'history> WorkflowContext<'history> {
@@ -309,6 +379,12 @@ impl<'history> WorkflowContext<'history> {
             effect_resolver: None,
             cursor: 0,
             decision: None,
+            owned_state: Arc::new(Mutex::new(OwnedContextState {
+                execution_id,
+                history: Arc::from(history.to_vec()),
+                cursor: 0,
+                decision: None,
+            })),
         }
     }
 
@@ -325,6 +401,18 @@ impl<'history> WorkflowContext<'history> {
             effect_resolver: Some(effect_resolver),
             cursor: 0,
             decision: None,
+            owned_state: Arc::new(Mutex::new(OwnedContextState {
+                execution_id,
+                history: Arc::from(history.to_vec()),
+                cursor: 0,
+                decision: None,
+            })),
+        }
+    }
+
+    fn orchestration_context(&self) -> OrchestrationContext {
+        OrchestrationContext {
+            state: Arc::clone(&self.owned_state),
         }
     }
 
@@ -432,8 +520,23 @@ impl<'history> WorkflowContext<'history> {
         }
     }
 
-    pub(crate) const fn cursor(&self) -> usize {
-        self.cursor
+    pub(crate) fn cursor(&self) -> usize {
+        self.cursor.max(
+            self.owned_state
+                .lock()
+                .expect("orchestration context lock must not be poisoned")
+                .cursor,
+        )
+    }
+
+    pub(crate) fn take_decision(&mut self) -> Option<ContextDecision> {
+        self.decision.take().or_else(|| {
+            self.owned_state
+                .lock()
+                .expect("orchestration context lock must not be poisoned")
+                .decision
+                .take()
+        })
     }
 
     /// Return the immutable execution identity being replayed.

@@ -16,29 +16,26 @@ struct GreetingInput {
 
 fn orchestrations() -> OrchestrationRegistry {
     OrchestrationRegistry::builder()
-        .register_typed::<GreetingInput, Vec<u8>, kuberic_dex::ActivityInvocationError, _>(
+        .register_typed::<GreetingInput, Vec<u8>, kuberic_dex::ActivityInvocationError, _, _>(
             "OrdinaryAsync",
-            |context: &mut OrchestrationContext<'_>, input| {
-                Box::pin(async move {
-                    // FR012_WORKFLOW_START
-                    let result = context
-                        .schedule_activity_typed::<GreetingInput, Vec<u8>>("ordinary-async", &input)
-                        .await?;
-                    Ok(result)
-                    // FR012_WORKFLOW_END
-                })
+            |context: OrchestrationContext, input| async move {
+                // FR012_WORKFLOW_START
+                let cloned = context.clone();
+                let result = cloned
+                    .schedule_activity_typed::<GreetingInput, Vec<u8>>("ordinary-async", &input)
+                    .await?;
+                Ok(result)
+                // FR012_WORKFLOW_END
             },
         )
-        .register_typed::<GreetingInput, String, String, _>(
+        .register_typed::<GreetingInput, String, String, _, _>(
             "ImmediateSuccess",
-            |_context: &mut OrchestrationContext<'_>, input| {
-                Box::pin(async move { Ok(input.message) })
-            },
+            |_context: OrchestrationContext, input| async move { Ok(input.message) },
         )
-        .register_typed::<GreetingInput, String, String, _>(
+        .register_typed::<GreetingInput, String, String, _, _>(
             "ImmediateFailure",
-            |_context: &mut OrchestrationContext<'_>, input| {
-                Box::pin(async move { Err(format!("cannot greet {}", input.message)) })
+            |_context: OrchestrationContext, input| async move {
+                Err(format!("cannot greet {}", input.message))
             },
         )
         .build()
@@ -102,9 +99,9 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
 
     let library_exports = include_str!("../src/lib.rs");
     let async_surface_exported =
-        library_exports.contains("OrchestrationContext, OrchestrationFuture");
-    let low_level_surface_hidden = library_exports
-        .contains("#[doc(hidden)]\npub use workflow::{Orchestration, Workflow, WorkflowContext");
+        library_exports.contains("OrchestrationContext, OrchestrationRegistry");
+    let low_level_surface_hidden =
+        library_exports.contains("#[doc(hidden)]\npub use workflow::{Workflow, WorkflowContext");
 
     let predicates = [
         (
@@ -112,6 +109,10 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
             matches!(first_turn, HostOutcome::ScheduleAccepted { .. }),
         ),
         ("no author-written poll or state machine", !authored_poll),
+        (
+            "no author-written future boxing",
+            !body.contains("Box::pin"),
+        ),
         (
             "no raw identity, byte, serde, or bound plumbing",
             !raw_plumbing,
@@ -202,27 +203,21 @@ fn typed_orchestration_boundary_round_trips_results_and_reports_bad_input() {
 #[test]
 fn orchestration_registry_rejects_invalid_names_and_duplicates() {
     let empty = OrchestrationRegistry::builder()
-        .register_typed::<GreetingInput, String, String, _>(
+        .register_typed::<GreetingInput, String, String, _, _>(
             "",
-            |_context: &mut OrchestrationContext<'_>, input| {
-                Box::pin(async move { Ok(input.message) })
-            },
+            |_context: OrchestrationContext, input| async move { Ok(input.message) },
         )
         .build();
     assert!(matches!(empty, Err(OrchestrationRegistryError::EmptyName)));
 
     let duplicate = OrchestrationRegistry::builder()
-        .register_typed::<GreetingInput, String, String, _>(
+        .register_typed::<GreetingInput, String, String, _, _>(
             "Greeting",
-            |_context: &mut OrchestrationContext<'_>, input| {
-                Box::pin(async move { Ok(input.message) })
-            },
+            |_context: OrchestrationContext, input| async move { Ok(input.message) },
         )
-        .register_typed::<GreetingInput, String, String, _>(
+        .register_typed::<GreetingInput, String, String, _, _>(
             "Greeting",
-            |_context: &mut OrchestrationContext<'_>, input| {
-                Box::pin(async move { Ok(input.message) })
-            },
+            |_context: OrchestrationContext, input| async move { Ok(input.message) },
         )
         .build();
     assert!(matches!(

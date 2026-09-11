@@ -19,14 +19,12 @@ struct Greeting {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let orchestrations = OrchestrationRegistry::builder()
-        .register_typed::<GreetingInput, Greeting, ActivityInvocationError, _>(
+        .register_typed::<GreetingInput, Greeting, ActivityInvocationError, _, _>(
             "HelloWorld",
-            |context: &mut OrchestrationContext<'_>, input| {
-                Box::pin(async move {
-                    context
-                        .schedule_activity_typed::<GreetingInput, Greeting>("Greet", &input)
-                        .await
-                })
+            |context: OrchestrationContext, input| async move {
+                context
+                    .schedule_activity_typed::<GreetingInput, Greeting>("Greet", &input)
+                    .await
             },
         )
         .build()?;
