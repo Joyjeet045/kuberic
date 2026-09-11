@@ -337,6 +337,37 @@ async fn three_replicas_copy_quorum_failover_restart_and_fencing() {
             .await
             .is_err()
     );
+    let configuration = ReplicaSetConfig {
+        members: vec![second.info().await],
+        write_quorum: 2,
+    };
+    third
+        .execute(DurableReplicaAction::UpdateCatchUpConfiguration {
+            current: configuration.clone(),
+            previous: ReplicaSetConfig {
+                members: vec![],
+                write_quorum: 0,
+            },
+        })
+        .await;
+    third
+        .execute(DurableReplicaAction::UpdateCurrentConfiguration {
+            current: configuration,
+        })
+        .await;
+    let after_switchover = tokio::time::timeout(
+        Duration::from_secs(10),
+        third
+            .replica
+            .write(vec![put("after-switchover", "replicated")]),
+    )
+    .await
+    .expect("demoted replica must resume replication")
+    .unwrap();
+    assert_eq!(
+        second.replica.applied_lsn().await.unwrap(),
+        after_switchover
+    );
     third.execute(DurableReplicaAction::Close).await;
     let lsn = third.replica.applied_lsn().await.unwrap();
     (&mut third.service).await.unwrap();

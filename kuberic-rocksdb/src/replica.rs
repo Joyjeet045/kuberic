@@ -202,14 +202,14 @@ impl RocksReplica {
 
     async fn drain(
         &self,
-        mut stream: OperationStream,
+        stream: &mut OperationStream,
         token: CancellationToken,
         copy: bool,
     ) -> Result<()> {
         let mut contents = Vec::new();
         loop {
             let operation = tokio::select! {
-                _ = token.cancelled() => return Err(Error::RecoveryRequired),
+                _ = token.cancelled() => return if copy { Err(Error::RecoveryRequired) } else { Ok(()) },
                 operation = stream.get_operation() => operation,
             };
             let Some(operation) = operation else { break };
@@ -332,7 +332,8 @@ impl RocksReplica {
         let mut provider: Option<mpsc::UnboundedReceiver<StateProviderEvent>> = None;
         let mut copy_stream = None;
         let mut replication_stream = None;
-        let mut drain: Option<tokio::task::JoinHandle<Result<()>>> = None;
+        let mut drain: Option<tokio::task::JoinHandle<(Option<OperationStream>, Result<()>)>> =
+            None;
         let mut drain_token = CancellationToken::new();
         let mut role = Role::Unknown;
         loop {
@@ -364,8 +365,9 @@ impl RocksReplica {
                                 if role == new_role { return Ok(()); }
                                 if role != Role::IdleSecondary || !matches!(new_role, Role::ActiveSecondary | Role::Primary) { drain_token.cancel(); }
                                 if let Some(handle) = drain.take() {
-                                    let result = handle.await.map_err(|_| Error::RecoveryRequired)?;
-                                    if role == Role::IdleSecondary && matches!(new_role, Role::ActiveSecondary | Role::Primary) { result?; }
+                                    let (stream, result) = handle.await.map_err(|_| Error::RecoveryRequired)?;
+                                    if role == Role::ActiveSecondary { replication_stream = stream; }
+                                    if matches!(new_role, Role::ActiveSecondary | Role::Primary) { result?; }
                                 }
                                 self.access(move |inner| {
                                     if inner.failed && matches!(new_role, Role::Primary | Role::ActiveSecondary) { return Err(Error::RecoveryRequired); }
@@ -375,13 +377,13 @@ impl RocksReplica {
                                 }).await?;
                                 drain_token = CancellationToken::new();
                                 let stream = match new_role { Role::IdleSecondary => copy_stream.take(), Role::ActiveSecondary => replication_stream.take(), _ => None };
-                                if let Some(stream) = stream {
+                                if let Some(mut stream) = stream {
                                     let replica = self.clone();
                                     let token = drain_token.clone();
                                     drain = Some(tokio::spawn(async move {
-                                        let result = replica.drain(stream, token.clone(), new_role == Role::IdleSecondary).await;
-                                        if result.is_err() && !token.is_cancelled() { replica.fault().await; }
-                                        result
+                                        let result = replica.drain(&mut stream, token.clone(), new_role == Role::IdleSecondary).await;
+                                        if result.is_err() && (new_role == Role::ActiveSecondary || !token.is_cancelled()) { replica.fault().await; }
+                                        ((new_role == Role::ActiveSecondary).then_some(stream), result)
                                     }));
                                 }
                                 role = new_role;
@@ -428,6 +430,27 @@ fn core_error(error: Error) -> kuberic_core::KubericError {
 mod tests {
     use super::*;
     use kuberic_core::handles::PartitionState;
+
+    #[tokio::test]
+    async fn cancelled_replication_drain_can_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let replica = RocksReplica::open(directory.path().into()).await.unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let (sender, mut stream) = OperationStream::channel(1);
+        replica.drain(&mut stream, token, false).await.unwrap();
+        let payload = record(vec![]).unwrap();
+        sender
+            .send(Operation::new(1, payload.into(), None))
+            .await
+            .unwrap();
+        drop(sender);
+        replica
+            .drain(&mut stream, CancellationToken::new(), false)
+            .await
+            .unwrap();
+        assert_eq!(replica.applied_lsn().await.unwrap(), 1);
+    }
 
     #[tokio::test]
     async fn missing_active_database_and_concurrent_open_fail_closed() {
@@ -481,7 +504,7 @@ mod tests {
             value: b"durable".to_vec(),
         }])
         .unwrap();
-        let (sender, stream) = OperationStream::channel(1);
+        let (sender, mut stream) = OperationStream::channel(1);
         let (ack, acknowledged) = tokio::sync::oneshot::channel();
         sender
             .send(Operation::new(1, payload.into(), Some(ack)))
@@ -489,14 +512,14 @@ mod tests {
             .unwrap();
         drop(sender);
         replica
-            .drain(stream, CancellationToken::new(), false)
+            .drain(&mut stream, CancellationToken::new(), false)
             .await
             .unwrap();
         acknowledged.await.unwrap();
         drop(replica);
         let replica = RocksReplica::open(directory.path().into()).await.unwrap();
         assert_eq!(replica.applied_lsn().await.unwrap(), 1);
-        let (sender, stream) = OperationStream::channel(1);
+        let (sender, mut stream) = OperationStream::channel(1);
         let (ack, acknowledged) = tokio::sync::oneshot::channel();
         sender
             .send(Operation::new(2, Bytes::from_static(b"invalid"), Some(ack)))
@@ -505,7 +528,7 @@ mod tests {
         drop(sender);
         assert!(
             replica
-                .drain(stream, CancellationToken::new(), false)
+                .drain(&mut stream, CancellationToken::new(), false)
                 .await
                 .is_err()
         );
@@ -517,7 +540,7 @@ mod tests {
             value: b"must-not-apply".to_vec(),
         }])
         .unwrap();
-        let (sender, stream) = OperationStream::channel(1);
+        let (sender, mut stream) = OperationStream::channel(1);
         let (ack, acknowledged) = tokio::sync::oneshot::channel();
         sender
             .send(Operation::new(2, payload.into(), Some(ack)))
@@ -525,7 +548,9 @@ mod tests {
             .unwrap();
         drop(sender);
         assert!(matches!(
-            replica.drain(stream, CancellationToken::new(), false).await,
+            replica
+                .drain(&mut stream, CancellationToken::new(), false)
+                .await,
             Err(Error::RecoveryRequired)
         ));
         assert!(acknowledged.await.is_err());
