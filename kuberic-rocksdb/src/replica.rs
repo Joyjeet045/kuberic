@@ -221,8 +221,13 @@ impl RocksReplica {
             } else {
                 let data = operation.data.clone();
                 let lsn = operation.lsn;
-                self.access(move |inner| inner.store.apply_record(lsn, &data))
-                    .await?;
+                self.access(move |inner| {
+                    if inner.failed {
+                        return Err(Error::RecoveryRequired);
+                    }
+                    inner.store.apply_record(lsn, &data)
+                })
+                .await?;
             }
             operation.acknowledge();
         }
@@ -506,5 +511,31 @@ mod tests {
         );
         assert!(acknowledged.await.is_err());
         assert_eq!(replica.applied_lsn().await.unwrap(), 1);
+        replica.fault().await;
+        let payload = record(vec![Mutation::Put {
+            key: b"key".to_vec(),
+            value: b"must-not-apply".to_vec(),
+        }])
+        .unwrap();
+        let (sender, stream) = OperationStream::channel(1);
+        let (ack, acknowledged) = tokio::sync::oneshot::channel();
+        sender
+            .send(Operation::new(2, payload.into(), Some(ack)))
+            .await
+            .unwrap();
+        drop(sender);
+        assert!(matches!(
+            replica.drain(stream, CancellationToken::new(), false).await,
+            Err(Error::RecoveryRequired)
+        ));
+        assert!(acknowledged.await.is_err());
+        assert_eq!(replica.applied_lsn().await.unwrap(), 1);
+        assert_eq!(
+            replica
+                .access(|inner| Ok(inner.store.database.get(user_key(b"key"))?))
+                .await
+                .unwrap(),
+            Some(b"durable".to_vec())
+        );
     }
 }
