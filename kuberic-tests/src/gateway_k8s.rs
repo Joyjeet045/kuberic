@@ -1,8 +1,14 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use k8s_openapi::api::{apps::v1::Deployment, core::v1::Service, discovery::v1::EndpointSlice};
-use kube::api::{ApiResource, DynamicObject, ListParams, Patch, PatchParams};
+use k8s_openapi::api::{
+    apps::v1::Deployment,
+    core::v1::{Pod, Service},
+    discovery::v1::EndpointSlice,
+};
+use kube::api::{
+    ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, Preconditions,
+};
 use kube::{Api, Client};
 use kvstore::proto::kv_store_client::KvStoreClient;
 use kvstore::proto::{GetRequest, PutRequest};
@@ -387,30 +393,50 @@ async fn verify_isolation(clients: &mut [KvStoreClient<Channel>; 2]) -> Result<(
     Ok(())
 }
 
-async fn switch_primary(
+async fn transition_primary(
     client: Client,
     application: &str,
     existing: &mut KvStoreClient<Channel>,
+    failover: bool,
 ) -> Result<()> {
     let before = wait_set(client.clone(), application, None).await?;
     let primary = before.data["status"]["currentPrimary"]
         .as_str()
         .context("missing primary")?;
-    let target = before.data["status"]["members"]
-        .as_array()
-        .context("missing members")?
-        .iter()
-        .filter_map(|member| member["name"].as_str())
-        .find(|name| *name != primary)
-        .context("missing switchover target")?
-        .to_string();
-    resources(client.clone(), "kuberic.io", "KubericSet", "kubericsets")
-        .patch_status(
+    let sets = resources(client.clone(), "kuberic.io", "KubericSet", "kubericsets");
+    let target = if failover {
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NAMESPACE);
+        let pod = pods.get(primary).await?;
+        pods.delete(
+            primary,
+            &DeleteParams {
+                grace_period_seconds: Some(0),
+                preconditions: Some(Preconditions {
+                    uid: pod.metadata.uid,
+                    resource_version: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+        None
+    } else {
+        let target = before.data["status"]["members"]
+            .as_array()
+            .context("missing members")?
+            .iter()
+            .filter_map(|member| member["name"].as_str())
+            .find(|name| *name != primary)
+            .context("missing switchover target")?
+            .to_string();
+        sets.patch_status(
             application,
             &PatchParams::default(),
             &Patch::Merge(serde_json::json!({"status": {"targetPrimary": target}})),
         )
         .await?;
+        Some(target)
+    };
     match existing
         .get(GetRequest {
             key: "shared-key".into(),
@@ -425,12 +451,24 @@ async fn switch_primary(
             tracing::info!(application, %error, "existing connection interrupted by primary transition")
         }
     }
-    wait_set(client.clone(), application, Some(&target)).await?;
-    wait_primary_endpoint(client, application, &target).await?;
-    let replacement = reconnect(application, "after-switchover", application).await?;
+    let promoted = wait_resource(&sets, application, "promoted primary", |object| {
+        object.data["status"]["phase"] == "Healthy"
+            && object.data["status"]["currentPrimary"]
+                .as_str()
+                .is_some_and(|actual| {
+                    actual != primary && target.as_ref().is_none_or(|expected| actual == expected)
+                })
+    })
+    .await?;
+    let target = promoted.data["status"]["currentPrimary"]
+        .as_str()
+        .context("missing promoted primary")?;
+    wait_primary_endpoint(client, application, target).await?;
+    let replacement = reconnect(application, "after-transition", application).await?;
     *existing = replacement;
     tracing::info!(
         application,
+        failover,
         old_primary = primary,
         new_primary = target,
         "reconnected through unchanged authority and host port"
@@ -478,7 +516,7 @@ async fn scenario() -> Result<()> {
         "unknown authority reached a backend"
     );
 
-    for index in 0..APPLICATIONS.len() {
+    for (index, failover) in [(0, false), (1, false), (0, true), (1, true)] {
         let other = 1 - index;
         let stopping = CancellationToken::new();
         let mut unaffected = clients[other].clone();
@@ -487,7 +525,7 @@ async fn scenario() -> Result<()> {
             loop {
                 round_trip(&mut unaffected, "unaffected-probe", APPLICATIONS[other])
                     .await
-                    .context("unaffected application's route failed during peer switchover")?;
+                    .context("unaffected application's route failed during peer transition")?;
                 probes += 1;
                 tokio::select! {
                     _ = stopping.cancelled() => return Ok::<_, anyhow::Error>(probes),
@@ -496,8 +534,13 @@ async fn scenario() -> Result<()> {
             }
         };
         let transition = async {
-            let result =
-                switch_primary(client.clone(), APPLICATIONS[index], &mut clients[index]).await;
+            let result = transition_primary(
+                client.clone(),
+                APPLICATIONS[index],
+                &mut clients[index],
+                failover,
+            )
+            .await;
             stopping.cancel();
             result
         };

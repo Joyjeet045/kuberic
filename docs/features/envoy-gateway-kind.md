@@ -125,11 +125,13 @@ The separate `gateway` CI job explicitly runs the ignored cluster test. It:
 2. Verifies listener, NodePort ownership, route backend and Service selectors.
 3. Writes the same key with different values plus set-specific keys, checking
    data isolation and rejection of unknown authorities.
-4. Requests switchover for each application in turn, exercises its existing
-   connection, waits for the new primary and endpoints, and verifies fresh
-   connections through the unchanged authority and host port.
+4. Requests switchover for each application in turn, then deletes each set's
+  current primary pod with a UID precondition to exercise unplanned failover.
+  For every transition it exercises the existing connection, waits for a
+  different primary and the corresponding endpoints, and verifies fresh
+  connections through the unchanged authority and host port.
 5. Continuously writes and reads through the other application's route during
-   each transition, then checks isolation again.
+  every switchover and failover, then checks isolation again.
 
 The normal workspace test suite keeps the direct NodePort test unchanged and
 does not install or require Envoy. Cluster-free tests verify authority routing
