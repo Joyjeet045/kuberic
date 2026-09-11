@@ -1,0 +1,19 @@
+[package]
+name = "kuberic-transactional-replicator"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+kuberic-core = { path = "../kuberic-core" }
+kuberic-transaction-log = { path = "../kuberic-transaction-log" }
+tokio.workspace = true
+bytes.workspace = true
+serde = { workspace = true, features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+sha2 = "0.10"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

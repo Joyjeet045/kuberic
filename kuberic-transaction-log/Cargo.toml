@@ -1,0 +1,10 @@
+[package]
+name = "kuberic-transaction-log"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+crc32fast.workspace = true
+tempfile = "3"
+fs2 = "0.4"

@@ -1,0 +1,17 @@
+[package]
+name = "kuberic-state-manager"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+kuberic-core = { path = "../kuberic-core" }
+kuberic-transactional-replicator = { path = "../kuberic-transactional-replicator" }
+tokio.workspace = true
+serde = { workspace = true, features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+rand.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio-stream.workspace = true
