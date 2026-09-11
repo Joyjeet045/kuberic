@@ -37,6 +37,8 @@ pub enum Error {
     ResourceExhausted,
     #[error("request identity was reused with different transaction data")]
     DuplicateRequest,
+    #[error("transaction result requires quorum confirmation; retry the original transaction")]
+    UnconfirmedCommit,
     #[error("storage: {0}")]
     Storage(#[from] std::io::Error),
     #[error("encoding: {0}")]
@@ -305,10 +307,14 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
                     if context.generation != inner.generation {
                         return Err(Error::StaleEpoch);
                     }
-                    if let Some(version) = retained_result(&inner.snapshot, &identity, digest)? {
-                        return Ok(Err(version));
+                    let retained = retained_result(&inner.snapshot, &identity, digest)?;
+                    if let Some(version) = retained {
+                        if version.0 <= inner.confirmed_lsn {
+                            return Ok(Err(version));
+                        }
+                    } else {
+                        inner.snapshot.state.validate(&observations, &command)?;
                     }
-                    inner.snapshot.state.validate(&observations, &command)?;
                     let payload = encode(
                         &Envelope {
                             format: FORMAT,
@@ -328,10 +334,11 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
                         inner.replicator.clone().ok_or(Error::NotPrimary)?,
                         inner.token.clone(),
                         inner.generation,
+                        retained,
                     )))
                 })
                 .await?;
-            let (payload, replicator, token, generation) = match preparation {
+            let (payload, replicator, token, generation, retained) = match preparation {
                 Ok(preparation) => preparation,
                 Err(version) => return Ok(version),
             };
@@ -355,7 +362,7 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
                     inner.log.append(Record { lsn, payload })?;
                     inner.snapshot = snapshot;
                     inner.confirmed_lsn = lsn;
-                    Ok(CommitVersion(lsn))
+                    Ok(retained.unwrap_or(CommitVersion(lsn)))
                 })
                 .await;
             if applied.is_err() {
@@ -375,7 +382,12 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
         self.access(move |inner| {
             ensure_writable(inner)?;
             match inner.snapshot.results.get(&identity.request) {
-                Some(outcome) if outcome.identity == identity => Ok(Some(outcome.version)),
+                Some(outcome) if outcome.identity == identity => {
+                    if outcome.version.0 > inner.confirmed_lsn {
+                        return Err(Error::UnconfirmedCommit);
+                    }
+                    Ok(Some(outcome.version))
+                }
                 Some(_) => Err(Error::DuplicateRequest),
                 None => Ok(None),
             }

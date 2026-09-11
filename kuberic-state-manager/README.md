@@ -65,11 +65,16 @@ Conflicts return `Error::Conflict`; repeat the application logic in a new
 transaction. Stale epochs, expired contexts, resource exhaustion, incompatible
 providers and conflicting retry identities have distinct errors.
 
-Each successful commit, including read-only commits, has one replicated record
+Each new transaction commit, including read-only commits, has one replicated record
 and LSN. Atomic publication covers the registry, every affected dictionary and
 the commit result. A retained `TransactionId` can query the original result
 after a lost response, promotion or restart. `with_identity` supports replaying
-the same request; changing its mutation payload is rejected. For provider
+the same request; changing its mutation payload is rejected. Queries return
+`Error::UnconfirmedCommit` when recovery has retained a result without quorum
+confirmation. An identical retry obtains quorum through an additional record,
+without applying mutations again, and returns the original commit version.
+Alternatively, commit a new read-only transaction to confirm the adopted prefix
+and query the original identity again. For provider
 creation retries, query the original identity before constructing new providers,
 whose incarnation IDs intentionally differ.
 

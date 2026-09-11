@@ -40,6 +40,12 @@ require fully confirmed primary state. A promoted
 replica can retain an in-doubt accepted suffix according to Kuberic's election
 authority; clients must query/retry the original identity, not assume that a
 lost reply means abort. A subsequent successful commit confirms that prefix.
+`committed_result` returns `Error::UnconfirmedCommit` for retained outcomes past
+the confirmed boundary. Retrying the identical transaction replicates a
+confirmation record before reporting success, without applying its mutations
+again or changing its original commit version. Already confirmed retries need
+no additional record. A successful read-only transaction also confirms the
+adopted prefix, after which clients can query its retained results again.
 Epoch callbacks reconstruct state and retained outcomes to the supplied
 authority boundary before truncating the log. A boundary older than the
 checkpoint fails explicitly and requires authoritative full copy.

@@ -540,14 +540,10 @@ async fn cross_provider_copy_failover_checkpoint_and_restart() {
         .execute(DurableReplicaAction::UpdateEpoch { epoch })
         .await;
     second.configure(&[&third]).await;
-    assert_eq!(
-        second
-            .manager
-            .committed_result(identity.clone())
-            .await
-            .unwrap(),
-        Some(version)
-    );
+    assert!(matches!(
+        second.manager.committed_result(identity.clone()).await,
+        Err(Error::UnconfirmedCommit)
+    ));
     let mut read = second.manager.create_transaction().await.unwrap();
     let left = read.get_dictionary::<String, i64>("left").unwrap().unwrap();
     let right = read
@@ -557,6 +553,14 @@ async fn cross_provider_copy_failover_checkpoint_and_restart() {
     assert_eq!(left.get(&mut read, &"balance".into()).unwrap(), Some(90));
     assert_eq!(right.get(&mut read, &"balance".into()).unwrap(), Some(110));
     read.commit().await.unwrap();
+    assert_eq!(
+        second
+            .manager
+            .committed_result(identity.clone())
+            .await
+            .unwrap(),
+        Some(version)
+    );
     second.manager.checkpoint().await.unwrap();
     let backup = directory.path().join("backup");
     second.manager.backup(backup.clone()).await.unwrap();
@@ -610,21 +614,63 @@ async fn cross_provider_copy_failover_checkpoint_and_restart() {
             .is_err()
     );
     restored_read.abort();
+    let epoch = Epoch::new(0, 3);
+    second
+        .execute(DurableReplicaAction::RevokeWriteStatus)
+        .await;
+    second
+        .execute(DurableReplicaAction::ChangeRole {
+            epoch,
+            role: Role::ActiveSecondary,
+        })
+        .await;
+    third
+        .execute(DurableReplicaAction::ChangeRole {
+            epoch,
+            role: Role::Primary,
+        })
+        .await;
+    third.configure(&[&second]).await;
+    let mut transfer = third.manager.create_transaction().await.unwrap();
+    let left = transfer
+        .get_dictionary::<String, i64>("left")
+        .unwrap()
+        .unwrap();
+    let right = transfer
+        .get_dictionary::<String, i64>("right")
+        .unwrap()
+        .unwrap();
+    left.set(&mut transfer, &"balance".into(), &89).unwrap();
+    right.set(&mut transfer, &"balance".into(), &111).unwrap();
+    let after_switchover =
+        tokio::time::timeout(std::time::Duration::from_secs(10), transfer.commit())
+            .await
+            .expect("demoted replica must resume replication")
+            .unwrap();
+    assert_eq!(
+        second.manager.applied_lsn().await.unwrap(),
+        after_switchover.0
+    );
     third.execute(DurableReplicaAction::Close).await;
     (&mut third.service).await.unwrap();
     drop(third);
     let restarted = Pod::start(3, directory.path().join("three")).await;
     restarted
-        .primary(OpenMode::Existing, Epoch::new(0, 3))
+        .primary(OpenMode::Existing, Epoch::new(0, 4))
         .await;
-    assert_eq!(
-        restarted.manager.committed_result(identity).await.unwrap(),
-        Some(version)
-    );
+    assert!(matches!(
+        restarted.manager.committed_result(identity.clone()).await,
+        Err(Error::UnconfirmedCommit)
+    ));
     let mut read = restarted.manager.create_transaction().await.unwrap();
     let right = read
         .get_dictionary::<String, i64>("right")
         .unwrap()
         .unwrap();
-    assert_eq!(right.get(&mut read, &"balance".into()).unwrap(), Some(110));
+    assert_eq!(right.get(&mut read, &"balance".into()).unwrap(), Some(111));
+    read.commit().await.unwrap();
+    assert_eq!(
+        restarted.manager.committed_result(identity).await.unwrap(),
+        Some(version)
+    );
 }

@@ -7,14 +7,14 @@ use tokio::sync::mpsc;
 impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
     async fn drain(
         &self,
-        mut stream: OperationStream,
+        stream: &mut OperationStream,
         token: CancellationToken,
         copy: bool,
     ) -> Result<()> {
         let mut contents = Vec::new();
         loop {
             let operation = tokio::select! {
-                _ = token.cancelled() => return Err(Error::RecoveryRequired),
+                _ = token.cancelled() => return if copy { Err(Error::RecoveryRequired) } else { Ok(()) },
                 operation = stream.get_operation() => operation,
             };
             let Some(operation) = operation else { break };
@@ -179,7 +179,8 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
         let mut provider: Option<mpsc::UnboundedReceiver<StateProviderEvent>> = None;
         let mut copy_stream = None;
         let mut replication_stream = None;
-        let mut drain: Option<tokio::task::JoinHandle<Result<()>>> = None;
+        let mut drain: Option<tokio::task::JoinHandle<(Option<OperationStream>, Result<()>)>> =
+            None;
         let mut drain_token = CancellationToken::new();
         let mut role = Role::Unknown;
         loop {
@@ -211,8 +212,9 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
                                 if role == new_role { return Ok(()); }
                                 if role != Role::IdleSecondary || !matches!(new_role, Role::ActiveSecondary | Role::Primary) { drain_token.cancel(); }
                                 if let Some(handle) = drain.take() {
-                                    let result = handle.await.map_err(|_| Error::RecoveryRequired)?;
-                                    if role == Role::IdleSecondary && matches!(new_role, Role::ActiveSecondary | Role::Primary) { result?; }
+                                    let (stream, result) = handle.await.map_err(|_| Error::RecoveryRequired)?;
+                                    if role == Role::ActiveSecondary { replication_stream = stream; }
+                                    if matches!(new_role, Role::ActiveSecondary | Role::Primary) { result?; }
                                 }
                                 self.access(move |inner| {
                                     if inner.failed && matches!(new_role, Role::Primary | Role::ActiveSecondary) { return Err(Error::RecoveryRequired); }
@@ -222,13 +224,13 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
                                 }).await?;
                                 drain_token = CancellationToken::new();
                                 let stream = match new_role { Role::IdleSecondary => copy_stream.take(), Role::ActiveSecondary => replication_stream.take(), _ => None };
-                                if let Some(stream) = stream {
+                                if let Some(mut stream) = stream {
                                     let replica = self.clone();
                                     let token = drain_token.clone();
                                     drain = Some(tokio::spawn(async move {
-                                        let result = replica.drain(stream, token.clone(), new_role == Role::IdleSecondary).await;
-                                        if result.is_err() && !token.is_cancelled() { replica.fault().await; }
-                                        result
+                                        let result = replica.drain(&mut stream, token.clone(), new_role == Role::IdleSecondary).await;
+                                        if result.is_err() && (new_role == Role::ActiveSecondary || !token.is_cancelled()) { replica.fault().await; }
+                                        ((new_role == Role::ActiveSecondary).then_some(stream), result)
                                     }));
                                 }
                                 role = new_role;
@@ -333,6 +335,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_replication_drain_can_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let replica = TransactionalReplicator::<Counter>::open(directory.path().into())
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let (sender, mut stream) = OperationStream::channel(1);
+        replica.drain(&mut stream, token, false).await.unwrap();
+        let payload = encode(
+            &Envelope {
+                format: FORMAT,
+                provider_format: Counter::FORMAT_ID.into(),
+                confirmed_lsn: 0,
+                identity: identity(1),
+                command: 7u64,
+            },
+            MAX_TRANSACTION_BYTES,
+        )
+        .unwrap();
+        sender
+            .send(Operation::new(1, payload.into(), None))
+            .await
+            .unwrap();
+        drop(sender);
+        replica
+            .drain(&mut stream, CancellationToken::new(), false)
+            .await
+            .unwrap();
+        assert_eq!(replica.applied_lsn().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn crash_writer() {
         let Ok(path) = std::env::var("KUBERIC_RC_CRASH_PATH") else {
             return;
@@ -398,16 +433,83 @@ mod tests {
                 "{stage}"
             );
             if durable {
-                assert_eq!(
-                    replica
-                        .commit(context, identity(1), state.0, 7)
-                        .await
-                        .unwrap(),
-                    CommitVersion(1)
-                );
+                let writer = replica.clone();
+                let retry =
+                    tokio::spawn(
+                        async move { writer.commit(context, identity(1), state.0, 7).await },
+                    );
+                if stage != "checkpointed" {
+                    let request =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    request.reply.send(Ok(2)).unwrap();
+                }
+                assert_eq!(retry.await.unwrap().unwrap(), CommitVersion(1));
                 assert!(requests.try_recv().is_err());
             } else {
                 assert_eq!(replica.committed_result(identity(1)).await.unwrap(), None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_unconfirmed_retry_requires_quorum() {
+        for quorum_succeeds in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let payload = encode(
+                &Envelope {
+                    format: FORMAT,
+                    provider_format: Counter::FORMAT_ID.into(),
+                    confirmed_lsn: 0,
+                    identity: identity(1),
+                    command: 7u64,
+                },
+                MAX_TRANSACTION_BYTES,
+            )
+            .unwrap();
+            let mut log = TransactionLog::open(directory.path().into()).unwrap();
+            log.append(Record { lsn: 1, payload }).unwrap();
+            drop(log);
+            let (replica, mut requests) = primary(directory.path().into()).await;
+            assert!(matches!(
+                replica.committed_result(identity(1)).await,
+                Err(Error::UnconfirmedCommit)
+            ));
+            let (context, state) = replica.begin(TransactionOptions::default()).await.unwrap();
+            assert_eq!(state.0, 7);
+            let writer = replica.clone();
+            let commit =
+                tokio::spawn(async move { writer.commit(context, identity(1), 0, 7).await });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv())
+                .await
+                .expect("unconfirmed retry must reach quorum replication")
+                .unwrap();
+            if quorum_succeeds {
+                request.reply.send(Ok(2)).unwrap();
+                assert_eq!(commit.await.unwrap().unwrap(), CommitVersion(1));
+                assert_eq!(replica.applied_lsn().await.unwrap(), 2);
+                assert_eq!(
+                    replica
+                        .begin(TransactionOptions::default())
+                        .await
+                        .unwrap()
+                        .1
+                        .0,
+                    7
+                );
+                assert_eq!(
+                    replica.committed_result(identity(1)).await.unwrap(),
+                    Some(CommitVersion(1))
+                );
+            } else {
+                request
+                    .reply
+                    .send(Err(kuberic_core::KubericError::NoWriteQuorum))
+                    .unwrap();
+                assert!(matches!(commit.await.unwrap(), Err(Error::Replication(_))));
+                assert_eq!(replica.applied_lsn().await.unwrap(), 1);
             }
         }
     }
@@ -513,7 +615,7 @@ mod tests {
             MAX_TRANSACTION_BYTES,
         )
         .unwrap();
-        let (sender, stream) = OperationStream::channel(1);
+        let (sender, mut stream) = OperationStream::channel(1);
         let (ack, acknowledged) = tokio::sync::oneshot::channel();
         sender
             .send(Operation::new(1, payload.into(), Some(ack)))
@@ -521,7 +623,7 @@ mod tests {
             .unwrap();
         drop(sender);
         replica
-            .drain(stream, CancellationToken::new(), false)
+            .drain(&mut stream, CancellationToken::new(), false)
             .await
             .unwrap();
         acknowledged.await.unwrap();
@@ -553,7 +655,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let (sender, stream) = OperationStream::channel(1);
+        let (sender, mut stream) = OperationStream::channel(1);
         let (ack, acknowledged) = tokio::sync::oneshot::channel();
         sender
             .send(Operation::new(
@@ -566,7 +668,7 @@ mod tests {
         drop(sender);
         assert!(
             replica
-                .drain(stream, CancellationToken::new(), false)
+                .drain(&mut stream, CancellationToken::new(), false)
                 .await
                 .is_err()
         );
@@ -624,7 +726,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (sender, stream) = OperationStream::channel(2);
+        let (sender, mut stream) = OperationStream::channel(2);
         for lsn in 1..=2 {
             let payload = encode(
                 &Envelope {
@@ -644,7 +746,7 @@ mod tests {
         }
         drop(sender);
         replica
-            .drain(stream, CancellationToken::new(), false)
+            .drain(&mut stream, CancellationToken::new(), false)
             .await
             .unwrap();
         replica
@@ -716,7 +818,7 @@ mod tests {
                 MAX_TRANSACTION_BYTES,
             )
             .unwrap();
-            let (sender, stream) = OperationStream::channel(1);
+            let (sender, mut stream) = OperationStream::channel(1);
             let (ack, acknowledged) = tokio::sync::oneshot::channel();
             sender
                 .send(Operation::new(1, payload.into(), Some(ack)))
@@ -725,7 +827,7 @@ mod tests {
             drop(sender);
             assert_eq!(
                 replica
-                    .drain(stream, CancellationToken::new(), false)
+                    .drain(&mut stream, CancellationToken::new(), false)
                     .await
                     .is_ok(),
                 expected
