@@ -19,5 +19,7 @@ kube-lease-manager.workspace = true
 kube-leader-election.workspace = true
 rand.workspace = true
 tokio-util.workspace = true
+tokio-stream.workspace = true
+anyhow.workspace = true
 serial_test.workspace = true
 kvstore = { path = "../examples/kvstore" }

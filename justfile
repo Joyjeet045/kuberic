@@ -82,3 +82,15 @@ kvstore-deploy: verify-kind-context
 kvstore-delete: verify-kind-context
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         delete -f examples/kvstore/deploy/kubericset.yaml
+
+# Install the pinned Gateway reference in its dedicated cluster.
+gateway-install: verify-kind-context kuberic-operator-deploy
+    bash scripts/gateway_kind.sh install
+
+# Run only the separate Gateway integration scenario.
+gateway-test: verify-kind-context
+    cargo test -p kuberic-tests gateway_k8s::test_gateway_k8s_multi_application -- --ignored --exact --nocapture
+
+# Collect Gateway and application diagnostics from the owned cluster.
+gateway-diagnostics: verify-kind-context
+    bash scripts/gateway_kind.sh diagnostics

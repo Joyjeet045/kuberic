@@ -68,3 +68,69 @@ jobs:
 
     - name: Run workspace tests
       run: cargo test --workspace --all-features -- --nocapture
+
+  gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      KIND_CLUSTER_NAME: kuberic-gw-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBECONFIG: /tmp/kuberic-gateway-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBE_CONTEXT: kind-kuberic-gw-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Read rust version from rust-toolchain.toml
+      id: rust-version
+      run: echo "version=$(grep '^channel' rust-toolchain.toml | sed 's/.*\"\(.*\)\"/\1/')" >> "$GITHUB_OUTPUT"
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ steps.rust-version.outputs.version }}
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: gateway
+
+    - uses: taiki-e/install-action@protoc
+    - uses: taiki-e/install-action@just
+    - uses: azure/setup-helm@v4.3.1
+      with:
+        version: v3.19.0
+
+    - name: Create dedicated Gateway KinD cluster
+      uses: helm/kind-action@v1
+      with:
+        version: v0.30.0
+        node_image: kindest/node:v1.34.0
+        cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+        config: deploy/gateway/kind-config.yaml
+        kubeconfig: ${{ env.KUBECONFIG }}
+
+    - name: Record and verify isolated Gateway ownership
+      run: |
+        printf '%s\n' \
+          "cluster=${KIND_CLUSTER_NAME}" \
+          "context=${KUBE_CONTEXT}" \
+          "kubeconfig=${KUBECONFIG}" \
+          | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
+        just verify-kind-context
+
+    - name: Build and load application images
+      run: just images
+
+    - name: Install pinned Gateway API and Envoy Gateway
+      run: just gateway-install
+
+    - name: Test shared authority routing and independent primary transitions
+      run: just gateway-test
+
+    - name: Collect Gateway diagnostics
+      if: failure()
+      run: just gateway-diagnostics > gateway-diagnostics.log 2>&1
+
+    - uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: gateway-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+        path: gateway-diagnostics.log
+        if-no-files-found: ignore

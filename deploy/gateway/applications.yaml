@@ -1,0 +1,27 @@
+apiVersion: kuberic.io/v1
+kind: KubericSet
+metadata:
+  name: kvstore-a
+  namespace: xedio
+spec:
+  replicas: 3
+  image: localhost/kvstore:latest
+  port: 8080
+  controlPort: 9090
+  dataPort: 9091
+  storage: "256Mi"
+  failoverDelay: 5
+---
+apiVersion: kuberic.io/v1
+kind: KubericSet
+metadata:
+  name: kvstore-b
+  namespace: xedio
+spec:
+  replicas: 3
+  image: localhost/kvstore:latest
+  port: 8080
+  controlPort: 9090
+  dataPort: 9091
+  storage: "256Mi"
+  failoverDelay: 5

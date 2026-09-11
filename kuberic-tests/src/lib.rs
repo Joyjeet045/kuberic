@@ -2,6 +2,9 @@
 mod kvstore_k8s;
 
 #[cfg(test)]
+mod gateway_k8s;
+
+#[cfg(test)]
 mod lease_election;
 
 #[cfg(test)]
