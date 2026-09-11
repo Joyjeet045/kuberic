@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -54,7 +54,7 @@ pub trait TransactionalStateProvider:
 
     fn validate(&self, observed: &Self::Observations, command: &Self::Command) -> Result<()>;
     fn apply(&mut self, command: &Self::Command, version: CommitVersion) -> Result<()>;
-    fn validate_snapshot(&self) -> Result<()>;
+    fn validate_snapshot(&self, version: CommitVersion) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +135,7 @@ impl<State: TransactionalStateProvider> Default for Snapshot<State> {
 struct Envelope<Command> {
     format: u32,
     provider_format: String,
+    confirmed_lsn: i64,
     identity: TransactionId,
     command: Command,
 }
@@ -156,7 +157,11 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<
     {
         return Err(Error::Invalid("invalid record length or checksum".into()));
     }
-    Ok(postcard::from_bytes(&bytes[32..])?)
+    let (value, remaining) = postcard::take_from_bytes(&bytes[32..])?;
+    if !remaining.is_empty() {
+        return Err(Error::Invalid("trailing record bytes".into()));
+    }
+    Ok(value)
 }
 
 struct Inner<State> {
@@ -192,7 +197,12 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
         tokio::task::spawn_blocking(move || {
             let log = TransactionLog::open(path)?;
             let snapshot = recover::<State>(&log, log.last_lsn())?;
-            let confirmed_lsn = log.checkpoint_record().map_or(0, |record| record.lsn);
+            let mut confirmed_lsn = log.checkpoint_record().map_or(0, |record| record.lsn);
+            for record in log.records() {
+                let envelope: Envelope<State::Command> =
+                    decode(&record.payload, MAX_TRANSACTION_BYTES)?;
+                confirmed_lsn = confirmed_lsn.max(envelope.confirmed_lsn);
+            }
             Ok(Self {
                 inner: Arc::new(Mutex::new(Inner {
                     log,
@@ -282,24 +292,13 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
         if identity.request.is_empty() || identity.request.len() > 128 {
             return Err(Error::Invalid("request ID must be 1-128 bytes".into()));
         }
-        let payload = encode(
-            &Envelope {
-                format: FORMAT,
-                provider_format: State::FORMAT_ID.into(),
-                identity: identity.clone(),
-                command: command.clone(),
-            },
-            MAX_TRANSACTION_BYTES,
-        )?;
         let replica = self.clone();
         tokio::spawn(async move {
             let _gate = tokio::time::timeout_at(context.deadline, replica.gate.lock())
                 .await
                 .map_err(|_| Error::Expired)?;
             context.ensure_active()?;
-            let envelope = decode::<Envelope<State::Command>>(&payload, MAX_TRANSACTION_BYTES)?;
-            let digest: [u8; 32] = Sha256::digest(postcard::to_allocvec(&envelope.command)?).into();
-            let payload_for_check = payload.clone();
+            let digest: [u8; 32] = Sha256::digest(postcard::to_allocvec(&command)?).into();
             let preparation = replica
                 .access(move |inner| {
                     ensure_writable(inner)?;
@@ -309,21 +308,30 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
                     if let Some(version) = retained_result(&inner.snapshot, &identity, digest)? {
                         return Ok(Err(version));
                     }
-                    inner.log.check_capacity(payload_for_check.len())?;
                     inner.snapshot.state.validate(&observations, &command)?;
-                    let _ = next_snapshot(
-                        &inner.snapshot,
-                        inner.snapshot.applied_lsn + 1,
-                        &payload_for_check,
+                    let payload = encode(
+                        &Envelope {
+                            format: FORMAT,
+                            provider_format: State::FORMAT_ID.into(),
+                            confirmed_lsn: inner.confirmed_lsn,
+                            identity,
+                            command,
+                        },
+                        MAX_TRANSACTION_BYTES,
                     )?;
+                    let _ =
+                        next_snapshot(&inner.snapshot, inner.snapshot.applied_lsn + 1, &payload)?;
+                    reclaim_if_needed(inner, payload.len())?;
+                    inner.log.check_capacity(payload.len())?;
                     Ok(Ok((
+                        payload,
                         inner.replicator.clone().ok_or(Error::NotPrimary)?,
                         inner.token.clone(),
                         inner.generation,
                     )))
                 })
                 .await?;
-            let (replicator, token, generation) = match preparation {
+            let (payload, replicator, token, generation) = match preparation {
                 Ok(preparation) => preparation,
                 Err(version) => return Ok(version),
             };
@@ -377,23 +385,16 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
 
     pub async fn checkpoint(&self) -> Result<()> {
         let _gate = self.gate.lock().await;
-        let result = self
-            .access(|inner| {
-                ensure_writable(inner)?;
-                if inner.confirmed_lsn != inner.snapshot.applied_lsn {
-                    return Err(Error::RecoveryRequired);
-                }
-                inner.log.checkpoint(Record {
-                    lsn: inner.snapshot.applied_lsn,
-                    payload: encode(&inner.snapshot, MAX_SNAPSHOT_BYTES)?,
-                })?;
-                Ok(())
-            })
-            .await;
-        if result.is_err() {
-            self.fault().await;
-        }
-        result
+        self.access(|inner| {
+            if inner.failed || inner.token.is_cancelled() {
+                return Err(Error::RecoveryRequired);
+            }
+            if !matches!(inner.role, Role::Primary | Role::ActiveSecondary) {
+                return Err(Error::NotPrimary);
+            }
+            checkpoint_inner(inner)
+        })
+        .await
     }
 
     pub async fn backup(&self, destination: PathBuf) -> Result<()> {
@@ -456,6 +457,40 @@ fn ensure_writable<State>(inner: &Inner<State>) -> Result<()> {
     Ok(())
 }
 
+fn checkpoint_inner<State: TransactionalStateProvider>(inner: &mut Inner<State>) -> Result<()> {
+    let target = inner.confirmed_lsn;
+    let snapshot = recover::<State>(&inner.log, target)?;
+    let record = Record {
+        lsn: target,
+        payload: encode(&snapshot, MAX_SNAPSHOT_BYTES)?,
+    };
+    inner.failed = true;
+    if let Err(error) = inner.log.checkpoint(record) {
+        if let Some(partition) = &inner.partition {
+            partition.report_fault(FaultType::Transient);
+        }
+        return Err(error.into());
+    }
+    inner.failed = false;
+    Ok(())
+}
+
+fn reclaim_if_needed<State: TransactionalStateProvider>(
+    inner: &mut Inner<State>,
+    additional: usize,
+) -> Result<()> {
+    if inner
+        .log
+        .retained_bytes()?
+        .saturating_add(additional as u64 + 24)
+        > kuberic_transaction_log::MAX_RETAINED_LOG / 2
+        && inner.confirmed_lsn > inner.log.checkpoint_record().map_or(0, |record| record.lsn)
+    {
+        checkpoint_inner(inner)?;
+    }
+    Ok(())
+}
+
 fn retained_result<State>(
     snapshot: &Snapshot<State>,
     identity: &TransactionId,
@@ -489,6 +524,8 @@ fn next_snapshot<State: TransactionalStateProvider>(
     let envelope: Envelope<State::Command> = decode(payload, MAX_TRANSACTION_BYTES)?;
     if envelope.format != FORMAT
         || envelope.provider_format != State::FORMAT_ID
+        || envelope.confirmed_lsn < 0
+        || envelope.confirmed_lsn >= lsn
         || envelope.identity.request.is_empty()
         || envelope.identity.request.len() > 128
     {
@@ -521,7 +558,7 @@ fn next_snapshot<State: TransactionalStateProvider>(
         }
     }
     snapshot.applied_lsn = lsn;
-    snapshot.state.validate_snapshot()?;
+    snapshot.state.validate_snapshot(CommitVersion(lsn))?;
     let _ = encode(&snapshot, MAX_SNAPSHOT_BYTES)?;
     Ok(snapshot)
 }
@@ -535,17 +572,23 @@ fn checked_snapshot<State: TransactionalStateProvider>(payload: &[u8]) -> Result
     {
         return Err(Error::Invalid("invalid checkpoint format".into()));
     }
+    let mut identities = BTreeSet::new();
+    let mut versions = BTreeSet::new();
     for (request, outcome) in &snapshot.results {
         if request != &outcome.identity.request
             || request.is_empty()
             || request.len() > 128
             || outcome.version.0 <= 0
             || outcome.version.0 > snapshot.applied_lsn
+            || !identities.insert(outcome.identity.transaction)
+            || !versions.insert(outcome.version.0)
         {
             return Err(Error::Invalid("invalid retained transaction result".into()));
         }
     }
-    snapshot.state.validate_snapshot()?;
+    snapshot
+        .state
+        .validate_snapshot(CommitVersion(snapshot.applied_lsn))?;
     Ok(snapshot)
 }
 

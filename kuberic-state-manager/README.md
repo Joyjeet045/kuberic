@@ -80,7 +80,9 @@ close and abort. Persistence runs on blocking workers rather than Tokio threads.
 State providers apply against a private candidate snapshot and become visible
 only at a single publication point. Checkpoint and copy contain the entire
 registry, type metadata, dictionary state, tombstones, and retry outcomes.
-Old log bytes are reclaimed only after durable checkpoint publication.
+Old log bytes are reclaimed only after durable checkpoint publication. Primary
+and secondary writes automatically checkpoint confirmed prefixes near the log
+budget; unconfirmed suffixes remain available for recovery or epoch rollback.
 
 See the sibling transactional-replicator README for accepted/durable/committed/
 applied/checkpointed distinctions, in-doubt outcomes, bounded retry retention,
@@ -89,7 +91,7 @@ backup/restore administration, and exact size limits.
 ## Scope and Verification
 
 This implements the dictionary MVP from #52. ReliableQueue, pessimistic lock
-modes, group commit, automatic checkpoint scheduling and schema migration remain
+modes, group commit, time-based checkpoint scheduling and schema migration remain
 later phases, not implied capabilities. Backups are local atomic files; external
 backup storage and cluster-wide restore orchestration belong to the caller.
 
@@ -102,5 +104,6 @@ Tests cover cross-provider atomic visibility, key/range/registry conflicts,
 conditional mutations, abort/expiry/admission, lost replies and deduplication,
 log corruption/torn tails, failed checkpoint publication, stale transaction
 contexts, actual gRPC copy failures, three-replica copy/catch-up, promotion,
-checkpoint/backup and restart recovery. Existing custom providers and examples
+checkpoint/backup/restore, abrupt process exit across commit boundaries and
+restart recovery. Existing custom providers and examples
 are unchanged and remain covered by workspace CI.

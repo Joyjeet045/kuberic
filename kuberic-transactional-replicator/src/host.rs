@@ -31,16 +31,35 @@ impl<State: TransactionalStateProvider> TransactionalReplicator<State> {
                         return Err(Error::RecoveryRequired);
                     }
                     if lsn <= inner.snapshot.applied_lsn {
+                        if let Some(record) =
+                            inner.log.records().iter().find(|record| record.lsn == lsn)
+                        {
+                            return if record.payload == payload {
+                                Ok(())
+                            } else {
+                                Err(Error::DuplicateRequest)
+                            };
+                        }
                         let envelope: Envelope<State::Command> =
                             decode(&payload, MAX_TRANSACTION_BYTES)?;
                         let digest =
                             Sha256::digest(postcard::to_allocvec(&envelope.command)?).into();
-                        if retained_result(&inner.snapshot, &envelope.identity, digest)?.is_none() {
+                        if envelope.format != FORMAT
+                            || envelope.provider_format != State::FORMAT_ID
+                            || envelope.confirmed_lsn < 0
+                            || envelope.confirmed_lsn >= lsn
+                            || retained_result(&inner.snapshot, &envelope.identity, digest)?
+                                != Some(CommitVersion(lsn))
+                        {
                             return Err(Error::DuplicateRequest);
                         }
                         return Ok(());
                     }
                     let snapshot = next_snapshot(&inner.snapshot, lsn, &payload)?;
+                    let envelope: Envelope<State::Command> =
+                        decode(&payload, MAX_TRANSACTION_BYTES)?;
+                    inner.confirmed_lsn = inner.confirmed_lsn.max(envelope.confirmed_lsn);
+                    reclaim_if_needed(inner, payload.len())?;
                     inner.log.append(Record { lsn, payload })?;
                     inner.snapshot = snapshot;
                     Ok(())
@@ -278,7 +297,7 @@ mod tests {
                 .ok_or_else(|| Error::Invalid("counter overflow".into()))?;
             Ok(())
         }
-        fn validate_snapshot(&self) -> Result<()> {
+        fn validate_snapshot(&self, _version: CommitVersion) -> Result<()> {
             Ok(())
         }
     }
@@ -310,6 +329,86 @@ mod tests {
         TransactionId {
             transaction,
             request: format!("request-{transaction}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_writer() {
+        let Ok(path) = std::env::var("KUBERIC_RC_CRASH_PATH") else {
+            return;
+        };
+        let stage = std::env::var("KUBERIC_RC_CRASH_STAGE").unwrap();
+        let (replica, mut requests) = primary(path.into()).await;
+        let (context, state) = replica.begin(TransactionOptions::default()).await.unwrap();
+        let writer = replica.clone();
+        let commit =
+            tokio::spawn(async move { writer.commit(context, identity(1), state.0, 7).await });
+        let request = requests.recv().await.unwrap();
+        if stage == "accepted" {
+            std::process::exit(0);
+        }
+        if stage == "durable" {
+            replica
+                .access(move |inner| {
+                    inner.log.append(Record {
+                        lsn: 1,
+                        payload: request.data.to_vec(),
+                    })?;
+                    assert_eq!(inner.snapshot.applied_lsn, 0);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            std::process::exit(0);
+        }
+        request.reply.send(Ok(1)).unwrap();
+        if stage == "quorum" {
+            std::process::exit(0);
+        }
+        assert_eq!(commit.await.unwrap().unwrap(), CommitVersion(1));
+        if stage == "checkpointed" {
+            replica.checkpoint().await.unwrap();
+        }
+        std::process::exit(0);
+    }
+
+    #[tokio::test]
+    async fn abrupt_exit_recovers_transaction_at_each_commit_boundary() {
+        for stage in ["accepted", "quorum", "durable", "applied", "checkpointed"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().to_path_buf();
+            let status = tokio::task::spawn_blocking(move || {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "host::tests::crash_writer", "--nocapture"])
+                    .env("KUBERIC_RC_CRASH_PATH", path)
+                    .env("KUBERIC_RC_CRASH_STAGE", stage)
+                    .status()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(status.success(), "crash helper failed at {stage}");
+            let (replica, mut requests) = primary(directory.path().into()).await;
+            let durable = matches!(stage, "durable" | "applied" | "checkpointed");
+            let (context, state) = replica.begin(TransactionOptions::default()).await.unwrap();
+            assert_eq!(state.0, if durable { 7 } else { 0 }, "{stage}");
+            assert_eq!(
+                replica.applied_lsn().await.unwrap(),
+                i64::from(durable),
+                "{stage}"
+            );
+            if durable {
+                assert_eq!(
+                    replica
+                        .commit(context, identity(1), state.0, 7)
+                        .await
+                        .unwrap(),
+                    CommitVersion(1)
+                );
+                assert!(requests.try_recv().is_err());
+            } else {
+                assert_eq!(replica.committed_result(identity(1)).await.unwrap(), None);
+            }
         }
     }
 
@@ -407,6 +506,7 @@ mod tests {
             &Envelope {
                 format: FORMAT,
                 provider_format: Counter::FORMAT_ID.into(),
+                confirmed_lsn: 0,
                 identity: identity(1),
                 command: 7u64,
             },
@@ -472,6 +572,214 @@ mod tests {
         );
         assert!(acknowledged.await.is_err());
         assert_eq!(replica.applied_lsn().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_checkpoint_does_not_fence_a_healthy_replica() {
+        let directory = tempfile::tempdir().unwrap();
+        let (replica, mut requests) = primary(directory.path().into()).await;
+        replica
+            .access(|inner| {
+                inner.role = Role::IdleSecondary;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(replica.checkpoint().await, Err(Error::NotPrimary)));
+        replica
+            .access(|inner| {
+                inner.role = Role::Primary;
+                inner.confirmed_lsn = 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(replica.checkpoint().await, Err(Error::Invalid(_))));
+        replica
+            .access(|inner| {
+                inner.confirmed_lsn = 0;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (context, state) = replica.begin(TransactionOptions::default()).await.unwrap();
+        let writer = replica.clone();
+        let commit =
+            tokio::spawn(async move { writer.commit(context, identity(1), state.0, 7).await });
+        requests.recv().await.unwrap().reply.send(Ok(1)).unwrap();
+        assert_eq!(commit.await.unwrap().unwrap(), CommitVersion(1));
+        replica.checkpoint().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn secondary_checkpoints_only_confirmed_prefix_and_retains_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let replica = TransactionalReplicator::<Counter>::open(directory.path().into())
+            .await
+            .unwrap();
+        replica
+            .access(|inner| {
+                inner.role = Role::ActiveSecondary;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (sender, stream) = OperationStream::channel(2);
+        for lsn in 1..=2 {
+            let payload = encode(
+                &Envelope {
+                    format: FORMAT,
+                    provider_format: Counter::FORMAT_ID.into(),
+                    confirmed_lsn: lsn - 1,
+                    identity: identity(lsn as u128),
+                    command: 7u64,
+                },
+                MAX_TRANSACTION_BYTES,
+            )
+            .unwrap();
+            sender
+                .send(Operation::new(lsn, payload.into(), None))
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        replica
+            .drain(stream, CancellationToken::new(), false)
+            .await
+            .unwrap();
+        replica
+            .access(|inner| {
+                reclaim_if_needed(
+                    inner,
+                    kuberic_transaction_log::MAX_RETAINED_LOG as usize / 2,
+                )?;
+                assert_eq!(inner.log.checkpoint_record().unwrap().lsn, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        replica.checkpoint().await.unwrap();
+        replica
+            .access(|inner| {
+                assert_eq!(inner.log.checkpoint_record().unwrap().lsn, 1);
+                assert_eq!(inner.log.records()[0].lsn, 2);
+                assert_eq!(inner.snapshot.state.0, 14);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(replica);
+        let replica = TransactionalReplicator::<Counter>::open(directory.path().into())
+            .await
+            .unwrap();
+        replica
+            .access(|inner| {
+                assert_eq!(inner.confirmed_lsn, 1);
+                assert_eq!(inner.snapshot.state.0, 14);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        replica
+            .provider(StateProviderEvent::UpdateEpoch {
+                epoch: kuberic_core::types::Epoch::new(1, 1),
+                previous_epoch_last_lsn: 1,
+                reply,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        assert_eq!(
+            replica
+                .access(|inner| Ok(inner.snapshot.state.0))
+                .await
+                .unwrap(),
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_conflicting_lsn_and_invalid_snapshot_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let replica = TransactionalReplicator::<Counter>::open(directory.path().into())
+            .await
+            .unwrap();
+        for (transaction, expected) in [(1, true), (1, true), (2, false)] {
+            let payload = encode(
+                &Envelope {
+                    format: FORMAT,
+                    provider_format: Counter::FORMAT_ID.into(),
+                    confirmed_lsn: 0,
+                    identity: identity(transaction),
+                    command: 7u64,
+                },
+                MAX_TRANSACTION_BYTES,
+            )
+            .unwrap();
+            let (sender, stream) = OperationStream::channel(1);
+            let (ack, acknowledged) = tokio::sync::oneshot::channel();
+            sender
+                .send(Operation::new(1, payload.into(), Some(ack)))
+                .await
+                .unwrap();
+            drop(sender);
+            assert_eq!(
+                replica
+                    .drain(stream, CancellationToken::new(), false)
+                    .await
+                    .is_ok(),
+                expected
+            );
+            assert_eq!(acknowledged.await.is_ok(), expected);
+        }
+        let mut snapshot = replica
+            .access(|inner| Ok(inner.snapshot.clone()))
+            .await
+            .unwrap();
+        let mut duplicate = snapshot.results["request-1"].clone();
+        duplicate.identity.request = "another-request".into();
+        snapshot
+            .results
+            .insert(duplicate.identity.request.clone(), duplicate);
+        assert!(
+            checked_snapshot::<Counter>(&encode(&snapshot, MAX_SNAPSHOT_BYTES).unwrap()).is_err()
+        );
+        let mut payload = postcard::to_allocvec(&7u64).unwrap();
+        payload.push(0);
+        let mut bytes = Sha256::digest(&payload).to_vec();
+        bytes.extend_from_slice(&payload);
+        assert!(decode::<u64>(&bytes, MAX_TRANSACTION_BYTES).is_err());
+    }
+
+    #[tokio::test]
+    async fn retained_outcome_eviction_is_bounded_and_explicit() {
+        let mut snapshot = Snapshot::<Counter>::default();
+        for lsn in 1..=RETAINED_RESULTS as i64 + 1 {
+            let payload = encode(
+                &Envelope {
+                    format: FORMAT,
+                    provider_format: Counter::FORMAT_ID.into(),
+                    confirmed_lsn: lsn - 1,
+                    identity: identity(lsn as u128),
+                    command: 1u64,
+                },
+                MAX_TRANSACTION_BYTES,
+            )
+            .unwrap();
+            snapshot = next_snapshot(&snapshot, lsn, &payload).unwrap();
+        }
+        let snapshot =
+            checked_snapshot::<Counter>(&encode(&snapshot, MAX_SNAPSHOT_BYTES).unwrap()).unwrap();
+        let digest = Sha256::digest(postcard::to_allocvec(&1u64).unwrap()).into();
+        assert_eq!(snapshot.results.len(), RETAINED_RESULTS);
+        assert_eq!(
+            retained_result(&snapshot, &identity(1), digest).unwrap(),
+            None
+        );
+        assert_eq!(
+            retained_result(&snapshot, &identity(2), digest).unwrap(),
+            Some(CommitVersion(2))
+        );
     }
 
     #[tokio::test]

@@ -33,7 +33,10 @@ Terminology:
 - **Checkpointed:** a synced snapshot generation was atomically selected.
 
 The coordinator tracks local quorum confirmation separately from applied LSN.
-Only confirmed primary state can be checkpointed or backed up. A promoted
+Each envelope carries the primary's last quorum-confirmed LSN; secondaries and
+recovery use that durable metadata to checkpoint only the confirmed prefix,
+retaining any unconfirmed suffix in the same published generation. Backups
+require fully confirmed primary state. A promoted
 replica can retain an in-doubt accepted suffix according to Kuberic's election
 authority; clients must query/retry the original identity, not assume that a
 lost reply means abort. A subsequent successful commit confirms that prefix.
@@ -66,7 +69,11 @@ live primary's history or coordinate cluster-wide disaster recovery.
   Reusing a retained request or transaction ID with different data is an error.
   After eviction, an old ID has no exactly-once guarantee and may execute again.
 - The log's 64 MiB retained-history limit is checked before replication.
-  Applications invoke checkpoint at confirmed boundaries to reclaim it.
+  Primary and secondary writes checkpoint the latest confirmed prefix when the
+  next record would cross 32 MiB of retained history. `checkpoint()` also allows
+  explicit reclamation on either active role. An unconfirmed suffix is never
+  discarded to meet a capacity limit; absent a confirmed prefix, writes fail
+  explicitly at the hard limit and require authority resolution or full copy.
 
 This MVP uses one record per complete transaction, optimistic serializability,
 and synchronous durability. It does not implement separate prepare/commit

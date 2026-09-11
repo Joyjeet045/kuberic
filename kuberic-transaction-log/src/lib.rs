@@ -199,12 +199,7 @@ impl TransactionLog {
         if self.failed {
             return Err(invalid("log requires recovery"));
         }
-        let length = self
-            .file
-            .as_ref()
-            .ok_or_else(|| invalid("log requires recovery"))?
-            .metadata()?
-            .len();
+        let length = self.retained_bytes()?;
         if payload_length > MAX_RECORD
             || length
                 .saturating_add(payload_length as u64)
@@ -218,24 +213,49 @@ impl TransactionLog {
         Ok(())
     }
 
+    pub fn retained_bytes(&self) -> io::Result<u64> {
+        Ok(self
+            .file
+            .as_ref()
+            .ok_or_else(|| invalid("log requires recovery"))?
+            .metadata()?
+            .len())
+    }
+
     pub fn checkpoint(&mut self, snapshot: Record) -> io::Result<()> {
-        if self.failed || snapshot.lsn != self.last_lsn() {
+        if self.failed
+            || snapshot.lsn < self.checkpoint.as_ref().map_or(0, |record| record.lsn)
+            || snapshot.lsn > self.last_lsn()
+        {
             return Err(invalid("invalid checkpoint boundary"));
         }
-        self.install_checkpoint(snapshot)
+        let suffix = self
+            .records
+            .iter()
+            .filter(|record| record.lsn > snapshot.lsn)
+            .cloned()
+            .collect();
+        self.publish_generation(snapshot, suffix)
     }
 
     pub fn install_checkpoint(&mut self, snapshot: Record) -> io::Result<()> {
+        self.publish_generation(snapshot, Vec::new())
+    }
+
+    fn publish_generation(&mut self, snapshot: Record, suffix: Vec<Record>) -> io::Result<()> {
         let bytes = encode(&snapshot)?;
         let temporary = tempfile::Builder::new()
             .prefix("generation-")
             .tempdir_in(&self.root)?;
         atomic_write(&temporary.path().join("checkpoint"), &bytes)?;
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .open(temporary.path().join("transactions.log"))?;
+        for record in &suffix {
+            file.write_all(&encode(record)?)?;
+        }
         file.sync_all()?;
         #[cfg(unix)]
         File::open(temporary.path())?.sync_all()?;
@@ -248,7 +268,7 @@ impl TransactionLog {
         atomic_write(&self.root.join("active"), name.as_bytes())?;
         self.file = Some(file);
         let previous = std::mem::replace(&mut self.generation, generation);
-        self.records.clear();
+        self.records = suffix;
         self.checkpoint = Some(snapshot);
         self.failed = false;
         if previous != self.root {
@@ -389,6 +409,37 @@ mod tests {
         assert_eq!(log.last_lsn(), 1);
         assert!(log.records().is_empty());
         assert_eq!(log.checkpoint_record().unwrap().payload, b"copied");
+    }
+
+    #[test]
+    fn prefix_checkpoint_retains_unconfirmed_suffix_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut log = TransactionLog::open(directory.path().into()).unwrap();
+        for lsn in 1..=3 {
+            log.append(Record {
+                lsn,
+                payload: vec![lsn as u8],
+            })
+            .unwrap();
+        }
+        log.checkpoint(Record {
+            lsn: 2,
+            payload: b"confirmed".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(
+            log.records(),
+            &[Record {
+                lsn: 3,
+                payload: vec![3]
+            }]
+        );
+        drop(log);
+        let mut log = TransactionLog::open(directory.path().into()).unwrap();
+        assert_eq!(log.checkpoint_record().unwrap().lsn, 2);
+        assert_eq!(log.last_lsn(), 3);
+        log.rollback(2).unwrap();
+        assert!(log.records().is_empty());
     }
 
     #[test]

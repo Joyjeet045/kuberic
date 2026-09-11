@@ -519,6 +519,8 @@ async fn cross_provider_copy_failover_checkpoint_and_restart() {
     let version = transfer.commit().await.unwrap();
     assert_eq!(second.manager.applied_lsn().await.unwrap(), version.0);
     assert_eq!(third.manager.applied_lsn().await.unwrap(), version.0);
+    second.manager.checkpoint().await.unwrap();
+    third.manager.checkpoint().await.unwrap();
     primary
         .execute(DurableReplicaAction::RevokeWriteStatus)
         .await;
@@ -566,6 +568,48 @@ async fn cross_provider_copy_failover_checkpoint_and_restart() {
         restored.applied_lsn().await.unwrap(),
         second.manager.applied_lsn().await.unwrap()
     );
+    drop(restored);
+    let restored = Pod::start(4, directory.path().join("restored")).await;
+    restored.primary(OpenMode::Existing, Epoch::new(1, 1)).await;
+    assert_eq!(
+        restored
+            .manager
+            .committed_result(identity.clone())
+            .await
+            .unwrap(),
+        Some(version)
+    );
+    let mut restored_read = restored.manager.create_transaction().await.unwrap();
+    assert_eq!(
+        restored_read.provider_names().unwrap(),
+        vec!["left", "right"]
+    );
+    let restored_left = restored_read
+        .get_dictionary::<String, i64>("left")
+        .unwrap()
+        .unwrap();
+    let restored_right = restored_read
+        .get_dictionary::<String, i64>("right")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restored_left
+            .get(&mut restored_read, &"balance".into())
+            .unwrap(),
+        Some(90)
+    );
+    assert_eq!(
+        restored_right
+            .get(&mut restored_read, &"balance".into())
+            .unwrap(),
+        Some(110)
+    );
+    assert!(
+        restored_read
+            .get_dictionary::<String, String>("right")
+            .is_err()
+    );
+    restored_read.abort();
     third.execute(DurableReplicaAction::Close).await;
     (&mut third.service).await.unwrap();
     drop(third);

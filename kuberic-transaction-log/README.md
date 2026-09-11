@@ -7,7 +7,8 @@ checksum, payload and full-record checksum. Append returns only after
 record with an invalid header/checksum without rewriting the source history.
 
 Checkpoint installation writes a complete new generation containing the
-checkpoint and an empty log, syncs both, then atomically publishes its name.
+checkpoint and its retained suffix, syncs both, then atomically publishes its
+name. Full copy installation selects an empty suffix instead.
 Log reclamation happens only after publication. A crash cannot combine a new
 checkpoint with the previous generation's suffix, including during replica copy.
 Rollback writes a replacement log before changing in-memory history.
@@ -17,8 +18,8 @@ the log directory through an exclusive lock.
 The format currently permits 64 MiB records and 64 MiB of retained log bytes.
 The caller checks capacity before replication and checkpoints at a confirmed
 boundary to reclaim history. The transactional coordinator imposes smaller
-transaction and snapshot budgets. These are explicit MVP limits, not automatic
-background retention policy. Old orphan generations after a crash may be
+transaction and snapshot budgets and automatically checkpoints confirmed prefixes
+near half the retained-log budget. Old orphan generations after a crash may be
 removed offline; they are never replayed through the active generation pointer.
 
 `atomic_write` uses file sync plus parent-directory sync on Unix. Windows uses

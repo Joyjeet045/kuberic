@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::PathBuf;
@@ -116,8 +118,8 @@ impl TransactionalStateProvider for Registry {
     type Command = Vec<Change>;
     type Observations = Observations;
 
-    fn validate_snapshot(&self) -> Result<()> {
-        if self.providers.len() > 1024 || self.revision < 0 {
+    fn validate_snapshot(&self, version: CommitVersion) -> Result<()> {
+        if self.providers.len() > 1024 || self.revision < 0 || self.revision > version.0 {
             return Err(Error::Invalid("invalid registry snapshot".into()));
         }
         for (name, provider) in &self.providers {
@@ -128,10 +130,10 @@ impl TransactionalStateProvider for Registry {
                 || provider.value_type.is_empty()
                 || provider.value_type.len() > 128
                 || provider.revision < 0
-                || provider
-                    .entries
-                    .iter()
-                    .any(|(key, value)| key.len() > 64 * 1024 || value.version < 0)
+                || provider.revision > version.0
+                || provider.entries.iter().any(|(key, value)| {
+                    key.len() > 64 * 1024 || value.version < 0 || value.version > provider.revision
+                })
             {
                 return Err(Error::Invalid("invalid dictionary snapshot".into()));
             }
@@ -626,5 +628,43 @@ impl<Key: ReliableValue, Item: ReliableValue> ReliableDictionary<Key, Item> {
             .filter_map(|(key, entry)| entry.bytes.as_ref().map(|value| (key, value)))
             .map(|(key, value)| Ok((postcard::from_bytes(key)?, postcard::from_bytes(value)?)))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_versions_must_not_exceed_their_boundary() {
+        let mut registry = Registry::default();
+        registry
+            .apply(
+                &vec![Change::Create {
+                    name: "values".into(),
+                    id: 1,
+                    key_type: "i64".into(),
+                    key_version: 1,
+                    value_type: "i64".into(),
+                    value_version: 1,
+                }],
+                CommitVersion(2),
+            )
+            .unwrap();
+        assert!(registry.validate_snapshot(CommitVersion(1)).is_err());
+        assert!(registry.validate_snapshot(CommitVersion(2)).is_ok());
+        registry
+            .providers
+            .get_mut("values")
+            .unwrap()
+            .entries
+            .insert(
+                vec![1],
+                Value {
+                    version: 3,
+                    bytes: Some(vec![7]),
+                },
+            );
+        assert!(registry.validate_snapshot(CommitVersion(3)).is_err());
     }
 }
