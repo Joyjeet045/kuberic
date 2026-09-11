@@ -1,0 +1,138 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kubericsets.dex.kuberic.io
+spec:
+  group: dex.kuberic.io
+  names:
+    kind: KubericSet
+    listKind: KubericSetList
+    plural: kubericsets
+    shortNames:
+    - kls2
+    singular: kubericset
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    additionalPrinterColumns:
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .status.workflow.phase
+      name: Workflow
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            required:
+            - image
+            properties:
+              image:
+                type: string
+              replicas:
+                type: integer
+                format: int32
+                default: 3
+          status:
+            type: object
+            nullable: true
+            properties:
+              workflow:
+                type: object
+                nullable: true
+                required:
+                - workflowName
+                - executionId
+                - checkpointName
+                - observedGeneration
+                - phase
+                properties:
+                  workflowName:
+                    type: string
+                  executionId:
+                    type: string
+                  checkpointName:
+                    type: string
+                  observedGeneration:
+                    type: integer
+                    format: int64
+                  phase:
+                    type: string
+                    enum:
+                    - running
+                    - completed
+                    - failed
+                    - quarantined
+    subresources:
+      status: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kuberic-operator2
+  namespace: xedio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kuberic-operator2
+  namespace: xedio
+rules:
+- apiGroups: ["dex.kuberic.io"]
+  resources: ["kubericsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["dex.kuberic.io"]
+  resources: ["kubericsets/status"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kuberic-operator2
+  namespace: xedio
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kuberic-operator2
+subjects:
+- kind: ServiceAccount
+  name: kuberic-operator2
+  namespace: xedio
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kuberic-operator2
+  namespace: xedio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kuberic-operator2
+  template:
+    metadata:
+      labels:
+        app: kuberic-operator2
+    spec:
+      serviceAccountName: kuberic-operator2
+      containers:
+      - name: operator
+        image: localhost/kuberic-operator2:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: KUBERIC_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace

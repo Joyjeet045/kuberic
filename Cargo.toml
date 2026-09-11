@@ -10,6 +10,7 @@ members = [
   "kuberic-transactional-replicator",
   "kuberic-state-manager",
   "kuberic-operator",
+  "kuberic-operator2",
   "kuberic-tests",
   "sqlite-commit-barrier",
 ]
@@ -53,3 +54,4 @@ test-log = { version = "0.2", default-features = false, features = ["trace"] }
 kube-lease-manager = "0.12.0"
 kube-leader-election = "0.44.0"
 whoami = "2"
+uuid = "1"

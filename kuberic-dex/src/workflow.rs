@@ -216,7 +216,7 @@ enum WorkflowFailure<E> {
 ///
 /// Application code should normally use [`OrchestrationRegistry`] instead.
 #[async_trait]
-pub trait Workflow: Sync {
+pub trait Workflow: Send + Sync {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome;
 }
 
