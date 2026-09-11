@@ -11,19 +11,25 @@ readonly GATEWAY_API_VERSION=v1.6.1
 [[ "$KUBE_CONTEXT" == "kind-${KIND_CLUSTER_NAME}" ]]
 just verify-kind-context
 kubectl_cmd=(kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" --request-timeout=30s)
+diagnostic_cmd=(kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" --request-timeout=5s)
 helm_cmd=(helm --kubeconfig "$KUBECONFIG" --kube-context "$KUBE_CONTEXT")
 
 diagnostics() {
     for namespace in xedio envoy-gateway-system; do
         for resource in gateways grpcroutes envoyproxies services endpointslices pods deployments events kubericsets; do
-            "${kubectl_cmd[@]}" get "$resource" -n "$namespace" -o yaml || true
+            "${diagnostic_cmd[@]}" get "$resource" -n "$namespace" -o yaml || true
         done
-        "${kubectl_cmd[@]}" logs -n "$namespace" --all-containers=true --prefix=true \
+        "${diagnostic_cmd[@]}" logs -n "$namespace" --all-containers=true --prefix=true \
             -l app.kubernetes.io/name=envoy-gateway --tail=200 || true
-        "${kubectl_cmd[@]}" logs -n "$namespace" --all-containers=true --prefix=true \
+        "${diagnostic_cmd[@]}" logs -n "$namespace" --all-containers=true --prefix=true \
             -l gateway.envoyproxy.io/owning-gateway-name=kuberic --tail=200 || true
     done
-    "${kubectl_cmd[@]}" get gatewayclasses -o yaml || true
+    "${diagnostic_cmd[@]}" get gatewayclasses -o yaml || true
+    "${diagnostic_cmd[@]}" logs -n xedio deployment/kuberic-operator --all-containers=true --prefix=true --tail=200 || true
+    for application in kvstore-a kvstore-b; do
+        "${diagnostic_cmd[@]}" logs -n xedio --all-containers=true --prefix=true \
+            -l "kuberic.io/set=${application}" --tail=200 || true
+    done
 }
 
 if [[ "${1:-}" == diagnostics ]]; then

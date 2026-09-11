@@ -64,10 +64,13 @@ The installer waits for the operator, CRDs, controller, GatewayClass and
 Gateway. The test additionally waits for accepted/resolved routes, available
 proxy pods, the generated NodePort, healthy application sets and the correct
 primary EndpointSlices. Route conditions must refer to the resource's current
-generation; stale `Accepted` conditions do not count as readiness. All waits
-are bounded. Installation and test failures collect GatewayClass, Gateway,
+generation and the exact Gateway namespace/listener; stale or unrelated
+`Accepted` conditions do not count as readiness. All waits are bounded:
+installation has a 15-minute overall limit, reconnection has a 90-second
+deadline, and diagnostic collection has a 180-second overall limit with
+5-second Kubernetes requests. Installation and test failures collect GatewayClass, Gateway,
 GRPCRoute, EnvoyProxy, Service, EndpointSlice, pod, deployment, event and
-KubericSet diagnostics, along with controller/proxy logs.
+KubericSet diagnostics, along with controller, proxy, operator and application logs.
 
 ```sh
 just gateway-diagnostics
@@ -119,6 +122,11 @@ reconnect and retry appropriate operations rather than expecting the same
 transport connection to survive. Retrying arbitrary non-idempotent writes
 requires application-level request identity, not a Gateway guarantee.
 
+The test retries connection failures and gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`
+or `CANCELLED` responses during reconnection. Permanent errors and data-integrity
+failures fail immediately; a later success cannot hide incorrect routing or
+missing data. Only idempotent test puts are retried.
+
 The separate `gateway` CI job explicitly runs the ignored cluster test. It:
 
 1. Installs the pinned dependencies and both independent three-replica sets.
@@ -126,16 +134,18 @@ The separate `gateway` CI job explicitly runs the ignored cluster test. It:
 3. Writes the same key with different values plus set-specific keys, checking
    data isolation and rejection of unknown authorities.
 4. Requests switchover for each application in turn, then deletes each set's
-  current primary pod with a UID precondition to exercise unplanned failover.
-  For every transition it exercises the existing connection, waits for a
-  different primary and the corresponding endpoints, and verifies fresh
-  connections through the unchanged authority and host port.
+   current primary pod with a required UID precondition to exercise unplanned failover.
+   For every transition it exercises the existing connection, waits for a
+   different primary and the corresponding endpoints, and verifies fresh
+   connections through the unchanged authority and host port.
 5. Continuously writes and reads through the other application's route during
-  every switchover and failover, then checks isolation again.
+   every switchover and failover, then verifies both applications' shared and
+   application-specific keys survive and remain isolated.
 
 The normal workspace test suite keeps the direct NodePort test unchanged and
 does not install or require Envoy. Cluster-free tests verify authority routing
-to a loopback server and reject stale/unresolved route readiness conditions:
+to a loopback server, exact-parent/current-generation route readiness, transient
+retry recovery, permanent/integrity failure handling, and stalled-attempt deadlines:
 
 ```sh
 cargo test -p kuberic-tests gateway_

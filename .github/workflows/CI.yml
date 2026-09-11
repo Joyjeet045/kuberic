@@ -126,6 +126,7 @@ jobs:
 
     - name: Collect Gateway diagnostics
       if: failure()
+      timeout-minutes: 4
       run: just gateway-diagnostics > gateway-diagnostics.log 2>&1
 
     - uses: actions/upload-artifact@v4

@@ -59,6 +59,32 @@ fn conditions_ready(conditions: Option<&Value>, generation: i64, required: &[&st
         })
 }
 
+fn route_ready(route: &DynamicObject) -> bool {
+    route
+        .data
+        .pointer("/status/parents")
+        .and_then(Value::as_array)
+        .is_some_and(|parents| {
+            parents.iter().any(|parent| {
+                let reference = &parent["parentRef"];
+                reference["name"] == "kuberic"
+                    && reference["sectionName"] == "grpc"
+                    && reference["namespace"].as_str().unwrap_or(NAMESPACE) == NAMESPACE
+                    && reference["group"]
+                        .as_str()
+                        .unwrap_or("gateway.networking.k8s.io")
+                        == "gateway.networking.k8s.io"
+                    && reference["kind"].as_str().unwrap_or("Gateway") == "Gateway"
+                    && parent["controllerName"] == "gateway.envoyproxy.io/gatewayclass-controller"
+                    && conditions_ready(
+                        parent.get("conditions"),
+                        route.metadata.generation.unwrap_or_default(),
+                        &["Accepted", "ResolvedRefs"],
+                    )
+            })
+        })
+}
+
 async fn wait_resource(
     api: &Api<DynamicObject>,
     name: &str,
@@ -155,24 +181,7 @@ async fn wait_gateway(client: Client) -> Result<()> {
             ),
             application,
             "accepted and resolved GRPCRoute",
-            |object| {
-                object
-                    .data
-                    .pointer("/status/parents")
-                    .and_then(Value::as_array)
-                    .is_some_and(|parents| {
-                        parents.iter().any(|parent| {
-                            parent["parentRef"]["name"] == "kuberic"
-                                && parent["controllerName"]
-                                    == "gateway.envoyproxy.io/gatewayclass-controller"
-                                && conditions_ready(
-                                    parent.get("conditions"),
-                                    object.metadata.generation.unwrap_or_default(),
-                                    &["Accepted", "ResolvedRefs"],
-                                )
-                        })
-                    })
-            },
+            route_ready,
         )
         .await?;
         ensure!(
@@ -345,27 +354,54 @@ async fn round_trip(client: &mut KvStoreClient<Channel>, key: &str, value: &str)
     Ok(())
 }
 
-async fn reconnect(application: &str, key: &str, value: &str) -> Result<KvStoreClient<Channel>> {
-    let deadline = Instant::now() + Duration::from_secs(90);
+fn retryable_gateway_error(error: &anyhow::Error) -> bool {
+    if let Some(status) = error.downcast_ref::<tonic::Status>() {
+        return matches!(
+            status.code(),
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
+        );
+    }
+    error.downcast_ref::<tonic::transport::Error>().is_some()
+}
+
+async fn retry_gateway<T>(
+    mut attempt: impl AsyncFnMut() -> Result<T>,
+    deadline: Instant,
+    retry_delay: Duration,
+) -> Result<T> {
     loop {
-        let result = async {
+        let result = tokio::time::timeout_at(deadline, attempt())
+            .await
+            .context("Gateway reconnect deadline exceeded")?;
+        match result {
+            Ok(client) => return Ok(client),
+            Err(error) if !retryable_gateway_error(&error) => {
+                return Err(error.context("non-retryable Gateway response"));
+            }
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error.context("Gateway reconnect deadline exceeded"));
+            }
+            Err(error) => {
+                tracing::info!(%error, "retrying a fresh Gateway connection")
+            }
+        }
+        tokio::time::sleep_until((Instant::now() + retry_delay).min(deadline)).await;
+    }
+}
+
+async fn reconnect(application: &str, key: &str, value: &str) -> Result<KvStoreClient<Channel>> {
+    retry_gateway(
+        async || {
             let mut client =
                 connect_gateway(ENDPOINT, &format!("{application}.kuberic.test")).await?;
             round_trip(&mut client, key, value).await?;
-            Ok::<_, anyhow::Error>(client)
-        }
-        .await;
-        match result {
-            Ok(client) => return Ok(client),
-            Err(error) if Instant::now() >= deadline => {
-                return Err(error.context(format!("reconnect timed out for {application}")));
-            }
-            Err(error) => {
-                tracing::info!(application, %error, "retrying a fresh Gateway connection")
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+            Ok(client)
+        },
+        Instant::now() + Duration::from_secs(90),
+        Duration::from_secs(1),
+    )
+    .await
+    .with_context(|| format!("Gateway reconnect failed for {application}"))
 }
 
 async fn verify_isolation(clients: &mut [KvStoreClient<Channel>; 2]) -> Result<()> {
@@ -379,6 +415,12 @@ async fn verify_isolation(clients: &mut [KvStoreClient<Channel>; 2]) -> Result<(
         ensure!(
             result.found && result.value == APPLICATIONS[index],
             "route crossed application boundary: {result:?}"
+        );
+        let own_key = format!("only-{}", APPLICATIONS[index]);
+        let retained = client.get(GetRequest { key: own_key }).await?.into_inner();
+        ensure!(
+            retained.found && retained.value == APPLICATIONS[index],
+            "application-specific data did not survive: {retained:?}"
         );
         let other_key = format!("only-{}", APPLICATIONS[1 - index]);
         ensure!(
@@ -412,7 +454,11 @@ async fn transition_primary(
             &DeleteParams {
                 grace_period_seconds: Some(0),
                 preconditions: Some(Preconditions {
-                    uid: pod.metadata.uid,
+                    uid: Some(
+                        pod.metadata
+                            .uid
+                            .context("primary pod has no UID; refusing unfenced deletion")?,
+                    ),
                     resource_version: None,
                 }),
                 ..Default::default()
@@ -443,10 +489,16 @@ async fn transition_primary(
         })
         .await
     {
-        Ok(response) => ensure!(
-            response.into_inner().value == application,
-            "old connection returned another application's data"
-        ),
+        Ok(response) => {
+            let response = response.into_inner();
+            ensure!(
+                response.found && response.value == application,
+                "old connection returned missing or incorrect data"
+            );
+        }
+        Err(error) if !retryable_gateway_error(&anyhow::Error::new(error.clone())) => {
+            return Err(error.into());
+        }
         Err(error) => {
             tracing::info!(application, %error, "existing connection interrupted by primary transition")
         }
@@ -567,6 +619,118 @@ async fn test_gateway_k8s_multi_application() {
         let _ = tokio::time::timeout(Duration::from_secs(180), diagnostic).await;
         panic!("Gateway integration failed: {result:?}");
     }
+}
+
+#[test]
+fn gateway_route_readiness_requires_the_expected_parent() {
+    let mut route: DynamicObject = serde_json::from_value(serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1", "kind": "GRPCRoute",
+        "metadata": {"name": "kvstore-a", "namespace": NAMESPACE, "generation": 2},
+        "status": {"parents": [{
+            "parentRef": {"name": "kuberic", "sectionName": "grpc"},
+            "controllerName": "gateway.envoyproxy.io/gatewayclass-controller",
+            "conditions": [
+                {"type": "Accepted", "status": "True", "observedGeneration": 2},
+                {"type": "ResolvedRefs", "status": "True", "observedGeneration": 2},
+            ]
+        }]}
+    }))
+    .unwrap();
+    assert!(route_ready(&route));
+    for (field, unexpected) in [
+        ("name", "other"),
+        ("namespace", "other"),
+        ("sectionName", "http"),
+        ("group", "other.example"),
+        ("kind", "Service"),
+    ] {
+        let expected = route.data["status"]["parents"][0]["parentRef"].clone();
+        route.data["status"]["parents"][0]["parentRef"][field] = unexpected.into();
+        assert!(
+            !route_ready(&route),
+            "unexpected {field} must not satisfy readiness"
+        );
+        route.data["status"]["parents"][0]["parentRef"] = expected;
+    }
+    route.metadata.generation = Some(3);
+    assert!(!route_ready(&route));
+}
+
+#[test]
+fn gateway_retries_never_hide_integrity_or_permanent_failures() {
+    for code in [
+        tonic::Code::Unavailable,
+        tonic::Code::DeadlineExceeded,
+        tonic::Code::Cancelled,
+    ] {
+        let error = anyhow::Error::new(tonic::Status::new(code, "primary transition"))
+            .context("routed request");
+        assert!(retryable_gateway_error(&error));
+    }
+    for code in [
+        tonic::Code::PermissionDenied,
+        tonic::Code::Unauthenticated,
+        tonic::Code::InvalidArgument,
+        tonic::Code::Unimplemented,
+        tonic::Code::Internal,
+        tonic::Code::DataLoss,
+    ] {
+        assert!(!retryable_gateway_error(&anyhow::Error::new(
+            tonic::Status::new(code, "invalid response")
+        )));
+    }
+    assert!(!retryable_gateway_error(&anyhow::anyhow!(
+        "unexpected routed value"
+    )));
+}
+
+#[tokio::test]
+async fn gateway_reconnect_recovers_transient_failures_without_masking_integrity_errors() {
+    let mut attempts = 0;
+    let connected = retry_gateway(
+        async || {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(tonic::Status::unavailable("primary is changing").into());
+            }
+            Ok("reconnected")
+        },
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_millis(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(connected, "reconnected");
+    assert_eq!(attempts, 2);
+
+    let mut attempts = 0;
+    let failed: Result<()> = retry_gateway(
+        async || {
+            attempts += 1;
+            Err(anyhow::anyhow!("unexpected routed value"))
+        },
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_millis(1),
+    )
+    .await;
+    assert!(failed.unwrap_err().to_string().contains("non-retryable"));
+    assert_eq!(attempts, 1);
+}
+
+#[tokio::test]
+async fn gateway_reconnect_bounds_a_stalled_attempt() {
+    let result = retry_gateway(
+        async || std::future::pending::<Result<()>>().await,
+        Instant::now() + Duration::from_millis(10),
+        Duration::from_millis(1),
+    )
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("deadline exceeded")
+    );
 }
 
 #[test]

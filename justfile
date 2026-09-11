@@ -85,7 +85,7 @@ kvstore-delete: verify-kind-context
 
 # Install the pinned Gateway reference in its dedicated cluster.
 gateway-install: verify-kind-context kuberic-operator-deploy
-    bash scripts/gateway_kind.sh install
+    timeout --kill-after=15s 15m bash scripts/gateway_kind.sh install
 
 # Run only the separate Gateway integration scenario.
 gateway-test: verify-kind-context
@@ -93,4 +93,4 @@ gateway-test: verify-kind-context
 
 # Collect Gateway and application diagnostics from the owned cluster.
 gateway-diagnostics: verify-kind-context
-    bash scripts/gateway_kind.sh diagnostics
+    timeout --kill-after=5s 180s bash scripts/gateway_kind.sh diagnostics
