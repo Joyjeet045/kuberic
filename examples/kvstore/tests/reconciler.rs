@@ -1293,26 +1293,36 @@ async fn advance_until_pending_action(
     mut status: KubericSetStatus,
     kind: DurableActionKind,
 ) -> KubericSetStatus {
-    for _ in 0..60 {
-        if status
-            .operation
-            .as_ref()
-            .and_then(|operation| operation.pending_action.as_ref())
-            .is_some_and(|action| action.kind == kind && action.dispatch_agent_generation.is_some())
-        {
-            return status;
-        }
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if status
+                .operation
+                .as_ref()
+                .and_then(|operation| operation.pending_action.as_ref())
+                .is_some_and(|action| {
+                    action.kind == kind && action.dispatch_agent_generation.is_some()
+                })
+            {
+                break;
+            }
 
-        reconcile_set(
-            &make_set(name, replicas, Some(status.clone())),
-            api,
-            &ReconcilerState::default(),
-        )
-        .await
-        .unwrap();
-        status = api.last_status().unwrap();
-    }
-    panic!("durable switchover did not reach pending action {kind:?}");
+            reconcile_set(
+                &make_set(name, replicas, Some(status.clone())),
+                api,
+                &ReconcilerState::default(),
+            )
+            .await
+            .unwrap();
+            status = api.last_status().unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "durable operation did not reach pending action {kind:?}: {status:?}"
+    );
+    status
 }
 
 async fn advance_add_until_phase(
@@ -1357,17 +1367,24 @@ async fn drive_operation_to_healthy_with_state(
     replicas: i32,
     mut status: KubericSetStatus,
 ) -> KubericSetStatus {
-    for _ in 0..120 {
-        reconcile_set(&make_set(name, replicas, Some(status.clone())), api, state)
-            .await
-            .unwrap();
-        status = api.last_status().unwrap();
-        if status.phase == Phase::Healthy {
-            return status;
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            reconcile_set(&make_set(name, replicas, Some(status.clone())), api, state)
+                .await
+                .unwrap();
+            status = api.last_status().unwrap();
+            if status.phase == Phase::Healthy {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("durable operation did not return to Healthy: {status:?}");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "durable operation did not return to Healthy: {status:?}"
+    );
+    status
 }
 
 async fn advance_remove_until_operation_phase(
