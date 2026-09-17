@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod kvstore_k8s;
+mod gateway_k8s;
 
 #[cfg(test)]
 mod lease_election;
@@ -175,36 +175,6 @@ pub mod test_utils {
             }
             Err(e) => panic!("Failed to get deployment: {}", e),
         }
-    }
-
-    pub async fn ensure_kvstore_deployed() {
-        static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-        INIT.get_or_init(async || {
-            ensure_kuberic_operator_deployed().await;
-            ensure_kvstore_deployed_internal().await;
-        })
-        .await;
-    }
-
-    async fn ensure_kvstore_deployed_internal() {
-        tracing::info!("Ensuring kvstore KubericSet is deployed...");
-        let repo_root = get_repo_root();
-        let path = repo_root
-            .join("examples")
-            .join("kvstore")
-            .join("deploy")
-            .join("kubericset.yaml");
-        kubectl_apply(&path).await;
-
-        wait_pods_ready(NS_XEDIO, "kuberic.io/set=kvstore", 3, 120)
-            .await
-            .expect("kvstore pods failed to become ready");
-
-        // Wait for operator to reconcile status to Healthy
-        wait_kubericset_healthy(NS_XEDIO, "kvstore", 3, 60)
-            .await
-            .expect("kvstore KubericSet failed to reach Healthy phase");
-        tracing::info!("kvstore deployed and healthy");
     }
 
     pub async fn wait_kubericset_healthy(

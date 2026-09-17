@@ -1428,6 +1428,7 @@ dependencies = [
 name = "kuberic-tests"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "k8s-openapi",
  "kube",
  "kube-leader-election",
@@ -1436,9 +1437,9 @@ dependencies = [
  "prost",
  "rand",
  "serde_json",
- "serial_test",
  "test-log",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tonic",
  "tracing",

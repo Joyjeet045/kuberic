@@ -1,0 +1,79 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: kuberic-envoy
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: kuberic
+  namespace: xedio
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        replicas: 1
+      envoyService:
+        type: NodePort
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              ports:
+              - port: 8080
+                nodePort: 30090
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: kuberic
+  namespace: xedio
+spec:
+  gatewayClassName: kuberic-envoy
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: kuberic
+  listeners:
+  - name: grpc
+    protocol: HTTP
+    port: 8080
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: kvstore-a
+  namespace: xedio
+spec:
+  parentRefs:
+  - name: kuberic
+    sectionName: grpc
+  hostnames:
+  - kvstore-a.kuberic.test
+  rules:
+  - backendRefs:
+    - name: kvstore-a-rw
+      port: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: kvstore-b
+  namespace: xedio
+spec:
+  parentRefs:
+  - name: kuberic
+    sectionName: grpc
+  hostnames:
+  - kvstore-b.kuberic.test
+  rules:
+  - backendRefs:
+    - name: kvstore-b-rw
+      port: 8080

@@ -1,5 +1,11 @@
 # KVStore Kubernetes Deployment
 
+The KinD setup below records the original single-set implementation. For
+current development and CI, use the [shared Gateway setup](../features/envoy-gateway-kind.md).
+It replaces the single-set test and uses `deploy/kind-config.yaml` with two
+KVStore applications. The old single-set manifest and NodePort overlay have
+been removed; the snippets below are historical.
+
 Deploy the kvstore example as a KubericSet in KinD, matching the
 existing xdata-app deployment pattern.
 

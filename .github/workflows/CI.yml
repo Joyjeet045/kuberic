@@ -11,6 +11,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       KIND_CLUSTER_NAME: kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
       KUBECONFIG: /tmp/kuberic-kind-kubeconfig-${{ github.run_id }}-${{ github.run_attempt }}
@@ -32,6 +33,21 @@ jobs:
     
     - uses: taiki-e/install-action@protoc
     - uses: taiki-e/install-action@just
+    - uses: azure/setup-helm@v4.3.1
+      with:
+        version: v3.19.0
+
+    - uses: actions/cache@v4
+      with:
+        path: target/downloads
+        key: gateway-downloads-${{ hashFiles('scripts/gateway_kind.sh') }}
+
+    - name: Check download caching and shell syntax
+      run: |
+        for script in scripts/download.sh scripts/download_test.sh scripts/gateway_kind.sh; do
+          bash -n "$script"
+        done
+        bash scripts/download_test.sh
 
     - name: Install PostgreSQL
       run: |
@@ -50,8 +66,10 @@ jobs:
     - name: Kubernetes KinD Cluster
       uses: helm/kind-action@v1
       with:
+        version: v0.30.0
+        node_image: kindest/node:v1.34.0
         cluster_name: ${{ env.KIND_CLUSTER_NAME }}
-        config: deploy/kind-isolated-config.yaml
+        config: deploy/kind-config.yaml
         kubeconfig: ${{ env.KUBECONFIG }}
 
     - name: Record and verify isolated KinD ownership
@@ -66,5 +84,20 @@ jobs:
     - name: Build and load Docker images
       run: just images
 
+    - name: Install pinned Gateway API and Envoy Gateway
+      run: just gateway-install
+
     - name: Run workspace tests
       run: cargo test --workspace --all-features -- --nocapture
+
+    - name: Collect Gateway diagnostics
+      if: failure()
+      timeout-minutes: 4
+      run: just gateway-diagnostics > gateway-diagnostics.log 2>&1
+
+    - uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: gateway-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+        path: gateway-diagnostics.log
+        if-no-files-found: ignore
