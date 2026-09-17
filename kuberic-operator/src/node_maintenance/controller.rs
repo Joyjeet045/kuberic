@@ -1,21 +1,41 @@
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Node, Pod};
 use k8s_openapi::jiff::Timestamp;
+use std::collections::BTreeSet;
+
+use crate::crd::{KubericSet, Phase, ReconfigurationPhase};
 
 use super::api::{
     NodeMaintenanceRequest, NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus,
 };
-use super::discovery::{DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
+use super::attestation::{CommittedMember, CommittedTopology, Epoch, LiveMember, LiveObservation};
+use super::discovery::{Discovery, DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
 use super::preflight::{Preflight, preflight};
+use super::safety::{SetPlacement, reconcile_preparation};
 
 pub const SET_LABEL: &str = "kuberic.io/set";
 pub const ROLE_LABEL: &str = "kuberic.io/role";
+
+#[derive(Debug, PartialEq, Clone, Default)]
+pub struct SetEvidence {
+    pub committed: Option<CommittedTopology>,
+    pub live: Option<LiveObservation>,
+}
+
+fn epoch_of(epoch: &crate::crd::EpochStatus) -> Epoch {
+    Epoch {
+        data_loss_number: epoch.data_loss_number,
+        configuration_number: epoch.configuration_number,
+    }
+}
 
 #[async_trait]
 pub trait MaintenanceApi: Send + Sync {
     async fn get_node(&self, name: &str) -> Result<Option<NodeRef>, String>;
 
     async fn list_maintenance_pods(&self) -> Result<Vec<MaintenancePod>, String>;
+
+    async fn get_set_evidence(&self, namespace: &str, name: &str) -> Result<SetEvidence, String>;
 
     async fn patch_request_status(
         &self,
@@ -54,14 +74,35 @@ where
                 Vec::new()
             };
 
-            reconcile_discovery(DiscoveryInput {
+            let discovered = reconcile_discovery(DiscoveryInput {
                 spec: ctx.spec,
                 generation: ctx.generation,
                 previous: ctx.previous,
                 node: node.as_ref(),
                 pods: &pods,
                 now: ctx.now,
-            })
+            });
+
+            match discovered {
+                Discovery::Blocked(status) => status,
+                Discovery::Discovered(status) => {
+                    let mut placements = Vec::with_capacity(status.affected_sets.len());
+                    for set in &status.affected_sets {
+                        let evidence = api.get_set_evidence(&set.namespace, &set.name).await?;
+                        placements.push(SetPlacement {
+                            committed: evidence.committed,
+                            live: evidence.live,
+                            promotable_pod_uids: promotable_pod_uids(
+                                &pods,
+                                &set.namespace,
+                                &set.name,
+                                &ctx.spec.node_name,
+                            ),
+                        });
+                    }
+                    reconcile_preparation(status, &placements, ctx.now)
+                }
+            }
         }
     };
 
@@ -77,6 +118,23 @@ where
         status,
         persisted: true,
     })
+}
+
+fn promotable_pod_uids(
+    pods: &[MaintenancePod],
+    namespace: &str,
+    set_name: &str,
+    node_name: &str,
+) -> BTreeSet<String> {
+    pods.iter()
+        .filter(|pod| pod.namespace == namespace && pod.set_name == set_name)
+        .filter(|pod| {
+            pod.node_name
+                .as_deref()
+                .is_some_and(|node| node != node_name)
+        })
+        .map(|pod| pod.uid.clone())
+        .collect()
 }
 
 pub struct KubeMaintenanceApi {
@@ -130,6 +188,59 @@ impl MaintenanceApi for KubeMaintenanceApi {
             .collect())
     }
 
+    async fn get_set_evidence(&self, namespace: &str, name: &str) -> Result<SetEvidence, String> {
+        let api: kube::Api<KubericSet> = kube::Api::namespaced(self.client.clone(), namespace);
+        let Some(set) = api.get_opt(name).await.map_err(|e| e.to_string())? else {
+            return Ok(SetEvidence::default());
+        };
+        let Some(status) = set.status else {
+            return Ok(SetEvidence::default());
+        };
+        let committed = status
+            .stable_snapshot
+            .as_ref()
+            .map(|snapshot| CommittedTopology {
+                epoch: epoch_of(&snapshot.epoch),
+                write_quorum: snapshot.write_quorum,
+                members: snapshot
+                    .members
+                    .iter()
+                    .map(|member| CommittedMember {
+                        id: member.id,
+                        pod_uid: member.instance_id.clone(),
+                        is_primary: member.id == snapshot.primary_id,
+                    })
+                    .collect(),
+            });
+        let primary_pod_uid = status.current_primary.as_deref().and_then(|primary| {
+            status
+                .members
+                .iter()
+                .find(|member| member.name == primary)
+                .map(|member| member.instance_id.clone())
+        });
+        let live = LiveObservation {
+            epoch: epoch_of(&status.epoch),
+            settled: status.phase == Phase::Healthy
+                && status.reconfiguration_phase == ReconfigurationPhase::None,
+            primary_pod_uid,
+            members: status
+                .members
+                .iter()
+                .map(|member| LiveMember {
+                    id: member.id,
+                    pod_uid: member.instance_id.clone(),
+                    is_primary: member.role == "primary",
+                    healthy: member.healthy,
+                })
+                .collect(),
+        };
+        Ok(SetEvidence {
+            committed,
+            live: Some(live),
+        })
+    }
+
     async fn patch_request_status(
         &self,
         name: &str,
@@ -150,6 +261,7 @@ mod tests {
     use super::*;
     use crate::node_maintenance::api::{
         MaintenanceBlockedReason, MaintenanceDesiredState, MaintenanceOperation, MaintenancePhase,
+        PREPARED_CONDITION_TYPE,
     };
     use std::sync::Mutex;
 
@@ -159,9 +271,11 @@ mod tests {
     struct MockApi {
         node: Option<NodeRef>,
         pods: Vec<MaintenancePod>,
+        evidence: SetEvidence,
         patches: Mutex<Vec<NodeMaintenanceRequestStatus>>,
         node_calls: Mutex<usize>,
         list_calls: Mutex<usize>,
+        topology_calls: Mutex<usize>,
         fail_patch: bool,
         fail_get_node: bool,
     }
@@ -179,6 +293,15 @@ mod tests {
         async fn list_maintenance_pods(&self) -> Result<Vec<MaintenancePod>, String> {
             *self.list_calls.lock().unwrap() += 1;
             Ok(self.pods.clone())
+        }
+
+        async fn get_set_evidence(
+            &self,
+            _namespace: &str,
+            _name: &str,
+        ) -> Result<SetEvidence, String> {
+            *self.topology_calls.lock().unwrap() += 1;
+            Ok(self.evidence.clone())
         }
 
         async fn patch_request_status(
@@ -247,6 +370,44 @@ mod tests {
             },
         )
         .await
+    }
+
+    fn evidence(primary: &str, members: &[&str], write_quorum: u32) -> SetEvidence {
+        let uid = |pod: &str| format!("uid-{pod}");
+        let epoch = Epoch {
+            data_loss_number: 0,
+            configuration_number: 1,
+        };
+        SetEvidence {
+            committed: Some(CommittedTopology {
+                epoch,
+                write_quorum,
+                members: members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pod)| CommittedMember {
+                        id: index as i64 + 1,
+                        pod_uid: uid(pod),
+                        is_primary: *pod == primary,
+                    })
+                    .collect(),
+            }),
+            live: Some(LiveObservation {
+                epoch,
+                settled: true,
+                primary_pod_uid: Some(uid(primary)),
+                members: members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pod)| LiveMember {
+                        id: index as i64 + 1,
+                        pod_uid: uid(pod),
+                        is_primary: *pod == primary,
+                        healthy: true,
+                    })
+                    .collect(),
+            }),
+        }
     }
 
     fn assert_no_discovery(api: &MockApi) {
@@ -324,6 +485,311 @@ mod tests {
         let repeat = run_spec(&api, &spec, &outcome.status).await.unwrap();
         assert!(!repeat.persisted);
         assert_eq!(api.patches.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_secondary_only_node_is_prepared_when_quorum_survives() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Prepared);
+        assert!(outcome.status.prepared_at.is_some());
+        assert!(outcome.status.affected_sets[0].primary_moved);
+        assert!(outcome.status.affected_sets[0].quorum_without_node);
+
+        let condition = outcome
+            .status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == PREPARED_CONDITION_TYPE)
+            .expect("prepared condition");
+        assert_eq!(condition.status, "True");
+        assert_eq!(condition.reason, "PrimariesMovedAndQuorumVerified");
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_survivor_is_never_reported_as_prepared() {
+        let mut evidence = evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2);
+        evidence
+            .live
+            .as_mut()
+            .expect("live")
+            .members
+            .iter_mut()
+            .find(|member| member.pod_uid == "uid-kv-1")
+            .expect("member")
+            .healthy = false;
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence,
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_ne!(outcome.status.phase, MaintenancePhase::Prepared);
+        assert_eq!(
+            outcome.status.blocked_reason,
+            Some(MaintenanceBlockedReason::BlockedByQuorum)
+        );
+        assert!(!outcome.status.affected_sets[0].quorum_without_node);
+    }
+
+    #[tokio::test]
+    async fn a_reconfiguring_set_is_never_reported_as_prepared() {
+        let mut evidence = evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2);
+        evidence.live.as_mut().expect("live").settled = false;
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence,
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Preparing);
+        assert!(outcome.status.prepared_at.is_none());
+        assert!(!outcome.status.affected_sets[0].quorum_without_node);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_incarnation_is_never_reported_as_prepared() {
+        let mut evidence = evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2);
+        evidence
+            .live
+            .as_mut()
+            .expect("live")
+            .members
+            .iter_mut()
+            .find(|member| member.pod_uid == "uid-kv-1")
+            .expect("member")
+            .pod_uid = "uid-kv-1-restarted".to_string();
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence,
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Preparing);
+        assert!(outcome.status.prepared_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn losing_write_quorum_blocks_preparation() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![
+                pod("kv-1", Some("worker-04"), false),
+                pod("kv-2", Some("worker-04"), false),
+            ],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Blocked);
+        assert_eq!(
+            outcome.status.blocked_reason,
+            Some(MaintenanceBlockedReason::BlockedByQuorum)
+        );
+        assert!(outcome.status.prepared_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_primary_on_the_node_waits_while_a_replica_elsewhere_can_take_over() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![
+                pod("kv-0", Some("worker-04"), true),
+                pod("kv-1", Some("worker-05"), false),
+                pod("kv-2", Some("worker-06"), false),
+            ],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Preparing);
+        assert!(!outcome.status.affected_sets[0].primary_moved);
+        assert!(!outcome.status.affected_sets[0].no_eligible_target);
+        assert!(outcome.status.affected_sets[0].quorum_without_node);
+    }
+
+    #[tokio::test]
+    async fn a_primary_with_no_scheduled_replica_elsewhere_is_blocked() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![
+                pod("kv-0", Some("worker-04"), true),
+                pod("kv-1", None, false),
+                pod("kv-2", None, false),
+            ],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Blocked);
+        assert_eq!(
+            outcome.status.blocked_reason,
+            Some(MaintenanceBlockedReason::NoEligibleTarget)
+        );
+        assert!(outcome.status.affected_sets[0].no_eligible_target);
+        assert!(outcome.status.prepared_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_request_is_never_prepared_while_a_primary_remains_on_the_node() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-0", Some("worker-04"), true)],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        let condition = outcome
+            .status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == PREPARED_CONDITION_TYPE)
+            .expect("prepared condition");
+        assert_eq!(condition.status, "False");
+    }
+
+    #[tokio::test]
+    async fn an_unpublished_topology_never_reports_readiness() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence: SetEvidence::default(),
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Preparing);
+        assert!(!outcome.status.affected_sets[0].quorum_without_node);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_delivery_does_not_rewrite_a_prepared_request() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let first = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+        assert!(first.persisted);
+
+        let second = run(&api, &first.status).await.unwrap();
+        assert!(!second.persisted);
+        assert_eq!(second.status, first.status);
+        assert_eq!(api.patches.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preparation_resumes_from_persisted_status_after_a_restart() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let persisted = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap()
+            .status;
+
+        let restarted = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let resumed = run(&restarted, &persisted).await.unwrap();
+
+        assert_eq!(resumed.status.phase, MaintenancePhase::Prepared);
+        assert_eq!(resumed.status.prepared_at, persisted.prepared_at);
+        assert!(!resumed.persisted);
+    }
+
+    #[tokio::test]
+    async fn a_primary_that_moves_away_advances_the_request_to_prepared() {
+        let blocked = MockApi {
+            node: Some(node()),
+            pods: vec![
+                pod("kv-0", Some("worker-04"), true),
+                pod("kv-1", Some("worker-05"), false),
+                pod("kv-2", Some("worker-06"), false),
+            ],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let preparing = run(&blocked, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap()
+            .status;
+        assert_eq!(preparing.phase, MaintenancePhase::Preparing);
+
+        let moved = MockApi {
+            node: Some(node()),
+            pods: vec![
+                pod("kv-0", Some("worker-04"), false),
+                pod("kv-1", Some("worker-05"), true),
+                pod("kv-2", Some("worker-06"), false),
+            ],
+            evidence: evidence("kv-1", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let outcome = run(&moved, &preparing).await.unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Prepared);
+        assert!(outcome.status.affected_sets[0].primary_moved);
+        assert!(outcome.status.prepared_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_node_without_replicas_is_prepared_without_a_topology_read() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-0", Some("worker-09"), true)],
+            ..Default::default()
+        };
+        let outcome = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.phase, MaintenancePhase::Prepared);
+        assert!(outcome.status.affected_sets.is_empty());
+        assert_eq!(*api.topology_calls.lock().unwrap(), 0);
     }
 
     #[tokio::test]

@@ -99,6 +99,9 @@ pub struct AffectedKubericSetStatus {
     pub primary_moved: bool,
 
     #[serde(default)]
+    pub no_eligible_target: bool,
+
+    #[serde(default)]
     pub quorum_without_node: bool,
 }
 
@@ -163,6 +166,10 @@ impl MaintenancePhase {
 
     pub fn is_safe_to_drain(self) -> bool {
         matches!(self, Self::Prepared)
+    }
+
+    pub fn excludes_primary_placement(self) -> bool {
+        matches!(self, Self::Preparing | Self::Prepared | Self::Blocked)
     }
 
     pub fn requires_reason(self) -> bool {
@@ -334,6 +341,20 @@ mod tests {
     }
 
     #[test]
+    fn placement_is_excluded_only_once_preparation_has_started() {
+        for phase in all_phases() {
+            let expected = matches!(
+                phase,
+                MaintenancePhase::Preparing
+                    | MaintenancePhase::Prepared
+                    | MaintenancePhase::Blocked
+            );
+            assert_eq!(phase.excludes_primary_placement(), expected, "{phase:?}");
+        }
+        assert!(!MaintenancePhase::Requested.excludes_primary_placement());
+    }
+
+    #[test]
     fn unsafe_phases_require_a_reason() {
         for phase in all_phases() {
             let expected = matches!(
@@ -419,6 +440,9 @@ mod tests {
             "affectedSets",
             "podUid",
             "isPrimary",
+            "primaryMoved",
+            "noEligibleTarget",
+            "quorumWithoutNode",
             "blockedReason",
             "InvalidNotBefore",
             "InvalidDeadline",
