@@ -1282,20 +1282,13 @@ pub async fn reconcile_set(
 
             // --- Switchover check (only when all replicas are healthy) ---
             let requested_primary = set.status.as_ref().and_then(|s| s.target_primary.clone());
-            let switchover_engine_ready =
-                validate_new_switchover_engine(set.spec.switchover_execution_mode).is_ok();
-            let maintenance_nodes = if requested_primary.is_some() || switchover_engine_ready {
-                api.list_maintenance_nodes().await.unwrap_or_else(|error| {
-                    warn!(
-                        name,
-                        error,
-                        "maintenance node lookup failed; leaving primary placement unchanged"
-                    );
-                    BTreeSet::new()
-                })
-            } else {
+            let maintenance_nodes = api.list_maintenance_nodes().await.unwrap_or_else(|error| {
+                warn!(
+                    name,
+                    error, "maintenance node lookup failed; leaving primary placement unchanged"
+                );
                 BTreeSet::new()
-            };
+            });
             let candidates: Vec<PlacementCandidate> = current_pods
                 .iter()
                 .map(|(id, _, pod)| PlacementCandidate {
@@ -1320,7 +1313,6 @@ pub async fn reconcile_set(
                     None
                 }
                 Some(requested) => Some(requested),
-                None if !switchover_engine_ready => None,
                 None => switchover_target_for_maintenance(
                     &candidates,
                     current_primary.as_deref(),
