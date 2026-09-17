@@ -9,5 +9,6 @@ alias kind="<kind location>/kind.exe"
 ```
 
 For multiple KVStore applications sharing one loopback host port, see the
-[Envoy Gateway KinD reference](features/envoy-gateway-kind.md). It uses a
-dedicated cluster and leaves the direct NodePort example unchanged.
+[Envoy Gateway KinD setup](features/envoy-gateway-kind.md). Local development
+and CI use this single setup, with two applications behind one Gateway. It
+replaces the former single-set NodePort setup.

@@ -4,6 +4,25 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 readonly ENVOY_GATEWAY_VERSION=v1.9.1
 readonly GATEWAY_API_VERSION=v1.6.1
+readonly artifact_dir="${KUBERIC_DOWNLOAD_DIR:-${CARGO_TARGET_DIR:-target}/downloads}"
+readonly gateway_api="$artifact_dir/gateway-api-${GATEWAY_API_VERSION}.yaml"
+readonly gateway_crds_chart="$artifact_dir/gateway-crds-helm-${ENVOY_GATEWAY_VERSION}.tgz"
+readonly gateway_chart="$artifact_dir/gateway-helm-${ENVOY_GATEWAY_VERSION}.tgz"
+
+download_artifacts() {
+    bash scripts/download.sh \
+        "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml" \
+        d7fa77650e4ef28fca0411536fcb5e237deb4d50301cfded3be49d9a1b7bbd02 "$gateway_api"
+    bash scripts/download.sh oci://docker.io/envoyproxy/gateway-crds-helm \
+        ad2e1215749249ff6c8a2d82fb820c70edbb18a7ffc7331355632fb67b944688 "$gateway_crds_chart" "$ENVOY_GATEWAY_VERSION"
+    bash scripts/download.sh oci://docker.io/envoyproxy/gateway-helm \
+        68ce74961eeb5fc5e395628d6bbed9305a85b34619bd7ee17b01187f101bb8c5 "$gateway_chart" "$ENVOY_GATEWAY_VERSION"
+}
+
+if [[ "${1:-}" == download ]]; then
+    download_artifacts
+    exit 0
+fi
 
 : "${KIND_CLUSTER_NAME:?Set an isolated KIND_CLUSTER_NAME}"
 : "${KUBECONFIG:?Set an isolated KUBECONFIG}"
@@ -36,7 +55,7 @@ if [[ "${1:-}" == diagnostics ]]; then
     diagnostics
     exit 0
 fi
-[[ "${1:-}" == install ]] || { echo 'Usage: gateway_kind.sh install|diagnostics' >&2; exit 2; }
+[[ "${1:-}" == install ]] || { echo 'Usage: gateway_kind.sh download|install|diagnostics' >&2; exit 2; }
 trap diagnostics ERR
 
 "${kubectl_cmd[@]}" rollout status -n xedio deployment/kuberic-operator --timeout=180s
@@ -44,32 +63,30 @@ trap diagnostics ERR
 "${kubectl_cmd[@]}" wait --for=condition=Established crd/kubericsets.kuberic.io --timeout=120s
 
 [[ "$(docker port "${KIND_CLUSTER_NAME}-control-plane" 30090/tcp)" == '127.0.0.1:30090' ]] || {
-    echo 'Use deploy/gateway/kind-config.yaml: loopback host port 30090 is required.' >&2
+    echo 'Use deploy/kind-config.yaml: loopback host port 30090 is required.' >&2
     exit 1
 }
 "${kubectl_cmd[@]}" get services -A -o json | jq -e '
     [.items[] | select(any(.spec.ports[]?; .nodePort == 30090)) |
       select(.metadata.labels["gateway.envoyproxy.io/owning-gateway-name"] != "kuberic" or
              .metadata.labels["gateway.envoyproxy.io/owning-gateway-namespace"] != "xedio")] | length == 0
-' >/dev/null || { echo 'NodePort 30090 belongs to another Service; use a separate cluster.' >&2; exit 1; }
+' >/dev/null || { echo 'NodePort 30090 belongs to another Service; only Envoy may own it.' >&2; exit 1; }
 
+download_artifacts
 temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
-curl --fail --location --retry 3 --connect-timeout 20 --max-time 180 \
-    "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml" \
-    -o "$temporary/gateway-api.yaml"
-"${kubectl_cmd[@]}" apply --server-side -f "$temporary/gateway-api.yaml"
+"${kubectl_cmd[@]}" apply --server-side -f "$gateway_api"
 "${kubectl_cmd[@]}" get crd gateways.gateway.networking.k8s.io -o json | \
     jq -e --arg version "$GATEWAY_API_VERSION" '.metadata.annotations["gateway.networking.k8s.io/bundle-version"] == $version' >/dev/null
-timeout 180 "${helm_cmd[@]}" template eg-crds oci://docker.io/envoyproxy/gateway-crds-helm \
-    --version "$ENVOY_GATEWAY_VERSION" --set crds.gatewayAPI.enabled=false \
+timeout 180 "${helm_cmd[@]}" template eg-crds "$gateway_crds_chart" \
+    --set crds.gatewayAPI.enabled=false \
     --set crds.envoyGateway.enabled=true > "$temporary/envoy-crds.yaml"
 "${kubectl_cmd[@]}" apply --server-side -f "$temporary/envoy-crds.yaml"
 "${kubectl_cmd[@]}" wait --for=condition=Established --timeout=120s \
     crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
     crd/grpcroutes.gateway.networking.k8s.io crd/envoyproxies.gateway.envoyproxy.io
-timeout 360 "${helm_cmd[@]}" upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
-    --version "$ENVOY_GATEWAY_VERSION" --namespace envoy-gateway-system --create-namespace \
+timeout 360 "${helm_cmd[@]}" upgrade --install eg "$gateway_chart" \
+    --namespace envoy-gateway-system --create-namespace \
     --set crds.enabled=false --wait --timeout 5m
 "${kubectl_cmd[@]}" wait -n envoy-gateway-system deployment/envoy-gateway \
     --for=condition=Available --timeout=120s

@@ -1,6 +1,6 @@
 # Shared Gateway Access in KinD
 
-The reference deployment routes two independent KVStore applications through
+The development and CI deployment routes two independent KVStore applications through
 `127.0.0.1:30090`. The gRPC HTTP/2 authority chooses the application:
 
 ```text
@@ -25,7 +25,16 @@ installation is disabled to avoid installing a second Gateway API bundle.
 The chart selects its matching Envoy Proxy version; the data-plane image is
 not independently overridden.
 
-The dedicated CI job uses KinD v0.30.0, Kubernetes v1.34.0 and Helm v3.19.0.
+Downloads are cached in `${CARGO_TARGET_DIR:-target}/downloads`; set
+`KUBERIC_DOWNLOAD_DIR` to use another build directory. The installer checks
+each file's pinned SHA-256 before use, including files already in the cache.
+The manifest hash comes from its GitHub release asset, and the chart hashes
+come from their OCI chart layers. A corrupt cache entry is downloaded again;
+failed downloads and checksum mismatches are never installed. Helm renders
+and installs the verified local chart archives without fetching them again.
+CI restores this directory with `actions/cache`.
+
+CI uses KinD v0.30.0, Kubernetes v1.34.0 and Helm v3.19.0.
 Envoy Gateway and these manifests are reference/test dependencies, not a
 production requirement. Production deployments can use a conformant
 `GatewayClass` of their choice.
@@ -33,27 +42,32 @@ production requirement. Production deployments can use a conformant
 ## Run the Reference
 
 Requirements: Linux or a Linux development environment, Docker, KinD, kubectl,
-Helm, just, curl, jq, GNU timeout, and the repository Rust/protoc prerequisites.
+Helm, just, curl, jq, GNU timeout, sha256sum, and the repository Rust/protoc prerequisites.
 Port 30090 must be free on the host. This example is plaintext and binds only
 to loopback; it does not expose a public authenticated endpoint.
 
-Use a **separate cluster** from the direct KVStore NodePort example. Both
-scenarios use NodePort 30090, but only Envoy may own that port in the Gateway
-cluster. The installer refuses to take it from a different Service.
+This is the single KinD setup for KVStore, replacing the old single-set
+NodePort setup. Only Envoy owns NodePort 30090. Do not apply a direct
+application NodePort overlay to this cluster; the installer refuses to take
+the port from a different Service.
 
 From the repository root:
 
 ```sh
-export KIND_CLUSTER_NAME=kuberic-gateway-dev
+export KIND_CLUSTER_NAME=kuberic-dev
 export KUBECONFIG="$(mktemp -d)/kubeconfig"
 export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
-export KIND_CONFIG=deploy/gateway/kind-config.yaml
 
 just create-kind-cluster
 just images
-just gateway-install
+just kvstore-deploy
 just gateway-test
 ```
+
+The default cluster config is `deploy/kind-config.yaml`. `just kvstore-deploy`
+runs `just gateway-install`, deploying the Gateway and both KVStore sets.
+Run `cargo test --workspace --all-features` for the complete suite, including
+the Gateway scenario. CI uses the same cluster and setup for all tests.
 
 The existing isolated-cluster ownership checks apply to every Kubernetes
 operation. Do not point these commands at a default or production kubeconfig.
@@ -127,7 +141,7 @@ or `CANCELLED` responses during reconnection. Permanent errors and data-integrit
 failures fail immediately; a later success cannot hide incorrect routing or
 missing data. Only idempotent test puts are retried.
 
-The separate `gateway` CI job explicitly runs the ignored cluster test. It:
+The normal workspace test suite runs the Gateway cluster test. The workflow:
 
 1. Installs the pinned dependencies and both independent three-replica sets.
 2. Verifies listener, NodePort ownership, route backend and Service selectors.
@@ -142,13 +156,14 @@ The separate `gateway` CI job explicitly runs the ignored cluster test. It:
    every switchover and failover, then verifies both applications' shared and
    application-specific keys survive and remain isolated.
 
-The normal workspace test suite keeps the direct NodePort test unchanged and
-does not install or require Envoy. Cluster-free tests verify authority routing
+The former single-set NodePort tests are replaced by this two-application
+scenario. Cluster-free tests verify authority routing
 to a loopback server, exact-parent/current-generation route readiness, transient
 retry recovery, permanent/integrity failure handling, and stalled-attempt deadlines:
 
 ```sh
-cargo test -p kuberic-tests gateway_
+cargo test -p kuberic-tests gateway_ -- --skip gateway_k8s::test_gateway_k8s_multi_application
+bash scripts/download_test.sh
 ```
 
 ## Protocol Scope

@@ -54,13 +54,9 @@ Replicated SQLite database with gRPC Execute/Query/ExecuteBatch API. Ships WAL f
 
 ## Kubernetes Deployment
 
-Requires a K8s cluster (tested with [KinD](https://kind.sigs.k8s.io/)):
-
-```bash
-# Deploy operator + kvstore (3 replicas)
-kubectl apply -f kuberic-operator/deploy/deployment.yaml
-kubectl apply -f examples/kvstore/deploy/kubericset.yaml
-```
+For local development and CI, use the [shared Gateway KinD setup](docs/features/envoy-gateway-kind.md).
+It deploys the operator and two three-replica KVStore applications behind one
+loopback port. `just kvstore-deploy` installs this setup in the owned cluster.
 
 The operator watches `KubericSet` resources and manages the full lifecycle: pod creation, Open → Idle → Active → Primary promotion, failover, and scale up/down.
 

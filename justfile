@@ -1,7 +1,7 @@
 cluster_name := env_var_or_default("KIND_CLUSTER_NAME", "")
 kubeconfig := env_var_or_default("KUBECONFIG", "")
 cluster_context := "kind-" + cluster_name
-kind_config := env_var_or_default("KIND_CONFIG", "deploy/kind-isolated-config.yaml")
+kind_config := env_var_or_default("KIND_CONFIG", "deploy/kind-config.yaml")
 ownership_receipt := kubeconfig + ".kuberic-owner"
 
 # Build and load all container images into Kind.
@@ -73,23 +73,21 @@ kvstore-image: verify-kind-context build-rust-bins
         -f examples/kvstore/deploy/Dockerfile .
     kind load docker-image localhost/kvstore:latest --name {{ cluster_name }}
 
-# Deploy kvstore.
-kvstore-deploy: verify-kind-context
-    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        apply -f examples/kvstore/deploy/kubericset.yaml
+# Deploy the KVStore applications through the shared Gateway.
+kvstore-deploy: gateway-install
 
-# Delete kvstore.
+# Delete the KVStore applications and their Gateway routes.
 kvstore-delete: verify-kind-context
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        delete -f examples/kvstore/deploy/kubericset.yaml
+        delete -f deploy/gateway/resources.yaml -f deploy/gateway/applications.yaml
 
-# Install the pinned Gateway reference in its dedicated cluster.
+# Install the pinned Gateway and both KVStore applications in the owned cluster.
 gateway-install: verify-kind-context kuberic-operator-deploy
     timeout --kill-after=15s 15m bash scripts/gateway_kind.sh install
 
-# Run only the separate Gateway integration scenario.
+# Run the KVStore Gateway integration scenario.
 gateway-test: verify-kind-context
-    cargo test -p kuberic-tests gateway_k8s::test_gateway_k8s_multi_application -- --ignored --exact --nocapture
+    cargo test -p kuberic-tests gateway_k8s::test_gateway_k8s_multi_application -- --exact --nocapture
 
 # Collect Gateway and application diagnostics from the owned cluster.
 gateway-diagnostics: verify-kind-context

@@ -531,7 +531,7 @@ async fn transition_primary(
 async fn scenario() -> Result<()> {
     ensure!(
         crate::test_utils::isolated_kvstore_endpoint() == ENDPOINT,
-        "Gateway test requires its dedicated fixed-port KinD config"
+        "KinD tests require the loopback mapping in deploy/kind-config.yaml"
     );
     let client = crate::test_utils::isolated_kube_client().await;
     for application in APPLICATIONS {
@@ -607,7 +607,6 @@ async fn scenario() -> Result<()> {
 
 #[tokio::test]
 #[test_log::test]
-#[ignore = "requires the separate Envoy Gateway KinD deployment; run just gateway-test"]
 async fn test_gateway_k8s_multi_application() {
     let result = tokio::time::timeout(Duration::from_secs(900), scenario()).await;
     if !matches!(result, Ok(Ok(()))) {

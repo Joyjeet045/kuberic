@@ -29,13 +29,10 @@ spec:
 
 ## Deployment
 
-```bash
-# Deploy the operator
-kubectl apply -f kuberic-operator/deploy/deployment.yaml
-
-# Create a replicated service
-kubectl apply -f examples/kvstore/deploy/kubericset.yaml
-```
+For development and CI, follow the [shared Gateway KinD setup](../docs/features/envoy-gateway-kind.md).
+`just kvstore-deploy` installs the operator, both KVStore applications, and
+their Gateway in the owned cluster. Gateway installation remains outside the
+operator; the operator continues to manage only Kuberic resources.
 
 ## Architecture
 
