@@ -34,6 +34,23 @@ For development and CI, follow the [shared Gateway KinD setup](../docs/features/
 their Gateway in the owned cluster. Gateway installation remains outside the
 operator; the operator continues to manage only Kuberic resources.
 
+## Planned Node Maintenance
+
+An external coordinator creates a cluster-scoped `NodeMaintenanceRequest` for
+one node and event. Kuberic moves primaries through its durable switchover path,
+attests surviving write quorum, and reports `KubericPrepared=True`. The coordinator
+owns cordon, eviction, infrastructure execution, and the final provider acknowledgment.
+
+Set `spec.desiredState` to `Complete` or `Cancel` to release the request. Placement
+remains excluded through `Releasing` until the node and affected replica sets
+have recovered. Deletion follows the same guarded cancellation path through a
+finalizer. Failed and expired requests also require explicit release.
+
+See [Node maintenance](../docs/features/node-maintenance.md) for the lifecycle,
+replacement/reimage rules, Events, metrics, and the external AKS Scheduled Events
+bridge contract. The operator exposes Prometheus metrics at `/metrics` on port
+8081, configurable with `KUBERIC_METRICS_ADDR`; keep this endpoint cluster-private.
+
 ## Architecture
 
 | Module | Purpose |
@@ -41,4 +58,4 @@ operator; the operator continues to manage only Kuberic resources.
 | `crd.rs` | `KubericSet` CRD definition and status types |
 | `reconciler.rs` | Main reconcile loop — pod management, lifecycle orchestration |
 | `cluster_api.rs` | Kubernetes API helpers for pod/service operations |
-| `node_maintenance/` | `NodeMaintenanceRequest` CRD, preflight decisions and affected-replica discovery |
+| `node_maintenance/` | Request lifecycle, discovery, safety attestation, guarded release, Events, and metrics |

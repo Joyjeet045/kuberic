@@ -2,8 +2,10 @@ pub mod api;
 pub mod attestation;
 pub mod controller;
 pub mod discovery;
+pub mod observability;
 pub mod placement;
 pub mod preflight;
+mod release;
 pub mod safety;
 
 pub use api::{

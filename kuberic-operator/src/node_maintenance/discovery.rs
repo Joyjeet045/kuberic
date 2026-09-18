@@ -13,6 +13,7 @@ use super::api::{
 pub struct NodeRef {
     pub name: String,
     pub uid: String,
+    pub ready: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -205,6 +206,7 @@ mod tests {
             provider_event_id: Some("event-123".to_string()),
             not_before: None,
             deadline: Some("2026-09-06T21:00:00Z".to_string()),
+            release_node_uid: None,
         }
     }
 
@@ -212,6 +214,7 @@ mod tests {
         NodeRef {
             name: "worker-04".to_string(),
             uid: uid.to_string(),
+            ready: true,
         }
     }
 

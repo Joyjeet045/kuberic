@@ -8,6 +8,7 @@ use super::discovery::finish;
 
 pub enum Preflight {
     Settled(NodeMaintenanceRequestStatus),
+    Release(NodeMaintenanceRequestStatus),
     Discover,
 }
 
@@ -21,26 +22,30 @@ pub fn preflight(
     status.observed_generation = generation;
     status.observed_desired_state = Some(spec.desired_state);
 
-    if previous.phase.is_terminal() {
+    if previous.phase == MaintenancePhase::Released {
         return Preflight::Settled(status);
     }
 
     if spec.desired_state.releases_request() {
-        let phase = status.phase;
-        let reason = status.blocked_reason;
+        if previous.phase == MaintenancePhase::Releasing {
+            return Preflight::Release(status);
+        }
+        status
+            .release_started_at
+            .get_or_insert_with(|| now.to_string());
         return Preflight::Settled(finish(
             status,
-            phase,
-            reason,
+            MaintenancePhase::Releasing,
+            None,
             Some(format!(
-                "{:?} observed; this controller does not yet perform release reconciliation",
+                "{:?} requested; waiting for safe placement release",
                 spec.desired_state
             )),
             now,
         ));
     }
 
-    if previous.phase == MaintenancePhase::Releasing {
+    if previous.phase.is_terminal() || previous.phase == MaintenancePhase::Releasing {
         return Preflight::Settled(status);
     }
 
@@ -143,13 +148,14 @@ mod tests {
             provider_event_id: Some("event-123".to_string()),
             not_before: None,
             deadline: None,
+            release_node_uid: None,
         }
     }
 
     fn settled(result: Preflight) -> NodeMaintenanceRequestStatus {
         match result {
             Preflight::Settled(status) => status,
-            Preflight::Discover => panic!("expected a settled decision"),
+            Preflight::Discover | Preflight::Release(_) => panic!("expected a settled decision"),
         }
     }
 
@@ -310,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_request_only_records_the_observed_desired_state() {
+    fn an_expired_request_can_be_explicitly_released() {
         let mut spec = spec();
         spec.desired_state = MaintenanceDesiredState::Complete;
         let previous = NodeMaintenanceRequestStatus {
@@ -321,11 +327,9 @@ mod tests {
         };
         let status = settled(preflight(&spec, Some(2), &previous, now()));
 
-        assert_eq!(status.phase, MaintenancePhase::Expired);
-        assert_eq!(
-            status.message.as_deref(),
-            Some("deadline exceeded before preparation completed")
-        );
+        assert_eq!(status.phase, MaintenancePhase::Releasing);
+        assert!(status.phase.excludes_primary_placement());
+        assert_eq!(status.release_started_at.as_deref(), Some(NOW));
         assert_eq!(status.observed_generation, Some(2));
         assert_eq!(
             status.observed_desired_state,
@@ -334,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn a_release_is_acknowledged_without_claiming_to_be_releasing() {
+    fn a_release_revokes_prepared_before_checking_restoration() {
         for desired in [
             MaintenanceDesiredState::Complete,
             MaintenanceDesiredState::Cancel,
@@ -342,27 +346,27 @@ mod tests {
             let mut spec = spec();
             spec.desired_state = desired;
             let previous = NodeMaintenanceRequestStatus {
-                phase: MaintenancePhase::Preparing,
+                phase: MaintenancePhase::Prepared,
+                prepared_at: Some(NOW.to_string()),
                 message: Some("discovered 1 affected set(s)".to_string()),
                 ..Default::default()
             };
             let status = settled(preflight(&spec, Some(1), &previous, now()));
 
-            assert_eq!(status.phase, MaintenancePhase::Preparing, "{desired:?}");
-            assert_ne!(status.phase, MaintenancePhase::Releasing, "{desired:?}");
+            assert_eq!(status.phase, MaintenancePhase::Releasing, "{desired:?}");
+            assert!(status.phase.excludes_primary_placement());
+            assert!(status.prepared_at.is_none());
+            assert_eq!(status.conditions[0].status, "False");
             assert_eq!(status.observed_desired_state, Some(desired));
-            assert!(
-                status
-                    .message
-                    .as_deref()
-                    .is_some_and(|message| message.contains("release reconciliation")),
-                "{desired:?}"
-            );
+            assert!(matches!(
+                preflight(&spec, Some(1), &status, now()),
+                Preflight::Release(_)
+            ));
         }
     }
 
     #[test]
-    fn a_release_does_not_erase_why_a_request_is_blocked() {
+    fn cancellation_can_release_a_blocked_request() {
         let mut spec = spec();
         spec.desired_state = MaintenanceDesiredState::Cancel;
         let previous = NodeMaintenanceRequestStatus {
@@ -372,11 +376,8 @@ mod tests {
         };
         let status = settled(preflight(&spec, Some(1), &previous, now()));
 
-        assert_eq!(status.phase, MaintenancePhase::Blocked);
-        assert_eq!(
-            status.blocked_reason,
-            Some(MaintenanceBlockedReason::NodeNotFound)
-        );
+        assert_eq!(status.phase, MaintenancePhase::Releasing);
+        assert_eq!(status.blocked_reason, None);
     }
 
     #[test]
