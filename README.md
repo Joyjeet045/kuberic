@@ -64,6 +64,17 @@ external manifests or Helm charts.
 
 The operator watches `KubericSet` resources and manages the full lifecycle: pod creation, Open → Idle → Active → Primary promotion, failover, and scale up/down.
 
+## Continuous Delivery
+
+After CI passes, pushes to `main` and version tags publish Linux AMD64 images to
+GitHub Container Registry:
+
+- `ghcr.io/${{ github.repository_owner }}/kvstore`
+- `ghcr.io/${{ github.repository_owner }}/kuberic-operator`
+
+Main-branch images receive immutable commit SHA tags. A semantic version tag
+such as `v0.1.0` also publishes the exact version tag.
+
 ## Design
 
 - [Core protocols](docs/features/kuberic/protocols.md) — replication, copy, failover, switchover
