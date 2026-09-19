@@ -33,21 +33,11 @@ jobs:
     
     - uses: taiki-e/install-action@protoc
     - uses: taiki-e/install-action@just
-    - uses: azure/setup-helm@v4.3.1
-      with:
-        version: v3.19.0
 
-    - uses: actions/cache@v4
-      with:
-        path: target/downloads
-        key: gateway-downloads-${{ hashFiles('scripts/gateway_kind.sh') }}
-
-    - name: Check download caching and shell syntax
+    - name: Check external dependency tooling
       run: |
-        for script in scripts/download.sh scripts/download_test.sh scripts/gateway_kind.sh; do
-          bash -n "$script"
-        done
-        bash scripts/download_test.sh
+        bash -n scripts/gateway_kind.sh
+        bash scripts/external_dependencies_test.sh
 
     - name: Install PostgreSQL
       run: |
@@ -62,6 +52,20 @@ jobs:
 
     - name: Run cargo clippy
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+    - name: Install Helm
+      uses: azure/setup-helm@v4.3.1
+      with:
+        version: v3.19.0
+
+    - name: Restore external dependency bundle
+      uses: actions/cache@v4
+      with:
+        path: .kuberic-cache/external
+        key: external-dependencies-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/external-dependencies.json') }}
+
+    - name: Prepare pinned external dependencies
+      run: just prepare-external-dependencies
 
     - name: Kubernetes KinD Cluster
       uses: helm/kind-action@v1

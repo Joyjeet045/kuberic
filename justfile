@@ -76,13 +76,21 @@ kvstore-image: verify-kind-context build-rust-bins
 # Deploy the KVStore applications through the shared Gateway.
 kvstore-deploy: gateway-install
 
+# Download and verify the pinned external test dependencies.
+prepare-external-dependencies:
+    bash scripts/external_dependencies.sh prepare
+
+# Verify the prepared dependency bundle without network access.
+verify-external-dependencies:
+    bash scripts/external_dependencies.sh verify
+
 # Delete the KVStore applications and their Gateway routes.
 kvstore-delete: verify-kind-context
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         delete -f deploy/gateway/resources.yaml -f deploy/gateway/applications.yaml
 
 # Install the pinned Gateway and both KVStore applications in the owned cluster.
-gateway-install: verify-kind-context kuberic-operator-deploy
+gateway-install: verify-external-dependencies verify-kind-context kuberic-operator-deploy
     timeout --kill-after=15s 15m bash scripts/gateway_kind.sh install
 
 # Run the KVStore Gateway integration scenario.

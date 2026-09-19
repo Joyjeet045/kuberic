@@ -19,20 +19,27 @@ the deployment owner.
 
 The installer uses **Envoy Gateway v1.9.1** and **Gateway API v1.6.1**, a pairing
 from the [Envoy Gateway compatibility matrix](https://gateway.envoyproxy.io/news/releases/matrix/).
-It installs the pinned experimental Gateway API bundle, followed by Envoy's
-pinned extension CRDs and controller chart. The controller chart's CRD
-installation is disabled to avoid installing a second Gateway API bundle.
-The chart selects its matching Envoy Proxy version; the data-plane image is
-not independently overridden.
+Envoy's pinned CRD chart supplies the standard Gateway API bundle and the
+Envoy-specific extension CRDs. The controller chart's CRD installation is
+disabled to avoid installing a second copy. The chart selects its matching
+Envoy Proxy version; the data-plane image is not independently overridden.
 
-Downloads are cached in `${CARGO_TARGET_DIR:-target}/downloads`; set
-`KUBERIC_DOWNLOAD_DIR` to use another build directory. The installer checks
-each file's pinned SHA-256 before use, including files already in the cache.
-The manifest hash comes from its GitHub release asset, and the chart hashes
-come from their OCI chart layers. A corrupt cache entry is downloaded again;
-failed downloads and checksum mismatches are never installed. Helm renders
-and installs the verified local chart archives without fetching them again.
-CI restores this directory with `actions/cache`.
+`scripts/external-dependencies.json` records the source, version, local filename,
+and SHA-256 of every external artifact. Run
+`just prepare-external-dependencies` once to populate
+`.kuberic-cache/external`; set `KUBERIC_EXTERNAL_DIR` to use another directory.
+Preparation checks each file's pinned SHA-256, including files already in the
+cache. The chart hashes come from their OCI chart layers. A corrupt cache entry
+is downloaded again; failed downloads and checksum mismatches are never
+published.
+
+Installation and tests never download these artifacts. They verify that the
+local bundle matches the current dependency manifest and fail with preparation
+instructions when it is missing, stale, or corrupt. Helm renders and installs
+the verified local chart archives without fetching them again. CI restores the
+same directory with `actions/cache` and runs preparation as an explicit step.
+Container images referenced by the charts remain normal container-runtime
+dependencies and may be pulled when they are not already present.
 
 CI uses KinD v0.30.0, Kubernetes v1.34.0 and Helm v3.19.0.
 Envoy Gateway and these manifests are reference/test dependencies, not a
@@ -54,6 +61,8 @@ the port from a different Service.
 From the repository root:
 
 ```sh
+just prepare-external-dependencies
+
 export KIND_CLUSTER_NAME=kuberic-dev
 export KUBECONFIG="$(mktemp -d)/kubeconfig"
 export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
@@ -163,7 +172,7 @@ retry recovery, permanent/integrity failure handling, and stalled-attempt deadli
 
 ```sh
 cargo test -p kuberic-tests gateway_ -- --skip gateway_k8s::test_gateway_k8s_multi_application
-bash scripts/download_test.sh
+bash scripts/external_dependencies_test.sh
 ```
 
 ## Protocol Scope
