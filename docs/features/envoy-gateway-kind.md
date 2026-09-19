@@ -51,6 +51,11 @@ NodePort setup. Only Envoy owns NodePort 30090. Do not apply a direct
 application NodePort overlay to this cluster; the installer refuses to take
 the port from a different Service.
 
+The canonical cluster has one control-plane and two worker nodes. Its host-port
+mapping enters the control-plane node, while Envoy can run on either worker.
+The proxy Service therefore explicitly uses `externalTrafficPolicy: Cluster`;
+`Local` would drop external traffic when that node has no Envoy endpoint.
+
 From the repository root:
 
 ```sh

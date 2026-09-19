@@ -293,6 +293,16 @@ async fn wait_gateway(client: Client) -> Result<()> {
                     .any(|port| port.port == 8080 && port.node_port == Some(30090)),
                 "Envoy listener/NodePort mismatch"
             );
+            ensure!(
+                service
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .external_traffic_policy
+                    .as_deref()
+                    == Some("Cluster"),
+                "Envoy NodePort must route across nodes from the control-plane host mapping"
+            );
             if deployment_ready(&controller)
                 && !proxies.items.is_empty()
                 && proxies.items.iter().all(deployment_ready)
