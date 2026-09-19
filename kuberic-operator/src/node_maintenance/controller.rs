@@ -25,6 +25,7 @@ pub const ROLE_LABEL: &str = "kuberic.io/role";
 #[derive(Debug, PartialEq, Clone, Default)]
 pub struct SetEvidence {
     pub set_exists: bool,
+    pub creation_pending: bool,
     pub committed: Option<CommittedTopology>,
     pub live: Option<LiveObservation>,
 }
@@ -219,6 +220,14 @@ async fn restoration_blocker<A: MaintenanceApi + ?Sized>(
             .filter(|pod| pod.namespace == namespace && pod.set_name == name)
             .collect();
         if !evidence.set_exists && set_pods.is_empty() {
+            continue;
+        }
+        if evidence.creation_pending
+            && (spec.desired_state == MaintenanceDesiredState::Cancel
+                || !prepared_sets
+                    .iter()
+                    .any(|set| set.namespace == namespace && set.name == name))
+        {
             continue;
         }
         let attestation = attest(
@@ -439,6 +448,7 @@ impl MaintenanceApi for KubeMaintenanceApi {
         let Some(status) = set.status else {
             return Ok(SetEvidence {
                 set_exists: true,
+                creation_pending: true,
                 ..Default::default()
             });
         };
@@ -483,6 +493,7 @@ impl MaintenanceApi for KubeMaintenanceApi {
         };
         Ok(SetEvidence {
             set_exists: true,
+            creation_pending: matches!(status.phase, Phase::Pending | Phase::Creating),
             committed,
             live: Some(live),
         })
@@ -514,6 +525,52 @@ mod tests {
     use std::sync::Mutex;
 
     const NOW: &str = "2026-09-06T20:00:00Z";
+
+    #[tokio::test]
+    async fn drained_requests_retract_prepared_when_surviving_quorum_is_lost() {
+        let mut api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let prepared = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap()
+            .status;
+        assert_eq!(prepared.phase, MaintenancePhase::Prepared);
+        api.pods.clear();
+        api.evidence.live.as_mut().unwrap().members[1].healthy = false;
+        let drained = run(&api, &prepared).await.unwrap().status;
+        assert_eq!(drained.phase, MaintenancePhase::Blocked);
+        assert_eq!(
+            drained.blocked_reason,
+            Some(MaintenanceBlockedReason::BlockedByQuorum)
+        );
+        assert_eq!(drained.conditions[0].status, "False");
+        assert!(drained.prepared_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn unchanged_prepared_discovery_is_stable_across_clock_ticks() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-2", Some("worker-04"), false)],
+            evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+            ..Default::default()
+        };
+        let prepared = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap()
+            .status;
+        let mut request = request_with_identity();
+        request.status = Some(prepared.clone());
+        let mut ctx = request_context(&request);
+        ctx.now = "2026-09-06T20:01:00Z".parse().unwrap();
+        let next = reconcile_request(&api, ctx).await.unwrap();
+        assert_eq!(next.status, prepared);
+        assert!(!next.persisted);
+    }
 
     #[derive(Default)]
     struct MockApi {
@@ -678,6 +735,7 @@ mod tests {
         };
         SetEvidence {
             set_exists: true,
+            creation_pending: false,
             committed: Some(CommittedTopology {
                 epoch,
                 write_quorum,
@@ -1007,6 +1065,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_can_release_creation_paused_by_the_same_request() {
+        let api = MockApi {
+            node: Some(node()),
+            pods: vec![pod("kv-0", Some("worker-04"), false)],
+            evidence: SetEvidence {
+                set_exists: true,
+                creation_pending: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let preparing = run(&api, &NodeMaintenanceRequestStatus::default())
+            .await
+            .unwrap()
+            .status;
+        assert_ne!(preparing.phase, MaintenancePhase::Prepared);
+        let canceled_spec = NodeMaintenanceRequestSpec {
+            desired_state: MaintenanceDesiredState::Cancel,
+            ..spec()
+        };
+        let releasing = run_spec(&api, &canceled_spec, &preparing)
+            .await
+            .unwrap()
+            .status;
+        let released = run_spec(&api, &canceled_spec, &releasing)
+            .await
+            .unwrap()
+            .status;
+        assert_eq!(released.phase, MaintenancePhase::Released);
+        let complete_spec = NodeMaintenanceRequestSpec {
+            desired_state: MaintenanceDesiredState::Complete,
+            ..spec()
+        };
+        let mut previously_prepared = releasing.clone();
+        previously_prepared.prepared_sets = Some(preparing.affected_sets);
+        let blocked = run_spec(&api, &complete_spec, &previously_prepared)
+            .await
+            .unwrap()
+            .status;
+        assert_eq!(blocked.phase, MaintenancePhase::Releasing);
+        assert_eq!(
+            blocked.blocked_reason,
+            Some(MaintenanceBlockedReason::ConflictingOperation)
+        );
+        previously_prepared.prepared_sets = Some(Vec::new());
+        let new_workload = run_spec(&api, &complete_spec, &previously_prepared)
+            .await
+            .unwrap()
+            .status;
+        assert_eq!(new_workload.phase, MaintenancePhase::Released);
+    }
+
+    #[tokio::test]
     async fn reimage_requires_new_replica_incarnations_but_cancellation_does_not() {
         let api = MockApi {
             node: Some(node()),
@@ -1096,7 +1207,8 @@ mod tests {
         let inventory = prepared.prepared_sets.clone();
         api.pods.clear();
         let drained = run_spec(&api, &spec, &prepared).await.unwrap().status;
-        assert!(drained.affected_sets.is_empty());
+        assert_eq!(drained.affected_sets.len(), 1);
+        assert_eq!(drained.affected_sets[0].replicas[0].pod_uid, "uid-kv-2");
         assert_eq!(drained.prepared_sets, inventory);
         api.evidence.live.as_mut().unwrap().settled = false;
         spec.desired_state = MaintenanceDesiredState::Complete;

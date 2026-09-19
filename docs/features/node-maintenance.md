@@ -40,6 +40,11 @@ placement, and uses the existing durable switchover workflow. Preparation needs
 a healthy primary and attested write quorum outside the node. Missing or
 contradictory evidence never counts as success. An empty node needs no switchover.
 
+Initial partition creation, including resuming its durable checkpoint, pauses
+while a target pod is on an excluded node. A failed maintenance lookup stops
+planned placement. An already completed targetPrimary does not pin the primary
+to a node that now needs maintenance.
+
 A coordinator may use the acknowledgment only when all of the following match
 its freshly read request and target node:
 
@@ -83,6 +88,9 @@ preconditions on spec updates, and verify observedGeneration after waiting.
    write quorum. Returning replicas must have joined the committed topology and
    be healthy. Concurrent scale, failover, or switchover delays release with
    `ConflictingOperation`; incomplete rebuilding reports `ReplicaRecoveryIncomplete`.
+   Cancellation may resume initial creation paused by this request. Completion
+   also permits a newly appearing, never-prepared set to resume creation after
+   the node is Ready; previously prepared sets must pass recovery checks.
 4. Kuberic persists `Released`, releasedAt, releasedNodeUid, and the observed
    desired state. Only then is this request's placement exclusion removed and
    its finalizer cleared. The original nodeUid remains an audit record.
@@ -137,8 +145,11 @@ stays Releasing if recovery cannot be proven. Cancellation does not require
 rebuilding replicas for an operation that never happened.
 
 The first Prepared transition freezes `status.preparedSets` for recovery checks.
-Live discovery continues in affectedSets, but draining pods or discovering rebuilt
-pods does not erase the original inventory or reinterpret new replicas as old ones.
+Discovery retains previously affected sets and Pod UIDs in affectedSets while
+adding new ones. Draining the node does not turn the request into an empty-node
+success: surviving quorum is still checked and loss of it retracts Prepared.
+The frozen preparedSets inventory prevents rebuilt replicas from being mistaken
+for pre-maintenance replicas during release.
 
 ## Duplicate Delivery and Restarts
 
@@ -268,3 +279,41 @@ with the workspace suite in the [owned Gateway KinD environment](envoy-gateway-k
 It creates uniquely named, unschedulable synthetic Node fixtures, never drains real
 worker workloads, and checks the running controller, admission validation, status
 fencing, overlapping requests, release, deletion, changed Node UIDs, and Events.
+
+The canonical KinD configuration has one control-plane and two worker nodes.
+CI runs the real-replica regression separately after the workspace suite because
+it restarts the operator:
+
+```sh
+cargo test -p kuberic-tests \
+   node_maintenance_k8s::test_real_replicas_survive_node_maintenance \
+   -- --ignored --exact --nocapture
+```
+
+It pre-places only its fixture pods, one per node, without adding a production
+placement policy. It writes through the shared Gateway, prepares the primary's
+node, restarts the operator, verifies the durable primary move, cancels an
+overlapping secondary request, cordons the node, evicts the old primary through
+the Eviction API with a two-of-three PDB, waits for replica rebuild, completes
+maintenance, and checks every acknowledged value after each transition. Mutations
+and cleanup are limited to the owned cluster and fixture identities. Actual Azure
+reboots or provider acknowledgments are not performed by these tests.
+
+### Acceptance Coverage
+
+| Issue #43 requirement | Verification |
+| --- | --- |
+| Provider-neutral API, durable state, status ownership | API/schema tests, Kubernetes admission and stale-write tests |
+| Node-wide affected workload and replica discovery | Discovery tests, retained post-drain inventory regression |
+| Durable primary move and surviving write quorum | Attestation tests and three-node real-replica Gateway writes |
+| No planned primary placement during maintenance | Initial/resumed creation and explicit-target regressions, real primary relocation |
+| Fail-closed readiness, insufficient quorum, no eligible target, deadlines | Preflight/safety tests and post-drain quorum-loss regression |
+| Cancellation, completion, duplicate delivery, operator restart | Mock lifecycle tests, live API scenario, real-replica restart and overlap scenario |
+| Node replacement/reimage and safe restoration | UID-confirmation API test, replica-incarnation and recovery-inventory tests |
+| Events, metrics, operational guidance | Event/metrics tests, live controller Events, documented scrape and recovery procedures |
+| AKS integration and distinction from abrupt failure | External bridge contract above; no private Service Fabric protocol dependency |
+
+Emergency-election protocol changes, a production Azure bridge, and destructive
+storage cleanup remain outside the maintainer-defined three-PR scope. Readiness
+does not claim these behaviors are implemented or provide an indefinite platform
+maintenance veto.

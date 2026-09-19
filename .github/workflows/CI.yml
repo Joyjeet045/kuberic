@@ -90,6 +90,9 @@ jobs:
     - name: Run workspace tests
       run: cargo test --workspace --all-features -- --nocapture
 
+    - name: Run real-replica maintenance lifecycle
+      run: cargo test -p kuberic-tests node_maintenance_k8s::test_real_replicas_survive_node_maintenance -- --ignored --exact --nocapture
+
     - name: Collect Gateway diagnostics
       if: failure()
       timeout-minutes: 4
