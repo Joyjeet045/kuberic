@@ -60,12 +60,12 @@ jobs:
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
     - name: Install Helm
-      uses: azure/setup-helm@v4.3.1
+      uses: azure/setup-helm@v5.0.1
       with:
         version: v3.19.0
 
     - name: Restore external dependency bundle
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: .kuberic-cache/external
         key: external-dependencies-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/external-dependencies.json') }}
@@ -105,7 +105,7 @@ jobs:
       timeout-minutes: 4
       run: just gateway-diagnostics > gateway-diagnostics.log 2>&1
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       if: failure()
       with:
         name: gateway-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
@@ -131,7 +131,7 @@ jobs:
       with:
         build-warnings: ""
 
-    - uses: taiki-e/install-action@cfb6a08e73d810c62150cc379cc3670921bec901 # protoc
+    - uses: taiki-e/install-action@757c7bc08f104fb182fa6182cf7a65c7ecf50e62 # protoc
 
     - name: Verify source ref is current
       run: |
