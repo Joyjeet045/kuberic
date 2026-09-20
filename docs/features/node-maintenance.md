@@ -235,31 +235,15 @@ preStop hook alone is not a maintenance acknowledgment protocol.
 kubectl get nmr
 kubectl describe nmr worker-04-reboot-event-123
 kubectl get nmr worker-04-reboot-event-123 -o yaml
-kubectl -n xedio port-forward deployment/kuberic-operator 8081:8081
 ```
 
-Scrape `http://127.0.0.1:8081/metrics` through that port-forward, or configure an
-internal pod scrape on the named metrics port. KUBERIC_METRICS_ADDR defaults to
-0.0.0.0:8081. Do not expose it through a public Gateway; metrics have no separate
-authentication endpoint.
-
-Metrics use only bounded operation, phase, reason, and stage labels:
-
-- `kuberic_node_maintenance_status_transitions_total`
-- `kuberic_node_maintenance_preparation_duration_seconds`
-- `kuberic_node_maintenance_release_duration_seconds`
-- `kuberic_node_maintenance_errors_total`
-
-Latency uses persisted timestamps, so an operator restart during preparation or
-release does not reset the measured interval. Counters and histograms are
-process-local and reset on restart. A new Prepared transition after readiness
-retraction records another observation. Status is the durable authority.
+Status is the durable authority. Metrics are deferred to a separate feature.
 
 Normal Events report preparation, release, Completed, and Cancelled. Warning
 Events report blocked, failed, expired, and recovery-blocked outcomes. Unchanged
 reconciles do not emit repeated Events. Cluster-scoped request Events are stored
-in the default namespace. Event publication failures are logged and counted but
-do not roll back a persisted safety transition; Events are best-effort diagnostics.
+in the default namespace. Event publication failures are logged but do not roll
+back a persisted safety transition; Events are best-effort diagnostics.
 
 Planned maintenance is not abrupt-failure recovery. Forced platform actions,
 network partitions, and emergency failover still use ordinary quorum, epoch
@@ -272,7 +256,7 @@ quorum loss or forced disruption.
 
 Focused mock tests run with `cargo test -p kuberic-operator --lib node_maintenance`.
 They cover preparation, release retries, cancellation, restart, Node/Pod identity,
-unsafe recovery, stale writes, finalizers, schema synchronization, Events, and metrics.
+unsafe recovery, stale writes, finalizers, schema synchronization, and Events.
 
 The non-ignored `test_node_maintenance_release_replacement_and_deletion` test runs
 with the workspace suite in the [owned Gateway KinD environment](envoy-gateway-kind.md).
@@ -310,7 +294,7 @@ reboots or provider acknowledgments are not performed by these tests.
 | Fail-closed readiness, insufficient quorum, no eligible target, deadlines | Preflight/safety tests and post-drain quorum-loss regression |
 | Cancellation, completion, duplicate delivery, operator restart | Mock lifecycle tests, live API scenario, real-replica restart and overlap scenario |
 | Node replacement/reimage and safe restoration | UID-confirmation API test, replica-incarnation and recovery-inventory tests |
-| Events, metrics, operational guidance | Event/metrics tests, live controller Events, documented scrape and recovery procedures |
+| Events and operational guidance | Event tests, live controller Events, documented status and recovery procedures |
 | AKS integration and distinction from abrupt failure | External bridge contract above; no private Service Fabric protocol dependency |
 
 Emergency-election protocol changes, a production Azure bridge, and destructive

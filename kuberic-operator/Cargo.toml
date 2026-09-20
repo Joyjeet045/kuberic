@@ -27,8 +27,6 @@ tracing-subscriber.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
-axum.workspace = true
-prometheus.workspace = true
 
 [dev-dependencies]
 kuberic-core = { path = "../kuberic-core", features = ["testing"] }

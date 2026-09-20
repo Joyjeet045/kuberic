@@ -2299,12 +2299,6 @@ spec:
                     type: object
                   nullable: true
                   type: array
-                preparationStartedAt:
-                  nullable: true
-                  type: string
-                releaseStartedAt:
-                  nullable: true
-                  type: string
                 releasedAt:
                   nullable: true
                   type: string
@@ -2403,9 +2397,6 @@ spec:
       containers:
       - name: operator
         image: localhost/kuberic-operator:latest
-        ports:
-        - name: metrics
-          containerPort: 8081
         imagePullPolicy: IfNotPresent
         env:
         - name: RUST_LOG

@@ -106,12 +106,6 @@ pub struct NodeMaintenanceRequestStatus {
     pub prepared_at: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub preparation_started_at: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub release_started_at: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub released_at: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -534,8 +528,6 @@ mod tests {
             "InvalidDeadline",
             "NodeNotReady",
             "releaseNodeUid",
-            "preparationStartedAt",
-            "releaseStartedAt",
             "releasedAt",
             "releasedNodeUid",
         ] {

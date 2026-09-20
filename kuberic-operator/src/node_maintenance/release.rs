@@ -108,7 +108,6 @@ mod tests {
         NodeMaintenanceRequestStatus {
             phase: MaintenancePhase::Releasing,
             node_uid: Some("original-uid".to_string()),
-            release_started_at: Some(now().to_string()),
             ..Default::default()
         }
     }

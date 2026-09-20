@@ -10,7 +10,7 @@ use tracing::info;
 
 use kuberic_operator::cluster_api::KubeClusterApi;
 use kuberic_operator::crd::KubericSet;
-use kuberic_operator::node_maintenance::observability::MaintenanceMetrics;
+use kuberic_operator::node_maintenance::observability::transition_event;
 use kuberic_operator::node_maintenance::{
     KubeMaintenanceApi, NodeMaintenanceRequest, RequestContext, reconcile_request,
 };
@@ -28,7 +28,6 @@ struct Context {
 struct MaintenanceContext {
     api: KubeMaintenanceApi,
     events: Recorder,
-    metrics: MaintenanceMetrics,
 }
 
 #[tokio::main]
@@ -38,17 +37,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting kuberic-operator");
 
     let client = Client::try_default().await?;
-    let metrics = MaintenanceMetrics::new()?;
-    let metrics_address =
-        std::env::var("KUBERIC_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
-    let metrics_listener = tokio::net::TcpListener::bind(&metrics_address).await?;
-    let metrics_router = metrics.router();
-    let metrics_server = async move {
-        if let Err(error) = axum::serve(metrics_listener, metrics_router).await {
-            tracing::error!(%error, "metrics server failed");
-        }
-    };
-    info!(address = %metrics_address, "serving operator metrics");
 
     let sets: Api<KubericSet> = Api::all(client.clone());
     let pods: Api<Pod> = Api::all(client.clone());
@@ -73,7 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     instance: std::env::var("POD_NAME").ok(),
                 },
             ),
-            metrics,
             api: KubeMaintenanceApi {
                 client: maintenance_client,
             },
@@ -104,9 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await
                     .map_err(OperatorError)?;
-                    if let Some(event) = context.metrics.observe(&request.spec, &previous, &outcome) {
+                    if let Some(event) = transition_event(&request.spec, &previous, &outcome) {
                         if let Err(error) = context.events.publish(&event, &request.object_ref(&())).await {
-                            context.metrics.event_error();
                             tracing::warn!(request = %name, %error, "maintenance Event publication failed");
                         }
                     }
@@ -119,8 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Action::requeue(std::time::Duration::from_secs(30))
                     })
                 },
-                |_request: Arc<NodeMaintenanceRequest>, error: &OperatorError, context: Arc<MaintenanceContext>| {
-                    context.metrics.reconcile_error();
+                |_request: Arc<NodeMaintenanceRequest>, error: &OperatorError, _context: Arc<MaintenanceContext>| {
                     tracing::warn!(?error, "node maintenance controller error");
                     Action::requeue(std::time::Duration::from_secs(10))
                 },
@@ -167,7 +152,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exited = tokio::select! {
         _ = maintenance => "node maintenance",
         _ = sets_controller => "kubericset",
-        _ = metrics_server => "metrics",
     };
 
     tracing::error!(controller = exited, "controller stream ended unexpectedly");

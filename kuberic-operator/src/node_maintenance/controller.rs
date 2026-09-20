@@ -126,14 +126,10 @@ where
                 Vec::new()
             };
 
-            let mut previous = ctx.previous.clone();
-            previous
-                .preparation_started_at
-                .get_or_insert_with(|| ctx.now.to_string());
             let discovered = reconcile_discovery(DiscoveryInput {
                 spec: ctx.spec,
                 generation: ctx.generation,
-                previous: &previous,
+                previous: ctx.previous,
                 node: node.as_ref(),
                 pods: &pods,
                 now: ctx.now,

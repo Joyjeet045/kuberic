@@ -47,9 +47,8 @@ have recovered. Deletion follows the same guarded cancellation path through a
 finalizer. Failed and expired requests also require explicit release.
 
 See [Node maintenance](../docs/features/node-maintenance.md) for the lifecycle,
-replacement/reimage rules, Events, metrics, and the external AKS Scheduled Events
-bridge contract. The operator exposes Prometheus metrics at `/metrics` on port
-8081, configurable with `KUBERIC_METRICS_ADDR`; keep this endpoint cluster-private.
+replacement/reimage rules, Events, and the external AKS Scheduled Events bridge
+contract. Metrics are deferred to a separate feature.
 
 ## Architecture
 
@@ -58,4 +57,4 @@ bridge contract. The operator exposes Prometheus metrics at `/metrics` on port
 | `crd.rs` | `KubericSet` CRD definition and status types |
 | `reconciler.rs` | Main reconcile loop — pod management, lifecycle orchestration |
 | `cluster_api.rs` | Kubernetes API helpers for pod/service operations |
-| `node_maintenance/` | Request lifecycle, discovery, safety attestation, guarded release, Events, and metrics |
+| `node_maintenance/` | Request lifecycle, discovery, safety attestation, guarded release, and Events |

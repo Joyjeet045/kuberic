@@ -30,9 +30,6 @@ pub fn preflight(
         if previous.phase == MaintenancePhase::Releasing {
             return Preflight::Release(status);
         }
-        status
-            .release_started_at
-            .get_or_insert_with(|| now.to_string());
         return Preflight::Settled(finish(
             status,
             MaintenancePhase::Releasing,
@@ -329,7 +326,7 @@ mod tests {
 
         assert_eq!(status.phase, MaintenancePhase::Releasing);
         assert!(status.phase.excludes_primary_placement());
-        assert_eq!(status.release_started_at.as_deref(), Some(NOW));
+        assert!(status.released_at.is_none());
         assert_eq!(status.observed_generation, Some(2));
         assert_eq!(
             status.observed_desired_state,
