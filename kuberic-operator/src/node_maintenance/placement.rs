@@ -49,6 +49,21 @@ pub fn switchover_target_for_maintenance(
         .map(|candidate| candidate.pod_name.clone())
 }
 
+pub(crate) fn planned_switchover_target(
+    candidates: &[PlacementCandidate],
+    current_primary: Option<&str>,
+    requested_primary: Option<&str>,
+    maintenance_nodes: &BTreeSet<String>,
+) -> Option<String> {
+    requested_primary
+        .filter(|requested| Some(*requested) != current_primary)
+        .filter(|requested| explicit_target_is_eligible(candidates, requested, maintenance_nodes))
+        .map(str::to_string)
+        .or_else(|| {
+            switchover_target_for_maintenance(candidates, current_primary, maintenance_nodes)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +78,63 @@ mod tests {
 
     fn nodes(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_completed_target_does_not_pin_the_primary_to_a_maintenance_node() {
+        let candidates = [
+            candidate(1, Some("worker-04")),
+            candidate(2, Some("worker-05")),
+        ];
+        assert_eq!(
+            planned_switchover_target(
+                &candidates,
+                Some("kv-0"),
+                Some("kv-0"),
+                &nodes(&["worker-04"])
+            ),
+            Some("kv-1".to_string())
+        );
+        assert_eq!(
+            planned_switchover_target(&candidates, Some("kv-0"), Some("kv-0"), &nodes(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_ineligible_requested_target_cannot_block_a_required_maintenance_move() {
+        let candidates = [
+            candidate(1, Some("worker-04")),
+            candidate(2, Some("worker-05")),
+            candidate(3, Some("worker-06")),
+        ];
+        assert_eq!(
+            planned_switchover_target(
+                &candidates,
+                Some("kv-0"),
+                Some("kv-1"),
+                &nodes(&["worker-04", "worker-05"])
+            ),
+            Some("kv-2".to_string())
+        );
+        assert_eq!(
+            planned_switchover_target(
+                &candidates,
+                Some("kv-2"),
+                Some("kv-0"),
+                &nodes(&["worker-04"])
+            ),
+            None
+        );
+        assert_eq!(
+            planned_switchover_target(
+                &candidates,
+                Some("kv-0"),
+                Some("kv-2"),
+                &nodes(&["worker-04"])
+            ),
+            Some("kv-2".to_string())
+        );
     }
 
     #[test]

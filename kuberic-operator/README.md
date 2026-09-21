@@ -34,6 +34,29 @@ For development and CI, follow the [shared Gateway KinD setup](../docs/features/
 their Gateway in the owned cluster. Gateway installation remains outside the
 operator; the operator continues to manage only Kuberic resources.
 
+## Planned Node Maintenance
+
+An external coordinator creates a cluster-scoped `NodeMaintenanceRequest` for
+one node and event. Kuberic moves primaries through its durable switchover path,
+attests surviving write quorum, and reports `KubericPrepared=True`. The coordinator
+owns cordon, eviction, infrastructure execution, and the final provider acknowledgment.
+
+The immutable recovery policies are `spec.nodeRecovery` (`Return` or
+`MayDisappear`) and `spec.replicaRecovery` (`Preserve` or `Rebuild`), defaulting to
+`Return` and `Preserve`. Provider-specific operation names remain coordinator
+metadata, not controller behavior.
+
+Set `spec.desiredState` to `Complete` or `Cancel` to release the request. Placement
+remains excluded through `Releasing` until the node and affected replica sets
+have recovered. An absent Node can waive only Node readiness, never workload
+recovery. Deletion follows the same guarded release path through a finalizer:
+it cancels `Prepare` but preserves an existing `Complete` decision. Failed and
+expired requests also require explicit release.
+
+See [Node maintenance](../docs/features/node-maintenance.md) for the lifecycle,
+replacement/reimage rules, Events, and the external AKS Scheduled Events bridge
+contract. Metrics are deferred to a separate feature.
+
 ## Architecture
 
 | Module | Purpose |
@@ -41,4 +64,4 @@ operator; the operator continues to manage only Kuberic resources.
 | `crd.rs` | `KubericSet` CRD definition and status types |
 | `reconciler.rs` | Main reconcile loop — pod management, lifecycle orchestration |
 | `cluster_api.rs` | Kubernetes API helpers for pod/service operations |
-| `node_maintenance/` | `NodeMaintenanceRequest` CRD, preflight decisions and affected-replica discovery |
+| `node_maintenance/` | Request lifecycle, discovery, safety attestation, guarded release, and Events |

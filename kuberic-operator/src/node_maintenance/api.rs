@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::crd::StatusCondition;
 
 pub const PREPARED_CONDITION_TYPE: &str = "KubericPrepared";
+pub const MAINTENANCE_FINALIZER: &str = "kuberic.io/node-maintenance";
 
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[kube(
@@ -16,27 +17,43 @@ pub const PREPARED_CONDITION_TYPE: &str = "KubericPrepared";
     derive = "PartialEq",
     status = "NodeMaintenanceRequestStatus",
     printcolumn = r#"{"name":"Node","type":"string","jsonPath":".spec.nodeName"}"#,
-    printcolumn = r#"{"name":"Operation","type":"string","jsonPath":".spec.operation"}"#,
+    printcolumn = r#"{"name":"NodeRecovery","type":"string","jsonPath":".spec.nodeRecovery"}"#,
+    printcolumn = r#"{"name":"ReplicaRecovery","type":"string","jsonPath":".spec.replicaRecovery"}"#,
     printcolumn = r#"{"name":"Desired","type":"string","jsonPath":".spec.desiredState"}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Deadline","type":"string","jsonPath":".spec.deadline"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-validations" = [
+    {"rule": "self.nodeName == oldSelf.nodeName", "message": "nodeName is immutable; create a new request"},
+    {"rule": "self.nodeRecovery == oldSelf.nodeRecovery", "message": "nodeRecovery is immutable; create a new request"},
+    {"rule": "self.replicaRecovery == oldSelf.replicaRecovery", "message": "replicaRecovery is immutable; create a new request"},
+    {"rule": "has(self.provider) == has(oldSelf.provider) && (!has(self.provider) || self.provider == oldSelf.provider)", "message": "provider is immutable; create a new request"},
+    {"rule": "has(self.providerEventId) == has(oldSelf.providerEventId) && (!has(self.providerEventId) || self.providerEventId == oldSelf.providerEventId)", "message": "providerEventId is immutable; create a new request"},
+    {"rule": "has(self.notBefore) == has(oldSelf.notBefore) && (!has(self.notBefore) || self.notBefore == oldSelf.notBefore)", "message": "notBefore is immutable; create a new request"},
+    {"rule": "oldSelf.desiredState == 'Prepare' || self.desiredState == oldSelf.desiredState", "message": "a release decision cannot be changed; create a new request for another event"},
+    {"rule": "self.desiredState != 'Prepare' || !has(self.releaseNodeUid)", "message": "releaseNodeUid requires Complete or Cancel"}
+]))]
 pub struct NodeMaintenanceRequestSpec {
-    #[schemars(extend("minLength" = 1))]
+    #[schemars(extend("minLength" = 1, "maxLength" = 253))]
     pub node_name: String,
 
     #[serde(default)]
-    pub operation: MaintenanceOperation,
+    pub node_recovery: NodeRecovery,
+
+    #[serde(default)]
+    pub replica_recovery: ReplicaRecovery,
 
     #[serde(default)]
     pub desired_state: MaintenanceDesiredState,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("maxLength" = 128))]
     pub provider: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("maxLength" = 256))]
     pub provider_event_id: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +63,18 @@ pub struct NodeMaintenanceRequestSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time", "maxLength" = 64))]
     pub deadline: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("minLength" = 1, "maxLength" = 128))]
+    pub release_node_uid: Option<String>,
+}
+
+impl NodeMaintenanceRequest {
+    pub fn excludes_primary_placement(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|status| status.phase.excludes_primary_placement())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
@@ -69,6 +98,9 @@ pub struct NodeMaintenanceRequestStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub affected_sets: Vec<AffectedKubericSetStatus>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_sets: Option<Vec<AffectedKubericSetStatus>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<MaintenanceBlockedReason>,
 
@@ -77,6 +109,12 @@ pub struct NodeMaintenanceRequestStatus {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prepared_at: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_node_uid: Option<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<StatusCondition>,
@@ -117,19 +155,17 @@ pub struct AffectedReplicaStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
-pub enum MaintenanceOperation {
+pub enum NodeRecovery {
     #[default]
-    Reboot,
-    Reimage,
-    OsUpgrade,
-    Replace,
-    Shutdown,
+    Return,
+    MayDisappear,
 }
 
-impl MaintenanceOperation {
-    pub fn discards_local_state(self) -> bool {
-        matches!(self, Self::Reimage | Self::Replace)
-    }
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
+pub enum ReplicaRecovery {
+    #[default]
+    Preserve,
+    Rebuild,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
@@ -169,7 +205,15 @@ impl MaintenancePhase {
     }
 
     pub fn excludes_primary_placement(self) -> bool {
-        matches!(self, Self::Preparing | Self::Prepared | Self::Blocked)
+        matches!(
+            self,
+            Self::Preparing
+                | Self::Prepared
+                | Self::Blocked
+                | Self::Failed
+                | Self::Expired
+                | Self::Releasing
+        )
     }
 
     pub fn requires_reason(self) -> bool {
@@ -208,7 +252,8 @@ impl MaintenancePhase {
                 Self::Requested | Self::Preparing | Self::Failed | Self::Expired | Self::Releasing
             ),
             Self::Releasing => matches!(next, Self::Released | Self::Failed),
-            Self::Failed | Self::Expired | Self::Released => false,
+            Self::Failed | Self::Expired => next == Self::Releasing,
+            Self::Released => false,
         }
     }
 }
@@ -216,7 +261,9 @@ impl MaintenancePhase {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
 pub enum MaintenanceBlockedReason {
     NodeNotFound,
+    NodeNotReady,
     NodeIncarnationChanged,
+    ReplicaRecoveryIncomplete,
     InvalidNotBefore,
     InvalidDeadline,
     BlockedByQuorum,
@@ -313,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_phases_accept_no_transition() {
+    fn terminal_preparation_outcomes_allow_only_explicit_release() {
         for terminal in [
             MaintenancePhase::Failed,
             MaintenancePhase::Expired,
@@ -321,9 +368,10 @@ mod tests {
         ] {
             assert!(terminal.is_terminal());
             for next in all_phases() {
-                assert!(
-                    !terminal.can_transition_to(next),
-                    "{terminal:?} must not transition to {next:?}"
+                assert_eq!(
+                    terminal.can_transition_to(next),
+                    terminal != MaintenancePhase::Released && next == MaintenancePhase::Releasing,
+                    "unexpected transition from {terminal:?} to {next:?}"
                 );
             }
         }
@@ -341,13 +389,16 @@ mod tests {
     }
 
     #[test]
-    fn placement_is_excluded_only_once_preparation_has_started() {
+    fn unreleased_preparation_outcomes_keep_placement_excluded() {
         for phase in all_phases() {
             let expected = matches!(
                 phase,
                 MaintenancePhase::Preparing
                     | MaintenancePhase::Prepared
                     | MaintenancePhase::Blocked
+                    | MaintenancePhase::Failed
+                    | MaintenancePhase::Expired
+                    | MaintenancePhase::Releasing
             );
             assert_eq!(phase.excludes_primary_placement(), expected, "{phase:?}");
         }
@@ -373,12 +424,63 @@ mod tests {
     }
 
     #[test]
-    fn reimage_and_replace_discard_local_state() {
-        assert!(MaintenanceOperation::Reimage.discards_local_state());
-        assert!(MaintenanceOperation::Replace.discards_local_state());
-        assert!(!MaintenanceOperation::Reboot.discards_local_state());
-        assert!(!MaintenanceOperation::OsUpgrade.discards_local_state());
-        assert!(!MaintenanceOperation::Shutdown.discards_local_state());
+    fn completion_cancellation_and_deletion_cannot_bypass_persisted_placement_exclusion() {
+        for phase in all_phases() {
+            for desired in [
+                MaintenanceDesiredState::Prepare,
+                MaintenanceDesiredState::Complete,
+                MaintenanceDesiredState::Cancel,
+            ] {
+                for deleting in [false, true] {
+                    let mut request: NodeMaintenanceRequest =
+                        serde_json::from_value(serde_json::json!({
+                            "metadata": {"name": "request"},
+                            "spec": {"nodeName": "worker-04", "desiredState": desired},
+                            "status": {"phase": phase}
+                        }))
+                        .unwrap();
+                    if deleting {
+                        request.metadata.deletion_timestamp =
+                            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                                "2026-09-18T10:00:00Z".parse().unwrap(),
+                            ));
+                    }
+                    assert_eq!(
+                        request.excludes_primary_placement(),
+                        phase.excludes_primary_placement()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_policies_default_to_return_and_preserve_and_round_trip_independently() {
+        let defaults: NodeMaintenanceRequestSpec =
+            serde_json::from_value(serde_json::json!({"nodeName": "worker-04"})).unwrap();
+        assert_eq!(defaults.node_recovery, NodeRecovery::Return);
+        assert_eq!(defaults.replica_recovery, ReplicaRecovery::Preserve);
+        for node_recovery in [NodeRecovery::Return, NodeRecovery::MayDisappear] {
+            for replica_recovery in [ReplicaRecovery::Preserve, ReplicaRecovery::Rebuild] {
+                let spec = NodeMaintenanceRequestSpec {
+                    node_recovery,
+                    replica_recovery,
+                    ..defaults.clone()
+                };
+                let json = serde_json::to_value(&spec).unwrap();
+                assert_eq!(json["nodeRecovery"], serde_json::json!(node_recovery));
+                assert_eq!(json["replicaRecovery"], serde_json::json!(replica_recovery));
+                assert!(json.get("operation").is_none());
+                let decoded: NodeMaintenanceRequestSpec = serde_json::from_value(json).unwrap();
+                assert_eq!(decoded, spec);
+            }
+        }
+        for invalid in [
+            serde_json::json!({"nodeName": "worker-04", "nodeRecovery": "Replace"}),
+            serde_json::json!({"nodeName": "worker-04", "replicaRecovery": "Reimage"}),
+        ] {
+            assert!(serde_json::from_value::<NodeMaintenanceRequestSpec>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -392,8 +494,12 @@ mod tests {
             "\"Cancel\""
         );
         assert_eq!(
-            serde_json::to_string(&MaintenanceOperation::OsUpgrade).unwrap(),
-            "\"OsUpgrade\""
+            serde_json::to_string(&NodeRecovery::MayDisappear).unwrap(),
+            "\"MayDisappear\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReplicaRecovery::Rebuild).unwrap(),
+            "\"Rebuild\""
         );
     }
 
@@ -401,12 +507,14 @@ mod tests {
     fn spec_round_trips_through_camel_case_json() {
         let spec = NodeMaintenanceRequestSpec {
             node_name: "worker-node-04".to_string(),
-            operation: MaintenanceOperation::Reboot,
+            node_recovery: NodeRecovery::Return,
+            replica_recovery: ReplicaRecovery::Preserve,
             desired_state: MaintenanceDesiredState::Prepare,
             provider: Some("Manual".to_string()),
             provider_event_id: Some("event-123".to_string()),
             not_before: Some("2026-09-06T20:00:00Z".to_string()),
             deadline: Some("2026-09-06T21:00:00Z".to_string()),
+            release_node_uid: None,
         };
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["nodeName"], "worker-node-04");
@@ -429,6 +537,8 @@ mod tests {
         let deployment = include_str!("../../deploy/deployment.yaml");
         for required in [
             "nodeName",
+            "nodeRecovery",
+            "replicaRecovery",
             "desiredState",
             "providerEventId",
             "notBefore",
@@ -446,6 +556,10 @@ mod tests {
             "blockedReason",
             "InvalidNotBefore",
             "InvalidDeadline",
+            "NodeNotReady",
+            "releaseNodeUid",
+            "releasedAt",
+            "releasedNodeUid",
         ] {
             assert!(
                 generated.contains(required),
@@ -482,5 +596,49 @@ mod tests {
                 "operator must not {forbidden} requests owned by the coordinator: {verbs}"
             );
         }
+    }
+
+    #[test]
+    fn deployed_maintenance_crd_matches_the_generated_schema_and_yaml_is_valid() {
+        let documents: Vec<serde_json::Value> =
+            serde_yaml_ng::Deserializer::from_str(include_str!("../../deploy/deployment.yaml"))
+                .map(|document| serde_json::Value::deserialize(document).unwrap())
+                .collect();
+        let deployed = documents
+            .iter()
+            .find(|document| document["metadata"]["name"] == "nodemaintenancerequests.kuberic.io")
+            .unwrap();
+        let generated = serde_json::to_value(NodeMaintenanceRequest::crd()).unwrap();
+        assert_eq!(deployed["spec"], generated["spec"]);
+        let rules = &generated["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["x-kubernetes-validations"];
+        assert_eq!(rules.as_array().unwrap().len(), 8);
+        let properties = &generated["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"];
+        assert_eq!(properties["nodeRecovery"]["default"], "Return");
+        assert_eq!(
+            properties["nodeRecovery"]["enum"],
+            serde_json::json!(["Return", "MayDisappear"])
+        );
+        assert_eq!(properties["replicaRecovery"]["default"], "Preserve");
+        assert_eq!(
+            properties["replicaRecovery"]["enum"],
+            serde_json::json!(["Preserve", "Rebuild"])
+        );
+        assert!(properties.get("operation").is_none());
+    }
+
+    #[test]
+    fn documented_request_examples_deserialize_with_the_current_api() {
+        let document = include_str!("../../../docs/features/node-maintenance.md");
+        let mut examples = 0;
+        for block in document.split("```yaml").skip(1) {
+            let yaml = block.split_once("```").unwrap().0.trim();
+            let request: NodeMaintenanceRequest = serde_yaml_ng::from_str(yaml).unwrap();
+            assert_eq!(request.spec.node_name, "worker-04");
+            assert_eq!(request.metadata.namespace, None);
+            examples += 1;
+        }
+        assert_eq!(examples, 2);
     }
 }

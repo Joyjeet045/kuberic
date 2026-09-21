@@ -22,3 +22,4 @@ tokio-util.workspace = true
 tokio-stream.workspace = true
 anyhow.workspace = true
 kvstore = { path = "../examples/kvstore" }
+kuberic-operator = { path = "../kuberic-operator" }
