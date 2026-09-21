@@ -7,7 +7,6 @@ members = [
   "examples/sqlite",
   "kuberic-core",
   "kuberic-operator",
-  "kuberic-operator2",
   "kuberic-tests",
   "sqlite-commit-barrier",
 ]
