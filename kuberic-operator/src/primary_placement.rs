@@ -1054,16 +1054,50 @@ mod tests {
     }
 
     #[test]
-    fn one_primary_difference_is_not_an_improvement_and_disabled_is_non_disruptive() {
-        let (set, mut placements, observations, mut policy) = fixture();
-        placements[0].domain_primaries = 1;
+    fn tie_break_only_does_not_admit_proactive_moves() {
+        let (set, placements, observations, mut policy) = fixture();
         let mut status = PlacementStatus::default();
-        rebalance_target(&set, &placements, &observations, &policy, &mut status, 100);
-        assert_eq!(status.reason, "InsufficientImprovement");
         policy.mode = BalancingMode::TieBreakOnly;
-        rebalance_target(&set, &placements, &observations, &policy, &mut status, 200);
+        assert_eq!(
+            rebalance_target(&set, &placements, &observations, &policy, &mut status, 200),
+            None
+        );
         assert_eq!(status.reason, "TieBreakOnly");
         assert!(status.target_pod.is_none());
+    }
+
+    #[test]
+    fn minimum_improvement_uses_the_post_move_boundary() {
+        for (source, target, minimum, expected) in [
+            (1, 0, 1, None),
+            (2, 0, 1, Some(2)),
+            (4, 1, 2, Some(2)),
+            (4, 1, 3, None),
+        ] {
+            let (set, mut placements, observations, mut policy) = fixture();
+            placements[0].domain_primaries = source;
+            placements[1].domain_primaries = target;
+            placements[2].eligible = false;
+            policy.minimum_improvement = minimum;
+            let mut status = PlacementStatus::default();
+            assert_eq!(
+                rebalance_target(&set, &placements, &observations, &policy, &mut status, 100),
+                None
+            );
+            assert_eq!(
+                rebalance_target(&set, &placements, &observations, &policy, &mut status, 160),
+                expected,
+                "source={source}, target={target}, minimum={minimum}"
+            );
+            assert_eq!(
+                status.reason,
+                if expected.is_some() {
+                    "Scheduled"
+                } else {
+                    "InsufficientImprovement"
+                }
+            );
+        }
     }
 
     fn inventory(set: &KubericSet) -> PlacementInventory {

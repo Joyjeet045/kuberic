@@ -143,8 +143,10 @@ missing-topology counts, scheduling diagnostics, candidate identity and score,
 hysteresis, cooldown, and the durable operation ID/outcome.
 
 - `ReplicaTopologyReady` reports scheduler failures and Required-domain
-  violations, including label drift after placement. Incomplete inventory or
-  ordinary scheduling progress is Unknown, not proof of a violation.
+  violations, including label drift after placement. Failed or incomplete
+  inventory, missing topology evidence, and ordinary scheduling progress are
+  Unknown, not proof of a violation. Known scheduler failures and Required
+  violations still report False even when other evidence is unavailable.
 - `PrimaryBalanced` is Unknown when balancing is disabled, tie-break-only,
   not evaluated during initial/failover selection, or evidence is unavailable.
   It is True for `Completed` or `InsufficientImprovement`, and False for

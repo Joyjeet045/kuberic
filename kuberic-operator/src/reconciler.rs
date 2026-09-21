@@ -1921,6 +1921,8 @@ fn update_placement_conditions(status: &mut KubericSetStatus) {
                 placement.unschedulable_replicas
             ),
         )
+    } else if placement.reason == "ObservationUnavailable" {
+        ("ObservationUnavailable", placement.message.clone())
     } else if placement.missing_topology_replicas > 0 {
         (
             "MissingTopology",
@@ -1938,7 +1940,13 @@ fn update_placement_conditions(status: &mut KubericSetStatus) {
     placement_condition(
         status,
         "ReplicaTopologyReady",
-        if matches!(reason, "RequiredTopologyUnverified" | "SchedulingPending") {
+        if matches!(
+            reason,
+            "RequiredTopologyUnverified"
+                | "SchedulingPending"
+                | "MissingTopology"
+                | "ObservationUnavailable"
+        ) {
             None
         } else {
             Some(reason == "TopologyObserved")
@@ -1956,6 +1964,7 @@ fn update_placement_conditions(status: &mut KubericSetStatus) {
             | "FailoverPlacement"
             | "MaintenanceExclusion"
             | "DensityUnavailable"
+            | "MissingTopology"
             | "ObservationUnavailable" => None,
             reason => Some(matches!(reason, "InsufficientImprovement" | "Completed")),
         },
@@ -4047,6 +4056,119 @@ async fn ensure_pod(
 mod tests {
     use super::*;
     use kuberic_core::remove_replica::ManualRemoveReplicaClock;
+
+    #[test]
+    fn placement_conditions_distinguish_unknown_evidence_from_known_violations() {
+        for (reason, scheduling_reason, missing, topology_reason, topology_ready, primary_ready) in [
+            (
+                "MissingTopology",
+                None,
+                1,
+                "MissingTopology",
+                "Unknown",
+                "Unknown",
+            ),
+            (
+                "ObservationUnavailable",
+                None,
+                1,
+                "ObservationUnavailable",
+                "Unknown",
+                "Unknown",
+            ),
+            (
+                "ObservationUnavailable",
+                None,
+                0,
+                "ObservationUnavailable",
+                "Unknown",
+                "Unknown",
+            ),
+            (
+                "WaitingForReplicas",
+                Some("SchedulingPending"),
+                1,
+                "SchedulingPending",
+                "Unknown",
+                "False",
+            ),
+            (
+                "MissingTopology",
+                Some("RequiredTopologyViolation"),
+                1,
+                "RequiredTopologyViolation",
+                "False",
+                "Unknown",
+            ),
+            (
+                "ObservationUnavailable",
+                Some("Unschedulable"),
+                1,
+                "Unschedulable",
+                "False",
+                "Unknown",
+            ),
+            (
+                "ObservationUnavailable",
+                Some("RequiredTopologyUnverified"),
+                1,
+                "RequiredTopologyUnverified",
+                "Unknown",
+                "Unknown",
+            ),
+            (
+                "InsufficientImprovement",
+                None,
+                0,
+                "TopologyObserved",
+                "True",
+                "True",
+            ),
+        ] {
+            let mut status = KubericSetStatus {
+                placement: Some(crate::primary_placement::PlacementStatus {
+                    reason: reason.to_string(),
+                    message: "placement evidence".to_string(),
+                    scheduling_reason: scheduling_reason.map(str::to_string),
+                    missing_topology_replicas: missing,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            update_placement_conditions(&mut status);
+            let topology = status
+                .conditions
+                .iter()
+                .find(|condition| condition.type_ == "ReplicaTopologyReady")
+                .unwrap();
+            assert_eq!(topology.reason, topology_reason, "{reason}");
+            assert_eq!(topology.status, topology_ready, "{reason}");
+            let primary = status
+                .conditions
+                .iter()
+                .find(|condition| condition.type_ == "PrimaryBalanced")
+                .unwrap();
+            assert_eq!(primary.status, primary_ready, "{reason}");
+            let transition = primary.last_transition_time.clone();
+            let unchanged = status.clone();
+            update_placement_conditions(&mut status);
+            assert_eq!(status, unchanged);
+            status
+                .placement
+                .as_mut()
+                .unwrap()
+                .message
+                .push_str(" refreshed");
+            update_placement_conditions(&mut status);
+            let primary = status
+                .conditions
+                .iter()
+                .find(|condition| condition.type_ == "PrimaryBalanced")
+                .unwrap();
+            assert_eq!(primary.last_transition_time, transition);
+            assert!(primary.message.ends_with(" refreshed"));
+        }
+    }
 
     fn snapshot(primary_id: i64, member_ids: &[i64]) -> StablePartitionSnapshotStatus {
         StablePartitionSnapshotStatus {

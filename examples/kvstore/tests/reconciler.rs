@@ -2171,6 +2171,67 @@ async fn test_primary_balancing_persists_intent_before_actions_and_retries_once(
 
 #[test_log::test(tokio::test)]
 #[serial]
+async fn test_primary_balancing_defers_to_scale_switchover_and_maintenance() {
+    for request in ["scale-down", "switchover", "maintenance"] {
+        let api = KvClusterApi::new();
+        let state = ReconcilerState::with_removal_clock(Arc::new(api.removal_clock.clone()));
+        let initial = create_healthy_set(&api, &state, "balance-precedence", 3).await;
+        let policy = configure_balancing(&api, &initial);
+        let mut set = make_set("balance-precedence", 3, Some(initial));
+        set.spec.primary_balancing = Some(policy);
+        reconcile_set(&set, &api, &state).await.unwrap();
+        set.status = api.last_status();
+        let placement = set.status.as_ref().unwrap().placement.as_ref().unwrap();
+        assert_eq!(placement.reason, "Stabilizing");
+        assert_eq!(
+            placement.target_pod.as_deref(),
+            Some("balance-precedence-1")
+        );
+        api.removal_clock.advance(1);
+        match request {
+            "scale-down" => set.spec.replicas = 2,
+            "switchover" => {
+                set.status.as_mut().unwrap().target_primary =
+                    Some("balance-precedence-2".to_string());
+            }
+            "maintenance" => {
+                api.maintenance_nodes
+                    .lock()
+                    .unwrap()
+                    .insert("node-0".to_string());
+            }
+            _ => unreachable!(),
+        }
+        api.reset_operations();
+        reconcile_set(&set, &api, &state).await.unwrap();
+        let planned = api.last_status().unwrap();
+        let operation = planned.operation.as_ref().unwrap();
+        if request == "scale-down" {
+            assert_eq!(planned.phase, Phase::RemovingReplica);
+            assert_eq!(operation.kind, DurableOperationKind::RemoveReplica);
+            assert_eq!(operation.target_replica_id, Some(3));
+        } else {
+            assert_eq!(planned.phase, Phase::Switchover);
+            assert_eq!(operation.kind, DurableOperationKind::Switchover);
+            assert_eq!(
+                operation.target_primary_id,
+                if request == "switchover" { 3 } else { 2 }
+            );
+        }
+        assert!(
+            planned.placement.as_ref().unwrap().operation_id.is_none(),
+            "{request}"
+        );
+        assert_eq!(
+            planned.current_primary.as_deref(),
+            Some("balance-precedence-0")
+        );
+        assert_status_reads_only(&api.operations());
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
 async fn test_primary_balancing_suppresses_unavailable_inventory_and_maintenance_targets() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -2187,6 +2248,18 @@ async fn test_primary_balancing_suppresses_unavailable_inventory_and_maintenance
         "ObservationUnavailable"
     );
     assert_eq!(unavailable.phase, Phase::Healthy);
+    for condition_type in ["ReplicaTopologyReady", "PrimaryBalanced"] {
+        let condition = unavailable
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == condition_type)
+            .unwrap();
+        assert_eq!(condition.status, "Unknown", "{condition_type}");
+        assert_eq!(
+            condition.reason, "ObservationUnavailable",
+            "{condition_type}"
+        );
+    }
     assert_status_reads_only(&api.operations());
     *api.fail_placement_inventory.lock().unwrap() = false;
     api.maintenance_nodes
