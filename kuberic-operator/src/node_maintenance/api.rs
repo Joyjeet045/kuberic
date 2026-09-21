@@ -17,7 +17,8 @@ pub const MAINTENANCE_FINALIZER: &str = "kuberic.io/node-maintenance";
     derive = "PartialEq",
     status = "NodeMaintenanceRequestStatus",
     printcolumn = r#"{"name":"Node","type":"string","jsonPath":".spec.nodeName"}"#,
-    printcolumn = r#"{"name":"Operation","type":"string","jsonPath":".spec.operation"}"#,
+    printcolumn = r#"{"name":"NodeRecovery","type":"string","jsonPath":".spec.nodeRecovery"}"#,
+    printcolumn = r#"{"name":"ReplicaRecovery","type":"string","jsonPath":".spec.replicaRecovery"}"#,
     printcolumn = r#"{"name":"Desired","type":"string","jsonPath":".spec.desiredState"}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Deadline","type":"string","jsonPath":".spec.deadline"}"#,
@@ -26,7 +27,8 @@ pub const MAINTENANCE_FINALIZER: &str = "kuberic.io/node-maintenance";
 #[serde(rename_all = "camelCase")]
 #[schemars(extend("x-kubernetes-validations" = [
     {"rule": "self.nodeName == oldSelf.nodeName", "message": "nodeName is immutable; create a new request"},
-    {"rule": "self.operation == oldSelf.operation", "message": "operation is immutable; create a new request"},
+    {"rule": "self.nodeRecovery == oldSelf.nodeRecovery", "message": "nodeRecovery is immutable; create a new request"},
+    {"rule": "self.replicaRecovery == oldSelf.replicaRecovery", "message": "replicaRecovery is immutable; create a new request"},
     {"rule": "has(self.provider) == has(oldSelf.provider) && (!has(self.provider) || self.provider == oldSelf.provider)", "message": "provider is immutable; create a new request"},
     {"rule": "has(self.providerEventId) == has(oldSelf.providerEventId) && (!has(self.providerEventId) || self.providerEventId == oldSelf.providerEventId)", "message": "providerEventId is immutable; create a new request"},
     {"rule": "has(self.notBefore) == has(oldSelf.notBefore) && (!has(self.notBefore) || self.notBefore == oldSelf.notBefore)", "message": "notBefore is immutable; create a new request"},
@@ -38,7 +40,10 @@ pub struct NodeMaintenanceRequestSpec {
     pub node_name: String,
 
     #[serde(default)]
-    pub operation: MaintenanceOperation,
+    pub node_recovery: NodeRecovery,
+
+    #[serde(default)]
+    pub replica_recovery: ReplicaRecovery,
 
     #[serde(default)]
     pub desired_state: MaintenanceDesiredState,
@@ -150,19 +155,17 @@ pub struct AffectedReplicaStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
-pub enum MaintenanceOperation {
+pub enum NodeRecovery {
     #[default]
-    Reboot,
-    Reimage,
-    OsUpgrade,
-    Replace,
-    Shutdown,
+    Return,
+    MayDisappear,
 }
 
-impl MaintenanceOperation {
-    pub fn discards_local_state(self) -> bool {
-        matches!(self, Self::Reimage | Self::Replace)
-    }
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
+pub enum ReplicaRecovery {
+    #[default]
+    Preserve,
+    Rebuild,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
@@ -452,12 +455,32 @@ mod tests {
     }
 
     #[test]
-    fn reimage_and_replace_discard_local_state() {
-        assert!(MaintenanceOperation::Reimage.discards_local_state());
-        assert!(MaintenanceOperation::Replace.discards_local_state());
-        assert!(!MaintenanceOperation::Reboot.discards_local_state());
-        assert!(!MaintenanceOperation::OsUpgrade.discards_local_state());
-        assert!(!MaintenanceOperation::Shutdown.discards_local_state());
+    fn recovery_policies_default_to_return_and_preserve_and_round_trip_independently() {
+        let defaults: NodeMaintenanceRequestSpec =
+            serde_json::from_value(serde_json::json!({"nodeName": "worker-04"})).unwrap();
+        assert_eq!(defaults.node_recovery, NodeRecovery::Return);
+        assert_eq!(defaults.replica_recovery, ReplicaRecovery::Preserve);
+        for node_recovery in [NodeRecovery::Return, NodeRecovery::MayDisappear] {
+            for replica_recovery in [ReplicaRecovery::Preserve, ReplicaRecovery::Rebuild] {
+                let spec = NodeMaintenanceRequestSpec {
+                    node_recovery,
+                    replica_recovery,
+                    ..defaults.clone()
+                };
+                let json = serde_json::to_value(&spec).unwrap();
+                assert_eq!(json["nodeRecovery"], serde_json::json!(node_recovery));
+                assert_eq!(json["replicaRecovery"], serde_json::json!(replica_recovery));
+                assert!(json.get("operation").is_none());
+                let decoded: NodeMaintenanceRequestSpec = serde_json::from_value(json).unwrap();
+                assert_eq!(decoded, spec);
+            }
+        }
+        for invalid in [
+            serde_json::json!({"nodeName": "worker-04", "nodeRecovery": "Replace"}),
+            serde_json::json!({"nodeName": "worker-04", "replicaRecovery": "Reimage"}),
+        ] {
+            assert!(serde_json::from_value::<NodeMaintenanceRequestSpec>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -471,8 +494,12 @@ mod tests {
             "\"Cancel\""
         );
         assert_eq!(
-            serde_json::to_string(&MaintenanceOperation::OsUpgrade).unwrap(),
-            "\"OsUpgrade\""
+            serde_json::to_string(&NodeRecovery::MayDisappear).unwrap(),
+            "\"MayDisappear\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReplicaRecovery::Rebuild).unwrap(),
+            "\"Rebuild\""
         );
     }
 
@@ -480,7 +507,8 @@ mod tests {
     fn spec_round_trips_through_camel_case_json() {
         let spec = NodeMaintenanceRequestSpec {
             node_name: "worker-node-04".to_string(),
-            operation: MaintenanceOperation::Reboot,
+            node_recovery: NodeRecovery::Return,
+            replica_recovery: ReplicaRecovery::Preserve,
             desired_state: MaintenanceDesiredState::Prepare,
             provider: Some("Manual".to_string()),
             provider_event_id: Some("event-123".to_string()),
@@ -509,6 +537,8 @@ mod tests {
         let deployment = include_str!("../../deploy/deployment.yaml");
         for required in [
             "nodeName",
+            "nodeRecovery",
+            "replicaRecovery",
             "desiredState",
             "providerEventId",
             "notBefore",
@@ -582,7 +612,20 @@ mod tests {
         assert_eq!(deployed["spec"], generated["spec"]);
         let rules = &generated["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
             ["x-kubernetes-validations"];
-        assert_eq!(rules.as_array().unwrap().len(), 7);
+        assert_eq!(rules.as_array().unwrap().len(), 8);
+        let properties = &generated["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"];
+        assert_eq!(properties["nodeRecovery"]["default"], "Return");
+        assert_eq!(
+            properties["nodeRecovery"]["enum"],
+            serde_json::json!(["Return", "MayDisappear"])
+        );
+        assert_eq!(properties["replicaRecovery"]["default"], "Preserve");
+        assert_eq!(
+            properties["replicaRecovery"]["enum"],
+            serde_json::json!(["Preserve", "Rebuild"])
+        );
+        assert!(properties.get("operation").is_none());
     }
 
     #[test]

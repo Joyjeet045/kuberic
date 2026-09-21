@@ -20,17 +20,44 @@ apiVersion: kuberic.io/v1alpha1
 kind: NodeMaintenanceRequest
 metadata:
   name: worker-04-reboot-event-123
+  annotations:
+    maintenance.example.com/provider-operation: Reboot
 spec:
   nodeName: worker-04
-  operation: Reboot
+  nodeRecovery: Return
+  replicaRecovery: Preserve
   desiredState: Prepare
   provider: Manual
   providerEventId: event-123
   deadline: "2026-10-01T21:00:00Z"
 ```
 
-Operations are `Reboot`, `OsUpgrade`, `Reimage`, `Replace`, and `Shutdown`.
-`Prepare` and `Reboot` are defaults. Optional `notBefore` is the earliest time to
+Two independent safety policies describe recovery:
+
+- `nodeRecovery`: `Return` (default) requires the Node to return Ready;
+  `MayDisappear` also permits completion when the Node is absent.
+- `replicaRecovery`: `Preserve` (default) permits the existing replica incarnations;
+  `Rebuild` requires recorded pre-maintenance Pod UIDs to be gone on completion.
+  Both policies still require settled topology and a healthy write quorum.
+
+All four combinations are supported. Provider-specific operation names belong in
+coordinator-owned metadata, such as the example annotation, not operator logic.
+The coordinator must select policies from the actual infrastructure plan:
+
+| Provider intent | nodeRecovery | replicaRecovery |
+| --- | --- | --- |
+| Reboot or OS upgrade preserving local state | Return | Preserve |
+| Reimage discarding local state | Return | Rebuild |
+| Replacement discarding local state; original Node may disappear | MayDisappear | Rebuild |
+| Shutdown without a local-state rebuild requirement | MayDisappear | Preserve |
+
+If an OS upgrade or shutdown also discards local state, select `Rebuild` instead.
+These fields replace the former `operation` field in this unstable API; update
+coordinators and manifests together. Do not upgrade with unreleased old-format
+requests: complete or cancel them safely under the old controller first, then
+create new requests with the appropriate policies for subsequent events.
+
+`Prepare` is the default desired state. Optional `notBefore` is the earliest time to
 **begin preparation**, not the time at which infrastructure may disrupt the node.
 `deadline` bounds preparation; it does not expire an already prepared request.
 
@@ -60,7 +87,7 @@ as a perpetual permit. `Blocked`, `Failed`, or `Expired` never authorizes drain.
 Examples of reasons include `BlockedByQuorum`, `NoEligibleTarget`,
 `NodeIncarnationChanged`, and `DeadlineExceeded`.
 
-The request identity (`nodeName`, operation, provider, providerEventId, and
+The request identity (`nodeName`, nodeRecovery, replicaRecovery, provider, providerEventId, and
 notBefore) is immutable. A release decision cannot revert to Prepare or change
 between Complete and Cancel. Use a new request for a new event. The deadline and
 release Node UID can be corrected without replacing the request.
@@ -82,8 +109,9 @@ preconditions on spec updates, and verify observedGeneration after waiting.
 
 1. Kuberic durably enters `Releasing`, clears preparedAt, and publishes
    `KubericPrepared=False` before restoring placement.
-2. The target Node must be Ready and not deleting. It may remain cordoned:
-   Kuberic does not own cordon, taints, or uncordon.
+2. If present, the target Node must be Ready and not deleting. It may remain
+   cordoned: Kuberic does not own cordon, taints, or uncordon. The absent-Node
+   exceptions below waive only this Node check, never workload recovery.
 3. Affected and currently hosted replica sets must attest a settled primary and
    write quorum. Returning replicas must have joined the committed topology and
    be healthy. Concurrent scale, failover, or switchover delays release with
@@ -107,9 +135,13 @@ finalizer to bypass recovery. Failed and expired requests retain their placement
 exclusion until Complete, Cancel, or guarded deletion releases them.
 
 If the Node no longer exists, cancellation can finish without restoring any node.
-Completion for Replace or Shutdown can also finish for a removed node. Reboot,
-OsUpgrade, and Reimage completion wait for the node to return. Supplying a
-releaseNodeUid always means that exact node incarnation must exist and be Ready.
+Completion with `nodeRecovery: MayDisappear` can also finish for a removed node;
+`Return` waits for the node to return. Every candidate release, including
+cancellation and deletion with an absent Node, still checks the affected workloads'
+settled topology, surviving write quorum, and conflicting operations. Completion
+with `replicaRecovery: Rebuild` also checks for old replica UIDs even when the Node
+is absent. Supplying a releaseNodeUid always means that exact node incarnation
+must exist and be Ready.
 
 ## Replacement and Reimage
 
@@ -122,22 +154,25 @@ apiVersion: kuberic.io/v1alpha1
 kind: NodeMaintenanceRequest
 metadata:
   name: worker-04-replace-event-456
+  annotations:
+    maintenance.example.com/provider-operation: Replace
 spec:
   nodeName: worker-04
-  operation: Replace
+  nodeRecovery: MayDisappear
+  replicaRecovery: Rebuild
   desiredState: Complete
   provider: Manual
   providerEventId: event-456
   releaseNodeUid: 87b66909-8286-4aae-b4a5-73cbdb26c85d
 ```
 
-This example shows the final desired spec of an existing Replace request, not a
+This example shows the final desired spec of an existing replacement request, not a
 substitute for creating and preparing it before maintenance. Read the UID from
 the recovered Node; do not copy the example value. A second replacement invalidates
 that confirmation and release waits again.
 
-Reimage and Replace can lose local data even if a Node name, and sometimes its
-UID, survives. On completion, recorded pre-maintenance Pod UIDs must no longer be
+Reimage and replacement can lose local data even if a Node name, and sometimes its
+UID, survives. With `replicaRecovery: Rebuild`, recorded pre-maintenance Pod UIDs must no longer be
 present. Replacement replicas must be rebuilt and attest healthy committed
 membership. Kuberic does not delete PVCs, wipe storage, or invent data-loss epochs
 as part of maintenance. Use the normal replica-recovery procedure; the request
@@ -209,9 +244,12 @@ and your AKS/node-pool support policy; not every disruption offers advance notic
    scheduling restrictions after checking other active requests, and retain the
    request as an audit record or delete it after release.
 
-Typical intent mapping is Reboot to Reboot, Redeploy with local-state loss to
-Reimage/Replace, and Preempt or Terminate to Shutdown/Replace according to the
-actual infrastructure plan. Freeze requires a coordinator policy; it is not
+Use the policy mapping above: for example, Reboot normally selects `Return` and
+`Preserve`; Redeploy with local-state loss selects `Rebuild` and chooses `Return`
+or `MayDisappear` according to whether the target Node must return. Preempt and
+Terminate normally select `MayDisappear`, with replica recovery chosen from the
+actual infrastructure plan. Retain Azure event names only as coordinator metadata.
+Freeze requires a coordinator policy; it is not
 automatically safe merely because a duration estimate is short. OS upgrade and
 reimage notifications depend on the supported VM/node-pool configuration.
 
@@ -256,7 +294,9 @@ quorum loss or forced disruption.
 
 Focused mock tests run with `cargo test -p kuberic-operator --lib node_maintenance`.
 They cover preparation, release retries, cancellation, restart, Node/Pod identity,
-unsafe recovery, stale writes, finalizers, schema synchronization, and Events.
+unsafe recovery (including absent Nodes with lost quorum, unsettled topology, or
+old replica UIDs), all recovery-policy combinations, stale writes, finalizers,
+schema synchronization, and Events.
 
 The non-ignored `test_node_maintenance_release_replacement_and_deletion` test runs
 with the workspace suite in the [owned Gateway KinD environment](envoy-gateway-kind.md).

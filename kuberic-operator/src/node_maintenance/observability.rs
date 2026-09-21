@@ -75,7 +75,10 @@ mod tests {
     use serde_json::json;
 
     fn spec() -> NodeMaintenanceRequestSpec {
-        serde_json::from_value(json!({"nodeName": "worker-04", "operation": "Reboot"})).unwrap()
+        serde_json::from_value(json!({
+            "nodeName": "worker-04", "nodeRecovery": "Return", "replicaRecovery": "Preserve"
+        }))
+        .unwrap()
     }
 
     fn outcome(phase: MaintenancePhase) -> ReconcileOutcome {

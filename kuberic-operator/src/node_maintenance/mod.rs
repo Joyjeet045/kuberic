@@ -10,8 +10,8 @@ pub mod safety;
 
 pub use api::{
     AffectedKubericSetStatus, AffectedReplicaStatus, MaintenanceBlockedReason,
-    MaintenanceDesiredState, MaintenanceOperation, MaintenancePhase, NodeMaintenanceRequest,
-    NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus, PREPARED_CONDITION_TYPE,
+    MaintenanceDesiredState, MaintenancePhase, NodeMaintenanceRequest, NodeMaintenanceRequestSpec,
+    NodeMaintenanceRequestStatus, NodeRecovery, PREPARED_CONDITION_TYPE, ReplicaRecovery,
 };
 pub use attestation::{
     Attestation, CommittedMember, CommittedTopology, Epoch, LiveMember, LiveObservation, attest,

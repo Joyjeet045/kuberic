@@ -2060,8 +2060,11 @@ spec:
         - jsonPath: .spec.nodeName
           name: Node
           type: string
-        - jsonPath: .spec.operation
-          name: Operation
+        - jsonPath: .spec.nodeRecovery
+          name: NodeRecovery
+          type: string
+        - jsonPath: .spec.replicaRecovery
+          name: ReplicaRecovery
           type: string
         - jsonPath: .spec.desiredState
           name: Desired
@@ -2098,19 +2101,16 @@ spec:
                   maxLength: 253
                   minLength: 1
                   type: string
+                nodeRecovery:
+                  default: Return
+                  enum:
+                    - Return
+                    - MayDisappear
+                  type: string
                 notBefore:
                   format: date-time
                   maxLength: 64
                   nullable: true
-                  type: string
-                operation:
-                  default: Reboot
-                  enum:
-                    - Reboot
-                    - Reimage
-                    - OsUpgrade
-                    - Replace
-                    - Shutdown
                   type: string
                 provider:
                   maxLength: 128
@@ -2125,14 +2125,22 @@ spec:
                   minLength: 1
                   nullable: true
                   type: string
+                replicaRecovery:
+                  default: Preserve
+                  enum:
+                    - Preserve
+                    - Rebuild
+                  type: string
               required:
                 - nodeName
               type: object
               x-kubernetes-validations:
                 - rule: self.nodeName == oldSelf.nodeName
                   message: nodeName is immutable; create a new request
-                - rule: self.operation == oldSelf.operation
-                  message: operation is immutable; create a new request
+                - rule: self.nodeRecovery == oldSelf.nodeRecovery
+                  message: nodeRecovery is immutable; create a new request
+                - rule: self.replicaRecovery == oldSelf.replicaRecovery
+                  message: replicaRecovery is immutable; create a new request
                 - rule: has(self.provider) == has(oldSelf.provider) && (!has(self.provider) || self.provider == oldSelf.provider)
                   message: provider is immutable; create a new request
                 - rule: has(self.providerEventId) == has(oldSelf.providerEventId) && (!has(self.providerEventId) || self.providerEventId == oldSelf.providerEventId)

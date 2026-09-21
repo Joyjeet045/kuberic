@@ -1,8 +1,8 @@
 use k8s_openapi::jiff::Timestamp;
 
 use super::api::{
-    MaintenanceBlockedReason, MaintenanceDesiredState, MaintenanceOperation, MaintenancePhase,
-    NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus,
+    MaintenanceBlockedReason, MaintenanceDesiredState, MaintenancePhase,
+    NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus, NodeRecovery,
 };
 use super::discovery::{NodeRef, finish};
 
@@ -15,10 +15,7 @@ pub(super) fn reconcile_release(
     let Some(node) = node else {
         if spec.release_node_uid.is_none()
             && (spec.desired_state == MaintenanceDesiredState::Cancel
-                || matches!(
-                    spec.operation,
-                    MaintenanceOperation::Shutdown | MaintenanceOperation::Replace
-                ))
+                || spec.node_recovery == NodeRecovery::MayDisappear)
         {
             status.released_at = Some(now.to_string());
             return finish(
@@ -88,6 +85,7 @@ pub(super) fn reconcile_release(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node_maintenance::api::ReplicaRecovery;
     use serde_json::json;
 
     fn now() -> Timestamp {
@@ -95,11 +93,11 @@ mod tests {
     }
 
     fn spec(
-        operation: MaintenanceOperation,
+        node_recovery: NodeRecovery,
         desired: MaintenanceDesiredState,
     ) -> NodeMaintenanceRequestSpec {
         serde_json::from_value(json!({
-            "nodeName": "worker-04", "operation": operation, "desiredState": desired
+            "nodeName": "worker-04", "nodeRecovery": node_recovery, "desiredState": desired
         }))
         .unwrap()
     }
@@ -127,7 +125,7 @@ mod tests {
             MaintenanceDesiredState::Cancel,
         ] {
             let outcome = reconcile_release(
-                &spec(MaintenanceOperation::Reboot, desired),
+                &spec(NodeRecovery::Return, desired),
                 releasing(),
                 Some(&node("original-uid", true)),
                 now(),
@@ -144,10 +142,7 @@ mod tests {
     #[test]
     fn an_unready_node_remains_excluded() {
         let outcome = reconcile_release(
-            &spec(
-                MaintenanceOperation::Reboot,
-                MaintenanceDesiredState::Complete,
-            ),
+            &spec(NodeRecovery::Return, MaintenanceDesiredState::Complete),
             releasing(),
             Some(&node("original-uid", false)),
             now(),
@@ -162,32 +157,34 @@ mod tests {
     }
 
     #[test]
-    fn changed_incarnations_need_explicit_confirmation_even_for_reimage_or_replace() {
-        for operation in [
-            MaintenanceOperation::Reboot,
-            MaintenanceOperation::Reimage,
-            MaintenanceOperation::Replace,
-        ] {
-            let outcome = reconcile_release(
-                &spec(operation, MaintenanceDesiredState::Complete),
-                releasing(),
-                Some(&node("replacement-uid", true)),
-                now(),
-            );
-            assert_eq!(outcome.phase, MaintenancePhase::Releasing);
-            assert_eq!(
-                outcome.blocked_reason,
-                Some(MaintenanceBlockedReason::NodeIncarnationChanged)
-            );
-            assert_eq!(outcome.node_uid.as_deref(), Some("original-uid"));
-            assert!(outcome.released_at.is_none());
+    fn changed_incarnations_need_explicit_confirmation_for_every_recovery_policy() {
+        for node_recovery in [NodeRecovery::Return, NodeRecovery::MayDisappear] {
+            for replica_recovery in [ReplicaRecovery::Preserve, ReplicaRecovery::Rebuild] {
+                let spec = NodeMaintenanceRequestSpec {
+                    replica_recovery,
+                    ..spec(node_recovery, MaintenanceDesiredState::Complete)
+                };
+                let outcome = reconcile_release(
+                    &spec,
+                    releasing(),
+                    Some(&node("replacement-uid", true)),
+                    now(),
+                );
+                assert_eq!(outcome.phase, MaintenancePhase::Releasing);
+                assert_eq!(
+                    outcome.blocked_reason,
+                    Some(MaintenanceBlockedReason::NodeIncarnationChanged)
+                );
+                assert_eq!(outcome.node_uid.as_deref(), Some("original-uid"));
+                assert!(outcome.released_at.is_none());
+            }
         }
     }
 
     #[test]
     fn confirmed_replacement_retains_the_original_identity_for_audit() {
         let mut spec = spec(
-            MaintenanceOperation::Replace,
+            NodeRecovery::MayDisappear,
             MaintenanceDesiredState::Complete,
         );
         spec.release_node_uid = Some("replacement-uid".to_string());
@@ -210,53 +207,37 @@ mod tests {
 
     #[test]
     fn missing_nodes_only_release_cancellation_or_retirement_without_a_requested_replacement() {
-        for operation in [
-            MaintenanceOperation::Reboot,
-            MaintenanceOperation::Reimage,
-            MaintenanceOperation::OsUpgrade,
-            MaintenanceOperation::Replace,
-            MaintenanceOperation::Shutdown,
-        ] {
-            let outcome = reconcile_release(
-                &spec(operation, MaintenanceDesiredState::Complete),
-                releasing(),
-                None,
-                now(),
-            );
-            assert_eq!(
-                outcome.phase == MaintenancePhase::Released,
-                matches!(
-                    operation,
-                    MaintenanceOperation::Replace | MaintenanceOperation::Shutdown
-                )
-            );
-            let canceled = reconcile_release(
-                &spec(operation, MaintenanceDesiredState::Cancel),
-                releasing(),
-                None,
-                now(),
-            );
-            assert_eq!(canceled.phase, MaintenancePhase::Released);
+        for node_recovery in [NodeRecovery::Return, NodeRecovery::MayDisappear] {
+            for replica_recovery in [ReplicaRecovery::Preserve, ReplicaRecovery::Rebuild] {
+                for desired in [
+                    MaintenanceDesiredState::Complete,
+                    MaintenanceDesiredState::Cancel,
+                ] {
+                    let mut spec = NodeMaintenanceRequestSpec {
+                        replica_recovery,
+                        ..spec(node_recovery, desired)
+                    };
+                    let outcome = reconcile_release(&spec, releasing(), None, now());
+                    assert_eq!(
+                        outcome.phase == MaintenancePhase::Released,
+                        desired == MaintenanceDesiredState::Cancel
+                            || node_recovery == NodeRecovery::MayDisappear
+                    );
+                    spec.release_node_uid = Some("replacement-uid".to_string());
+                    let waiting = reconcile_release(&spec, releasing(), None, now());
+                    assert_eq!(
+                        waiting.blocked_reason,
+                        Some(MaintenanceBlockedReason::NodeNotFound)
+                    );
+                    assert!(waiting.phase.excludes_primary_placement());
+                }
+            }
         }
-        let mut spec = spec(
-            MaintenanceOperation::Replace,
-            MaintenanceDesiredState::Complete,
-        );
-        spec.release_node_uid = Some("replacement-uid".to_string());
-        let waiting = reconcile_release(&spec, releasing(), None, now());
-        assert_eq!(
-            waiting.blocked_reason,
-            Some(MaintenanceBlockedReason::NodeNotFound)
-        );
-        assert!(waiting.phase.excludes_primary_placement());
     }
 
     #[test]
     fn waiting_is_idempotent_across_clock_ticks() {
-        let spec = spec(
-            MaintenanceOperation::Reboot,
-            MaintenanceDesiredState::Complete,
-        );
+        let spec = spec(NodeRecovery::Return, MaintenanceDesiredState::Complete);
         let first = reconcile_release(
             &spec,
             releasing(),

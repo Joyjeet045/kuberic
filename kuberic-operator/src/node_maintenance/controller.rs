@@ -8,6 +8,7 @@ use crate::crd::{KubericSet, Phase, ReconfigurationPhase};
 use super::api::{
     MAINTENANCE_FINALIZER, MaintenanceBlockedReason, MaintenanceDesiredState, MaintenancePhase,
     NodeMaintenanceRequest, NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus,
+    ReplicaRecovery,
 };
 use super::attestation::{
     Attestation, CommittedMember, CommittedTopology, Epoch, LiveMember, LiveObservation, attest,
@@ -102,7 +103,7 @@ where
         Preflight::Release(status) => {
             let node = api.get_node(&spec.node_name).await?;
             let candidate = reconcile_release(&spec, status.clone(), node.as_ref(), ctx.now);
-            if candidate.phase == MaintenancePhase::Released && node.is_some() {
+            if candidate.phase == MaintenancePhase::Released {
                 if let Some((reason, message)) = restoration_blocker(api, &spec, &status).await? {
                     finish(
                         status,
@@ -197,7 +198,7 @@ async fn restoration_blocker<A: MaintenanceApi + ?Sized>(
         )
         .collect();
     if spec.desired_state == MaintenanceDesiredState::Complete
-        && spec.operation.discards_local_state()
+        && spec.replica_recovery == ReplicaRecovery::Rebuild
     {
         let old_replicas: BTreeSet<_> = prepared_sets
             .iter()
@@ -206,7 +207,7 @@ async fn restoration_blocker<A: MaintenanceApi + ?Sized>(
             .collect();
         if pods.iter().any(|pod| old_replicas.contains(&pod.uid)) {
             return Ok(Some((MaintenanceBlockedReason::ReplicaRecoveryIncomplete,
-                "state-losing maintenance requires rebuilding the recorded replica incarnations; the operator does not delete their storage automatically".to_string())));
+                "replicaRecovery=Rebuild requires rebuilding the recorded replica incarnations; the operator does not delete their storage automatically".to_string())));
         }
     }
     for (namespace, name) in affected {
@@ -515,7 +516,7 @@ impl MaintenanceApi for KubeMaintenanceApi {
 mod tests {
     use super::*;
     use crate::node_maintenance::api::{
-        MaintenanceBlockedReason, MaintenanceDesiredState, MaintenanceOperation, MaintenancePhase,
+        MaintenanceBlockedReason, MaintenanceDesiredState, MaintenancePhase, NodeRecovery,
         PREPARED_CONDITION_TYPE,
     };
     use std::sync::Mutex;
@@ -579,6 +580,8 @@ mod tests {
         topology_calls: Mutex<usize>,
         fail_patch: bool,
         fail_get_node: bool,
+        fail_list_pods: bool,
+        fail_get_evidence: bool,
         missing_finalizer: Mutex<bool>,
         finalizer_additions: Mutex<usize>,
         finalizer_removals: Mutex<usize>,
@@ -629,6 +632,9 @@ mod tests {
 
         async fn list_maintenance_pods(&self) -> Result<Vec<MaintenancePod>, String> {
             *self.list_calls.lock().unwrap() += 1;
+            if self.fail_list_pods {
+                return Err("pod list rejected".to_string());
+            }
             Ok(self.pods.clone())
         }
 
@@ -638,6 +644,9 @@ mod tests {
             _name: &str,
         ) -> Result<SetEvidence, String> {
             *self.topology_calls.lock().unwrap() += 1;
+            if self.fail_get_evidence {
+                return Err("evidence read rejected".to_string());
+            }
             Ok(self.evidence.clone())
         }
 
@@ -657,7 +666,8 @@ mod tests {
     fn spec() -> NodeMaintenanceRequestSpec {
         NodeMaintenanceRequestSpec {
             node_name: "worker-04".to_string(),
-            operation: MaintenanceOperation::Reboot,
+            node_recovery: NodeRecovery::Return,
+            replica_recovery: ReplicaRecovery::Preserve,
             desired_state: MaintenanceDesiredState::Prepare,
             provider: Some("Manual".to_string()),
             provider_event_id: Some("event-123".to_string()),
@@ -1061,6 +1071,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn absent_nodes_never_bypass_workload_recovery_on_completion_cancellation_or_deletion() {
+        for replica_recovery in [ReplicaRecovery::Preserve, ReplicaRecovery::Rebuild] {
+            for desired_state in [
+                MaintenanceDesiredState::Complete,
+                MaintenanceDesiredState::Cancel,
+                MaintenanceDesiredState::Prepare,
+            ] {
+                for reason in [
+                    MaintenanceBlockedReason::BlockedByQuorum,
+                    MaintenanceBlockedReason::ConflictingOperation,
+                ] {
+                    let mut api = MockApi {
+                        node: Some(node()),
+                        pods: vec![pod("kv-2", Some("worker-04"), false)],
+                        evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+                        ..Default::default()
+                    };
+                    let mut spec = NodeMaintenanceRequestSpec {
+                        node_recovery: NodeRecovery::MayDisappear,
+                        replica_recovery,
+                        ..spec()
+                    };
+                    let prepared = run_spec(&api, &spec, &NodeMaintenanceRequestStatus::default())
+                        .await
+                        .unwrap()
+                        .status;
+                    assert_eq!(prepared.phase, MaintenancePhase::Prepared);
+                    api.node = None;
+                    api.pods.clear();
+                    let live = api.evidence.live.as_mut().unwrap();
+                    live.members[2].healthy = false;
+                    match reason {
+                        MaintenanceBlockedReason::BlockedByQuorum => {
+                            live.members[1].healthy = false
+                        }
+                        MaintenanceBlockedReason::ConflictingOperation => live.settled = false,
+                        _ => unreachable!(),
+                    }
+                    spec.desired_state = desired_state;
+                    let deleting = desired_state == MaintenanceDesiredState::Prepare;
+                    let releasing = run_with_deletion(&api, &spec, &prepared, deleting)
+                        .await
+                        .unwrap()
+                        .status;
+                    assert_eq!(releasing.phase, MaintenancePhase::Releasing);
+                    let blocked = run_with_deletion(&api, &spec, &releasing, deleting)
+                        .await
+                        .unwrap()
+                        .status;
+                    assert_eq!(blocked.phase, MaintenancePhase::Releasing);
+                    assert_eq!(blocked.blocked_reason, Some(reason));
+                    assert!(blocked.phase.excludes_primary_placement());
+                    assert!(blocked.released_at.is_none());
+                    assert!(blocked.released_node_uid.is_none());
+                    assert_eq!(blocked.conditions[0].status, "False");
+                    assert_eq!(*api.finalizer_removals.lock().unwrap(), 0);
+                    let retry = run_with_deletion(&api, &spec, &blocked, deleting)
+                        .await
+                        .unwrap();
+                    assert_eq!(retry.status, blocked);
+                    assert!(!retry.persisted);
+
+                    let live = api.evidence.live.as_mut().unwrap();
+                    live.members[1].healthy = true;
+                    live.settled = true;
+                    let released = run_with_deletion(&api, &spec, &blocked, deleting)
+                        .await
+                        .unwrap()
+                        .status;
+                    assert_eq!(released.phase, MaintenancePhase::Released);
+                    assert_eq!(released.released_at.as_deref(), Some(NOW));
+                    assert!(released.released_node_uid.is_none());
+                    assert_eq!(released.node_uid, prepared.node_uid);
+                    assert_eq!(released.prepared_sets, prepared.prepared_sets);
+                    assert_eq!(*api.finalizer_removals.lock().unwrap(), 0);
+                    run_with_deletion(&api, &spec, &released, deleting)
+                        .await
+                        .unwrap();
+                    assert_eq!(*api.finalizer_removals.lock().unwrap(), 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_node_completion_requires_old_replica_uids_to_be_rebuilt_even_during_deletion() {
+        for deleting in [false, true] {
+            let mut api = MockApi {
+                node: Some(node()),
+                pods: vec![pod("kv-2", Some("worker-04"), false)],
+                evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+                ..Default::default()
+            };
+            let mut spec = NodeMaintenanceRequestSpec {
+                node_recovery: NodeRecovery::MayDisappear,
+                replica_recovery: ReplicaRecovery::Rebuild,
+                ..spec()
+            };
+            let prepared = run_spec(&api, &spec, &NodeMaintenanceRequestStatus::default())
+                .await
+                .unwrap()
+                .status;
+            assert_eq!(prepared.phase, MaintenancePhase::Prepared);
+            api.node = None;
+            spec.desired_state = MaintenanceDesiredState::Complete;
+            let releasing = run_with_deletion(&api, &spec, &prepared, deleting)
+                .await
+                .unwrap()
+                .status;
+            let blocked = run_with_deletion(&api, &spec, &releasing, deleting)
+                .await
+                .unwrap()
+                .status;
+            assert_eq!(blocked.phase, MaintenancePhase::Releasing);
+            assert_eq!(
+                blocked.blocked_reason,
+                Some(MaintenanceBlockedReason::ReplicaRecoveryIncomplete)
+            );
+            assert_eq!(
+                blocked.observed_desired_state,
+                Some(MaintenanceDesiredState::Complete)
+            );
+            assert!(blocked.released_at.is_none());
+            assert!(blocked.released_node_uid.is_none());
+            assert!(blocked.phase.excludes_primary_placement());
+            assert_eq!(*api.finalizer_removals.lock().unwrap(), 0);
+
+            api.pods = vec![pod("rebuilt-2", Some("worker-05"), false)];
+            api.evidence = evidence("kv-0", &["kv-0", "kv-1", "rebuilt-2"], 2);
+            let released = run_with_deletion(&api, &spec, &blocked, deleting)
+                .await
+                .unwrap()
+                .status;
+            assert_eq!(released.phase, MaintenancePhase::Released);
+            assert!(released.released_node_uid.is_none());
+            assert_eq!(released.prepared_sets, prepared.prepared_sets);
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_node_recovery_read_failures_preserve_exclusion_and_finalizer() {
+        for fail_list_pods in [false, true] {
+            let mut api = MockApi {
+                node: Some(node()),
+                pods: vec![pod("kv-2", Some("worker-04"), false)],
+                evidence: evidence("kv-0", &["kv-0", "kv-1", "kv-2"], 2),
+                ..Default::default()
+            };
+            let mut spec = NodeMaintenanceRequestSpec {
+                node_recovery: NodeRecovery::MayDisappear,
+                ..spec()
+            };
+            let prepared = run_spec(&api, &spec, &NodeMaintenanceRequestStatus::default())
+                .await
+                .unwrap()
+                .status;
+            api.node = None;
+            api.pods.clear();
+            spec.desired_state = MaintenanceDesiredState::Complete;
+            let releasing = run_spec(&api, &spec, &prepared).await.unwrap().status;
+            api.fail_list_pods = fail_list_pods;
+            api.fail_get_evidence = !fail_list_pods;
+            let patch_count = api.patches.lock().unwrap().len();
+            let error = run_spec(&api, &spec, &releasing).await.err().unwrap();
+            assert_eq!(
+                error,
+                if fail_list_pods {
+                    "pod list rejected"
+                } else {
+                    "evidence read rejected"
+                }
+            );
+            assert!(releasing.phase.excludes_primary_placement());
+            assert_eq!(api.patches.lock().unwrap().len(), patch_count);
+            assert_eq!(*api.finalizer_removals.lock().unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn cancellation_can_release_creation_paused_by_the_same_request() {
         let api = MockApi {
             node: Some(node()),
@@ -1114,7 +1303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reimage_requires_new_replica_incarnations_but_cancellation_does_not() {
+    async fn rebuild_requires_new_replica_incarnations_but_cancellation_does_not() {
         let api = MockApi {
             node: Some(node()),
             pods: vec![pod("kv-2", Some("worker-04"), false)],
@@ -1126,7 +1315,7 @@ mod tests {
             .unwrap()
             .status;
         let mut spec = NodeMaintenanceRequestSpec {
-            operation: MaintenanceOperation::Reimage,
+            replica_recovery: ReplicaRecovery::Rebuild,
             desired_state: MaintenanceDesiredState::Complete,
             ..spec()
         };
@@ -1151,7 +1340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deletion_cannot_downgrade_completion_to_bypass_reimage_recovery() {
+    async fn deletion_cannot_downgrade_completion_to_bypass_replica_rebuilding() {
         let api = MockApi {
             node: Some(node()),
             pods: vec![pod("kv-2", Some("worker-04"), false)],
@@ -1159,7 +1348,7 @@ mod tests {
             ..Default::default()
         };
         let mut spec = NodeMaintenanceRequestSpec {
-            operation: MaintenanceOperation::Reimage,
+            replica_recovery: ReplicaRecovery::Rebuild,
             ..spec()
         };
         let prepared = run_spec(&api, &spec, &NodeMaintenanceRequestStatus::default())
@@ -1193,7 +1382,7 @@ mod tests {
             ..Default::default()
         };
         let mut spec = NodeMaintenanceRequestSpec {
-            operation: MaintenanceOperation::Reimage,
+            replica_recovery: ReplicaRecovery::Rebuild,
             ..spec()
         };
         let prepared = run_spec(&api, &spec, &NodeMaintenanceRequestStatus::default())

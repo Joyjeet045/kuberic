@@ -226,7 +226,7 @@ fn set_prepared_condition(status: &mut NodeMaintenanceRequestStatus, now: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node_maintenance::api::{MaintenanceDesiredState, MaintenanceOperation};
+    use crate::node_maintenance::api::{MaintenanceDesiredState, NodeRecovery, ReplicaRecovery};
 
     const NOW: &str = "2026-09-06T20:00:00Z";
 
@@ -243,7 +243,8 @@ mod tests {
     fn spec(node: &str) -> NodeMaintenanceRequestSpec {
         NodeMaintenanceRequestSpec {
             node_name: node.to_string(),
-            operation: MaintenanceOperation::Reboot,
+            node_recovery: NodeRecovery::Return,
+            replica_recovery: ReplicaRecovery::Preserve,
             desired_state: MaintenanceDesiredState::Prepare,
             provider: Some("Manual".to_string()),
             provider_event_id: Some("event-123".to_string()),

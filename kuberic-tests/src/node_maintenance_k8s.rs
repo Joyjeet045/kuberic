@@ -104,7 +104,7 @@ async fn create_request(
 ) -> NodeMaintenanceRequest {
     api.create(&PostParams::default(), &serde_json::from_value(json!({
         "metadata": {"name": name},
-        "spec": {"nodeName": node, "operation": "Replace", "provider": "Manual", "providerEventId": name}
+        "spec": {"nodeName": node, "nodeRecovery": "MayDisappear", "replicaRecovery": "Rebuild", "provider": "Manual", "providerEventId": name}
     })).unwrap()).await.unwrap()
 }
 
@@ -208,7 +208,10 @@ async fn lifecycle_scenario() {
 
     for invalid in [
         json!({"nodeName": "another-node"}),
-        json!({"operation": "Reboot"}),
+        json!({"nodeRecovery": "Return"}),
+        json!({"replicaRecovery": "Preserve"}),
+        json!({"nodeRecovery": "Replace"}),
+        json!({"replicaRecovery": "Reimage"}),
         json!({"providerEventId": "another-event"}),
     ] {
         let error = requests
@@ -475,7 +478,7 @@ async fn reboot_request(
 ) -> NodeMaintenanceRequest {
     api.create(&PostParams::default(), &serde_json::from_value(json!({
         "metadata": {"name": name},
-        "spec": {"nodeName": node, "operation": "Reboot", "provider": "Manual", "providerEventId": name}
+        "spec": {"nodeName": node, "nodeRecovery": "Return", "replicaRecovery": "Preserve", "provider": "Manual", "providerEventId": name}
     })).unwrap()).await.unwrap()
 }
 
