@@ -76,7 +76,14 @@ just gateway-test
 The default cluster config is `deploy/kind-config.yaml`. `just kvstore-deploy`
 runs `just gateway-install`, deploying the Gateway and both KVStore sets.
 Run `cargo test --workspace --all-features` for the complete suite, including
-the Gateway scenario. CI uses the same cluster and setup for all tests.
+the Gateway scenario. CI uses `deploy/kind-ci-config.yaml` with an additional
+worker for topology-spreading tests, sharing that isolated cluster across tests.
+
+The Envoy NodePort explicitly uses `externalTrafficPolicy: Cluster`. The
+loopback host mapping enters the control-plane node, but Envoy may run on a
+worker; `Local` traffic policy would drop those connections when the mapped
+node has no local proxy endpoint. This reference setup does not preserve the
+original client source IP across cross-node forwarding.
 
 The existing isolated-cluster ownership checks apply to every Kubernetes
 operation. Do not point these commands at a default or production kubeconfig.

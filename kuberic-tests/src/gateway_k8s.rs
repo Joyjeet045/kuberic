@@ -21,6 +21,18 @@ const NAMESPACE: &str = "xedio";
 const APPLICATIONS: [&str; 2] = ["kvstore-a", "kvstore-b"];
 const ENDPOINT: &str = "http://127.0.0.1:30090";
 
+fn gateway_nodeport_ready(service: &Service) -> bool {
+    service.spec.as_ref().is_some_and(|spec| {
+        spec.type_.as_deref() == Some("NodePort")
+            && spec.external_traffic_policy.as_deref() == Some("Cluster")
+            && spec.ports.as_ref().is_some_and(|ports| {
+                ports
+                    .iter()
+                    .any(|port| port.port == 8080 && port.node_port == Some(30090))
+            })
+    })
+}
+
 async fn connect_gateway(address: &str, authority: &str) -> Result<KvStoreClient<Channel>> {
     let channel = Endpoint::from_shared(address.to_string())?
         .origin(format!("http://{authority}").parse()?)
@@ -270,16 +282,8 @@ async fn wait_gateway(client: Client) -> Result<()> {
                 "NodePort belongs to another namespace's Gateway"
             );
             ensure!(
-                service
-                    .spec
-                    .as_ref()
-                    .unwrap()
-                    .ports
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .any(|port| port.port == 8080 && port.node_port == Some(30090)),
-                "Envoy listener/NodePort mismatch"
+                gateway_nodeport_ready(service),
+                "Envoy must expose listener 8080 on NodePort 30090 with Cluster traffic policy"
             );
             if deployment_ready(&controller)
                 && !proxies.items.is_empty()
@@ -824,4 +828,26 @@ async fn gateway_client_dials_loopback_with_distinct_authorities() {
     }
     shutdown.cancel();
     server.await.unwrap();
+}
+
+#[test]
+fn gateway_nodeport_requires_cross_node_forwarding() {
+    let mut service: Service = serde_json::from_value(serde_json::json!({
+        "spec": {
+            "type": "NodePort",
+            "externalTrafficPolicy": "Cluster",
+            "ports": [{"port": 8080, "nodePort": 30090}]
+        }
+    }))
+    .unwrap();
+    assert!(gateway_nodeport_ready(&service));
+    for policy in [Some("Local".to_string()), None] {
+        service.spec.as_mut().unwrap().external_traffic_policy = policy;
+        assert!(!gateway_nodeport_ready(&service));
+    }
+    service.spec.as_mut().unwrap().external_traffic_policy = Some("Cluster".to_string());
+    service.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].node_port = Some(30091);
+    assert!(!gateway_nodeport_ready(&service));
+    service.spec = None;
+    assert!(!gateway_nodeport_ready(&service));
 }

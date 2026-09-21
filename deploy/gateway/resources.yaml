@@ -22,6 +22,7 @@ spec:
           type: StrategicMerge
           value:
             spec:
+              externalTrafficPolicy: Cluster
               ports:
               - port: 8080
                 nodePort: 30090
