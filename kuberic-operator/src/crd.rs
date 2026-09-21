@@ -65,12 +65,21 @@ pub struct KubericSetSpec {
     /// PVC retention policy on CR deletion: Delete (default) or Retain.
     #[serde(default)]
     pub pvc_retention_policy: PvcRetentionPolicy,
+
+    /// Replica placement rules. Omitted means preferred same-set hostname anti-affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<crate::scheduling::SchedulingPolicy>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_balancing: Option<crate::primary_placement::PrimaryBalancingPolicy>,
 }
 
 /// Status of the KubericSet.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KubericSetStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::primary_placement::PlacementStatus>,
     /// Current epoch.
     #[serde(default)]
     pub epoch: EpochStatus,
@@ -494,6 +503,8 @@ pub enum ConfigurationProgressSourceStatus {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DurableFailoverStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::durable::failover_election::FailoverPlacementSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_configuration: Option<FailoverConfigurationStatus>,
     pub current_configuration: FailoverConfigurationStatus,
@@ -1212,20 +1223,19 @@ mod tests {
                 ("Age", "date", ".metadata.creationTimestamp"),
             ]
         );
-        for required in [
-            "listKind: KubericSetList",
-            "additionalPrinterColumns:",
-            "jsonPath: .spec.replicas",
-            "jsonPath: .status.readyReplicas",
-            "jsonPath: .status.phase",
-            "jsonPath: .status.currentPrimary",
-            "jsonPath: .metadata.creationTimestamp",
-        ] {
-            assert!(
-                deployment.contains(required),
-                "deployment CRD metadata is missing {required}"
-            );
-        }
+        let documents: Vec<serde_json::Value> = serde_saphyr::from_multiple(deployment).unwrap();
+        let deployed_crd = documents
+            .iter()
+            .find(|document| document["metadata"]["name"] == "kubericsets.kuberic.io")
+            .unwrap();
+        assert_eq!(
+            deployed_crd.pointer("/spec/names/listKind"),
+            Some(&serde_json::json!("KubericSetList"))
+        );
+        assert_eq!(
+            deployed_crd.pointer("/spec/versions/0/additionalPrinterColumns"),
+            generated_crd.pointer("/spec/versions/0/additionalPrinterColumns"),
+        );
         for required in [
             "removeIntent",
             "removeCommitEvidence",
@@ -1277,16 +1287,10 @@ mod tests {
         }
         assert!(generated.contains("\"removeDeleteTargetPod\""));
         assert!(!generated.contains("\"removeDeleteTarget\""));
-        assert!(
-            deployment
-                .lines()
-                .any(|line| line.trim() == "- removeDeleteTargetPod")
-        );
-        assert!(
-            !deployment
-                .lines()
-                .any(|line| line.trim() == "- removeDeleteTarget")
-        );
+        let phases = deployed_crd.pointer("/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/operation/properties/phase/enum")
+            .and_then(serde_json::Value::as_array).unwrap();
+        assert!(phases.contains(&serde_json::json!("removeDeleteTargetPod")));
+        assert!(!phases.contains(&serde_json::json!("removeDeleteTarget")));
     }
 }
 

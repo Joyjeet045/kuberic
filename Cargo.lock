@@ -172,6 +172,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -180,6 +182,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1392,12 +1395,15 @@ name = "kuberic-operator"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "axum",
  "futures",
  "k8s-openapi",
  "kube",
  "kuberic-core",
+ "prometheus",
  "schemars",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
@@ -1433,6 +1439,7 @@ dependencies = [
  "kube",
  "kube-leader-election",
  "kube-lease-manager",
+ "kuberic-operator",
  "kvstore",
  "prost",
  "rand",
@@ -1883,6 +1890,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prometheus"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca5326d8d0b950a9acd87e6a3f94745394f62e4dae1b1ee22b2bc0c394af43a"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

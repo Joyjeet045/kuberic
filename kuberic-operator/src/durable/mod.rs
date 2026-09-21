@@ -18,10 +18,12 @@ pub(crate) use add_replica::final_attestation as attest_add_replica;
 pub use add_replica::{decide_add_replica, start_add_replica};
 pub use create_partition::{
     CreatePartitionTarget, decide_create_partition, start_create_partition,
+    start_create_partition_with_primary,
 };
 pub use failover::{
     action_for as failover_action_for, adopt_replacement_before_confirmation, decide_failover,
     pending_label as failover_pending_label, record_observation, start_failover,
+    start_failover_with_placement,
 };
 pub use remove_replica::{RemoveReplicaTarget, decide_remove_replica, start_remove_replica};
 pub use switchover::{decide, start_switchover};

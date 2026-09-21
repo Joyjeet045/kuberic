@@ -39,10 +39,29 @@ enum ActionObservation {
 
 pub fn start_create_partition(
     set_uid: &str,
+    targets: Vec<CreatePartitionTarget>,
+    committed_snapshot: Option<StablePartitionSnapshotStatus>,
+    min_replicas: usize,
+    now: i64,
+) -> Result<DurableOperationStatus, String> {
+    start_create_partition_with_primary(
+        set_uid,
+        targets,
+        committed_snapshot,
+        min_replicas,
+        now,
+        None,
+    )
+}
+
+/// Freeze the initial primary choice; an already committed prefix always wins.
+pub fn start_create_partition_with_primary(
+    set_uid: &str,
     mut targets: Vec<CreatePartitionTarget>,
     committed_snapshot: Option<StablePartitionSnapshotStatus>,
     min_replicas: usize,
     now: i64,
+    preferred_primary_id: Option<i64>,
 ) -> Result<DurableOperationStatus, String> {
     if targets.is_empty() {
         return Err("partition creation has no replica targets".to_string());
@@ -67,7 +86,29 @@ pub fn start_create_partition(
         }
     }
 
-    let primary_id = targets[0].replica_id;
+    if preferred_primary_id.is_some_and(|id| !ids.contains(&id)) {
+        return Err("preferred creation primary is absent from the exact targets".to_string());
+    }
+    let primary_id = committed_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.primary_id)
+        .or(preferred_primary_id)
+        .unwrap_or(targets[0].replica_id);
+    // Preserve committed ordering, then append new targets deterministically.
+    // The protocol opens/commits member zero before constructing secondaries.
+    targets.sort_by_key(|target| {
+        let committed_index = committed_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .members
+                .iter()
+                .position(|member| member.id == target.replica_id)
+        });
+        (
+            target.replica_id != primary_id,
+            committed_index.unwrap_or(usize::MAX),
+            target.replica_id,
+        )
+    });
     let epoch = committed_snapshot
         .as_ref()
         .map(|snapshot| snapshot.epoch.clone())
@@ -88,7 +129,16 @@ pub fn start_create_partition(
                 } else {
                     StableReplicaRoleStatus::ActiveSecondary
                 },
-                election_metadata: None,
+                election_metadata: committed_snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .members
+                        .iter()
+                        .find(|member| {
+                            member.id == target.replica_id
+                                && member.instance_id == target.instance_id
+                        })
+                        .and_then(|member| member.election_metadata.clone())
+                }),
             })
             .collect(),
         write_quorum: majority(targets.len()),
@@ -1297,13 +1347,18 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
     {
         return Err("creation primary identity is inconsistent".to_string());
     }
-    if !operation
-        .target_snapshot
-        .members
+    let ordered_tail_start = operation
+        .committed_snapshot
+        .as_ref()
+        .map_or(1, |snapshot| snapshot.members.len());
+    if ordered_tail_start > operation.target_snapshot.members.len() {
+        return Err("committed creation prefix exceeds target membership".to_string());
+    }
+    if !operation.target_snapshot.members[ordered_tail_start..]
         .windows(2)
         .all(|members| members[0].id < members[1].id)
     {
-        return Err("creation target members are not in deterministic ID order".to_string());
+        return Err("uncommitted creation targets are not in deterministic ID order".to_string());
     }
     let minimum = operation
         .minimum_committed_replicas
@@ -1562,7 +1617,6 @@ fn attempted_snapshot(
     }
     let mut expanded = committed.clone();
     expanded.members.push(next.clone());
-    expanded.members.sort_by_key(|member| member.id);
     expanded.write_quorum = majority(expanded.members.len());
     Ok(expanded)
 }
@@ -1891,6 +1945,187 @@ mod tests {
             snapshot_prefix(&operation.target_snapshot, 1).write_quorum,
             2
         );
+    }
+
+    #[test]
+    fn explicit_primary_is_first_and_survives_serde_replay() {
+        let operation =
+            start_create_partition_with_primary("set", targets(), None, 1, 10, Some(2)).unwrap();
+        assert_eq!(operation.target_primary_id, 2);
+        assert_eq!(operation.target_replica_id, Some(2));
+        assert_eq!(operation.target_pod_name.as_deref(), Some("pod-1"));
+        assert_eq!(
+            operation
+                .target_snapshot
+                .members
+                .iter()
+                .map(|member| member.id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        validate_operation(&operation).unwrap();
+        let serialized = serde_json::to_string(&operation).unwrap();
+        let mut restored: DurableOperationStatus = serde_json::from_str(&serialized).unwrap();
+        validate_operation(&restored).unwrap();
+        restored.phase = DurableOperationPhase::CreateOpenPrimary;
+        let Decision::Persist(pending) = decide_create_partition(
+            &restored,
+            &OperationObservations::new(),
+            &OperationPodIdentities::new(),
+            11,
+        )
+        .unwrap() else {
+            panic!("opening the selected primary must persist its action");
+        };
+        assert_eq!(pending.pending_action.unwrap().target_id, 2);
+
+        restored.committed_snapshot = Some(snapshot_prefix(&restored.target_snapshot, 0));
+        restored.target_replica_id = Some(1);
+        restored.target_instance_id = Some("one".to_string());
+        restored.target_pod_uid = Some("one".to_string());
+        restored.target_pod_name = Some("pod-0".to_string());
+        let expanded = attempted_snapshot(&restored).unwrap();
+        assert_eq!(expanded, restored.target_snapshot);
+        validate_committed_prefix(&expanded, &restored.target_snapshot).unwrap();
+    }
+
+    #[test]
+    fn committed_primary_and_prefix_override_new_preferences_on_recovery() {
+        let mut initial_targets = targets();
+        initial_targets.push(CreatePartitionTarget {
+            replica_id: 3,
+            instance_id: "three".to_string(),
+            pod_name: "pod-2".to_string(),
+        });
+        let initial =
+            start_create_partition_with_primary("set", initial_targets, None, 1, 10, Some(3))
+                .unwrap();
+        let committed = snapshot_prefix(&initial.target_snapshot, 1);
+        let recovery_targets = vec![
+            targets()[0].clone(),
+            CreatePartitionTarget {
+                replica_id: 3,
+                instance_id: "three".to_string(),
+                pod_name: "pod-2".to_string(),
+            },
+            targets()[1].clone(),
+        ];
+        for preference in [None, Some(1), Some(2)] {
+            let recovered = start_create_partition_with_primary(
+                "set",
+                recovery_targets.clone(),
+                Some(committed.clone()),
+                1,
+                20,
+                preference,
+            )
+            .unwrap();
+            assert_eq!(recovered.target_primary_id, 3);
+            assert_eq!(recovered.target_snapshot.members[..2], committed.members);
+            assert_eq!(recovered.target_snapshot.members[2].id, 2);
+            validate_operation(&recovered).unwrap();
+            let restored: DurableOperationStatus =
+                serde_json::from_str(&serde_json::to_string(&recovered).unwrap()).unwrap();
+            validate_operation(&restored).unwrap();
+        }
+    }
+
+    #[test]
+    fn primary_preference_requires_exact_target_and_committed_incarnation() {
+        assert!(
+            start_create_partition_with_primary("set", targets(), None, 1, 10, Some(99),)
+                .unwrap_err()
+                .contains("exact targets")
+        );
+        let initial =
+            start_create_partition_with_primary("set", targets(), None, 1, 10, Some(2)).unwrap();
+        let committed = snapshot_prefix(&initial.target_snapshot, 0);
+        let mut replacement = targets();
+        replacement[1].instance_id = "replacement-two".to_string();
+        assert!(
+            start_create_partition_with_primary(
+                "set",
+                replacement,
+                Some(committed),
+                1,
+                20,
+                Some(1),
+            )
+            .unwrap_err()
+            .contains("exact target prefix")
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_committed_members_ahead_of_new_lower_id_targets() {
+        let make_target = |id| CreatePartitionTarget {
+            replica_id: id,
+            instance_id: format!("instance-{id}"),
+            pod_name: format!("pod-{id}"),
+        };
+        let initial = start_create_partition_with_primary(
+            "set",
+            [3, 4, 5].into_iter().map(make_target).collect(),
+            None,
+            1,
+            10,
+            Some(4),
+        )
+        .unwrap();
+        let committed = snapshot_prefix(&initial.target_snapshot, 1);
+        let recovered = start_create_partition_with_primary(
+            "set",
+            [2, 3, 4, 5].into_iter().map(make_target).collect(),
+            Some(committed),
+            1,
+            20,
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered
+                .target_snapshot
+                .members
+                .iter()
+                .map(|member| member.id)
+                .collect::<Vec<_>>(),
+            vec![4, 3, 2, 5]
+        );
+        validate_operation(&recovered).unwrap();
+        let observations = [2, 3, 4, 5]
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    observation(
+                        &format!("instance-{id}"),
+                        if id == 4 {
+                            Role::Primary
+                        } else {
+                            Role::ActiveSecondary
+                        },
+                        target_epoch(&recovered),
+                        None,
+                        "",
+                        true,
+                    ),
+                )
+            })
+            .collect();
+        let mut resumed = recovered;
+        advance_after_fencing(&mut resumed, &observations).unwrap();
+        assert_eq!(resumed.phase, DurableOperationPhase::CreateOpenSecondary);
+        assert_eq!(resumed.target_replica_id, Some(2));
+        let expanded = attempted_snapshot(&resumed).unwrap();
+        assert_eq!(
+            expanded
+                .members
+                .iter()
+                .map(|member| member.id)
+                .collect::<Vec<_>>(),
+            vec![4, 3, 2]
+        );
+        validate_committed_prefix(&expanded, &resumed.target_snapshot).unwrap();
     }
 
     #[test]

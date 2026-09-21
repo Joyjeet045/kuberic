@@ -446,6 +446,9 @@ struct KvClusterApi {
     peer_proxy_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     removal_clock: ManualRemoveReplicaClock,
     data_loss_behavior: service::DataLossBehavior,
+    placement_inventory: Mutex<Option<kuberic_operator::primary_placement::PlacementInventory>>,
+    fail_placement_inventory: Mutex<bool>,
+    maintenance_nodes: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl KvClusterApi {
@@ -475,6 +478,9 @@ impl KvClusterApi {
                     .as_secs() as i64,
             ),
             data_loss_behavior: service::DataLossBehavior::default(),
+            placement_inventory: Mutex::new(None),
+            fail_placement_inventory: Mutex::new(false),
+            maintenance_nodes: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -771,12 +777,38 @@ impl KvClusterApi {
 
 #[async_trait]
 impl ClusterApi for KvClusterApi {
+    async fn list_placement_inventory(
+        &self,
+    ) -> Result<kuberic_operator::primary_placement::PlacementInventory, String> {
+        if *self.fail_placement_inventory.lock().unwrap() {
+            return Err("injected placement inventory failure".to_string());
+        }
+        let mut inventory = self
+            .placement_inventory
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        let pods = self.pods.lock().unwrap().clone();
+        if let Some(name) = pods
+            .first()
+            .and_then(|pod| pod.metadata.labels.as_ref())
+            .and_then(|labels| labels.get("kuberic.io/set"))
+        {
+            inventory
+                .sets
+                .push(make_set(name, pods.len() as i32, self.last_status()));
+        }
+        inventory.pods.extend(pods);
+        Ok(inventory)
+    }
+
     async fn list_pods(&self, _ns: &str, _sel: &str) -> Result<Vec<Pod>, String> {
         Ok(self.pods.lock().unwrap().clone())
     }
 
     async fn list_maintenance_nodes(&self) -> Result<std::collections::BTreeSet<String>, String> {
-        Ok(std::collections::BTreeSet::new())
+        Ok(self.maintenance_nodes.lock().unwrap().clone())
     }
 
     async fn create_pod(&self, _ns: &str, pod: &Pod) -> Result<(), String> {
@@ -1082,6 +1114,8 @@ fn make_set_with_min(
             data_port: 9091,
             storage: "256Mi".to_string(),
             pvc_retention_policy: PvcRetentionPolicy::Delete,
+            scheduling: None,
+            primary_balancing: None,
         },
         status,
     }
@@ -1769,6 +1803,406 @@ fn assert_stable_snapshot(api: &KvClusterApi, status: &KubericSetStatus, member_
         };
         assert_eq!(member.role, expected_role);
     }
+}
+
+fn configure_balancing(
+    api: &KvClusterApi,
+    initial: &KubericSetStatus,
+) -> kuberic_operator::primary_placement::PrimaryBalancingPolicy {
+    use kuberic_operator::primary_placement::{
+        BalancingMode, PlacementInventory, PrimaryBalancingPolicy,
+    };
+    let nodes = (0..3).map(|index| serde_json::from_value(serde_json::json!({
+        "metadata": {"name": format!("node-{index}"), "labels": {"kubernetes.io/hostname": format!("node-{index}")}},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+    })).unwrap()).collect();
+    for (index, pod) in api.pods.lock().unwrap().iter_mut().enumerate() {
+        pod.spec.as_mut().unwrap().node_name = Some(format!("node-{index}"));
+    }
+    let mut inventory = PlacementInventory {
+        nodes,
+        ..Default::default()
+    };
+    for index in 0..2 {
+        let name = format!("other-{index}");
+        let uid = format!("other-uid-{index}");
+        let mut status = initial.clone();
+        status.operation = None;
+        status
+            .stable_snapshot
+            .as_mut()
+            .unwrap()
+            .members
+            .retain(|member| member.id == 1);
+        status.stable_snapshot.as_mut().unwrap().members[0].instance_id = uid.clone();
+        inventory.sets.push(make_set(&name, 1, Some(status)));
+        inventory.pods.push(serde_json::from_value(serde_json::json!({
+            "metadata": {"name": format!("{name}-0"), "namespace": "default", "uid": uid, "labels": {"kuberic.io/set": name}},
+            "spec": {"nodeName": "node-0", "containers": []}
+        })).unwrap());
+    }
+    *api.placement_inventory.lock().unwrap() = Some(inventory);
+    PrimaryBalancingPolicy {
+        mode: BalancingMode::Automatic,
+        cooldown_seconds: 30,
+        stabilization_seconds: 1,
+        ..Default::default()
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_required_spreading_surfaces_scheduler_evidence_without_starting_creation() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let mut set = make_set("unschedulable", 2, None);
+    set.spec.scheduling = Some(kuberic_operator::scheduling::SchedulingPolicy {
+        mode: kuberic_operator::scheduling::ReplicaAntiAffinityMode::Required,
+        ..Default::default()
+    });
+    reconcile_set(&set, &api, &state).await.unwrap();
+    api.pods.lock().unwrap()[0].status = Some(serde_json::from_value(serde_json::json!({
+        "phase": "Pending",
+        "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+            "message": "0/1 nodes are available: pod anti-affinity rules require another hostname domain"}]
+    })).unwrap());
+    set.status = api.last_status();
+    api.reset_operations();
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let waiting = api.last_status().unwrap();
+    assert_eq!(waiting.phase, Phase::Creating);
+    assert!(waiting.operation.is_none());
+    assert_eq!(
+        waiting.placement.as_ref().unwrap().unschedulable_replicas,
+        1
+    );
+    let condition = waiting
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == "ReplicaTopologyReady")
+        .unwrap();
+    assert_eq!(condition.status, "False");
+    assert_eq!(condition.reason, "Unschedulable");
+    assert!(condition.message.contains("anti-affinity"));
+    assert_status_reads_only(&api.operations());
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_primary_placement_selects_nonlowest_initial_primary_and_resumes() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("initial-placement", 3, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    let fixture = KubericSetStatus {
+        stable_snapshot: Some(kuberic_operator::crd::StablePartitionSnapshotStatus {
+            epoch: kuberic_operator::crd::EpochStatus {
+                data_loss_number: 0,
+                configuration_number: 1,
+            },
+            primary_id: 1,
+            write_quorum: 1,
+            members: vec![kuberic_operator::crd::StableReplicaSnapshotStatus {
+                id: 1,
+                instance_id: "fixture-primary".to_string(),
+                role: StableReplicaRoleStatus::Primary,
+                election_metadata: None,
+            }],
+        }),
+        ..Default::default()
+    };
+    let mut policy = configure_balancing(&api, &fixture);
+    policy.mode = kuberic_operator::primary_placement::BalancingMode::TieBreakOnly;
+    let mut set = make_set("initial-placement", 3, api.last_status());
+    set.spec.primary_balancing = Some(policy);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let planned = api.last_status().unwrap();
+    assert_eq!(planned.operation.as_ref().unwrap().target_primary_id, 2);
+    let completed = drive_create_partition(
+        &api,
+        &ReconcilerState::default(),
+        "initial-placement",
+        3,
+        planned,
+    )
+    .await;
+    assert_eq!(
+        completed.current_primary.as_deref(),
+        Some("initial-placement-1")
+    );
+    let mut client = connect_kv(&api.client_address("initial-placement-1").unwrap()).await;
+    client
+        .put(proto::PutRequest {
+            key: "initial".into(),
+            value: "placed".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        retry_get(&mut client, "initial").await.into_inner().value,
+        "placed"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_primary_placement_failover_ties_and_unavailable_density_are_persisted() {
+    for unavailable in [false, true] {
+        let api = KvClusterApi::new();
+        let state = ReconcilerState::default();
+        let initial = create_healthy_set(&api, &state, "placed-failover", 3).await;
+        let mut policy = configure_balancing(&api, &initial);
+        policy.mode = kuberic_operator::primary_placement::BalancingMode::TieBreakOnly;
+        {
+            let mut inventory = api.placement_inventory.lock().unwrap();
+            let inventory = inventory.as_mut().unwrap();
+            for pod in &mut inventory.pods {
+                pod.spec.as_mut().unwrap().node_name = Some("node-1".to_string());
+            }
+            if unavailable {
+                inventory.pods.pop();
+            }
+        }
+        api.crash_pod(initial.current_primary.as_deref().unwrap());
+        let mut set = make_set("placed-failover", 3, Some(initial));
+        set.spec.primary_balancing = Some(policy);
+        reconcile_set(&set, &api, &state).await.unwrap();
+        let planned = api.last_status().unwrap();
+        assert_eq!(planned.phase, Phase::FailingOver);
+        assert_eq!(
+            planned.placement.as_ref().unwrap().reason,
+            if unavailable {
+                "DensityUnavailable"
+            } else {
+                "FailoverPlacement"
+            }
+        );
+        let persisted: KubericSetStatus =
+            serde_json::from_value(serde_json::to_value(planned).unwrap()).unwrap();
+        let completed = drive_operation_to_healthy(&api, "placed-failover", 3, persisted).await;
+        assert_eq!(
+            completed.current_primary.as_deref(),
+            Some(if unavailable {
+                "placed-failover-1"
+            } else {
+                "placed-failover-2"
+            })
+        );
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_primary_balancing_uses_durable_switchover_across_restart() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::with_removal_clock(Arc::new(api.removal_clock.clone()));
+    let initial = create_healthy_set(&api, &state, "balanced", 3).await;
+    let original = initial.current_primary.clone().unwrap();
+    let mut client = connect_kv(&api.client_address(&original).unwrap()).await;
+    client
+        .put(proto::PutRequest {
+            key: "balance-proof".into(),
+            value: "durable".into(),
+        })
+        .await
+        .unwrap();
+    let policy = configure_balancing(&api, &initial);
+    let mut set = make_set("balanced", 3, Some(initial));
+    set.spec.primary_balancing = Some(policy.clone());
+    for _ in 0..30 {
+        reconcile_set(&set, &api, &state).await.unwrap();
+        set.status = api.last_status();
+        if set
+            .status
+            .as_ref()
+            .unwrap()
+            .placement
+            .as_ref()
+            .is_some_and(|placement| placement.reason == "Stabilizing")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        set.status
+            .as_ref()
+            .unwrap()
+            .placement
+            .as_ref()
+            .unwrap()
+            .reason,
+        "Stabilizing",
+        "placement: {:?}, live progress: {:?}",
+        set.status.as_ref().unwrap().placement,
+        live_replica_statuses(&api, "balanced", 3)
+            .await
+            .iter()
+            .map(|live| (
+                live.role,
+                live.current_progress,
+                live.committed_lsn,
+                live.catch_up_capability
+            ))
+            .collect::<Vec<_>>()
+    );
+    let persisted: KubericSetStatus =
+        serde_json::from_value(serde_json::to_value(set.status.unwrap()).unwrap()).unwrap();
+    api.removal_clock.advance(1);
+    let restarted = ReconcilerState::with_removal_clock(Arc::new(api.removal_clock.clone()));
+    let mut set = make_set("balanced", 3, Some(persisted));
+    set.spec.primary_balancing = Some(policy.clone());
+    reconcile_set(&set, &api, &restarted).await.unwrap();
+    let switching = api.last_status().unwrap();
+    assert_eq!(switching.phase, Phase::Switchover);
+    assert_eq!(
+        switching.placement.as_ref().unwrap().operation_id.as_ref(),
+        switching
+            .operation
+            .as_ref()
+            .map(|operation| &operation.operation_id)
+    );
+    let operation_id = switching.operation.as_ref().unwrap().operation_id.clone();
+    let replayed = ReconcilerState::with_removal_clock(Arc::new(api.removal_clock.clone()));
+    let completed =
+        drive_operation_to_healthy_with_state(&api, &replayed, "balanced", 3, switching).await;
+    assert_ne!(
+        completed.current_primary.as_deref(),
+        Some(original.as_str())
+    );
+    assert_eq!(completed.placement.as_ref().unwrap().reason, "Completed");
+    let mut client = connect_kv(
+        &api.client_address(completed.current_primary.as_deref().unwrap())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        retry_get(&mut client, "balance-proof")
+            .await
+            .into_inner()
+            .value,
+        "durable"
+    );
+    let mut set = make_set("balanced", 3, Some(completed));
+    set.spec.primary_balancing = Some(policy);
+    for _ in 0..60 {
+        reconcile_set(&set, &api, &restarted).await.unwrap();
+        set.status = api.last_status();
+        if set
+            .status
+            .as_ref()
+            .unwrap()
+            .stable_election_metadata_refresh
+            .is_none()
+        {
+            break;
+        }
+    }
+    reconcile_set(&set, &api, &restarted).await.unwrap();
+    let duplicate = api.last_status().unwrap();
+    assert_eq!(duplicate.phase, Phase::Healthy);
+    assert_eq!(duplicate.placement.as_ref().unwrap().reason, "Cooldown");
+    assert_eq!(
+        duplicate
+            .placement
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .as_deref(),
+        Some(operation_id.as_str())
+    );
+    api.removal_clock.advance(30);
+    set.status = Some(duplicate);
+    reconcile_set(&set, &api, &replayed).await.unwrap();
+    let settled = api.last_status().unwrap();
+    assert_eq!(settled.phase, Phase::Healthy);
+    assert_eq!(
+        settled.placement.as_ref().unwrap().reason,
+        "InsufficientImprovement"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_primary_balancing_persists_intent_before_actions_and_retries_once() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::with_removal_clock(Arc::new(api.removal_clock.clone()));
+    let initial = create_healthy_set(&api, &state, "balance-intent", 3).await;
+    let policy = configure_balancing(&api, &initial);
+    let mut set = make_set("balance-intent", 3, Some(initial));
+    set.spec.primary_balancing = Some(policy);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    set.status = api.last_status();
+    assert_eq!(
+        set.status
+            .as_ref()
+            .unwrap()
+            .placement
+            .as_ref()
+            .unwrap()
+            .reason,
+        "Stabilizing"
+    );
+    api.removal_clock.advance(1);
+    api.fail_next_status_patch();
+    api.reset_operations();
+    assert!(reconcile_set(&set, &api, &state).await.is_err());
+    assert_status_reads_only(&api.operations());
+    assert_eq!(api.last_status().unwrap(), set.status.clone().unwrap());
+    let restarted = ReconcilerState::with_removal_clock(Arc::new(api.removal_clock.clone()));
+    reconcile_set(&set, &api, &restarted).await.unwrap();
+    let operation = api.last_status().unwrap().operation.unwrap();
+    assert_eq!(operation.kind, DurableOperationKind::Switchover);
+    assert_status_reads_only(&api.operations());
+    set.status = api.last_status();
+    set.spec
+        .primary_balancing
+        .as_mut()
+        .unwrap()
+        .cooldown_seconds = 0;
+    reconcile_set(&set, &api, &restarted).await.unwrap();
+    assert_eq!(
+        api.last_status().unwrap().operation.unwrap().operation_id,
+        operation.operation_id
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_primary_balancing_suppresses_unavailable_inventory_and_maintenance_targets() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let initial = create_healthy_set(&api, &state, "balance-unavailable", 3).await;
+    let policy = configure_balancing(&api, &initial);
+    let mut set = make_set("balance-unavailable", 3, Some(initial));
+    set.spec.primary_balancing = Some(policy);
+    *api.fail_placement_inventory.lock().unwrap() = true;
+    api.reset_operations();
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let unavailable = api.last_status().unwrap();
+    assert_eq!(
+        unavailable.placement.as_ref().unwrap().reason,
+        "ObservationUnavailable"
+    );
+    assert_eq!(unavailable.phase, Phase::Healthy);
+    assert_status_reads_only(&api.operations());
+    *api.fail_placement_inventory.lock().unwrap() = false;
+    api.maintenance_nodes
+        .lock()
+        .unwrap()
+        .extend(["node-1".to_string(), "node-2".to_string()]);
+    set.status = Some(unavailable);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let maintenance = api.last_status().unwrap();
+    assert_eq!(maintenance.phase, Phase::Healthy);
+    assert_eq!(
+        maintenance.placement.as_ref().unwrap().reason,
+        "UnsafeCandidate"
+    );
+    assert!(maintenance.placement.as_ref().unwrap().target_pod.is_none());
+    assert_status_reads_only(&api.operations());
 }
 
 #[test_log::test(tokio::test)]

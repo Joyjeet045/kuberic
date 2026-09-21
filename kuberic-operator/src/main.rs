@@ -3,6 +3,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::watcher;
 use kube::{Api, Client};
 use tracing::info;
@@ -11,6 +12,9 @@ use kuberic_operator::cluster_api::KubeClusterApi;
 use kuberic_operator::crd::KubericSet;
 use kuberic_operator::node_maintenance::{
     KubeMaintenanceApi, NodeMaintenanceRequest, RequestContext, reconcile_request,
+};
+use kuberic_operator::placement_observability::{
+    metrics_listener_from_env, publish_persisted_placement_events, serve_metrics,
 };
 use kuberic_operator::reconciler::{ReconcileAction, ReconcilerState};
 
@@ -21,6 +25,7 @@ struct OperatorError(String);
 struct Context {
     api: KubeClusterApi,
     state: ReconcilerState,
+    events: Recorder,
 }
 
 #[tokio::main]
@@ -30,6 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting kuberic-operator");
 
     let client = Client::try_default().await?;
+    let metrics_listener = metrics_listener_from_env().await?;
+    let metrics = serve_metrics(client.clone(), metrics_listener);
 
     let sets: Api<KubericSet> = Api::all(client.clone());
     let pods: Api<Pod> = Api::all(client.clone());
@@ -39,6 +46,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client: client.clone(),
         },
         state: ReconcilerState::default(),
+        events: Recorder::new(
+            client.clone(),
+            Reporter {
+                controller: "kuberic-operator".to_string(),
+                instance: std::env::var("POD_NAME").ok(),
+            },
+        ),
     });
 
     info!("Watching KubericSets");
@@ -115,7 +129,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match kuberic_operator::reconciler::reconcile_set(&set, &ctx.api, &ctx.state)
                         .await
                     {
-                        Ok(ReconcileAction::Requeue(d)) => Ok(Action::requeue(d)),
+                        Ok(ReconcileAction::Requeue(d)) => {
+                            publish_persisted_placement_events(&ctx.api.client, &ctx.events, &set)
+                                .await;
+                            Ok(Action::requeue(d))
+                        }
                         Err(e) => Err(OperatorError(e)),
                     }
                 },
@@ -137,6 +155,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exited = tokio::select! {
         _ = maintenance => "node maintenance",
         _ = sets_controller => "kubericset",
+        result = metrics => {
+            result?;
+            "placement metrics"
+        },
     };
 
     tracing::error!(controller = exited, "controller stream ended unexpectedly");

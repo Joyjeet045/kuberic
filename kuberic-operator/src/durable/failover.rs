@@ -18,7 +18,7 @@ use crate::crd::{
 };
 use crate::durable::failover_election::{
     ElectionConfiguration, ElectionDecision, ElectionInput, ElectionMember, ElectionObservation,
-    accepted_observations, evaluate,
+    FailoverPlacementSnapshot, accepted_observations, evaluate_with_placement,
 };
 use crate::durable::{
     ACTION_DEADLINE_SECONDS, Decision, OperationObservations, bounded_error, poison,
@@ -33,7 +33,29 @@ pub fn start_failover(
     minimum_committed_replicas: usize,
     now: i64,
 ) -> Result<DurableOperationStatus, String> {
+    start_failover_with_placement(
+        set_identity,
+        previous_snapshot,
+        failed_primary_id,
+        minimum_committed_replicas,
+        now,
+        None,
+    )
+}
+
+/// Persist placement evidence before any election or failover action is dispatched.
+pub fn start_failover_with_placement(
+    set_identity: &str,
+    previous_snapshot: StablePartitionSnapshotStatus,
+    failed_primary_id: i64,
+    minimum_committed_replicas: usize,
+    now: i64,
+    placement: Option<FailoverPlacementSnapshot>,
+) -> Result<DurableOperationStatus, String> {
     validate_snapshot(&previous_snapshot)?;
+    if let Some(placement) = &placement {
+        placement.validate()?;
+    }
     if previous_snapshot.primary_id != failed_primary_id {
         return Err(format!(
             "failed primary {failed_primary_id} differs from stable primary {}",
@@ -87,6 +109,7 @@ pub fn start_failover(
         pending_action: None,
         last_error: None,
         failover: Some(DurableFailoverStatus {
+            placement,
             previous_configuration: None,
             current_configuration,
             observations: Vec::new(),
@@ -476,7 +499,7 @@ pub fn pending_label(operation: &DurableOperationStatus) -> Option<(i64, &'stati
 
 fn decide_assessment(operation: &DurableOperationStatus, now: i64) -> Result<Decision, String> {
     let input = election_input(operation)?;
-    match evaluate(&input)? {
+    match evaluate_with_placement(&input, operation.failover_ref()?.placement.as_ref())? {
         decision @ (ElectionDecision::Proceed { .. }
         | ElectionDecision::DataLossRequired { .. }) => {
             let data_loss_required = matches!(decision, ElectionDecision::DataLossRequired { .. });
@@ -1695,6 +1718,78 @@ mod tests {
                 local_faults: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn placement_is_persisted_before_dispatch_and_replayed_after_restart() {
+        let placement = FailoverPlacementSnapshot {
+            topology_key: Some("topology.kubernetes.io/zone".to_string()),
+            replicas: [2, 3]
+                .into_iter()
+                .map(
+                    |id| crate::durable::failover_election::FailoverReplicaPlacement {
+                        id,
+                        instance_id: format!("instance-{id}"),
+                        node_name: Some(format!("node-{id}")),
+                        topology_domain: Some(format!("zone-{id}")),
+                        domain_primary_count: Some(if id == 2 { 5 } else { 0 }),
+                        node_primary_count: Some(if id == 2 { 5 } else { 0 }),
+                        eligible: true,
+                    },
+                )
+                .collect(),
+        };
+        let mut operation =
+            start_failover_with_placement("set", snapshot(3), 1, 1, 100, Some(placement.clone()))
+                .unwrap();
+        assert_eq!(
+            operation.phase,
+            DurableOperationPhase::FailoverRecordStartingConfiguration
+        );
+        assert!(operation.pending_action.is_none());
+        assert_eq!(
+            operation.failover_ref().unwrap().placement.as_ref(),
+            Some(&placement)
+        );
+        operation.phase = DurableOperationPhase::FailoverAssess;
+        let mut observations = vec![
+            persisted_observation(&operation, 2, true),
+            persisted_observation(&operation, 3, true),
+        ];
+        for observation in &mut observations {
+            observation.current_lsn = 50;
+            observation.committed_lsn = 50;
+            observation.deactivation_catch_up_lsn = Some(50);
+        }
+        operation.failover_mut().unwrap().observations = observations;
+        let wire = serde_json::to_string(&operation).unwrap();
+        let restored: DurableOperationStatus = serde_json::from_str(&wire).unwrap();
+        let Decision::Persist(confirmed) =
+            decide_failover(&restored, &OperationObservations::new(), 101).unwrap()
+        else {
+            panic!("replayed placement must confirm a candidate");
+        };
+        assert_eq!(confirmed.target_primary_id, 3);
+        assert_eq!(
+            confirmed.failover_ref().unwrap().placement.as_ref(),
+            Some(&placement)
+        );
+        assert!(confirmed.failover_ref().unwrap().target_confirmed);
+        assert!(confirmed.pending_action.is_none());
+
+        let mut legacy_json = serde_json::to_value(&operation).unwrap();
+        legacy_json["failover"]
+            .as_object_mut()
+            .unwrap()
+            .remove("placement");
+        let legacy: DurableOperationStatus = serde_json::from_value(legacy_json).unwrap();
+        assert!(legacy.failover_ref().unwrap().placement.is_none());
+        let Decision::Persist(legacy_confirmed) =
+            decide_failover(&legacy, &OperationObservations::new(), 101).unwrap()
+        else {
+            panic!("legacy checkpoint must remain replayable");
+        };
+        assert_eq!(legacy_confirmed.target_primary_id, 2);
     }
 
     #[test]

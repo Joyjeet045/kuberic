@@ -27,6 +27,9 @@ tracing-subscriber.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+prometheus = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 kuberic-core = { path = "../kuberic-core", features = ["testing"] }
+serde-saphyr.workspace = true

@@ -1,10 +1,75 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 use kuberic_core::types::{
     Epoch, Lsn, ReplicaDeactivationInfo, ReplicaElectionConfiguration, ReplicaId,
     ReplicaInstanceId, Role, StableReplicaElectionMetadata, StableReplicaSnapshot,
 };
+
+/// Immutable placement evidence captured when a durable failover starts.
+/// Absent counts disable density ranking, rather than treating unknown as zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverPlacementSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology_key: Option<String>,
+    pub replicas: Vec<FailoverReplicaPlacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverReplicaPlacement {
+    pub id: ReplicaId,
+    pub instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_primary_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_primary_count: Option<u32>,
+    pub eligible: bool,
+}
+
+impl FailoverPlacementSnapshot {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let mut ids = BTreeSet::new();
+        let mut instances = BTreeSet::new();
+        if self
+            .topology_key
+            .as_ref()
+            .is_some_and(|key| key.trim().is_empty())
+        {
+            return Err("failover placement topology key is empty".to_string());
+        }
+        for replica in &self.replicas {
+            if replica.id <= 0
+                || replica.instance_id.is_empty()
+                || !ids.insert(replica.id)
+                || !instances.insert(&replica.instance_id)
+            {
+                return Err("failover placement has invalid or duplicate identity".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn eligible_replica(&self, candidate: &RankedCandidate) -> Option<&FailoverReplicaPlacement> {
+        self.replicas.iter().find(|replica| {
+            replica.id == candidate.id
+                && replica.instance_id == candidate.instance_id.as_str()
+                && replica.eligible
+                && replica
+                    .node_name
+                    .as_ref()
+                    .is_some_and(|name| !name.trim().is_empty())
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElectionMember {
@@ -121,9 +186,19 @@ pub struct ElectionInput {
 }
 
 pub fn evaluate(input: &ElectionInput) -> Result<ElectionDecision, String> {
+    evaluate_with_placement(input, None)
+}
+
+pub fn evaluate_with_placement(
+    input: &ElectionInput,
+    placement: Option<&FailoverPlacementSnapshot>,
+) -> Result<ElectionDecision, String> {
     validate_configuration(&input.current, "current")?;
     if let Some(previous) = &input.previous {
         validate_configuration(previous, "previous")?;
+    }
+    if let Some(placement) = placement {
+        placement.validate()?;
     }
 
     let accepted = accepted_observations(input);
@@ -167,7 +242,77 @@ pub fn evaluate(input: &ElectionInput) -> Result<ElectionDecision, String> {
         }
     };
 
-    let possible_candidates = possibly_better_outstanding(input, &accepted, &candidate);
+    // Keep every legacy safety wait, even if placement changes the stable-ID tie.
+    let mut possible_candidates = possibly_better_outstanding(input, &accepted, &candidate, false);
+    let candidate = if let Some(placement) = placement {
+        let candidates = candidate_pool(input, &accepted)?;
+        let safest = candidates
+            .iter()
+            .max_by(|left, right| compare_candidate_safety(left, right))
+            .ok_or_else(|| "no reachable catch-up-capable candidate".to_string())?;
+        let equally_safe = candidates
+            .iter()
+            .filter(|candidate| compare_candidate_safety(candidate, safest) == Ordering::Equal)
+            .collect::<Vec<_>>();
+        let eligible = equally_safe
+            .iter()
+            .filter_map(|candidate| {
+                placement
+                    .eligible_replica(candidate)
+                    .map(|entry| (*candidate, entry))
+            })
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            possible_candidates.extend(equally_safe.iter().map(|candidate| candidate.id));
+            possible_candidates.sort_unstable();
+            possible_candidates.dedup();
+            return Ok(ElectionDecision::WaitForBestCandidate {
+                possible_candidates,
+                previous,
+                current,
+            });
+        }
+        // Do not compare Some(count) with None or rank only the known subset.
+        let rank_density = eligible.iter().all(|(_, replica)| {
+            replica.node_primary_count.is_some()
+                && (placement.topology_key.is_none()
+                    || (replica
+                        .topology_domain
+                        .as_ref()
+                        .is_some_and(|domain| !domain.trim().is_empty())
+                        && replica.domain_primary_count.is_some()))
+        });
+        let (selected, _) = eligible
+            .into_iter()
+            .max_by(|(left, left_placement), (right, right_placement)| {
+                let density = if rank_density {
+                    let domain = if placement.topology_key.is_some() {
+                        right_placement
+                            .domain_primary_count
+                            .cmp(&left_placement.domain_primary_count)
+                    } else {
+                        Ordering::Equal
+                    };
+                    domain.then(
+                        right_placement
+                            .node_primary_count
+                            .cmp(&left_placement.node_primary_count),
+                    )
+                } else {
+                    Ordering::Equal
+                };
+                density.then(right.id.cmp(&left.id))
+            })
+            .expect("eligible candidate set is nonempty");
+        possible_candidates.extend(possibly_better_outstanding(
+            input, &accepted, selected, true,
+        ));
+        possible_candidates.sort_unstable();
+        possible_candidates.dedup();
+        selected.clone()
+    } else {
+        candidate
+    };
     if !possible_candidates.is_empty() {
         return Ok(ElectionDecision::WaitForBestCandidate {
             possible_candidates,
@@ -411,6 +556,16 @@ fn select_candidate(
     input: &ElectionInput,
     accepted: &BTreeMap<ReplicaId, ElectionObservation>,
 ) -> Result<RankedCandidate, String> {
+    candidate_pool(input, accepted)?
+        .into_iter()
+        .max_by(compare_candidates)
+        .ok_or_else(|| "no reachable catch-up-capable candidate".to_string())
+}
+
+fn candidate_pool(
+    input: &ElectionInput,
+    accepted: &BTreeMap<ReplicaId, ElectionObservation>,
+) -> Result<Vec<RankedCandidate>, String> {
     let freshest_deactivation = accepted
         .iter()
         .filter(|(id, _)| **id != input.failed_primary_id)
@@ -439,15 +594,25 @@ fn select_candidate(
         .filter(|candidate| candidate.first_retained_lsn <= input.required_catch_up_lsn)
         .cloned()
         .collect::<Vec<_>>();
-    let ranked = if capable.is_empty() {
+    Ok(if capable.is_empty() {
         candidates
     } else {
         capable
-    };
-    ranked
-        .into_iter()
-        .max_by(compare_candidates)
-        .ok_or_else(|| "no reachable catch-up-capable candidate".to_string())
+    })
+}
+
+fn compare_candidate_safety(left: &RankedCandidate, right: &RankedCandidate) -> Ordering {
+    left.deactivation
+        .epoch
+        .cmp(&right.deactivation.epoch)
+        .then(left.current_lsn.cmp(&right.current_lsn))
+        .then(left.committed_lsn.cmp(&right.committed_lsn))
+        .then(right.first_retained_lsn.cmp(&left.first_retained_lsn))
+        .then(
+            left.deactivation
+                .catch_up_lsn
+                .cmp(&right.deactivation.catch_up_lsn),
+        )
 }
 
 fn compare_candidates(left: &RankedCandidate, right: &RankedCandidate) -> Ordering {
@@ -463,6 +628,7 @@ fn possibly_better_outstanding(
     input: &ElectionInput,
     accepted: &BTreeMap<ReplicaId, ElectionObservation>,
     candidate: &RankedCandidate,
+    placement_enabled: bool,
 ) -> Vec<ReplicaId> {
     let members = all_members(input);
     let observed: BTreeSet<_> = input
@@ -483,6 +649,8 @@ fn possibly_better_outstanding(
                 && !observed.contains(&member.id)
                 && member.last_known.as_ref().is_none_or(|metadata| {
                     compare_last_known(member.id, metadata, candidate) == Ordering::Greater
+                        || (placement_enabled
+                            && compare_last_known_safety(metadata, candidate) != Ordering::Less)
                 })
         })
         .map(|member| member.id)
@@ -490,6 +658,27 @@ fn possibly_better_outstanding(
     possible.sort_unstable();
 
     possible
+}
+
+fn compare_last_known_safety(
+    metadata: &StableReplicaElectionMetadata,
+    candidate: &RankedCandidate,
+) -> Ordering {
+    metadata
+        .deactivation_epoch
+        .cmp(&candidate.deactivation.epoch)
+        .then(metadata.current_lsn.cmp(&candidate.current_lsn))
+        .then(metadata.committed_lsn.cmp(&candidate.committed_lsn))
+        .then(
+            candidate
+                .first_retained_lsn
+                .cmp(&metadata.first_retained_lsn),
+        )
+        .then(
+            metadata
+                .deactivation_catch_up_lsn
+                .cmp(&candidate.deactivation.catch_up_lsn),
+        )
 }
 
 fn compare_last_known(
@@ -645,6 +834,319 @@ mod tests {
                 .map(|id| (id, observation(id, &current, None, id * 10)))
                 .collect(),
         }
+    }
+
+    fn tied_input(ids: &[i64]) -> ElectionInput {
+        let mut input = input(ids);
+        for observation in input.observations.values_mut() {
+            observation.current_lsn = 50;
+            observation.committed_lsn = 50;
+            observation.deactivation.as_mut().unwrap().catch_up_lsn = 50;
+        }
+        input
+    }
+
+    fn placement(ids: &[i64]) -> FailoverPlacementSnapshot {
+        FailoverPlacementSnapshot {
+            topology_key: Some("topology.kubernetes.io/zone".to_string()),
+            replicas: ids
+                .iter()
+                .map(|id| FailoverReplicaPlacement {
+                    id: *id,
+                    instance_id: format!("instance-{id}"),
+                    node_name: Some(format!("node-{id}")),
+                    topology_domain: Some(format!("zone-{id}")),
+                    domain_primary_count: Some(10 - *id as u32),
+                    node_primary_count: Some(10 - *id as u32),
+                    eligible: true,
+                })
+                .collect(),
+        }
+    }
+
+    fn winner(input: &ElectionInput, placement: &FailoverPlacementSnapshot) -> ReplicaId {
+        let ElectionDecision::Proceed { candidate, .. } =
+            evaluate_with_placement(input, Some(placement)).unwrap()
+        else {
+            panic!("expected a safe election winner");
+        };
+        candidate.id
+    }
+
+    #[test]
+    fn placement_breaks_only_safety_equivalent_ties_in_domain_then_node_order() {
+        let input = tied_input(&[1, 2, 3]);
+        let mut placement = placement(&[2, 3]);
+        assert_eq!(winner(&input, &placement), 3);
+        placement.replicas[1].node_primary_count = Some(100);
+        assert_eq!(
+            winner(&input, &placement),
+            3,
+            "domain density is preferred first"
+        );
+        placement.replicas[0].domain_primary_count = placement.replicas[1].domain_primary_count;
+        assert_eq!(
+            winner(&input, &placement),
+            2,
+            "node density breaks domain ties"
+        );
+        placement.replicas[0].node_primary_count = Some(100);
+        assert_eq!(
+            winner(&input, &placement),
+            2,
+            "stable identity breaks density ties"
+        );
+        placement.replicas.reverse();
+        assert_eq!(winner(&input, &placement), 2);
+    }
+
+    #[test]
+    fn placement_never_outranks_freshness_or_log_coverage() {
+        let placement = placement(&[2, 3]);
+        for safety_dimension in 0..5 {
+            let mut input = tied_input(&[1, 2, 3]);
+            let preferred = input.observations.get_mut(&3).unwrap();
+            match safety_dimension {
+                0 => preferred.deactivation.as_mut().unwrap().epoch = Epoch::new(1, 3),
+                1 => {
+                    preferred.current_lsn = 49;
+                    preferred.committed_lsn = 49;
+                }
+                2 => preferred.committed_lsn = 49,
+                3 => {
+                    input.observations.get_mut(&2).unwrap().first_retained_lsn = Some(-1);
+                }
+                4 => preferred.deactivation.as_mut().unwrap().catch_up_lsn = 49,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                winner(&input, &placement),
+                2,
+                "safety dimension {safety_dimension}"
+            );
+        }
+        let mut input = tied_input(&[1, 2, 3]);
+        input.required_catch_up_lsn = 5;
+        input.observations.get_mut(&3).unwrap().first_retained_lsn = Some(6);
+        input.observations.get_mut(&3).unwrap().current_lsn = 100;
+        assert_eq!(
+            winner(&input, &placement),
+            2,
+            "catch-up capability precedes density"
+        );
+    }
+
+    #[test]
+    fn maintenance_excludes_promotion_not_quorum_or_target_evidence() {
+        let input = tied_input(&[1, 2, 3]);
+        let mut placement = placement(&[2, 3]);
+        placement.replicas[1].eligible = false;
+        let decision = evaluate_with_placement(&input, Some(&placement)).unwrap();
+        let ElectionDecision::Proceed {
+            candidate, current, ..
+        } = &decision
+        else {
+            panic!("maintenance replica must still provide quorum");
+        };
+        assert_eq!(candidate.id, 2);
+        assert_eq!(current.accepted, vec![2, 3]);
+        assert_eq!(current.required, 2);
+        let (_, members, _) = build_target(&input, &decision, false).unwrap();
+        assert!(members.iter().any(|member| member.id == 3));
+
+        let mut input = input;
+        input.observations.get_mut(&3).unwrap().current_lsn = 60;
+        assert!(
+            matches!(
+                evaluate_with_placement(&input, Some(&placement)).unwrap(),
+                ElectionDecision::WaitForBestCandidate { .. }
+            ),
+            "maintenance must not allow promoting an older replica"
+        );
+    }
+
+    #[test]
+    fn missing_density_or_topology_disables_the_entire_density_tie_break() {
+        let input = tied_input(&[1, 2, 3]);
+        for missing in 0..4 {
+            let mut placement = placement(&[2, 3]);
+            match missing {
+                0 => placement.replicas[1].node_primary_count = None,
+                1 => placement.replicas[1].domain_primary_count = None,
+                2 => placement.replicas[1].topology_domain = None,
+                3 => placement.replicas[0].node_primary_count = None,
+                _ => unreachable!(),
+            }
+            assert_eq!(winner(&input, &placement), 2);
+        }
+        let mut placement = placement(&[2, 3]);
+        placement.topology_key = None;
+        for replica in &mut placement.replicas {
+            replica.topology_domain = None;
+            replica.domain_primary_count = None;
+        }
+        assert_eq!(
+            winner(&input, &placement),
+            3,
+            "node-only policies need no topology"
+        );
+    }
+
+    #[test]
+    fn unknown_node_or_incarnation_never_inherits_placement_eligibility() {
+        let input = tied_input(&[1, 2, 3]);
+        for unknown in 0..3 {
+            let mut placement = placement(&[2, 3]);
+            match unknown {
+                0 => placement.replicas[1].node_name = None,
+                1 => placement.replicas[1].instance_id = "old-instance-3".to_string(),
+                2 => {
+                    placement.replicas.pop();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(winner(&input, &placement), 2);
+        }
+        let placement = FailoverPlacementSnapshot {
+            topology_key: None,
+            replicas: Vec::new(),
+        };
+        let ElectionDecision::WaitForBestCandidate { current, .. } =
+            evaluate_with_placement(&input, Some(&placement)).unwrap()
+        else {
+            panic!("no eligibility evidence must wait");
+        };
+        assert_eq!(current.accepted, vec![2, 3]);
+    }
+
+    #[test]
+    fn placement_cannot_bypass_observation_health_identity_or_configuration() {
+        for exclusion in 0..3 {
+            let mut input = tied_input(&[1, 2, 3]);
+            let preferred = input.observations.get_mut(&3).unwrap();
+            match exclusion {
+                0 => preferred.healthy = false,
+                1 => preferred.instance_id = ReplicaInstanceId::new("replacement"),
+                2 => preferred.configuration = None,
+                _ => unreachable!(),
+            }
+            let decision = evaluate_with_placement(&input, Some(&placement(&[2, 3]))).unwrap();
+            assert!(
+                !matches!(decision, ElectionDecision::Proceed { .. }),
+                "invalid evidence cannot satisfy quorum"
+            );
+            if let ElectionDecision::DataLossRequired {
+                candidate, current, ..
+            } = decision
+            {
+                assert_eq!(candidate.id, 2);
+                assert_eq!(current.accepted, vec![2]);
+                assert_eq!(current.required, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn configured_waits_preserve_legacy_and_ignore_outstanding_eligibility() {
+        let mut input = tied_input(&[1, 2, 3, 4, 5]);
+        input.observations.remove(&4);
+        let metadata = input
+            .current
+            .members
+            .iter_mut()
+            .find(|member| member.id == 4)
+            .unwrap()
+            .last_known
+            .as_mut()
+            .unwrap();
+        metadata.current_lsn = 50;
+        metadata.committed_lsn = 50;
+        metadata.deactivation_catch_up_lsn = 50;
+        let mut placement = placement(&[2, 3, 4, 5]);
+        placement
+            .replicas
+            .iter_mut()
+            .find(|replica| replica.id == 4)
+            .unwrap()
+            .eligible = false;
+        let ElectionDecision::WaitForBestCandidate {
+            possible_candidates,
+            current,
+            ..
+        } = evaluate_with_placement(&input, Some(&placement)).unwrap()
+        else {
+            panic!("density and eligibility must not bypass unresolved safe candidates");
+        };
+        assert_eq!(possible_candidates, vec![4]);
+        assert!(current.satisfied());
+
+        input
+            .current
+            .members
+            .iter_mut()
+            .find(|member| member.id == 4)
+            .unwrap()
+            .last_known = None;
+        assert!(matches!(
+            evaluate(&input).unwrap(),
+            ElectionDecision::WaitForBestCandidate { .. }
+        ));
+        assert!(matches!(
+            evaluate_with_placement(&input, Some(&placement)).unwrap(),
+            ElectionDecision::WaitForBestCandidate { .. }
+        ));
+    }
+
+    #[test]
+    fn changed_progress_rank_cannot_remove_a_legacy_outstanding_wait() {
+        let mut input = tied_input(&[1, 2, 3, 4, 5]);
+        input.observations.remove(&4);
+        input.observations.get_mut(&2).unwrap().committed_lsn = 49;
+        let metadata = input
+            .current
+            .members
+            .iter_mut()
+            .find(|member| member.id == 4)
+            .unwrap()
+            .last_known
+            .as_mut()
+            .unwrap();
+        metadata.current_lsn = 50;
+        metadata.committed_lsn = 48;
+        metadata.first_retained_lsn = -1;
+        metadata.deactivation_catch_up_lsn = 50;
+        for placement in [None, Some(placement(&[2, 3, 4, 5]))] {
+            let ElectionDecision::WaitForBestCandidate {
+                possible_candidates,
+                ..
+            } = evaluate_with_placement(&input, placement.as_ref()).unwrap()
+            else {
+                panic!("legacy log-coverage wait must survive configured progress ranking");
+            };
+            assert_eq!(possible_candidates, vec![4]);
+        }
+    }
+
+    #[test]
+    fn unconfigured_rank_ignores_new_committed_and_density_preferences() {
+        let mut input = tied_input(&[1, 2, 3]);
+        input.observations.get_mut(&2).unwrap().committed_lsn = 49;
+        let legacy = evaluate(&input).unwrap();
+        assert_eq!(legacy, evaluate_with_placement(&input, None).unwrap());
+        assert!(matches!(legacy, ElectionDecision::Proceed { candidate, .. } if candidate.id == 2));
+        assert_eq!(winner(&input, &placement(&[2, 3])), 3);
+    }
+
+    #[test]
+    fn duplicate_placement_identities_are_rejected() {
+        let input = tied_input(&[1, 2, 3]);
+        let mut placement = placement(&[2, 3]);
+        placement.replicas.push(placement.replicas[1].clone());
+        assert!(
+            evaluate_with_placement(&input, Some(&placement))
+                .unwrap_err()
+                .contains("duplicate")
+        );
     }
 
     #[test]

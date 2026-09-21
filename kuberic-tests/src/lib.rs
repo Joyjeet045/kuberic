@@ -5,6 +5,9 @@ mod gateway_k8s;
 mod lease_election;
 
 #[cfg(test)]
+mod topology_placement_k8s;
+
+#[cfg(test)]
 pub mod test_utils {
 
     const NS_XEDIO: &str = "xedio";

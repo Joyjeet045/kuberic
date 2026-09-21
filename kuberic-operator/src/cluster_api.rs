@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Service};
+use k8s_openapi::api::core::v1::{Node, PersistentVolumeClaim, Pod, Service};
 
 use kuberic_core::driver::ReplicaHandle;
 use kuberic_core::types::{ReplicaId, ReplicaInstanceId};
 
-use crate::crd::{KubericSetSpec, KubericSetStatus};
+use crate::crd::{KubericSet, KubericSetSpec, KubericSetStatus};
 use crate::node_maintenance::NodeMaintenanceRequest;
+use crate::primary_placement::PlacementInventory;
 
 fn uid_fenced_label_patch(
     pod: &Pod,
@@ -52,6 +53,8 @@ pub trait ClusterApi: Send + Sync {
 
     /// Names of nodes with an active NodeMaintenanceRequest.
     async fn list_maintenance_nodes(&self) -> Result<BTreeSet<String>, String>;
+
+    async fn list_placement_inventory(&self) -> Result<PlacementInventory, String>;
 
     /// Create a pod.
     async fn create_pod(&self, namespace: &str, pod: &Pod) -> Result<(), String>;
@@ -138,6 +141,22 @@ pub struct KubeClusterApi {
 
 #[async_trait]
 impl ClusterApi for KubeClusterApi {
+    async fn list_placement_inventory(&self) -> Result<PlacementInventory, String> {
+        let nodes: kube::Api<Node> = kube::Api::all(self.client.clone());
+        let sets: kube::Api<KubericSet> = kube::Api::all(self.client.clone());
+        let pods: kube::Api<Pod> = kube::Api::all(self.client.clone());
+        let all = kube::api::ListParams::default();
+        let set_pods = kube::api::ListParams::default().labels("kuberic.io/set");
+        let (nodes, sets, pods) =
+            tokio::try_join!(nodes.list(&all), sets.list(&all), pods.list(&set_pods))
+                .map_err(|error| format!("placement inventory read failed: {error}"))?;
+        Ok(PlacementInventory {
+            nodes: nodes.items,
+            sets: sets.items,
+            pods: pods.items,
+        })
+    }
+
     async fn list_pods(&self, namespace: &str, selector: &str) -> Result<Vec<Pod>, String> {
         let api: kube::Api<Pod> = kube::Api::namespaced(self.client.clone(), namespace);
         let params = kube::api::ListParams::default().labels(selector);

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,8 +38,7 @@ use crate::durable::{
     attest_add_replica, correlated_action_observation, decide, decide_add_replica,
     decide_create_partition, decide_failover, decide_remove_replica, fail_closed,
     failover_action_for, failover_pending_label, operation_condition, record_activity_error,
-    record_observation, start_add_replica, start_create_partition, start_failover,
-    start_remove_replica, start_switchover,
+    record_observation, start_add_replica, start_failover, start_remove_replica, start_switchover,
 };
 use crate::node_maintenance::{
     PlacementCandidate, explicit_target_is_eligible, switchover_target_for_maintenance,
@@ -52,6 +51,7 @@ pub struct ReconcilerState {
     /// Stable statuses whose first persistence attempt failed after the
     /// corresponding runtime topology had already committed.
     pending_statuses: Mutex<HashMap<String, KubericSetStatus>>,
+    placement_planning: Mutex<()>,
     removal_clock: Arc<dyn RemoveReplicaClock>,
 }
 
@@ -60,6 +60,7 @@ impl Default for ReconcilerState {
         Self {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
+            placement_planning: Mutex::new(()),
             removal_clock: Arc::new(SystemRemoveReplicaClock),
         }
     }
@@ -70,6 +71,7 @@ impl ReconcilerState {
         Self {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
+            placement_planning: Mutex::new(()),
             removal_clock: clock,
         }
     }
@@ -435,6 +437,12 @@ pub async fn reconcile_set(
     api: &dyn ClusterApi,
     state: &ReconcilerState,
 ) -> Result<ReconcileAction, String> {
+    // Serialize optional placement plans and their durable reservations across sets.
+    let _placement_plan = if set.spec.primary_balancing.is_some() {
+        Some(state.placement_planning.lock().await)
+    } else {
+        None
+    };
     let name = set.name_any();
     let namespace = set.namespace().unwrap_or_default();
     let set_key = format!("{}/{}", namespace, name);
@@ -475,6 +483,12 @@ pub async fn reconcile_set(
 
     match current_phase {
         Phase::Pending => {
+            if let Some(policy) = &set.spec.primary_balancing {
+                policy.validate()?;
+            }
+            if let Some(policy) = &set.spec.scheduling {
+                policy.validate()?;
+            }
             info!(name, "creating partition pods and services");
             create_services(api, set, &namespace).await?;
             create_pods(api, set, &namespace).await?;
@@ -544,6 +558,7 @@ pub async fn reconcile_set(
             }
             if ready_pods.len() < desired {
                 info!(name, ready = ready_pods.len(), desired, "waiting for pods");
+                report_replica_placement(set, api, &pods).await?;
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
             }
 
@@ -571,21 +586,32 @@ pub async fn reconcile_set(
                 })
                 .and_then(|operation| operation.committed_snapshot.clone());
             let now = unix_seconds();
-            let operation = start_create_partition(
+            let Some((preferred_primary, placement)) = initial_placement(set, api, &pods).await?
+            else {
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(10)));
+            };
+            let operation = crate::durable::start_create_partition_with_primary(
                 set.metadata.uid.as_deref().unwrap_or(&set_key),
                 targets,
                 committed_snapshot,
                 set.spec.min_replicas as usize,
                 now,
+                preferred_primary,
             )?;
             let mut status = KubericSetStatus {
                 phase: Phase::Creating,
                 operation: Some(operation.clone()),
+                placement: placement.or_else(|| {
+                    set.status
+                        .as_ref()
+                        .and_then(|status| status.placement.clone())
+                }),
                 ..set.status.clone().unwrap_or_default()
             };
             status.stable_snapshot = None;
             status.current_primary = None;
             status.target_primary = None;
+            update_placement_conditions(&mut status);
             set_operation_condition(&mut status, operation_condition(&operation, now));
             api.patch_set_status(
                 &namespace,
@@ -678,18 +704,25 @@ pub async fn reconcile_set(
                     .await?;
                     return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
                 }
-                let operation = start_failover(
-                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                let Some((operation, placement)) = placement_failover(
+                    set,
+                    api,
+                    &pods,
                     persisted_snapshot.clone(),
                     stable_primary.id,
-                    set.spec.min_replicas as usize,
                     now,
-                )?;
+                )
+                .await?
+                else {
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(10)));
+                };
                 let mut status = KubericSetStatus {
                     phase: Phase::FailingOver,
                     operation: Some(operation.clone()),
+                    placement,
                     ..set.status.clone().unwrap_or_default()
                 };
+                update_placement_conditions(&mut status);
                 set_operation_condition(&mut status, operation_condition(&operation, now));
                 api.patch_set_status(
                     &namespace,
@@ -934,18 +967,25 @@ pub async fn reconcile_set(
                         .await?;
                         return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
                     }
-                    let operation = start_failover(
-                        set.metadata.uid.as_deref().unwrap_or(&set_key),
+                    let Some((operation, placement)) = placement_failover(
+                        set,
+                        api,
+                        &pods,
                         persisted_snapshot.clone(),
                         primary_member.id,
-                        set.spec.min_replicas as usize,
                         now,
-                    )?;
+                    )
+                    .await?
+                    else {
+                        return Ok(ReconcileAction::Requeue(Duration::from_secs(10)));
+                    };
                     let mut status = KubericSetStatus {
                         phase: Phase::FailingOver,
                         operation: Some(operation.clone()),
+                        placement,
                         ..set.status.clone().unwrap_or_default()
                     };
+                    update_placement_conditions(&mut status);
                     set_operation_condition(&mut status, operation_condition(&operation, now));
                     api.patch_set_status(
                         &namespace,
@@ -1190,18 +1230,25 @@ pub async fn reconcile_set(
                 }
                 let failed_primary_id = current_primary_id
                     .ok_or_else(|| "stale partition has no primary ID".to_string())?;
-                let operation = start_failover(
-                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                let Some((operation, placement)) = placement_failover(
+                    set,
+                    api,
+                    &pods,
                     persisted_snapshot.clone(),
                     failed_primary_id,
-                    set.spec.min_replicas as usize,
                     now,
-                )?;
+                )
+                .await?
+                else {
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(10)));
+                };
                 let mut status = KubericSetStatus {
                     phase: Phase::FailingOver,
                     operation: Some(operation.clone()),
+                    placement,
                     ..set.status.clone().unwrap_or_default()
                 };
+                update_placement_conditions(&mut status);
                 set_operation_condition(&mut status, operation_condition(&operation, now));
                 api.patch_set_status(
                     &namespace,
@@ -1281,14 +1328,12 @@ pub async fn reconcile_set(
             }
 
             // --- Switchover check (only when all replicas are healthy) ---
-            let requested_primary = set.status.as_ref().and_then(|s| s.target_primary.clone());
-            let maintenance_nodes = api.list_maintenance_nodes().await.unwrap_or_else(|error| {
-                warn!(
-                    name,
-                    error, "maintenance node lookup failed; leaving primary placement unchanged"
-                );
-                BTreeSet::new()
-            });
+            let requested_primary = set
+                .status
+                .as_ref()
+                .and_then(|s| s.target_primary.clone())
+                .filter(|target| Some(target) != current_primary.as_ref());
+            let maintenance_nodes = api.list_maintenance_nodes().await?;
             let candidates: Vec<PlacementCandidate> = current_pods
                 .iter()
                 .map(|(id, _, pod)| PlacementCandidate {
@@ -1539,6 +1584,12 @@ pub async fn reconcile_set(
                 return Ok(action);
             }
 
+            if let Some(action) =
+                reconcile_primary_placement(set, api, state, &pods, &set_key).await?
+            {
+                return Ok(action);
+            }
+
             Ok(ReconcileAction::Requeue(Duration::from_secs(30)))
         }
 
@@ -1575,6 +1626,501 @@ pub async fn reconcile_set(
 // ---------------------------------------------------------------------------
 
 type CurrentPod<'a> = (ReplicaId, ReplicaInstanceId, &'a Pod);
+
+async fn initial_placement(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    pods: &[Pod],
+) -> Result<
+    Option<(
+        Option<i64>,
+        Option<crate::primary_placement::PlacementStatus>,
+    )>,
+    String,
+> {
+    use crate::primary_placement::{distribution, initial_primary, replica_placements, suppress};
+    let maintenance = api.list_maintenance_nodes().await?;
+    let Some(policy) = set.spec.primary_balancing.as_ref() else {
+        if maintenance.is_empty() {
+            return Ok(Some((None, None)));
+        }
+        let preferred = checked_pods_by_id(pods)?
+            .iter()
+            .filter(|(_, _, pod)| {
+                pod.spec
+                    .as_ref()
+                    .and_then(|spec| spec.node_name.as_ref())
+                    .is_some_and(|node| !maintenance.contains(node))
+            })
+            .map(|(id, _, _)| *id)
+            .min();
+        if preferred.is_none() {
+            return Err("no initial primary is known to be outside active maintenance".to_string());
+        }
+        return Ok(Some((preferred, None)));
+    };
+    policy.validate()?;
+    let inventory = match api.list_placement_inventory().await {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            let mut placement = distribution(set, pods, &[], &policy.topology_key);
+            suppress(&mut placement, "ObservationUnavailable", error);
+            persist_placement(set, api, placement).await?;
+            return Ok(None);
+        }
+    };
+    let mut placement = distribution(set, pods, &inventory.nodes, &policy.topology_key);
+    let candidates =
+        match replica_placements(set, pods, &inventory, &maintenance, &policy.topology_key) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                suppress(&mut placement, "MissingTopology", error);
+                persist_placement(set, api, placement).await?;
+                return Ok(None);
+            }
+        };
+    let Some(preferred) = initial_primary(&candidates) else {
+        suppress(
+            &mut placement,
+            "NoEligiblePrimary",
+            "no Ready, schedulable Node outside maintenance can host the initial primary",
+        );
+        persist_placement(set, api, placement).await?;
+        return Ok(None);
+    };
+    suppress(
+        &mut placement,
+        "InitialPlacement",
+        "initial primary ordered by eligible topology-domain density, node density, and replica ID; a committed creation prefix remains authoritative",
+    );
+    Ok(Some((Some(preferred), Some(placement))))
+}
+
+async fn placement_failover(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    pods: &[Pod],
+    snapshot: StablePartitionSnapshotStatus,
+    failed_primary: i64,
+    now: i64,
+) -> Result<
+    Option<(
+        DurableOperationStatus,
+        Option<crate::primary_placement::PlacementStatus>,
+    )>,
+    String,
+> {
+    use crate::durable::failover_election::{FailoverPlacementSnapshot, FailoverReplicaPlacement};
+    use crate::primary_placement::{distribution, node_eligible, replica_placements, suppress};
+    let set_key = format!("{}/{}", set.namespace().unwrap_or_default(), set.name_any());
+    let maintenance = api.list_maintenance_nodes().await?;
+    if set.spec.primary_balancing.is_none() && maintenance.is_empty() {
+        return Ok(Some((
+            start_failover(
+                set.metadata.uid.as_deref().unwrap_or(&set_key),
+                snapshot,
+                failed_primary,
+                set.spec.min_replicas as usize,
+                now,
+            )?,
+            set.status
+                .as_ref()
+                .and_then(|status| status.placement.clone()),
+        )));
+    }
+    let inventory = if set.spec.primary_balancing.is_some() {
+        match api.list_placement_inventory().await {
+            Ok(inventory) => Some(inventory),
+            Err(error) => {
+                let mut placement = distribution(set, pods, &[], placement_topology_key(set));
+                suppress(&mut placement, "ObservationUnavailable", error);
+                persist_placement(set, api, placement).await?;
+                return Ok(None);
+            }
+        }
+    } else {
+        None
+    };
+    let mut placement = distribution(
+        set,
+        pods,
+        inventory
+            .as_ref()
+            .map(|value| value.nodes.as_slice())
+            .unwrap_or(&[]),
+        placement_topology_key(set),
+    );
+    let density = inventory.as_ref().map(|inventory| {
+        replica_placements(
+            set,
+            pods,
+            inventory,
+            &maintenance,
+            placement_topology_key(set),
+        )
+    });
+    let ranked = match density {
+        Some(Ok(ranked)) => {
+            suppress(
+                &mut placement,
+                "FailoverPlacement",
+                "placement is a persisted tie-breaker only after election safety, quorum, catch-up capability and progress",
+            );
+            Some(ranked)
+        }
+        Some(Err(error)) => {
+            warn!(set = %set.name_any(), %error, "failover density unavailable; preserving safety-only ranking and Node eligibility");
+            suppress(
+                &mut placement,
+                "DensityUnavailable",
+                format!("safety-only failover ranking: {error}"),
+            );
+            None
+        }
+        None => {
+            suppress(
+                &mut placement,
+                "MaintenanceExclusion",
+                "safety-only failover ranking excludes active maintenance Nodes",
+            );
+            None
+        }
+    };
+    let replicas = snapshot
+        .members
+        .iter()
+        .map(|member| {
+            let pod = pods
+                .iter()
+                .find(|pod| pod.metadata.uid.as_deref() == Some(&member.instance_id));
+            let node_name = pod.and_then(|pod| pod.spec.as_ref()?.node_name.clone());
+            let node = inventory.as_ref().and_then(|inventory| {
+                inventory
+                    .nodes
+                    .iter()
+                    .find(|node| node.metadata.name == node_name)
+            });
+            let topology_domain = node
+                .and_then(|node| {
+                    node.metadata
+                        .labels
+                        .as_ref()?
+                        .get(placement_topology_key(set))
+                        .cloned()
+                })
+                .filter(|domain| !domain.is_empty());
+            let eligible = member.id != failed_primary
+                && pod.is_some_and(|pod| pod.metadata.deletion_timestamp.is_none())
+                && node_name
+                    .as_ref()
+                    .is_some_and(|name| !maintenance.contains(name))
+                && (inventory.is_none()
+                    || node.is_some_and(|node| node_eligible(node, &maintenance)));
+            let rank = ranked.as_ref().and_then(|ranks| {
+                ranks
+                    .iter()
+                    .find(|rank| rank.id == member.id && rank.instance_id == member.instance_id)
+            });
+            FailoverReplicaPlacement {
+                id: member.id,
+                instance_id: member.instance_id.clone(),
+                node_name,
+                topology_domain,
+                domain_primary_count: rank.map(|rank| rank.domain_primaries),
+                node_primary_count: rank.map(|rank| rank.node_primaries),
+                eligible,
+            }
+        })
+        .collect();
+    let operation = crate::durable::start_failover_with_placement(
+        set.metadata.uid.as_deref().unwrap_or(&set_key),
+        snapshot,
+        failed_primary,
+        set.spec.min_replicas as usize,
+        now,
+        Some(FailoverPlacementSnapshot {
+            topology_key: set
+                .spec
+                .primary_balancing
+                .as_ref()
+                .map(|policy| policy.topology_key.clone()),
+            replicas,
+        }),
+    )?;
+    Ok(Some((operation, Some(placement))))
+}
+
+fn placement_topology_key(set: &KubericSet) -> &str {
+    set.spec
+        .primary_balancing
+        .as_ref()
+        .map(|policy| policy.topology_key.as_str())
+        .or_else(|| {
+            set.spec
+                .scheduling
+                .as_ref()
+                .map(|policy| policy.topology_key.as_str())
+        })
+        .unwrap_or(crate::primary_placement::HOSTNAME_TOPOLOGY_KEY)
+}
+
+fn placement_condition(
+    status: &mut KubericSetStatus,
+    type_: &str,
+    ready: Option<bool>,
+    reason: &str,
+    message: &str,
+) {
+    let value = match ready {
+        Some(true) => "True",
+        Some(false) => "False",
+        None => "Unknown",
+    };
+    if status.conditions.iter().any(|condition| {
+        condition.type_ == type_
+            && condition.status == value
+            && condition.reason == reason
+            && condition.message == message
+    }) {
+        return;
+    }
+    let last_transition_time = status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == type_ && condition.status == value)
+        .map(|condition| condition.last_transition_time.clone())
+        .unwrap_or_else(|| k8s_openapi::jiff::Timestamp::now().to_string());
+    status
+        .conditions
+        .retain(|condition| condition.type_ != type_);
+    status.conditions.push(StatusCondition {
+        type_: type_.to_string(),
+        status: value.to_string(),
+        reason: reason.to_string(),
+        message: message.to_string(),
+        last_transition_time,
+    });
+}
+
+fn update_placement_conditions(status: &mut KubericSetStatus) {
+    let Some(placement) = status.placement.clone() else {
+        return;
+    };
+    let (reason, message) = if let Some(reason) = placement.scheduling_reason.as_deref() {
+        (
+            reason,
+            placement.scheduling_message.clone().unwrap_or_else(|| {
+                format!("scheduler reported {reason} without additional detail")
+            }),
+        )
+    } else if placement.unschedulable_replicas > 0 {
+        (
+            "Unschedulable",
+            format!(
+                "{} replica Pods cannot be scheduled; inspect PodScheduled and available topology domains",
+                placement.unschedulable_replicas
+            ),
+        )
+    } else if placement.missing_topology_replicas > 0 {
+        (
+            "MissingTopology",
+            format!(
+                "{} replicas have no scheduled Node or selected topology label",
+                placement.missing_topology_replicas
+            ),
+        )
+    } else {
+        (
+            "TopologyObserved",
+            "all replica topology domains are known".to_string(),
+        )
+    };
+    placement_condition(
+        status,
+        "ReplicaTopologyReady",
+        if matches!(reason, "RequiredTopologyUnverified" | "SchedulingPending") {
+            None
+        } else {
+            Some(reason == "TopologyObserved")
+        },
+        reason,
+        &message,
+    );
+    placement_condition(
+        status,
+        "PrimaryBalanced",
+        match placement.reason.as_str() {
+            "Disabled"
+            | "TieBreakOnly"
+            | "InitialPlacement"
+            | "FailoverPlacement"
+            | "MaintenanceExclusion"
+            | "DensityUnavailable"
+            | "ObservationUnavailable" => None,
+            reason => Some(matches!(reason, "InsufficientImprovement" | "Completed")),
+        },
+        &placement.reason,
+        &placement.message,
+    );
+}
+
+async fn persist_placement(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    placement: crate::primary_placement::PlacementStatus,
+) -> Result<bool, String> {
+    let mut status = set.status.clone().unwrap_or_default();
+    status.placement = Some(placement);
+    update_placement_conditions(&mut status);
+    if set.status.as_ref() == Some(&status) {
+        return Ok(false);
+    }
+    api.patch_set_status(
+        &set.namespace().unwrap_or_default(),
+        &set.name_any(),
+        &status,
+        set.metadata.resource_version.as_deref(),
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn report_replica_placement(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    pods: &[Pod],
+) -> Result<(), String> {
+    let mut placement = match api.list_placement_inventory().await {
+        Ok(inventory) => crate::primary_placement::distribution(
+            set,
+            pods,
+            &inventory.nodes,
+            placement_topology_key(set),
+        ),
+        Err(error) => {
+            warn!(set = %set.name_any(), %error, "replica topology observation unavailable");
+            let mut placement =
+                crate::primary_placement::distribution(set, pods, &[], placement_topology_key(set));
+            crate::primary_placement::suppress(&mut placement, "ObservationUnavailable", error);
+            persist_placement(set, api, placement).await?;
+            return Ok(());
+        }
+    };
+    crate::primary_placement::suppress(
+        &mut placement,
+        "WaitingForReplicas",
+        "replica scheduling/readiness takes precedence over balancing",
+    );
+    persist_placement(set, api, placement).await?;
+    Ok(())
+}
+
+async fn reconcile_primary_placement(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    pods: &[Pod],
+    set_key: &str,
+) -> Result<Option<ReconcileAction>, String> {
+    use crate::primary_placement::{distribution, rebalance_target, replica_placements, suppress};
+    let inventory = match api.list_placement_inventory().await {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            warn!(set = %set.name_any(), %error, "primary placement observation unavailable");
+            let mut placement = distribution(set, pods, &[], placement_topology_key(set));
+            suppress(&mut placement, "ObservationUnavailable", error);
+            persist_placement(set, api, placement).await?;
+            return Ok(None);
+        }
+    };
+    let mut placement = distribution(set, pods, &inventory.nodes, placement_topology_key(set));
+    let Some(policy) = &set.spec.primary_balancing else {
+        suppress(
+            &mut placement,
+            "Disabled",
+            "automatic primary balancing is not configured",
+        );
+        persist_placement(set, api, placement).await?;
+        return Ok(None);
+    };
+    policy.validate()?;
+    let maintenance = api.list_maintenance_nodes().await?;
+    let candidates =
+        match replica_placements(set, pods, &inventory, &maintenance, &policy.topology_key) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                warn!(set = %set.name_any(), %error, "primary topology evidence unavailable");
+                suppress(&mut placement, "MissingTopology", error);
+                persist_placement(set, api, placement).await?;
+                return Ok(None);
+            }
+        };
+    let snapshot = set
+        .status
+        .as_ref()
+        .and_then(|status| status.stable_snapshot.as_ref())
+        .ok_or_else(|| "primary balancing requires a stable topology".to_string())?;
+    let mut observations = BTreeMap::new();
+    for member in &snapshot.members {
+        let Some(pod) = pods
+            .iter()
+            .find(|pod| pod.metadata.uid.as_deref() == Some(&member.instance_id))
+        else {
+            continue;
+        };
+        if !is_pod_ready(pod) {
+            continue;
+        }
+        let observation = tokio::time::timeout(Duration::from_secs(10), async {
+            let handle = api.create_replica_handle(member.id, pod, &set.spec).await?;
+            handle.get_status().await.map_err(|error| error.to_string())
+        })
+        .await;
+        match observation {
+            Ok(Ok(observed)) => {
+                observations.insert(member.id, observed);
+            }
+            Ok(Err(error)) => {
+                warn!(set = %set.name_any(), replica = member.id, %error, "balancing safety observation failed");
+            }
+            Err(error) => {
+                warn!(set = %set.name_any(), replica = member.id, %error, "balancing safety observation timed out");
+            }
+        }
+    }
+    let now = state.removal_clock.unix_seconds();
+    let target = rebalance_target(set, &candidates, &observations, policy, &mut placement, now);
+    let Some(target_id) = target else {
+        persist_placement(set, api, placement).await?;
+        return Ok(None);
+    };
+    let operation = start_switchover(
+        set.metadata.uid.as_deref().unwrap_or(set_key),
+        snapshot.clone(),
+        target_id,
+        now,
+    )?;
+    placement.operation_id = Some(operation.operation_id.clone());
+    placement.last_rebalance_at = Some(now);
+    let mut status = KubericSetStatus {
+        phase: Phase::Switchover,
+        target_primary: placement.target_pod.clone(),
+        operation: Some(operation.clone()),
+        placement: Some(placement),
+        ..set.status.clone().unwrap_or_default()
+    };
+    update_placement_conditions(&mut status);
+    set_operation_condition(&mut status, operation_condition(&operation, now));
+    api.patch_set_status(
+        &set.namespace().unwrap_or_default(),
+        &set.name_any(),
+        &status,
+        set.metadata.resource_version.as_deref(),
+    )
+    .await?;
+    state.drivers.lock().await.remove(set_key);
+    Ok(Some(ReconcileAction::Requeue(Duration::from_secs(1))))
+}
 
 async fn reconcile_stable_election_metadata(
     set: &KubericSet,
@@ -2500,6 +3046,10 @@ async fn apply_failover_decision(
                 conditions: Vec::new(),
                 primary_failing_since: None,
                 stable_election_metadata_refresh: None,
+                placement: set
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.placement.clone()),
             };
             persist_committed_status(
                 api,
@@ -2616,8 +3166,14 @@ async fn reconcile_durable_operation(
             Some(_) => None,
         }
     });
+    let is_rebalance = set
+        .status
+        .as_ref()
+        .and_then(|status| status.placement.as_ref())
+        .and_then(|placement| placement.operation_id.as_deref())
+        == Some(operation.operation_id.as_str());
     if let Some(error) = identity_error {
-        let now = if operation.kind == DurableOperationKind::RemoveReplica {
+        let now = if operation.kind == DurableOperationKind::RemoveReplica || is_rebalance {
             state.removal_clock.unix_seconds()
         } else {
             unix_seconds()
@@ -2688,7 +3244,7 @@ async fn reconcile_durable_operation(
         handles.insert(*replica_id, handle);
     }
 
-    let now = if operation.kind == DurableOperationKind::RemoveReplica {
+    let now = if operation.kind == DurableOperationKind::RemoveReplica || is_rebalance {
         state.removal_clock.unix_seconds()
     } else {
         unix_seconds()
@@ -2774,6 +3330,8 @@ async fn reconcile_durable_operation(
         Decision::Persist(next_operation) => {
             let mut status = set.status.clone().unwrap_or_default();
             status.operation = Some(next_operation.clone());
+            crate::primary_placement::record_completion(&mut status, now, false);
+            update_placement_conditions(&mut status);
             set_operation_condition(&mut status, operation_condition(&next_operation, now));
             api.patch_set_status(
                 &namespace,
@@ -2983,7 +3541,7 @@ async fn reconcile_durable_operation(
         Decision::Complete {
             operation,
             snapshot,
-            compensated: _,
+            compensated,
         } => {
             let snapshot = snapshot_with_observed_metadata(snapshot, &observations);
             let recovery_snapshot = snapshot.clone();
@@ -3001,6 +3559,8 @@ async fn reconcile_durable_operation(
             status.stable_snapshot = Some(snapshot);
             status.operation = Some(operation.clone());
             status.primary_failing_since = None;
+            crate::primary_placement::record_completion(&mut status, now, compensated);
+            update_placement_conditions(&mut status);
             status.stable_election_metadata_refresh =
                 Some(crate::crd::StableElectionMetadataRefreshStatus {
                     snapshot_epoch: status.epoch.clone(),
@@ -3475,6 +4035,9 @@ async fn ensure_pod(
     namespace: &str,
     index: i32,
 ) -> Result<(), String> {
+    if let Some(policy) = &set.spec.scheduling {
+        policy.validate()?;
+    }
     let pod = build_pod(set, namespace, index);
     // create_pod is already idempotent (409 → Ok)
     api.create_pod(namespace, &pod).await
@@ -3740,9 +4303,62 @@ fn build_pod(set: &KubericSet, namespace: &str, index: i32) -> Pod {
                 liveness_probe: Some(liveness_probe),
                 ..Default::default()
             }],
-            ..Default::default()
+            ..crate::scheduling::scheduling_pod_spec(
+                &set_name,
+                namespace,
+                set.spec.scheduling.as_ref(),
+            )
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod scheduling_pod_tests {
+    use super::*;
+    use crate::scheduling::{ReplicaAntiAffinityMode, SchedulingPolicy, scheduling_pod_spec};
+
+    #[test]
+    fn build_pod_applies_default_and_configured_scheduling_without_changing_identity() {
+        let mut set: KubericSet = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kuberic.io/v1",
+            "kind": "KubericSet",
+            "metadata": {"name": "orders", "namespace": "production", "uid": "set-uid"},
+            "spec": {"image": "orders:v1"}
+        }))
+        .unwrap();
+        let default_pod = build_pod(&set, "production", 2);
+        let default_spec = default_pod.spec.as_ref().unwrap();
+        assert_eq!(
+            default_spec.affinity,
+            scheduling_pod_spec("orders", "production", None).affinity
+        );
+        let mut policy: SchedulingPolicy = serde_json::from_value(serde_json::json!({
+            "topologyKey": "topology.kubernetes.io/zone",
+            "nodeSelector": {"pool": "storage"},
+            "tolerations": [{"key": "storage", "operator": "Exists", "effect": "NoSchedule"}],
+            "topologySpreadConstraints": [{
+                "maxSkew": 1, "topologyKey": "topology.kubernetes.io/zone",
+                "whenUnsatisfiable": "ScheduleAnyway",
+                "labelSelector": {"matchLabels": {"kuberic.io/set": "orders"}}
+            }]
+        }))
+        .unwrap();
+        policy.mode = ReplicaAntiAffinityMode::Required;
+        let expected = scheduling_pod_spec("orders", "production", Some(&policy));
+        set.spec.scheduling = Some(policy);
+        let configured_pod = build_pod(&set, "production", 2);
+        let configured_spec = configured_pod.spec.as_ref().unwrap();
+        assert_eq!(configured_pod.metadata, default_pod.metadata);
+        assert_eq!(configured_spec.containers, default_spec.containers);
+        assert_eq!(configured_spec.affinity, expected.affinity);
+        assert_eq!(configured_spec.node_selector, expected.node_selector);
+        assert_eq!(configured_spec.tolerations, expected.tolerations);
+        assert_eq!(
+            configured_spec.topology_spread_constraints,
+            expected.topology_spread_constraints
+        );
+        assert!(configured_spec.node_name.is_none());
     }
 }
 
