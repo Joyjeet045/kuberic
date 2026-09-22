@@ -4,6 +4,7 @@ members = [
   "kuberic-dex",
   "examples/kvstore",
   "examples/postgres",
+  "examples/sqlserver",
   "examples/sqlite",
   "kuberic-core",
   "kuberic-operator",
@@ -45,6 +46,7 @@ clap = { version = "4", features = ["derive", "env"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 crc32fast = "1"
 serial_test = "4.0.1"
+sha2 = "0.11"
 tokio-postgres = "0.7"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 kube-lease-manager = "0.12.0"
