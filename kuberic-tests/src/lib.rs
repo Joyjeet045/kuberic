@@ -2,6 +2,9 @@
 mod gateway_k8s;
 
 #[cfg(test)]
+mod node_maintenance_k8s;
+
+#[cfg(test)]
 mod lease_election;
 
 #[cfg(test)]

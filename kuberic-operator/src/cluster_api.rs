@@ -175,14 +175,7 @@ impl ClusterApi for KubeClusterApi {
         Ok(list
             .items
             .into_iter()
-            .filter(|request| request.metadata.deletion_timestamp.is_none())
-            .filter(|request| !request.spec.desired_state.releases_request())
-            .filter(|request| {
-                request
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.phase.excludes_primary_placement())
-            })
+            .filter(NodeMaintenanceRequest::excludes_primary_placement)
             .map(|request| request.spec.node_name)
             .collect())
     }

@@ -18,15 +18,13 @@ A stateful replication framework for Kubernetes. Provides quorum-based replicati
 ```
 kuberic-core/          Core replication framework (replicator, driver, runtime)
 kuberic-operator/      K8s operator (reconciler, CRD, pod management)
-kuberic-operator2/     Minimal DEX-based operator for explicitly selected sets
 kuberic-dex/           Durable execution and deterministic replay kernel
 examples/kvstore/      Replicated key-value store (HashMap + WAL)
 examples/sqlite/       Replicated SQLite database (WAL frame shipping)
 ```
 
-See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/),
-[kuberic-operator2](kuberic-operator2/), and [Kuberic DEX](kuberic-dex/) for
-crate-level documentation.
+See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/), and
+[Kuberic DEX](kuberic-dex/) for crate-level documentation.
 
 The framework provides `PodRuntime` and `WalReplicator` — your service implements lifecycle event handlers and a gRPC API. See the [kvstore](examples/kvstore/) and [sqlite](examples/sqlite/) examples.
 
@@ -81,6 +79,7 @@ such as `v0.1.0` also publishes the exact version tag.
 - [Operator design](docs/features/kuberic/operator.md) — reconciler, CRD, pod management
 - [User API](docs/features/kuberic/user-api.md) — PodRuntime, lifecycle events, StateProvider
 - [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
+- [SQL Server design](docs/features/sqlserver/design.md) — native AG contract and safety gates
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work

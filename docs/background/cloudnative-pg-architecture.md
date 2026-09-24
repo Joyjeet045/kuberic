@@ -141,7 +141,8 @@ each reconciliation it:
 5. Reconciles infrastructure: Services, Secrets, PDBs, ConfigMaps
 6. Reconciles instances: creates missing pods, deletes excess, rolls updates
 7. Evaluates failover/switchover conditions
-8. Updates `Cluster.Status` with optimistic locking (`pkg/resources/status/patch.go`)
+8. Updates `Cluster.Status`; the central controller commonly uses the
+   optimistic-locking helper in `pkg/resources/status/patch.go`
 
 ### Operator → Pod Communication
 
@@ -161,7 +162,8 @@ reads pod IPs from the Kubernetes API on every reconcile.
 
 ### Status Management
 
-Status updates use an **optimistic-locking patch pattern**:
+The central cluster controller commonly uses an **optimistic-locking patch
+pattern**:
 
 1. Deep-copy current status
 2. Apply transaction functions (modify status fields)
@@ -411,7 +413,7 @@ coordinates these changes in the correct order:
 This is the most critical part of the operator. Automatic failover handles
 unplanned primary failure.
 
-**Core source:** `internal/controller/replicas.go` (~450 lines)  
+**Core source:** `internal/controller/replicas.go` (~450 lines)
 **Entry point:** `reconcileTargetPrimaryFromPods()`
 
 ### Step-by-Step Failover Sequence
@@ -774,16 +776,10 @@ an error from the HTTP status endpoint, the operator enters failover.
 ```
 Primary unreachable or not ready
   │
-  ├─ Set targetPrimary = PendingFailoverMarker
-  │   (signals old primary to shut down if it comes back)
-  │
   ├─ enforceFailoverDelay()
   │   ├─ Record currentPrimaryFailingSinceTimestamp
   │   ├─ Wait spec.failoverDelay seconds (default 0, 30s during online upgrade)
   │   └─ If primary recovers during delay → clear timestamp, cancel failover
-  │
-  ├─ Wait for AreWalReceiversDown() == true
-  │   (all replicas have disconnected from old primary)
   │
   ├─ evaluateQuorumCheck()
   │   ├─ Strong consistency: R + W > N
@@ -792,6 +788,14 @@ Primary unreachable or not ready
   │   │   R = promotable replicas within sync standbys
   │   └─ If quorum check FAILS → block failover, stay in PhaseFailOver
   │
+  ├─ Set targetPrimary = PendingFailoverMarker
+  │   (signals old primary to shut down if it comes back)
+  │
+  ├─ Remove old primary from write-service routing
+  │
+  ├─ Wait for AreWalReceiversDown() == true
+  │   (all replicas have disconnected from old primary)
+  │
   ├─ Select best candidate: sort replicas by:
   │   1. No errors (healthy pods first)
   │   2. ReceivedLsn (highest WAL received from old primary)
@@ -799,6 +803,7 @@ Primary unreachable or not ready
   │   4. Pod name (deterministic tiebreak)
   │
   ├─ Set targetPrimary = selected candidate
+  ├─ Target instance manager acquires the primary Lease
   ├─ Instance manager on candidate: pg_ctl promote
   ├─ Promoted instance: issues CHECKPOINT
   └─ Operator: update labels, services, CRD status
@@ -1018,13 +1023,14 @@ If R + W <= N:
 **Source:** `internal/controller/replicas_quorum.go:35-134`,
 `api/v1/cluster_types.go:386-391`
 
-**Key principle:** CNPG will NOT automatically failover with potential data loss.
-If quorum cannot be established, the cluster remains unavailable until:
+**When failover quorum is enabled:** CNPG will not automatically fail over when
+the quorum predicate cannot prove that a candidate contains all acknowledged
+transactions. The cluster remains unavailable until:
 - Enough replicas recover, OR
 - An administrator manually forces promotion (accepting data loss)
 
-This differs from systems that auto-failover with `RPO > 0` — CNPG defaults
-to availability sacrifice over data loss.
+This behavior is conditional on the failover-quorum configuration; it is not a
+universal default for every CNPG cluster.
 
 ---
 
@@ -1145,10 +1151,10 @@ explicit requeue intervals for in-progress operations:
 
 **Source:** `internal/controller/cluster_controller.go:153-270`
 
-**Optimistic locking:** All status updates use optimistic locking. On conflict
-(another reconciliation updated the CRD first), the operator immediately
-retries. This is the most common requeue reason and keeps the system eventually
-consistent without heavy locking.
+**Optimistic locking:** The central cluster-status helper uses optimistic
+locking and retries conflicts. Some instance-side status updates use ordinary
+merge patches instead, so optimistic locking is supported prior art rather
+than a universal property of every CNPG status write.
 
 ---
 

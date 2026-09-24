@@ -33,7 +33,10 @@ fn gateway_nodeport_ready(service: &Service) -> bool {
     })
 }
 
-async fn connect_gateway(address: &str, authority: &str) -> Result<KvStoreClient<Channel>> {
+pub(super) async fn connect_gateway(
+    address: &str,
+    authority: &str,
+) -> Result<KvStoreClient<Channel>> {
     let channel = Endpoint::from_shared(address.to_string())?
         .origin(format!("http://{authority}").parse()?)
         .connect_timeout(Duration::from_secs(5))
@@ -43,7 +46,12 @@ async fn connect_gateway(address: &str, authority: &str) -> Result<KvStoreClient
     Ok(KvStoreClient::new(channel))
 }
 
-fn resources(client: Client, group: &str, kind: &str, plural: &str) -> Api<DynamicObject> {
+pub(super) fn resources(
+    client: Client,
+    group: &str,
+    kind: &str,
+    plural: &str,
+) -> Api<DynamicObject> {
     Api::namespaced_with(
         client,
         NAMESPACE,
@@ -71,7 +79,7 @@ fn conditions_ready(conditions: Option<&Value>, generation: i64, required: &[&st
         })
 }
 
-fn route_ready(route: &DynamicObject) -> bool {
+pub(super) fn route_ready(route: &DynamicObject) -> bool {
     route
         .data
         .pointer("/status/parents")
@@ -97,7 +105,7 @@ fn route_ready(route: &DynamicObject) -> bool {
         })
 }
 
-async fn wait_resource(
+pub(super) async fn wait_resource(
     api: &Api<DynamicObject>,
     name: &str,
     description: &str,
@@ -119,7 +127,11 @@ async fn wait_resource(
     }
 }
 
-async fn wait_set(client: Client, name: &str, primary: Option<&str>) -> Result<DynamicObject> {
+pub(super) async fn wait_set(
+    client: Client,
+    name: &str,
+    primary: Option<&str>,
+) -> Result<DynamicObject> {
     wait_resource(
         &resources(client, "kuberic.io", "KubericSet", "kubericsets"),
         name,
@@ -285,6 +297,16 @@ async fn wait_gateway(client: Client) -> Result<()> {
                 gateway_nodeport_ready(service),
                 "Envoy must expose listener 8080 on NodePort 30090 with Cluster traffic policy"
             );
+            ensure!(
+                service
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .external_traffic_policy
+                    .as_deref()
+                    == Some("Cluster"),
+                "Envoy NodePort must route across nodes from the control-plane host mapping"
+            );
             if deployment_ready(&controller)
                 && !proxies.items.is_empty()
                 && proxies.items.iter().all(deployment_ready)
@@ -340,7 +362,11 @@ async fn wait_primary_endpoint(client: Client, application: &str, primary: &str)
     }
 }
 
-async fn round_trip(client: &mut KvStoreClient<Channel>, key: &str, value: &str) -> Result<()> {
+pub(super) async fn round_trip(
+    client: &mut KvStoreClient<Channel>,
+    key: &str,
+    value: &str,
+) -> Result<()> {
     client
         .put(PutRequest {
             key: key.into(),
@@ -368,7 +394,7 @@ fn retryable_gateway_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<tonic::transport::Error>().is_some()
 }
 
-async fn retry_gateway<T>(
+pub(super) async fn retry_gateway<T>(
     mut attempt: impl AsyncFnMut() -> Result<T>,
     deadline: Instant,
     retry_delay: Duration,

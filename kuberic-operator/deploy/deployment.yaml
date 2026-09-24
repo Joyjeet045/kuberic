@@ -3225,8 +3225,11 @@ spec:
         - jsonPath: .spec.nodeName
           name: Node
           type: string
-        - jsonPath: .spec.operation
-          name: Operation
+        - jsonPath: .spec.nodeRecovery
+          name: NodeRecovery
+          type: string
+        - jsonPath: .spec.replicaRecovery
+          name: ReplicaRecovery
           type: string
         - jsonPath: .spec.desiredState
           name: Desired
@@ -3260,31 +3263,59 @@ spec:
                     - Cancel
                   type: string
                 nodeName:
+                  maxLength: 253
                   minLength: 1
+                  type: string
+                nodeRecovery:
+                  default: Return
+                  enum:
+                    - Return
+                    - MayDisappear
                   type: string
                 notBefore:
                   format: date-time
                   maxLength: 64
                   nullable: true
                   type: string
-                operation:
-                  default: Reboot
-                  enum:
-                    - Reboot
-                    - Reimage
-                    - OsUpgrade
-                    - Replace
-                    - Shutdown
-                  type: string
                 provider:
+                  maxLength: 128
                   nullable: true
                   type: string
                 providerEventId:
+                  maxLength: 256
                   nullable: true
+                  type: string
+                releaseNodeUid:
+                  maxLength: 128
+                  minLength: 1
+                  nullable: true
+                  type: string
+                replicaRecovery:
+                  default: Preserve
+                  enum:
+                    - Preserve
+                    - Rebuild
                   type: string
               required:
                 - nodeName
               type: object
+              x-kubernetes-validations:
+                - rule: self.nodeName == oldSelf.nodeName
+                  message: nodeName is immutable; create a new request
+                - rule: self.nodeRecovery == oldSelf.nodeRecovery
+                  message: nodeRecovery is immutable; create a new request
+                - rule: self.replicaRecovery == oldSelf.replicaRecovery
+                  message: replicaRecovery is immutable; create a new request
+                - rule: has(self.provider) == has(oldSelf.provider) && (!has(self.provider) || self.provider == oldSelf.provider)
+                  message: provider is immutable; create a new request
+                - rule: has(self.providerEventId) == has(oldSelf.providerEventId) && (!has(self.providerEventId) || self.providerEventId == oldSelf.providerEventId)
+                  message: providerEventId is immutable; create a new request
+                - rule: has(self.notBefore) == has(oldSelf.notBefore) && (!has(self.notBefore) || self.notBefore == oldSelf.notBefore)
+                  message: notBefore is immutable; create a new request
+                - rule: oldSelf.desiredState == 'Prepare' || self.desiredState == oldSelf.desiredState
+                  message: a release decision cannot be changed; create a new request for another event
+                - rule: self.desiredState != 'Prepare' || !has(self.releaseNodeUid)
+                  message: releaseNodeUid requires Complete or Cancel
             status:
               nullable: true
               properties:
@@ -3330,7 +3361,9 @@ spec:
                 blockedReason:
                   enum:
                     - NodeNotFound
+                    - NodeNotReady
                     - NodeIncarnationChanged
+                    - ReplicaRecoveryIncomplete
                     - InvalidNotBefore
                     - InvalidDeadline
                     - BlockedByQuorum
@@ -3399,6 +3432,52 @@ spec:
                 preparedAt:
                   nullable: true
                   type: string
+                preparedSets:
+                  items:
+                    properties:
+                      hostsPrimary:
+                        default: false
+                        type: boolean
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      noEligibleTarget:
+                        default: false
+                        type: boolean
+                      primaryMoved:
+                        default: false
+                        type: boolean
+                      quorumWithoutNode:
+                        default: false
+                        type: boolean
+                      replicas:
+                        items:
+                          properties:
+                            isPrimary:
+                              default: false
+                              type: boolean
+                            podName:
+                              type: string
+                            podUid:
+                              type: string
+                          required:
+                            - podName
+                            - podUid
+                          type: object
+                        type: array
+                    required:
+                      - name
+                      - namespace
+                    type: object
+                  nullable: true
+                  type: array
+                releasedAt:
+                  nullable: true
+                  type: string
+                releasedNodeUid:
+                  nullable: true
+                  type: string
               type: object
           required:
             - spec
@@ -3431,7 +3510,7 @@ rules:
   verbs: ["update"]
 - apiGroups: ["kuberic.io"]
   resources: ["nodemaintenancerequests"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get", "list", "watch", "patch"]
 - apiGroups: ["kuberic.io"]
   resources: ["nodemaintenancerequests/status"]
   verbs: ["get", "update", "patch"]
@@ -3500,6 +3579,10 @@ spec:
         env:
         - name: RUST_LOG
           value: "info"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         resources:
           requests:
             memory: "64Mi"

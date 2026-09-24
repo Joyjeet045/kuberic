@@ -13,6 +13,7 @@ use super::api::{
 pub struct NodeRef {
     pub name: String,
     pub uid: String,
+    pub ready: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -71,8 +72,19 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> Discovery {
     }
 
     let node_uid = Some(node.uid.clone());
-    let affected_sets = discover_affected_sets(&input.spec.node_name, input.pods);
-    let rediscovered = status.node_uid != node_uid || status.affected_sets != affected_sets;
+    let affected_sets = discover_affected_sets(&input.spec.node_name, input.pods, input.previous);
+    let rediscovered = status.node_uid != node_uid
+        || status.affected_sets.len() != affected_sets.len()
+        || status
+            .affected_sets
+            .iter()
+            .zip(&affected_sets)
+            .any(|(previous, current)| {
+                previous.namespace != current.namespace
+                    || previous.name != current.name
+                    || previous.hosts_primary != current.hosts_primary
+                    || previous.replicas != current.replicas
+            });
     status.node_uid = node_uid;
     status.affected_sets = affected_sets;
     if rediscovered || status.discovery_completed_at.is_none() {
@@ -85,6 +97,7 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> Discovery {
 fn discover_affected_sets(
     node_name: &str,
     pods: &[MaintenancePod],
+    previous: &NodeMaintenanceRequestStatus,
 ) -> Vec<AffectedKubericSetStatus> {
     let mut grouped: BTreeMap<(String, String), AffectedKubericSetStatus> = BTreeMap::new();
 
@@ -112,9 +125,40 @@ fn discover_affected_sets(
         entry.hosts_primary |= pod.is_primary;
     }
 
+    for previous in previous
+        .affected_sets
+        .iter()
+        .chain(previous.prepared_sets.iter().flatten())
+    {
+        let entry = grouped
+            .entry((previous.namespace.clone(), previous.name.clone()))
+            .or_insert_with(|| AffectedKubericSetStatus {
+                namespace: previous.namespace.clone(),
+                name: previous.name.clone(),
+                replicas: Vec::new(),
+                hosts_primary: false,
+                primary_moved: false,
+                no_eligible_target: false,
+                quorum_without_node: false,
+            });
+        for replica in &previous.replicas {
+            if !entry
+                .replicas
+                .iter()
+                .any(|current| current.pod_uid == replica.pod_uid)
+            {
+                entry.replicas.push(AffectedReplicaStatus {
+                    is_primary: false,
+                    ..replica.clone()
+                });
+            }
+        }
+    }
     let mut sets: Vec<AffectedKubericSetStatus> = grouped.into_values().collect();
     for set in &mut sets {
-        set.replicas.sort_by(|a, b| a.pod_name.cmp(&b.pod_name));
+        set.replicas.sort_by(|left, right| {
+            (&left.pod_name, &left.pod_uid).cmp(&(&right.pod_name, &right.pod_uid))
+        });
     }
     sets
 }
@@ -182,7 +226,7 @@ fn set_prepared_condition(status: &mut NodeMaintenanceRequestStatus, now: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node_maintenance::api::{MaintenanceDesiredState, MaintenanceOperation};
+    use crate::node_maintenance::api::{MaintenanceDesiredState, NodeRecovery, ReplicaRecovery};
 
     const NOW: &str = "2026-09-06T20:00:00Z";
 
@@ -199,12 +243,14 @@ mod tests {
     fn spec(node: &str) -> NodeMaintenanceRequestSpec {
         NodeMaintenanceRequestSpec {
             node_name: node.to_string(),
-            operation: MaintenanceOperation::Reboot,
+            node_recovery: NodeRecovery::Return,
+            replica_recovery: ReplicaRecovery::Preserve,
             desired_state: MaintenanceDesiredState::Prepare,
             provider: Some("Manual".to_string()),
             provider_event_id: Some("event-123".to_string()),
             not_before: None,
             deadline: Some("2026-09-06T21:00:00Z".to_string()),
+            release_node_uid: None,
         }
     }
 
@@ -212,6 +258,7 @@ mod tests {
         NodeRef {
             name: "worker-04".to_string(),
             uid: uid.to_string(),
+            ready: true,
         }
     }
 
