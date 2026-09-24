@@ -3,12 +3,20 @@ resolver = "2"
 members = [
   "kuberic-dex",
   "examples/kvstore",
+  "examples/kvstore2",
   "examples/postgres",
   "examples/sqlserver",
   "examples/sqlite",
+  "kuberic-protocol",
+  "kuberic-runtime",
+  "kuberic-runtime-internal",
+  "kuberic-agent",
+  "kuberic-controller",
+  "kuberic-wire",
   "kuberic-core",
   "kuberic-operator",
   "kuberic-tests",
+  "kuberic-level-tests",
   "sqlite-commit-barrier",
 ]
 
@@ -24,12 +32,14 @@ rust-version = "1.85"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tokio-stream = "0.1"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
+axum = "0.8"
 base64 = "0.23"
 futures = "0.3"
 async-trait = "0.1"
 serde = "1"
 serde_json = "1"
+sha2 = "0.11"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tonic = "0.14"
@@ -46,7 +56,6 @@ clap = { version = "4", features = ["derive", "env"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 crc32fast = "1"
 serial_test = "4.0.1"
-sha2 = "0.11"
 tokio-postgres = "0.7"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 kube-lease-manager = "0.12.0"

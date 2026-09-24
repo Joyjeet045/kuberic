@@ -1,0 +1,158 @@
+name: Level-Triggered CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: Run the repeated full crash and partition matrix
+        type: boolean
+        default: true
+  schedule:
+    - cron: "17 3 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: level-triggered-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+  KIND_CLUSTER_NAME: kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}
+  KUBECONFIG: /tmp/kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
+  KUBE_CONTEXT: kind-kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}
+  KUBERIC_AGENT_BEARER_TOKEN: level-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  targeted:
+    name: Targeted checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: rustfmt, clippy
+          build-warnings: ""
+      - uses: taiki-e/install-action@protoc
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint level-triggered packages
+        run: >-
+          cargo clippy
+          -p kuberic-protocol
+          -p kuberic-wire
+          -p kuberic-runtime
+          -p kuberic-runtime-internal
+          -p kuberic-agent
+          -p kuberic-controller
+          -p kvstore2
+          -p kuberic-level-tests
+          --all-targets --all-features -- -D warnings
+      - name: Test level-triggered packages
+        run: >-
+          cargo test
+          -p kuberic-protocol
+          -p kuberic-wire
+          -p kuberic-runtime
+          -p kuberic-runtime-internal
+          -p kuberic-agent
+          -p kuberic-controller
+          -p kvstore2
+      - name: Compile isolated KinD tests
+        run: cargo test -p kuberic-level-tests --no-run
+      - name: Verify source and dependency isolation
+        run: |
+          scripts/check_level_triggered_scope.sh origin/main
+          scripts/check_level_triggered_dependencies.sh
+          scripts/check_level_triggered_documentation.sh
+
+  bootstrap-kind:
+    name: PR live smoke
+    needs: targeted
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+      - uses: taiki-e/install-action@protoc
+      - uses: taiki-e/install-action@just
+      - name: Create isolated KinD cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.30.0
+          node_image: kindest/node:v1.34.0
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          config: deploy/kind-config.yaml
+          kubeconfig: ${{ env.KUBECONFIG }}
+      - name: Record cluster ownership
+        run: |
+          printf '%s\n' \
+            "cluster=${KIND_CLUSTER_NAME}" \
+            "context=${KUBE_CONTEXT}" \
+            "kubeconfig=${KUBECONFIG}" \
+            | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
+          just verify-kind-context
+      - name: Build and load isolated images
+        run: just level-triggered-images
+      - name: Install isolated stack
+        run: just level-triggered-install
+      - name: Run bootstrap scenario
+        run: just level-triggered-kind-test bootstrap
+      - name: Run replacement scenario
+        run: just level-triggered-kind-test replacement
+      - name: Run failover scenario
+        run: just level-triggered-kind-test failover
+      - name: Collect diagnostics
+        if: failure()
+        run: just level-triggered-diagnostics
+
+  full-kind:
+    name: Full adversarial matrix (${{ matrix.run }})
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full_matrix)
+    needs: targeted
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+      - uses: taiki-e/install-action@protoc
+      - uses: taiki-e/install-action@just
+      - name: Create isolated KinD cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.30.0
+          node_image: kindest/node:v1.34.0
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          config: deploy/kind-config.yaml
+          kubeconfig: ${{ env.KUBECONFIG }}
+      - name: Record cluster ownership
+        run: |
+          printf '%s\n' \
+            "cluster=${KIND_CLUSTER_NAME}" \
+            "context=${KUBE_CONTEXT}" \
+            "kubeconfig=${KUBECONFIG}" \
+            | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
+          just verify-kind-context
+      - name: Build and load isolated images
+        run: just level-triggered-images
+      - name: Install isolated stack
+        run: just level-triggered-install
+      - name: Run full adversarial matrix
+        run: just level-triggered-kind-test all
+      - name: Collect diagnostics
+        if: failure()
+        run: just level-triggered-diagnostics

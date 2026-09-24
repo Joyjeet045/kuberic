@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package kuberic.level.v1;
+
+import "kuberic.proto";
+
+message ReplicationItem {
+  uint32 protocol_version = 1;
+  ReplicaIdentity sender = 2;
+  Epoch epoch = 3;
+  string previous_configuration_id = 4;
+  string current_configuration_id = 5;
+  int64 lsn = 6;
+  int64 committed_lsn = 7;
+  bytes data = 8;
+  ReplicaIdentity receiver = 9;
+  string sender_session_id = 10;
+  string receiver_session_id = 11;
+}
+
+message ReplicationAck {
+  uint32 protocol_version = 1;
+  ReplicaIdentity sender = 2;
+  ReplicaIdentity receiver = 3;
+  Epoch epoch = 4;
+  string previous_configuration_id = 5;
+  string current_configuration_id = 6;
+  int64 received_lsn = 7;
+  int64 applied_lsn = 8;
+  int64 committed_lsn = 9;
+  string sender_session_id = 10;
+  string receiver_session_id = 11;
+}
+
+message CopyItem {
+  uint32 protocol_version = 1;
+  string build_id = 2;
+  ReplicaIdentity sender = 3;
+  ReplicaIdentity receiver = 4;
+  Epoch epoch = 5;
+  string current_configuration_id = 6;
+  uint64 sequence = 7;
+  int64 lsn = 8;
+  int64 committed_lsn = 9;
+  int64 replication_boundary_lsn = 10;
+  bool final_item = 11;
+  bytes data = 12;
+  bool snapshot_chunk = 13;
+  string sender_session_id = 14;
+  string receiver_session_id = 15;
+}
+
+message CopyAck {
+  uint32 protocol_version = 1;
+  string build_id = 2;
+  ReplicaIdentity sender = 3;
+  ReplicaIdentity receiver = 4;
+  Epoch epoch = 5;
+  string current_configuration_id = 6;
+  uint64 sequence = 7;
+  int64 durable_lsn = 8;
+  int64 replication_boundary_lsn = 9;
+  bool final_item = 10;
+  bool snapshot_chunk = 11;
+  string sender_session_id = 12;
+  string receiver_session_id = 13;
+}
+
+service ReplicationData {
+  rpc Replicate(stream ReplicationItem) returns (stream ReplicationAck);
+  rpc Build(stream CopyItem) returns (stream CopyAck);
+}

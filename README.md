@@ -21,10 +21,18 @@ kuberic-operator/      K8s operator (reconciler, CRD, pod management)
 kuberic-dex/           Durable execution and deterministic replay kernel
 examples/kvstore/      Replicated key-value store (HashMap + WAL)
 examples/sqlite/       Replicated SQLite database (WAL frame shipping)
+
+kuberic-protocol/      Independent level-triggered domain model and evaluator
+kuberic-runtime/       Independent application and replication runtime
+kuberic-agent/         Durable replica-local authority and process hosting
+kuberic-controller/    operator.kuberic.io/v1alpha1 controller
+examples/kvstore2/     Level-triggered conformance application
 ```
 
 See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/), and
-[Kuberic DEX](kuberic-dex/) for crate-level documentation.
+[Kuberic DEX](kuberic-dex/) for classic crate-level documentation. The
+[level-triggered operator guide](docs/features/kuberic/level-triggered-operator.md)
+documents the independent experimental stack.
 
 The framework provides `PodRuntime` and `WalReplicator` — your service implements lifecycle event handlers and a gRPC API. See the [kvstore](examples/kvstore/) and [sqlite](examples/sqlite/) examples.
 
@@ -62,6 +70,12 @@ external manifests or Helm charts.
 
 The operator watches `KubericSet` resources and manages the full lifecycle: pod creation, Open → Idle → Active → Primary promotion, failover, and scale up/down.
 
+The independent level-triggered controller uses
+`operator.kuberic.io/v1alpha1` and distinct deployment assets. It currently
+supports fixed-cardinality bootstrap, replacement, ordinary failover, and
+non-destructive quorum-loss recovery for `kvstore2`; its images remain
+local/CI-only.
+
 ## Continuous Delivery
 
 After CI passes, pushes to `main` and version tags publish Linux AMD64 images to
@@ -82,6 +96,7 @@ such as `v0.1.0` also publishes the exact version tag.
 - [SQL Server design](docs/features/sqlserver/design.md) — native AG contract and safety gates
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
+- [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md) — independent stack deployment, authority, supported operations, and diagnostics
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
 
 ## License

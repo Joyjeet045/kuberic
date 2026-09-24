@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvstore2
+spec:
+  selector:
+    operator.kuberic.io/set-name: kvstore2
+    operator.kuberic.io/instance: disabled
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

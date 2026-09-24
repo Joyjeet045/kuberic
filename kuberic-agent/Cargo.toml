@@ -1,0 +1,29 @@
+[package]
+name = "kuberic-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Replica agent and durable hosting boundary for the level-triggered Kuberic stack"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+kuberic-protocol = { path = "../kuberic-protocol" }
+kuberic-runtime = { path = "../kuberic-runtime" }
+kuberic-runtime-internal = { path = "../kuberic-runtime-internal" }
+kuberic-wire = { path = "../kuberic-wire" }
+rusqlite.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }
+tonic.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,8 @@
+apiVersion: operator.kuberic.io/v1alpha1
+kind: KubericSet
+metadata:
+  name: kvstore2
+spec:
+  replicas: 3
+  image: localhost/kvstore2:level-triggered-v1
+  failoverDelaySeconds: 10

@@ -1,13 +1,15 @@
 # Level-Triggered Kuberic Operator
 
-> **Status:** Proposal
+> **Status:** Implemented MVP; retained as the historical design proposal
 >
-> **Scope:** A future Kuberic operator and replica-agent contract. This proposal
+> **Scope:** The independent operator and replica-agent contract. This design
 > does not change the existing `kuberic.io/v1` operator or CRD.
 >
-> This document specifies architecture, authority, and safety behavior only. It
-> does not define an implementation roadmap, migration sequence, or phased
-> delivery plan.
+> The as-built operational contract, deployment commands, supported behavior,
+> and limitations are documented in the
+> [level-triggered operator guide](../features/kuberic/level-triggered-operator.md).
+> This document preserves the design rationale and does not define a migration
+> from classic v1.
 
 ## Summary
 
@@ -257,7 +259,8 @@ Examples include:
 - operation ID;
 - operation kind;
 - target replica and exact incarnation;
-- start time or failover-delay timestamp.
+- exact Pod/PVC identity for a fresh agent store;
+- a persisted failure-observation timestamp when failover delay applies.
 
 ### Fail Closed
 
@@ -275,6 +278,7 @@ evidence results in `Wait` or `Unsafe`.
 | Replica process session | Ephemeral agent session ID |
 | Replica-local role, epoch, and configuration | Persisted replica-agent state |
 | Committed topology | Quorum-attested configuration accepted into status |
+| Current out-of-authority provisioning target | Compact `status.provisioning` intent |
 | Current transition target | Compact `status.transition` intent |
 | Effective transition safety inputs | Frozen `status.transition.effectivePolicy` |
 | Reconfiguration authority | Previous/Current Configuration, epochs, roles, and exact replica incarnations selected by the operator |
@@ -307,7 +311,7 @@ metadata:
 spec:
   replicas: 3
   image: example:v1
-  failoverDelay: 10
+  failoverDelaySeconds: 10
 status:
   initialized: true
   observedGeneration: 4
@@ -316,18 +320,31 @@ status:
     epoch:
       dataLossNumber: 1
       configurationNumber: 8
-    primaryId: 2
     members:
-      - id: 1
+      - replicaId: 1
         instanceId: "..."
-      - id: 2
+        agentGeneration: "..."
+        role: activeSecondary
+      - replicaId: 2
         instanceId: "..."
-      - id: 3
+        agentGeneration: "..."
+        role: primary
+      - replicaId: 3
         instanceId: "..."
+        agentGeneration: "..."
+        role: activeSecondary
     writeQuorum: 2
+  provisioning:
+    replaces:
+      replicaId: 3
+      instanceId: "old-pod-uid"
+      agentGeneration: "old-generation"
+    podUid: "new-pod-uid"
+    pvcUid: "..."
+    operationId: "..."
   transition:
-    id: "..."
-    kind: Failover
+    transitionId: "..."
+    kind: failover
     specGeneration: 4
     effectivePolicy:
       replicaSetSize: 3
@@ -340,21 +357,22 @@ status:
       epoch:
         dataLossNumber: 1
         configurationNumber: 9
-      primaryId: 2
       members:
-        - id: 1
+        - replicaId: 1
           instanceId: "..."
-          role: Secondary
-        - id: 2
+          agentGeneration: "..."
+          role: activeSecondary
+        - replicaId: 2
           instanceId: "..."
-          role: Primary
-        - id: 3
+          agentGeneration: "..."
+          role: primary
+        - replicaId: 3
           instanceId: "..."
-          role: Secondary
-    startedAt: "..."
+          agentGeneration: "..."
+          role: activeSecondary
   conditions:
     - type: Ready
-      status: "True"
+      status: "true"
       reason: Stable
 ```
 
@@ -367,12 +385,31 @@ The following do not belong in the public status:
 - loop indexes over members;
 - serialized intermediate observations;
 - generic workflow history.
+- a duplicated `primaryId` beside the uniquely validated `Primary` member;
+- an `identity` wrapper around configuration-member identity fields.
 
 `status.transition` is optional. Steady state has no transition. Before
 bootstrap, Kubernetes scaffolding derives from `spec.replicas`; afterward it
 uses the frozen accepted replica-set size. Every replacement or primary
 authority change requires explicit Previous/Current Configuration intent and a
 new current epoch.
+
+`status.provisioning` is also optional and identifies at most one exact fresh
+Pod/PVC target that remains outside replication authority. It is persisted
+before `InitializeAgentStore` or build dispatch. It does not count toward
+quorum, does not modify topology, and may be abandoned only before that
+incarnation enters an outstanding CC and after any old work is proven unable to
+complete. Bootstrap uses its persisted Bootstrap transition directly instead
+of a separate provisioning marker. Beginning the replacement PC/CC transition
+atomically clears the matching provisioning intent.
+
+Configuration members expose `replicaId`, `instanceId`, `agentGeneration`, and
+`role` directly. The public CRD derives the primary from the single member with
+role `primary`; it does not persist a duplicate `primaryId`. Canonical runtime
+types may retain that derived value internally and the protobuf compatibility
+field remains populated. Deserialization accepts the former nested-member and
+explicit-primary JSON shapes so existing durable agent metadata remains
+readable, while all new status serialization uses the compact shape.
 
 Transition ownership is asymmetric:
 
@@ -426,6 +463,17 @@ The following invariants apply:
     frozen `effectivePolicy.replicaSetSize`.
 15. A changed `spec.replicas` value does not authorize Kubernetes deletion,
     creation, or replication membership changes.
+16. `status.provisioning` never grants role, membership, quorum, or write
+    authority. Its old exact identity, new Pod UID, new PVC UID, and operation
+    ID are persisted. The resource UID, logical replica ID, initialization ID,
+    and durable generation are derived and must match the
+    `InitializeAgentStore` command.
+17. At most one provisioning intent exists, and no unrelated membership
+    transition begins while it is active.
+18. `status.observedGeneration` advances only after the accepted exact
+    incarnations report the requested image and the requested fixed policy
+    matches the frozen effective policy. Unsupported image, replica-count, or
+    failover-delay drift remains visible without mutating authority.
 
 ### Initialization Authority
 
@@ -515,10 +563,460 @@ report:
 - pending runtime action identity and bounded terminal result;
 - build or retirement state.
 
+The durable state is stored in a replica-local SQLite database on the replica
+PVC, under a Kuberic-owned metadata directory separate from application data.
+The database records the owning resource UID, logical replica ID, exact replica
+incarnation, durable agent generation, and schema version so persisted
+authority cannot be silently rebound to a different Pod incarnation.
+
+SQLite transactions define the agent's local commit boundary:
+
+- command intent and pending runtime-action identity are committed before the
+  corresponding runtime effect is issued;
+- authority and terminal evidence required for recovery are committed before
+  command completion is acknowledged;
+- related epoch, configuration, role, access, deactivation, and action updates
+  are committed atomically;
+- schema migration is explicit and transactional;
+- missing, corrupt, incompatible, or identity-mismatched storage is reported
+  as `Unsafe` rather than recreated as empty authority.
+
+The agent is the single writer. SQLite journaling and synchronization settings
+must provide durable commit semantics on the supported PVC filesystem and are
+validated by crash-boundary tests. The database does not contain application
+state. A process session ID remains ephemeral and changes on every agent
+process start; only the durable agent generation survives a process restart.
+
+Database absence has two distinct meanings:
+
+1. **Fresh provisioning:** The exact Pod and PVC were created for a
+   never-initialized bootstrap member or for a replacement that is still
+   outside PC and CC. The agent reports an uninitialized store and does not
+   create authority by itself. After the operator persists the corresponding
+   bootstrap or replacement intent, it may issue one fenced
+   `InitializeAgentStore` command naming the resource UID, logical replica ID,
+   Pod UID, PVC UID, initialization ID, operator-assigned durable agent
+   generation, and effective policy. The generation is deterministically
+   derived from the persisted initialization identity, allowing the complete
+   exact configuration to be persisted before store creation. The agent
+   atomically creates the schema and adopts that generation.
+2. **Established storage missing:** The Pod incarnation or accepted/outstanding
+   authority requires an existing durable generation, but the database is
+   absent, unreadable, incompatible, or identity-mismatched. The agent and
+   operator report `Unsafe`; they do not create a replacement database on that
+   PVC.
+
+A newly created PVC UID and persisted transition intent are therefore
+provisioning evidence, not authority by themselves. A retained PVC must not be
+rebound to a new Pod UID in the minimum contract.
+
+Runtime-effect recovery follows an explicit ordering:
+
+1. validate the command against current durable authority;
+2. commit operation intent and the pending runtime-effect identity;
+3. issue or reissue the idempotent runtime effect;
+4. observe its durable or reconstructible postcondition;
+5. atomically commit the resulting authority and terminal evidence;
+6. acknowledge command completion.
+
+Phase 3 implements this boundary in `kuberic-agent`. Process hosting and
+runtime effect sequencing live in the agent crate; unpublished
+`kuberic-runtime-internal` owns the narrow persistence and postcondition data
+contracts. `SqliteStore` is created only from validated bootstrap or
+replacement initialization authority, records exact storage identity, uses
+WAL with `synchronous=FULL`, and implements the narrow authority, replication,
+local-write, build-authorization, and build-progress capabilities. Reopen
+rejects missing established metadata, corruption, schema mismatch, and
+identity mismatch. Pending effect intent and retained terminal results are
+durable independently of process-session identity.
+
+A committed intent does not imply that its runtime effect ran. After a crash,
+the agent distinguishes pending intent from durable completion and resumes from
+the observed postcondition. Runtime authority that gates replication is
+persisted before the runtime can acknowledge work in that authority. In
+particular, a secondary must durably accept the exact epoch, configuration,
+replica incarnation, and agent generation before acknowledging replication in
+that epoch.
+
+Application state and RA metadata do not share a transaction. Recovery
+therefore uses conservative postconditions: application acknowledgements prove
+durable application progress, runtime operations are safe to repeat, and RA
+completion is recorded only after the corresponding application/runtime
+postcondition is observed. A crash between those commits causes re-observation
+or repetition, never inferred success or rollback of acknowledged progress.
+
+The application API follows Service Fabric V1 semantics with Rust async
+interfaces. Service lifecycle (`Open`, `ChangeRole`, `Close`, and `Abort`) is
+separate from state-provider callbacks (`UpdateEpoch`, committed progress,
+copy context/state, and data loss). Durable operation acceptance is an explicit
+acknowledgement on a service-owned operation stream, not a state-provider
+callback. Copy state is
+an opaque chunk stream installed through a captured LSN boundary; incremental
+replication remains a distinct ordered stream. Exact replica identity, epoch,
+configuration fencing, quorum accounting, and build sequencing remain runtime
+and agent responsibilities rather than application authority.
+
+The runtime MUST preserve the exact SF V1 interface divisions from
+`FabricRuntime.idl:495–539,577–633,687–758`, collapsing COM Begin/End pairs
+into async Rust methods:
+
+- `Replicator`: Open returning the replication address, ChangeRole(epoch,
+  role), UpdateEpoch, Close, Abort, CurrentProgress, and CatchUpCapability.
+- `PrimaryReplicator: Replicator`: OnDataLoss, UpdateCatchUpReplicaSetConfiguration,
+  WaitForCatchUpQuorum, UpdateCurrentReplicaSetConfiguration, BuildReplica,
+  and RemoveReplica.
+- `StateReplicator`: Replicate(operation data), GetReplicationStream,
+  GetCopyStream, and UpdateReplicatorSettings.
+- `StateProvider`: UpdateEpoch(epoch, previous epoch last LSN),
+  GetLastCommittedSequenceNumber, OnDataLoss, GetCopyContext, and GetCopyState.
+  Copy context and copy state are operation-data streams.
+
+`StatefulServiceReplica::open` MUST return the control `Replicator`, matching
+EndOpen. During Open the service selects a factory through its stateful
+partition and calls CreateReplicator with its state provider and settings.
+CreateReplicator returns both control and state interfaces. The service keeps
+the `StateReplicator` and consumes its copy/replication streams; `PodRuntime`
+retains and drives exactly the returned control interface. The primary
+interface is a separate, explicit Rust interface reference, corresponding to
+COM interface discovery. Constructor injection into `PodRuntime` is not the
+public replicator ownership model.
+
+`DefaultReplicatorFactory` provides the built-in exact-authority replicator;
+custom factories use the same partition boundary. The default factory
+selects a non-COM durable-storage adapter, independently of the SF
+`StateProvider`. Services and custom replicators MUST NOT be required to
+implement default-engine storage callbacks merely to implement the SF API.
+The factory constructs one complete shared `DefaultReplicatorInner` during
+CreateReplicator. Hosting retains application lifetime, one-shot registration,
+effect ordering, exact returned-interface identity, and control/primary
+discovery. A primary-capable bundle derives control and primary views from one
+implementation; independently supplied control and primary objects are not a
+valid construction. The public factory context exposes immutable identity and partition
+access capabilities, never a concrete hosting or default-engine root.
+A managed bridge carries Kuberic hosting/default-replicator integration
+through agent-owned registration and is not returned in the
+application-visible interface bundle. The construction token comes from the
+unpublished runtime-internal package so ordinary runtime consumers cannot
+forge the hosting boundary.
+User code constructs only the SF-shaped control, primary, and state interface
+bundle. Custom replicators own their data plane independently.
+Reservations, retries, exact ACK handling, authority admission, durable
+quorum finalization, queues, and copy/build bookkeeping belong to a distinct
+replication engine and MUST NOT be added to the public SF traits.
+
+Replica-local persistence uses least-authority interfaces even when one SQLite
+database implements them: replica authority, agent effect intent/result,
+replication progress, local-write journal, build authorization, and build
+execution progress. Build execution cannot authorize itself, replication code
+cannot mutate agent effect state, and application durability remains a
+separate transaction boundary.
+
+Delivery acknowledgement is explicit and one-shot. Dropping a delivered
+operation is not durable acceptance. Application acceptance precedes durable
+authority/build applied progress, which precedes an applied peer ACK; quorum
+readiness precedes application commit and retry-record completion, which
+precede client success. A receive-only ACK may precede application acceptance
+and never grants quorum credit.
+Agent status `currentProgress` is observation and retained-history repair input,
+not certified replication progress. It MUST NOT grant catch-up or client-commit
+quorum credit. `verifiedReplicationLsn` is a separate durable certificate bound
+to the report's exact identity, process session, epoch, and PC/CC authority.
+The agent accepts it only from the authenticated live peer session, and the
+replicator revalidates the authority before granting progress credit. Only an
+authority-bound applied replication ACK, verified-progress certificate, or
+completed build handoff may advance another replica's quorum slot.
+Transport remains caller-supplied, including build request dispatch and ACK
+delivery. Waiting for a build or catch-up quorum requires observed completion,
+not successful enqueueing.
+
+Lifecycle ordering follows Service Fabric: role changes fence access as
+required and drive the replicator before notifying the service. Primary
+promotion performs `ChangeRole`, replicator/state-provider `UpdateEpoch`, and
+then application `ChangeRole`. The completed role is published only after
+every required stage succeeds; partial completion remains explicit recovery
+evidence. Graceful close fences access, closes the replicator, and then closes
+the service. Abort stops the returned control before application teardown.
+Failed/cancelled Open aborts created interfaces. Failures, cancellation, epoch
+regression, and stale ACKs MUST fail closed.
+
+Copy context and copy state retain their multi-item stream semantics.
+Snapshot chunks, the captured copy boundary, and post-boundary replication use
+one bounded ordered build stream. Provider enumeration does not hold the global
+runtime effect/write lock. Retained-operation enumeration also occurs outside
+that lock after the build is installed as a catching-up target, so concurrent
+writes enter its pending handoff lane. Exact duplicate durable snapshot chunks
+are acknowledged without application redelivery; conflicting contents are
+rejected.
+
+Phase 4 implements the replica-local RA boundary. `EnsureConfiguration`
+commands are admitted against exact resource, incarnation, durable generation,
+epoch, PC/CC, policy, and operation identity. The agent persists private
+Demote, GetLSN, Catchup, Deactivate, ReplicatorRole, Epoch,
+ApplicationRole, and Activate stages. Each runtime effect has a durable
+sequence and retained postcondition, so restart resumes the first incomplete
+stage rather than exposing a controller workflow cursor.
+
+Partition information and independent read/write access are available through
+the application partition. Load and fault reports are accepted by the hosting
+owner and included in agent observations. Primary promotion uses separate
+durable replicator-role, provider-epoch, and application-role effects.
+
+Runtime replication and copy messages are implementation-neutral contracts in
+`kuberic-runtime-internal`; protobuf validation and conversion belong to the
+agent. The runtime crates no longer depend on `kuberic-wire`. The agent binds
+separate authenticated control/peer and replication listeners, opens the
+runtime only after both listeners bind, assigns a fresh process session,
+rejects retired sender or receiver sessions, and exposes bounded reliable send
+windows with reconnect, cancellation, truthful retained-range capability, and
+full-copy fallback.
+
+Phase 4 hardening rejects unequal same-epoch authority under a new operation
+ID while permitting only exact current-only completion of an admitted PC/CC
+transition. Changed authority cannot restore access during admission; primary
+read activation waits for local catch-up. Managed catch-up releases the
+progress lock so ACKs can complete it, and matching commands are serialized
+and revalidated at durable stage boundaries.
+
+Serving starts fail-closed listeners before reconstructing live hosting from
+durable authority, role, access, pending effect, and retained stage evidence.
+Readiness is revoked and the runtime is aborted on shutdown. Session
+replacement holds an owned delivery lease, so it cannot return while an
+old-session mutation remains in flight.
+
+Reliable windows require full copy when retained history is absent or
+cancelled. Older duplicate replication returns a cumulative received
+watermark compatible with applied progress. Reports retry until durable
+authority and repeated live snapshots agree, and deactivation retains its own
+epoch. Build selection is admitted by the agent before source execution; the
+engine cannot manufacture build permission. Returned copy-stream drop
+propagates cancellation into provider iteration and removes the build.
+
+The Phase 5 controller is isolated in `kuberic-controller` and watches only
+`operator.kuberic.io/v1alpha1`. Each reconcile loads the latest CR, owned Pods,
+PVCs, write Service, exact Kubernetes UIDs and resource versions, and available
+agent reports before normalizing one immutable `ObservationSnapshot`. The pure
+evaluator remains the only authority-selection owner. Status replacement uses
+optimistic resource-version fencing, routing changes use UID and
+resource-version tests, and one observed snapshot can dispatch at most one
+agent command. Stable, waiting, and recoverable unsafe states all have bounded
+re-observation intervals; agent startup `Unavailable` is a wait rather than
+permission to issue another authority command.
+
+Controller evidence is monotonic across effect failures: a missing, invalid,
+or unreachable report cannot erase the last accepted process-session
+watermark. Raw collection preserves every Pod incarnation for a logical
+replica, allowing accepted and out-of-authority replacement evidence to
+coexist without last-writer-wins loss. Never-initialized authority requires an
+explicit `Uninitialized` report from every exact Pod/PVC pair; unavailable or
+absent metadata is unknown storage, not proof that genesis is safe.
+
+Write routing has an independently observed Service-existence postcondition.
+Missing Services are recreated, unresolved selectors are fenced before
+publication, and `Ready` requires the Service selector to match the exact
+label on the attested primary Pod. A failed Service-list observation cannot be
+treated as confirmed routing absence.
+
+The Phase 6 vertical slice adds `examples/kvstore2` and
+`kuberic-level-tests`. Fresh Pods first expose an authenticated
+`Uninitialized` control service. `InitializeAgentStore` carries the exact
+full genesis configuration and creates `.kuberic/agent.sqlite3`; the process
+then reopens the same PVC through the normal durable agent and application
+runtime. Application state is stored separately under the application data
+directory.
+
+Bootstrap installs the deterministic full-size genesis configuration on every
+exact incarnation with WriteStatus closed. Because every genesis member has
+just proven a fresh empty store and progress zero, this initial slice uses a
+proof-based empty-state build: no copy payload exists to transfer, but every
+member must durably attest the same full configuration and assigned role.
+Only then does one status replacement set `initialized`, freeze the effective
+policy, accept the topology, and clear the transition. A separate fenced
+command grants primary WriteStatus; routing publication follows only after the
+granted report is observed.
+
+The agent supplies the authenticated gRPC dispatcher for replication and copy
+traffic. Every exact incarnation has a derived ClusterIP Service selected by
+its Pod UID, so an old and replacement incarnation remain concurrently
+addressable until CC is accepted. Process sessions are discovered before
+enqueue, receivers admit the authenticated exact sender session, and
+acknowledgements return through the runtime quorum tracker. Controller-created
+per-set Secrets distribute the same credential used by the controller.
+Immutable local image tags and explicit `IfNotPresent` policy keep the KinD
+harness offline.
+
+The isolated KinD scenario proves a three-member accepted topology, controller
+restart, exact secondary-container restart with the Pod UID and durable agent
+generation preserved, and a quorum-replicated write. Cluster-dependent tests
+remain ignored by default and require the owned `KUBECONFIG`,
+`KUBE_CONTEXT`, and `KIND_CLUSTER_NAME` tuple.
+
+Post-review hardening resumes the enclosing durable configuration command
+after reconstructing any pending runtime effect. Bootstrap topology acceptance
+requires the exact terminal install operation, no pending operation, and zero
+application progress on every member. Fresh metadata is not sufficient by
+itself: surviving application files produce unsafe storage, and established
+metadata must match the process's resource, replica, Pod, and PVC identity
+before runtime reconstruction.
+
+The KV provider publishes new in-memory state only after the candidate state
+is durably written and synced. Failed persistence therefore cannot be reused
+as `verify_applied` or progress evidence. The public state replicator also
+releases a newly reserved request when a different durable pending operation
+owns recovery, allowing the original write to resume.
+
+Outbound replication is independently retried per peer. One unavailable
+secondary cannot block delivery to another quorum member or terminate the
+primary. Re-observing the same peer process session preserves its retained
+window. Peer discovery and session admission are agent-owned, while the
+application supplies only deployment endpoint configuration. The controller
+observes and independently reconverges the peer Service and credential Secret
+in bootstrap, transition, and stable states.
+
+`ReplicaHost` is the reusable process boundary. It owns fresh/existing agent
+metadata, exact process identity validation, `PodRuntime`, `AgentService`,
+process sessions, authenticated peer transport, discovery, readiness,
+reconstruction, shutdown, and replica diagnostics. A stateful application
+supplies its `StatefulServiceReplica`, its application-storage classification,
+and endpoint configuration; it no longer constructs agent or transport
+internals.
+
+Phase 7 implements same-cardinality replacement. Definitive loss of a
+non-primary Pod with surviving exact storage creates one deterministic
+out-of-authority replacement Pod/PVC pair. The controller persists the exact
+provisioning identity before initialization. The primary admits a durable
+build authority, the target opens as Idle Secondary, and copy plus the
+post-snapshot replication gap must be durably acknowledged before status can
+freeze PC/CC. Empty replication gaps are represented by an empty stream rather
+than an invalid range.
+
+The evaluator installs PC/CC on reachable non-primary members before issuing
+the primary command, waits for the privately derived CC catch-up predicate,
+then installs current-only authority. PC and CC retain fixed cardinality and
+the old incarnation remains accepted until a current-only quorum and granted
+primary WriteStatus are observed. A missing target after CC is never
+substituted in place; current-only completion may proceed with another valid
+CC quorum, after which a later serialized replacement can repair the missing
+member.
+
+Current-only completion durably retires the replacement build on source and
+target before the command becomes terminal. The controller then removes the
+old exact endpoint and UID-fenced Pod/PVC scaffolding. Cleanup-only orphan
+storage cannot be mistaken for failure of the healthy accepted replacement.
+Pre-CC target loss clears provisioning and returns to deterministic
+provisioning without creating a second authority.
+
+Retained sender windows, ACK retirement, reconnect capability, and retry
+cadence now live in `kuberic-runtime::replicator::sender`; the agent retains
+only DNS, authentication, gRPC, and process-session discovery. A changed peer
+process session preserves domain payload windows and refreshes session fences
+on demand. Replacement builds reconstruct from durable build authority and
+application state, and registered writes are re-registered and republished if
+an authority refresh closes their process-local completion channel.
+
+The replacement KinD scenario proves pre/post-replacement quorum writes,
+copy/build handoff, equal-cardinality PC/CC acceptance, old PVC retirement,
+exact replacement process restart, authority reconstruction, and another
+quorum write. The original fresh-bootstrap scenario remains a separate
+regression gate.
+
+The post-Phase-7 SF alignment review tightened supported recovery paths.
+Exact pending current-only commands are classified before fresh admission, so
+their own durable PC-removal postcondition cannot invalidate replay. Internal
+outbound and discovery workers start before peer-dependent reconstruction,
+while external command/data admission and application readiness remain
+closed. Exact peer reports under the installed fence supply truthful durable
+progress; a cold primary replays retained operations to a lagging current
+member rather than waiting for a new client write.
+
+A replacement member returning before acceptance first receives its missing
+PC/CC installation before current-only completion. If it returns behind after
+acceptance, the controller treats the non-primary lag as a serialized
+same-cardinality replacement instead of withdrawing usable-quorum routing.
+Bootstrap incarnation supersession allocates a newer configuration epoch, so
+surviving partial installation at the old write-closed epoch can converge
+without weakening same-epoch conflict rejection.
+
+Build retries retain the same durable build authority but cancel abandoned
+process-local streams before retry. Providers must reproduce identical ordered
+copy bytes for the same captured boundary; `kvstore2` reconstructs that
+snapshot from retained operations. Copy chunks and directory entries are
+synced before durable acknowledgement, final-copy completion is insufficient
+until the replication gap reaches current source progress, and payload-bearing
+delivery tasks are bounded.
+
+The durable local-write journal includes the original committed watermark.
+Restart reconstruction verifies and republishes the exact registered
+operation under restored valid primary authority without requiring the
+original client future. Ordinary KV reads consume the independent partition
+ReadStatus and return a retryable denial unless access is Granted.
+
+Phase 8 implements non-destructive ordinary failover and quorum loss.
+`status.primaryFailure` binds the first failure observation to the exact
+accepted primary and persists the frozen-delay start time. Write routing is
+removed before a newer epoch is allocated. `status.quorumLoss` separately
+records loss of the accepted configuration's write quorum; the surviving
+primary publishes `NoWriteQuorum`, fences pending writes, and restores
+`Granted` automatically when the same configuration quorum returns without
+changing the data-loss number. Kuberic does not implement SF-style elapsed-time
+replica dropping or destructive data-loss recovery. Persistent quorum loss
+therefore remains write-closed unless the same quorum returns or separately
+validated permanent-fault evidence authorizes an exact replacement.
+
+Failover first preserves the accepted PC and any outstanding replacement CC,
+including its build authority. PC and CC read quorum must remain observable
+before the evaluator persists a newer write-closed election epoch. Reachable
+members durably accept that epoch before their progress is eligible. The
+agent's failover path changes the replicator role and updates the primary
+epoch before GetLSN, then retains exact deactivation epoch and LSN evidence.
+Candidate selection filters and orders this epoch-fenced evidence; changing a
+provisional candidate allocates another configuration epoch rather than
+rewriting same-epoch authority. The transition persists the selected
+`electionLsn`. Each replica durably authorizes only
+`min(localAppliedLsn, electionLsn)` under the new fence, preventing arbitrary
+old suffix credit while allowing the next contiguous operation after
+failover.
+
+The selected runtime Primary remains write-closed while retained-history
+repair runs. If a configured reachable member is behind the selected
+primary's retained range, the transition persists one exact
+`status.transition.repair` authority and performs a full-copy build under the
+failover configuration. PC/CC deactivation quorum, CC catch-up, current-only
+installation, granted primary WriteStatus, and a current quorum are required
+before status accepts and publishes the new topology. A returned stale former
+primary is admitted only as evidence for an exact newer-epoch correction; its
+old epoch cannot receive quorum credit.
+
+The level-triggered control protocol is version 3. `EnsureConfiguration`
+carries the intended primary access state rather than a write-grant boolean,
+allowing `ReconfigurationPending`, `NoWriteQuorum`, and `Granted` to remain
+distinct durable postconditions. Current-only completion can retire every
+build authority carried by replacement plus failover repair.
+
+Phase 9 adds generated authority traces, process-termination persistence
+boundaries, ambiguous-command replay, bounded no-watch resynchronization, and
+a fresh-cluster adversarial matrix. The live matrix composes replacement,
+quorum loss and healing, controller restart, one-replica network isolation,
+replica process reconstruction, failover, and stale former-primary direct
+access. Every client probe has a fixed timeout, and failure deadlines are
+bounded so the matrix fails with diagnostics rather than hanging. Scheduled
+CI runs the complete matrix twice on separate fresh clusters.
+
+The following contract blocks an end-to-end Service Fabric equivalence claim:
+
+| Contract | Required owner and phase |
+|---|---|
+| Destructive data-loss recovery, PC/CC abandonment, and non-intersecting authority recovery | Explicitly unsupported; requires separate design |
+
+Phase 10 added an exhaustive source-public signature inventory, including
+private-module and `#[doc(hidden)]` declarations, plus adversarial compile-fail
+fixtures for agent-owned runtime capabilities. The operational guide records
+the remaining cross-crate hidden surface and does not treat rustdoc visibility
+as access control.
+
 The current classic design treats loss of process-local role, epoch, or action
 correlation under the same Pod UID as a stale replica requiring removal and
-rebuild. Operator2 should not depend on volatile correlation state for normal
-recovery.
+rebuild. The level-triggered operator must not depend on volatile correlation
+state for normal recovery.
 
 The durable agent generation identifies persisted authority across process
 restarts. The process session ID identifies a specific running agent process.
@@ -530,6 +1028,20 @@ persisted configuration or action evidence.
 Commands should describe a desired postcondition and include exact authority:
 
 ```text
+InitializeAgentStore {
+    initialization_id,
+    resource_uid,
+    local_replica_id,
+    expected_instance_id,
+    expected_pod_uid,
+    expected_pvc_uid,
+    assigned_agent_generation,
+    effective_policy,
+    bootstrap_configuration
+}
+```
+
+```text
 EnsureConfiguration {
     operation_id,
     previous_configuration,
@@ -539,7 +1051,8 @@ EnsureConfiguration {
     effective_policy,
     local_replica_id,
     expected_instance_id,
-    expected_agent_generation
+    expected_agent_generation,
+    grant_write
 }
 ```
 
@@ -740,6 +1253,11 @@ Every acknowledgement is scoped to:
 - Previous/Current Configuration membership;
 - received, applied, and committed LSN as applicable.
 
+The progress ordering is `received >= applied >= committed`. Ordered receiver
+admission may publish received progress before the service durably applies the
+operation. Received progress may retire transport resend work, but only applied
+progress may contribute replication quorum credit.
+
 The required Service Fabric predicates are:
 
 | Operation | Required durable evidence |
@@ -786,6 +1304,12 @@ Each reconcile builds an immutable normalized snapshot containing:
 - the Kubernetes resource versions used for the observation pass;
 - current time;
 - explicit observation failures.
+
+Replica observations are keyed by logical replica ID plus exact Pod
+incarnation, not by logical replica ID alone. A replacement snapshot may
+therefore contain the accepted old PC incarnation and a new provisioning or CC
+incarnation simultaneously. Report watermarks are scoped to that exact
+incarnation and process session.
 
 Unreachable and absent are different states. A missing observation must never
 be represented as a default replica report.
@@ -849,6 +1373,12 @@ It performs:
 Pure evaluation enables exhaustive table tests, model-based testing, and fault
 injection without Kubernetes or gRPC.
 
+A stable `Ready=True` projection requires fresh evidence for the exact accepted
+primary, granted WriteStatus, the accepted epoch and Current Configuration,
+the required write quorum of healthy exact members, and write routing to that
+attested primary. Accepted status without that evidence produces bounded
+`Wait`; it is not sufficient to infer readiness.
+
 ## Reconciliation Flow
 
 ```text
@@ -906,16 +1436,20 @@ an implementation sequence or phased delivery plan.
 3. Select the deterministic initial primary incarnation.
 4. Persist a Bootstrap transition with empty PC, full-size genesis CC, initial
    epoch, initialization ID, and frozen effective policy.
-5. Ask that replica agent to open the runtime, install the epoch and genesis
-   bootstrap authority, and change role to runtime Primary with WriteStatus
-   denied.
-6. Build every other genesis member as an Idle Secondary outside the installed
-   configuration.
-7. Observe each member's copy/replication-gap completion, then install the full
-   genesis CC.
-8. Atomically set `initialized = true`, accept genesis CC as
+5. Initialize each exact fresh agent store using the persisted Bootstrap
+   transition, resource UID, Pod UID, PVC UID, logical replica ID, and
+   initialization ID.
+6. Ask the selected replica agent to open the runtime and remain write-closed.
+7. Establish every other genesis member. When all stores have just proven
+   fresh empty state at progress zero, no copy payload exists; installing the
+   same full genesis CC on every member is the build postcondition. A
+   non-empty genesis source would instead require the normal Idle Secondary
+   copy and replication-gap path.
+8. Observe every exact member attesting the full genesis CC and assigned role
+   while WriteStatus remains denied.
+9. Atomically set `initialized = true`, accept genesis CC as
    `status.topology`, and clear the Bootstrap transition.
-9. Observe granted WriteStatus and publish write routing.
+10. Observe granted WriteStatus and publish write routing.
 
 The operator may resume at any step by observing which configurations are
 already committed.
@@ -940,21 +1474,25 @@ configuration.
 2. Ensure the replacement Pod and PVC exist and observe its exact identity.
 3. Derive a deterministic operation ID from PC and the replacement
    incarnation.
-4. Open the replacement as an Idle Secondary outside PC and CC.
-5. Ask the primary replicator to build the exact replacement through copy plus
+4. Persist `status.provisioning`, then initialize the exact fresh agent
+   store using the resource UID, Pod UID, PVC UID, logical replica ID, and
+   initialization ID.
+5. Open the replacement as an Idle Secondary outside PC and CC.
+6. Ask the primary replicator to build the exact replacement through copy plus
    concurrent replication.
-6. Observe acknowledgement of both the final copy operation and the captured
+7. Observe acknowledgement of both the final copy operation and the captured
    replication boundary.
-7. Allocate a newer configuration epoch. PC contains the old incarnation; CC
-   replaces it with the new incarnation and retains exactly `N` members.
-8. Install the catch-up configuration and wait for the required CC quorum
+8. Allocate a newer configuration epoch. Atomically clear provisioning and
+   persist the transition: PC contains the old incarnation; CC replaces it
+   with the new incarnation and retains exactly `N` members.
+9. Install the catch-up configuration and wait for the required CC quorum
    progress. A replacement secondary is not unconditionally
    `must_catch_up`.
-9. Enter deactivation and collect the required PC deactivation/read-quorum
+10. Enter deactivation and collect the required PC deactivation/read-quorum
    evidence.
-10. Activate CC and complete the replica-agent reconfiguration.
-11. Install CC without PC and accept the same-cardinality topology.
-12. Close, retire, and delete or retain the old incarnation only after it is
+11. Activate CC and complete the replica-agent reconfiguration.
+12. Install CC without PC and accept the same-cardinality topology.
+13. Close, retire, and delete or retain the old incarnation only after it is
     absent from accepted topology and outstanding transition authority.
 
 Before CC is persisted, a failed build target may be abandoned after proving
@@ -1019,7 +1557,8 @@ Quorum loss and data loss remain distinct:
 
 1. If Current Configuration write quorum is unavailable, set
     `WriteStatus = NoWriteQuorum` and block writes.
-2. Record when quorum loss began and continue bounded re-observation.
+2. Persist a configuration-bound quorum-loss marker and continue bounded
+   re-observation.
 3. If quorum returns, resume without changing the data-loss epoch.
 4. If recovery would require abandoning PC or outstanding CC quorum, report
     `Unsafe` and remain write-closed.
@@ -1225,11 +1764,6 @@ and CC must expose a version supported by the operator and by the other
 participants. The evaluator returns `Unsafe` for incompatible mixed versions
 rather than silently downgrading guarantees.
 
-## Open Questions
-
-1. Where should the replica agent persist reconfiguration state, deactivation
-   information, and retained runtime results?
-
 ## Appendix: Minimum Viable Feature Set
 
 The minimum supported contract contains:
@@ -1274,6 +1808,10 @@ operations remain fail-closed:
 - planned switchover and its public request API;
 - applying new spec changes during an active reconfiguration; they are
   evaluated after the current PC/CC transition becomes stable;
+- stateful successful-write trace generation across delayed effects and
+  concurrent retained client connections; current model validation covers
+  authority observations and the live matrix covers bounded sequential
+  histories;
 - more than one unresolved reconfiguration; exactly one PC and one outstanding
   CC are supported;
 - mixed-version protocol negotiation; incompatible versions return `Unsafe`;

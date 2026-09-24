@@ -1,0 +1,10 @@
+[package]
+name = "runtime-api-leak"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+kuberic-runtime = { path = "../../../kuberic-runtime" }

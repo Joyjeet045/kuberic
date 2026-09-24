@@ -1,0 +1,16 @@
+[package]
+name = "kuberic-runtime-internal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Internal agent/runtime contracts for the level-triggered Kuberic stack"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+kuberic-protocol = { path = "../kuberic-protocol" }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true

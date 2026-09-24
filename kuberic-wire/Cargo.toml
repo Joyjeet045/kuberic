@@ -1,0 +1,19 @@
+[package]
+name = "kuberic-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Versioned protobuf and tonic contracts for the level-triggered Kuberic stack"
+readme = "README.md"
+
+[dependencies]
+kuberic-protocol = { path = "../kuberic-protocol" }
+prost.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
