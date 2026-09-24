@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "dependencies": [
+    {
+      "name": "envoy-gateway-crds",
+      "transport": "oci",
+      "source": "oci://docker.io/envoyproxy/gateway-crds-helm",
+      "version": "v1.9.1",
+      "sha256": "ad2e1215749249ff6c8a2d82fb820c70edbb18a7ffc7331355632fb67b944688",
+      "file": "gateway-crds-helm-v1.9.1.tgz"
+    },
+    {
+      "name": "envoy-gateway",
+      "transport": "oci",
+      "source": "oci://docker.io/envoyproxy/gateway-helm",
+      "version": "v1.9.1",
+      "sha256": "68ce74961eeb5fc5e395628d6bbed9305a85b34619bd7ee17b01187f101bb8c5",
+      "file": "gateway-helm-v1.9.1.tgz"
+    }
+  ]
+}

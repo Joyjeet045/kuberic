@@ -423,9 +423,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.1"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
 dependencies = [
  "cfg-if",
 ]
@@ -1478,29 +1478,12 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "kuberic-operator2"
-version = "0.0.1"
-dependencies = [
- "futures",
- "k8s-openapi",
- "kube",
- "kuberic-dex",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1521,17 +1504,19 @@ dependencies = [
 name = "kuberic-tests"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "k8s-openapi",
  "kube",
  "kube-leader-election",
  "kube-lease-manager",
+ "kuberic-operator",
  "kvstore",
  "prost",
  "rand",
  "serde_json",
- "serial_test",
  "test-log",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tonic",
  "tracing",
@@ -2539,12 +2524,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha1_smol"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2686,6 +2665,13 @@ dependencies = [
  "js-sys",
  "rsqlite-vfs",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "sqlserver-replicated"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -3191,18 +3177,6 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
-name = "uuid"
-version = "1.26.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
-dependencies = [
- "getrandom 0.4.3",
- "js-sys",
- "sha1_smol",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "valuable"

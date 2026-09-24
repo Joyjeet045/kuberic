@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+: "${KIND_CLUSTER_NAME:?Set an isolated KIND_CLUSTER_NAME}"
+: "${KUBECONFIG:?Set an isolated KUBECONFIG}"
+: "${KUBE_CONTEXT:?Set the isolated KUBE_CONTEXT}"
+[[ "$KUBE_CONTEXT" == "kind-${KIND_CLUSTER_NAME}" ]]
+just verify-kind-context
+kubectl_cmd=(kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" --request-timeout=30s)
+diagnostic_cmd=(kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" --request-timeout=5s)
+helm_cmd=(helm --kubeconfig "$KUBECONFIG" --kube-context "$KUBE_CONTEXT")
+
+diagnostics() {
+    for namespace in xedio envoy-gateway-system; do
+        for resource in gateways grpcroutes envoyproxies services endpointslices pods deployments events kubericsets; do
+            "${diagnostic_cmd[@]}" get "$resource" -n "$namespace" -o yaml || true
+        done
+        "${diagnostic_cmd[@]}" logs -n "$namespace" --all-containers=true --prefix=true \
+            -l app.kubernetes.io/name=envoy-gateway --tail=200 || true
+        "${diagnostic_cmd[@]}" logs -n "$namespace" --all-containers=true --prefix=true \
+            -l gateway.envoyproxy.io/owning-gateway-name=kuberic --tail=200 || true
+    done
+    "${diagnostic_cmd[@]}" get gatewayclasses -o yaml || true
+    "${diagnostic_cmd[@]}" logs -n xedio deployment/kuberic-operator --all-containers=true --prefix=true --tail=200 || true
+    for application in kvstore-a kvstore-b; do
+        "${diagnostic_cmd[@]}" logs -n xedio --all-containers=true --prefix=true \
+            -l "kuberic.io/set=${application}" --tail=200 || true
+    done
+}
+
+if [[ "${1:-}" == diagnostics ]]; then
+    diagnostics
+    exit 0
+fi
+[[ "${1:-}" == install ]] || { echo 'Usage: gateway_kind.sh install|diagnostics' >&2; exit 2; }
+
+bash scripts/external_dependencies.sh verify
+gateway_crds_chart=$(bash scripts/external_dependencies.sh path envoy-gateway-crds)
+gateway_chart=$(bash scripts/external_dependencies.sh path envoy-gateway)
+readonly gateway_crds_chart gateway_chart
+
+trap diagnostics ERR
+
+"${kubectl_cmd[@]}" rollout status -n xedio deployment/kuberic-operator --timeout=180s
+"${kubectl_cmd[@]}" wait --for=create crd/kubericsets.kuberic.io --timeout=120s
+"${kubectl_cmd[@]}" wait --for=condition=Established crd/kubericsets.kuberic.io --timeout=120s
+
+[[ "$(docker port "${KIND_CLUSTER_NAME}-control-plane" 30090/tcp)" == '127.0.0.1:30090' ]] || {
+    echo 'Use deploy/kind-config.yaml: loopback host port 30090 is required.' >&2
+    exit 1
+}
+"${kubectl_cmd[@]}" get services -A -o json | jq -e '
+    [.items[] | select(any(.spec.ports[]?; .nodePort == 30090)) |
+      select(.metadata.labels["gateway.envoyproxy.io/owning-gateway-name"] != "kuberic" or
+             .metadata.labels["gateway.envoyproxy.io/owning-gateway-namespace"] != "xedio")] | length == 0
+' >/dev/null || { echo 'NodePort 30090 belongs to another Service; only Envoy may own it.' >&2; exit 1; }
+
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
+timeout 180 "${helm_cmd[@]}" template eg-crds "$gateway_crds_chart" \
+    --set crds.gatewayAPI.enabled=true \
+    --set crds.gatewayAPI.channel=standard \
+    --set crds.envoyGateway.enabled=true > "$temporary/envoy-crds.yaml"
+"${kubectl_cmd[@]}" apply --server-side -f "$temporary/envoy-crds.yaml"
+"${kubectl_cmd[@]}" get crd gateways.gateway.networking.k8s.io -o json | jq -e '
+    .metadata.annotations["gateway.networking.k8s.io/bundle-version"] == "v1.6.1" and
+    .metadata.annotations["gateway.networking.k8s.io/channel"] == "standard"
+' >/dev/null
+"${kubectl_cmd[@]}" wait --for=condition=Established --timeout=120s \
+    crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
+    crd/grpcroutes.gateway.networking.k8s.io crd/envoyproxies.gateway.envoyproxy.io
+timeout 360 "${helm_cmd[@]}" upgrade --install eg "$gateway_chart" \
+    --namespace envoy-gateway-system --create-namespace \
+    --set crds.enabled=false --wait --timeout 5m
+"${kubectl_cmd[@]}" wait -n envoy-gateway-system deployment/envoy-gateway \
+    --for=condition=Available --timeout=120s
+"${kubectl_cmd[@]}" apply -f deploy/gateway/applications.yaml
+"${kubectl_cmd[@]}" apply -f deploy/gateway/resources.yaml
+"${kubectl_cmd[@]}" wait gatewayclass/kuberic-envoy --for=condition=Accepted --timeout=120s
+"${kubectl_cmd[@]}" wait -n xedio gateway/kuberic --for=condition=Programmed --timeout=180s

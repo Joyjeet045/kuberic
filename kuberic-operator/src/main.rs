@@ -3,12 +3,14 @@ use std::sync::Arc;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::watcher;
-use kube::{Api, Client};
+use kube::{Api, Client, Resource};
 use tracing::info;
 
 use kuberic_operator::cluster_api::KubeClusterApi;
 use kuberic_operator::crd::KubericSet;
+use kuberic_operator::node_maintenance::observability::transition_event;
 use kuberic_operator::node_maintenance::{
     KubeMaintenanceApi, NodeMaintenanceRequest, RequestContext, reconcile_request,
 };
@@ -21,6 +23,11 @@ struct OperatorError(String);
 struct Context {
     api: KubeClusterApi,
     state: ReconcilerState,
+}
+
+struct MaintenanceContext {
+    api: KubeMaintenanceApi,
+    events: Recorder,
 }
 
 #[tokio::main]
@@ -46,16 +53,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let maintenance_client = client.clone();
     let maintenance = async move {
         let requests: Api<NodeMaintenanceRequest> = Api::all(maintenance_client.clone());
-        let maintenance_api = Arc::new(KubeMaintenanceApi {
-            client: maintenance_client,
+        let maintenance_context = Arc::new(MaintenanceContext {
+            events: Recorder::new(
+                maintenance_client.clone(),
+                Reporter {
+                    controller: "kuberic.io/node-maintenance".to_string(),
+                    instance: std::env::var("POD_NAME").ok(),
+                },
+            ),
+            api: KubeMaintenanceApi {
+                client: maintenance_client,
+            },
         });
 
         Controller::new(requests, watcher::Config::default())
             .run(
-                |request: Arc<NodeMaintenanceRequest>, api: Arc<KubeMaintenanceApi>| async move {
-                    if request.metadata.deletion_timestamp.is_some() {
-                        return Ok(Action::await_change());
-                    }
+                |request: Arc<NodeMaintenanceRequest>, context: Arc<MaintenanceContext>| async move {
                     let name = request
                         .metadata
                         .name
@@ -63,10 +76,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .ok_or_else(|| OperatorError("request has no name".to_string()))?;
                     let previous = request.status.clone().unwrap_or_default();
 
-                    reconcile_request(
-                        api.as_ref(),
+                    let outcome = reconcile_request(
+                        &context.api,
                         RequestContext {
                             name: &name,
+                            uid: request.metadata.uid.as_deref().ok_or_else(|| OperatorError("request has no UID".to_string()))?,
+                            resource_version: request.metadata.resource_version.as_deref().ok_or_else(|| OperatorError("request has no resource version".to_string()))?,
+                            deleting: request.metadata.deletion_timestamp.is_some(),
                             spec: &request.spec,
                             generation: request.metadata.generation,
                             previous: &previous,
@@ -74,27 +90,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     )
                     .await
-                    .map(|outcome| {
-                        if outcome.persisted {
-                            info!(
-                                request = %name,
-                                phase = ?outcome.status.phase,
-                                "node maintenance status updated"
-                            );
+                    .map_err(OperatorError)?;
+                    if let Some(event) = transition_event(&request.spec, &previous, &outcome) {
+                        if let Err(error) = context.events.publish(&event, &request.object_ref(&())).await {
+                            tracing::warn!(request = %name, %error, "maintenance Event publication failed");
                         }
-                        if outcome.status.phase.is_terminal() {
-                            Action::await_change()
-                        } else {
-                            Action::requeue(std::time::Duration::from_secs(30))
-                        }
+                    }
+                    if outcome.persisted {
+                        info!(request = %name, phase = ?outcome.status.phase, "node maintenance status updated");
+                    }
+                    Ok(if outcome.status.phase.is_terminal() {
+                        Action::await_change()
+                    } else {
+                        Action::requeue(std::time::Duration::from_secs(30))
                     })
-                    .map_err(OperatorError)
                 },
-                |_request: Arc<NodeMaintenanceRequest>, error, _api: Arc<KubeMaintenanceApi>| {
+                |_request: Arc<NodeMaintenanceRequest>, error: &OperatorError, _context: Arc<MaintenanceContext>| {
                     tracing::warn!(?error, "node maintenance controller error");
                     Action::requeue(std::time::Duration::from_secs(10))
                 },
-                maintenance_api,
+                maintenance_context,
             )
             .for_each(|res| async move {
                 match res {

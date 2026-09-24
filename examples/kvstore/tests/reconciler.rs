@@ -433,6 +433,8 @@ struct KvClusterApi {
     statuses: Mutex<Vec<KubericSetStatus>>,
     pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
     services: Mutex<HashMap<String, Service>>,
+    maintenance_nodes: Mutex<std::collections::BTreeSet<String>>,
+    fail_maintenance_lookup: Mutex<bool>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
     fail_next_status_patch: Mutex<bool>,
     fail_after_next_status_patch: Mutex<bool>,
@@ -457,6 +459,8 @@ impl KvClusterApi {
             statuses: Mutex::new(Vec::new()),
             pvcs: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
+            maintenance_nodes: Mutex::new(std::collections::BTreeSet::new()),
+            fail_maintenance_lookup: Mutex::new(false),
             operations: Arc::new(Mutex::new(Vec::new())),
             fail_next_status_patch: Mutex::new(false),
             fail_after_next_status_patch: Mutex::new(false),
@@ -773,6 +777,13 @@ impl KvClusterApi {
 impl ClusterApi for KvClusterApi {
     async fn list_pods(&self, _ns: &str, _sel: &str) -> Result<Vec<Pod>, String> {
         Ok(self.pods.lock().unwrap().clone())
+    }
+
+    async fn list_maintenance_nodes(&self) -> Result<std::collections::BTreeSet<String>, String> {
+        if *self.fail_maintenance_lookup.lock().unwrap() {
+            return Err("maintenance lookup failed".to_string());
+        }
+        Ok(self.maintenance_nodes.lock().unwrap().clone())
     }
 
     async fn create_pod(&self, _ns: &str, pod: &Pod) -> Result<(), String> {
@@ -2047,6 +2058,87 @@ async fn test_post_recovery_pod_identity_drift_is_rejected_before_rpc() {
     .unwrap();
     assert_eq!(api.last_status().unwrap().phase, Phase::FailingOver);
     assert!(api.operations().is_empty());
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_maintenance_exclusion_pauses_new_and_resumed_creation() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let name = "maintenance-create";
+    reconcile_set(&make_set(name, 1, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    api.pods.lock().unwrap()[0].spec.as_mut().unwrap().node_name = Some("worker-04".to_string());
+    api.maintenance_nodes
+        .lock()
+        .unwrap()
+        .insert("worker-04".to_string());
+    api.reset_operations();
+    let creating = make_set(name, 1, api.last_status());
+    reconcile_set(&creating, &api, &state).await.unwrap();
+    assert!(api.last_status().unwrap().operation.is_none());
+    assert!(api.operations().is_empty());
+    *api.fail_maintenance_lookup.lock().unwrap() = true;
+    assert_eq!(
+        reconcile_set(&creating, &api, &state).await.err().unwrap(),
+        "maintenance lookup failed"
+    );
+    *api.fail_maintenance_lookup.lock().unwrap() = false;
+    api.maintenance_nodes.lock().unwrap().clear();
+    reconcile_set(&creating, &api, &state).await.unwrap();
+    let checkpoint = api.last_status().unwrap();
+    assert!(checkpoint.operation.is_some());
+    api.maintenance_nodes
+        .lock()
+        .unwrap()
+        .insert("worker-04".to_string());
+    let restarted = ReconcilerState::default();
+    reconcile_set(
+        &make_set(name, 1, Some(checkpoint.clone())),
+        &api,
+        &restarted,
+    )
+    .await
+    .unwrap();
+    assert_eq!(api.last_status().unwrap(), checkpoint);
+    assert!(api.operations().is_empty());
+    api.maintenance_nodes.lock().unwrap().clear();
+    let healthy = drive_create_partition(&api, &restarted, name, 1, checkpoint).await;
+    assert_eq!(healthy.phase, Phase::Healthy);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_maintenance_lookup_failure_blocks_explicit_switchover() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let name = "maintenance-lookup";
+    let mut status = create_healthy_set(&api, &state, name, 3).await;
+    let primary = status.current_primary.clone();
+    status.target_primary = Some(format!("{name}-1"));
+    *api.fail_maintenance_lookup.lock().unwrap() = true;
+    api.reset_operations();
+    assert_eq!(
+        reconcile_set(&make_set(name, 3, Some(status.clone())), &api, &state)
+            .await
+            .err()
+            .unwrap(),
+        "maintenance lookup failed"
+    );
+    assert_eq!(api.last_status().unwrap().current_primary, primary);
+    assert!(!api.operations().contains(&ControlOperation::ChangeRole));
+    assert!(
+        !api.operations()
+            .contains(&ControlOperation::RevokeWriteStatus)
+    );
+    assert_ne!(api.last_status().unwrap().phase, Phase::Switchover);
+    *api.fail_maintenance_lookup.lock().unwrap() = false;
+    reconcile_set(&make_set(name, 3, Some(status)), &api, &state)
+        .await
+        .unwrap();
+    assert_eq!(api.last_status().unwrap().phase, Phase::Switchover);
 }
 
 #[test_log::test(tokio::test)]
