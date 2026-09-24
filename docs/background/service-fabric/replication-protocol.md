@@ -333,8 +333,9 @@ or rebalancing):
   5.   │──── wait_for_catch_up_quorum() ───────►│
        │     [S catches up to committed LSN]    │
        │                                        │
-  6.   │     SF grants ReadStatus to S          │
-       │     Build complete                     │
+  6.   │     Replica becomes Active Secondary   │
+       │     Access status remains separately   │
+       │     controlled by the RA calculator    │
        │                                        │
 ```
 
@@ -495,11 +496,15 @@ if (lowestLSNAmongstMustCatchupReplicas != MaxLSN) {
 }
 ```
 
+The variable named `committed` in this path is the **Current Configuration
+quorum progress** supplied to catch-up, not necessarily the dual-PC/CC client
+commit position.
+
 Two conditions:
-1. **`committed >= previousConfigCatchupLsn`** — quorum has committed all
-   ops that existed at config-change time
-2. **`lowestLSNAmongstMustCatchupReplicas >= committed`** — every
-   must_catch_up replica has individually ACKed up to committed LSN
+1. **CC quorum progress ≥ `previousConfigCatchupLsn`** — the CC quorum reached
+   the boundary captured when catch-up configuration was installed
+2. **`lowestLSNAmongstMustCatchupReplicas` ≥ CC quorum progress** — every
+   `must_catch_up` replica individually reached current CC quorum progress
 
 If no must_catch_up replicas exist (`lowestLSN == MaxLSN`), only check 1
 applies. If no new ops arrived after config change, `committed ==
@@ -546,8 +551,8 @@ Order is **config-first, then close**:
 3. **Start reconfiguration**: `StartReconfiguration(isPrimaryChange: false)`
 4. **Remove from config**: `RemoveFromCurrentConfiguration(replica)` —
    removes from CC FIRST, before closing the replica
-5. **Primary broadcasts**: new config without the dropped secondary via
-   Phase0_Demote → Phase4_Activate flow
+5. **Primary broadcasts**: an `Other` reconfiguration starts at Phase 2
+   catch-up, then proceeds through Phase 3 deactivation and Phase 4 activation
 6. **Close replica**: replica receives close, releases resources
 
 ```cpp
@@ -583,4 +588,3 @@ SF **never drops the primary directly**. If PLB marks the primary for drop:
   allowing in-flight writes to complete
 
 ---
-

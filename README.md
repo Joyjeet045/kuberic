@@ -18,15 +18,13 @@ A stateful replication framework for Kubernetes. Provides quorum-based replicati
 ```
 kuberic-core/          Core replication framework (replicator, driver, runtime)
 kuberic-operator/      K8s operator (reconciler, CRD, pod management)
-kuberic-operator2/     Minimal DEX-based operator for explicitly selected sets
 kuberic-dex/           Durable execution and deterministic replay kernel
 examples/kvstore/      Replicated key-value store (HashMap + WAL)
 examples/sqlite/       Replicated SQLite database (WAL frame shipping)
 ```
 
-See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/),
-[kuberic-operator2](kuberic-operator2/), and [Kuberic DEX](kuberic-dex/) for
-crate-level documentation.
+See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/), and
+[Kuberic DEX](kuberic-dex/) for crate-level documentation.
 
 The framework provides `PodRuntime` and `WalReplicator` — your service implements lifecycle event handlers and a gRPC API. See the [kvstore](examples/kvstore/) and [sqlite](examples/sqlite/) examples.
 
@@ -56,15 +54,24 @@ Replicated SQLite database with gRPC Execute/Query/ExecuteBatch API. Ships WAL f
 
 ## Kubernetes Deployment
 
-Requires a K8s cluster (tested with [KinD](https://kind.sigs.k8s.io/)):
-
-```bash
-# Deploy operator + kvstore (3 replicas)
-kubectl apply -f kuberic-operator/deploy/deployment.yaml
-kubectl apply -f examples/kvstore/deploy/kubericset.yaml
-```
+For local development and CI, use the [shared Gateway KinD setup](docs/features/envoy-gateway-kind.md).
+It deploys the operator and two three-replica KVStore applications behind one
+loopback port. Run `just prepare-external-dependencies` once, then
+`just kvstore-deploy` installs this setup in the owned cluster without downloading
+external manifests or Helm charts.
 
 The operator watches `KubericSet` resources and manages the full lifecycle: pod creation, Open → Idle → Active → Primary promotion, failover, and scale up/down.
+
+## Continuous Delivery
+
+After CI passes, pushes to `main` and version tags publish Linux AMD64 images to
+GitHub Container Registry:
+
+- `ghcr.io/${{ github.repository_owner }}/kvstore`
+- `ghcr.io/${{ github.repository_owner }}/kuberic-operator`
+
+Main-branch images receive immutable commit SHA tags. A semantic version tag
+such as `v0.1.0` also publishes the exact version tag.
 
 ## Design
 
@@ -72,6 +79,7 @@ The operator watches `KubericSet` resources and manages the full lifecycle: pod 
 - [Operator design](docs/features/kuberic/operator.md) — reconciler, CRD, pod management
 - [User API](docs/features/kuberic/user-api.md) — PodRuntime, lifecycle events, StateProvider
 - [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
+- [SQL Server design](docs/features/sqlserver/design.md) — native AG contract and safety gates
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work

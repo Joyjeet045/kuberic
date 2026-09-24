@@ -34,17 +34,18 @@ upgrades.
 │                                                                 │
 │  Phase 1: GET LSN                                               │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ FM identifies correct new primary among current replicas  │  │
-│  │ RA queries all secondaries for their current LSN          │  │
-│  │ (get_current_progress)                                    │  │
-│  │ Replica with highest LSN = best candidate                 │  │
+│  │ FM nominates a provisional primary                        │  │
+│  │ Participating replicas accept the new epoch               │  │
+│  │ RA performs UpdateEpoch + GetLSN                          │  │
+│  │ Deactivation history and progress determine safe target   │  │
 │  └───────────────────────────────────────────────────────┬───┘  │
 │                                                          │      │
 │  Phase 2: CATCHUP                                        ▼      │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ New primary waits for secondaries to catch up             │  │
+│  │ Target runtime is Primary but remains write-closed         │  │
 │  │ Replicator sends missing operations to lagging replicas   │  │
-│  │ wait_for_catch_up_quorum(All) blocks until all caught up  │  │
+│  │ wait_for_catch_up_quorum(Write) waits for required set    │  │
+│  │ All is only a compatibility fallback where applicable     │  │
 │  │ Ensures quorum has all committed data before proceeding   │  │
 │  └───────────────────────────────────────────────────────┬───┘  │
 │                                                          │      │
@@ -57,10 +58,9 @@ upgrades.
 │                                                          │      │
 │  Phase 4: ACTIVATE                                       ▼      │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ New epoch applied (configuration_number incremented)      │  │
-│  │ New primary activated with change_role(Primary)           │  │
-│  │ Secondaries receive update_epoch() with new epoch         │  │
-│  │ New primary begins accepting writes                       │  │
+│  │ Deactivation and Current Configuration complete           │  │
+│  │ WriteStatus is recalculated for the new Primary           │  │
+│  │ Writes begin only after activation predicates hold        │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -92,14 +92,14 @@ upgrades.
 
 ### Primary Selection Logic
 
-The FM's `ReconfigurationTask::CompareForPrimary()` evaluates candidate
-replicas based on:
+The FM performs preliminary candidate selection using availability, role,
+configuration membership, creation state, and placement intent. It does not
+authoritatively rank candidates by LSN.
 
-1. **Data freshness** — highest LSN (current progress) wins
-2. **Replica health** — must be Up, not StandBy or Down
-3. **Quorum membership** — must be an Active Secondary in the current config
-4. **Placement constraints** — ToBePromoted flags respected
-5. **Configuration membership** — prefers replicas already in quorum
+The RA performs epoch-fenced GetLSN after the new reconfiguration epoch is
+accepted. It filters candidates using deactivation history and then compares
+replica progress to determine the safe primary. The FM may receive that result
+and issue a corrected reconfiguration.
 
 ---
 
@@ -146,8 +146,9 @@ Used during application upgrades, load balancing, or manual intervention.
 ```
 
 **Key difference from failover:** Phase 0 exists only in SwapPrimary. The old
-primary is alive and cooperates in the handoff. Phase 1 (Get LSN) is skipped
-because the new primary is already chosen.
+primary is alive and cooperates in the handoff. The initial demotion side does
+not need ordinary failover election, but continuation of a swap may enter
+Phase 1 to validate epoch and progress before promotion.
 
 ### Write Quorum Mode
 
@@ -204,17 +205,19 @@ The RA executes SwapPrimary as an ordered action list
    → Feature-flagged: IsPreWriteStatusCatchupEnabled (FailoverConfig)
    → When disabled: skips to step 3 (post-revoke catchup is the safety net)
 
-3. ChangeReplicaRole
-   → Old primary → ActiveSecondary (revokes write status)
-   → After this: UpdateReadAndWriteStatus re-evaluates access
+3. UpdateEpoch + ReplicatorUpdateCatchUpConfiguration
+   → Installs the swap epoch and mandatory post-revoke catch-up configuration
 
 4. CatchupReplicaSetAll (CatchupDuringSwap)
    → BeginWaitForCatchUpQuorum(WRITE_QUORUM or QUORUM_ALL)
    → CATCHUP #2: final sync after write revocation
    → Guarantees target has all committed data
 
-5. Phase4 Activate
-   → New primary promoted with new epoch
+5. UpdateReadWriteStatus + ChangeReplicatorRole + ChangeReplicaRole
+   → Final catch-up completes before runtime and service role demotion
+
+6. Phase4 Activate on the target
+   → Target runtime replicator becomes Primary and is activated in the new epoch
 ```
 
 **Key insight**: `PreWriteStatusRevokeCatchup` was added later as an
@@ -252,11 +255,10 @@ The trait also documents the `must_catchup` semantics (lines 157-163):
 > guaranteed to have must_catchup set, i.e. it must catch up (have all
 > the data) to be promoted to new primary.
 
-**Implication for kuberic**: Kuberic's proposed fix (one catchup before
-demotion) matches SF's `PreWriteStatusRevokeCatchup`. Since kuberic's
-`revoke_write_status` is an atomic flag (no writes can sneak in between
-catchup and revoke), the post-revoke catchup (#2) is unnecessary —
-the pre-revoke catchup alone guarantees the target has all data.
+**Implication for Kuberic:** pre-write-status-revoke catch-up is an optional
+downtime optimization. Post-revoke catch-up remains the correctness boundary:
+after WriteStatus is revoked, it proves that the target contains every write
+committed before revocation.
 
 ---
 
@@ -419,11 +421,12 @@ bool FailoverUnit::IsQuorumLost() const
 Where `WriteQuorumSize = ReplicaCount / 2 + 1` and
 `ReadQuorumSize = (ReplicaCount + 1) / 2`.
 
-**What happens during quorum loss:**
+**What happens after RA marks quorum loss:**
 
-The primary is **alive** but the replicator **immediately blocks writes**.
-`replicate()` does not hang or buffer — it returns `NoWriteQuorum` error
-synchronously.
+The primary may remain alive, but `WriteStatus` becomes `NoWriteQuorum`.
+Subsequent `replicate()` calls fail synchronously at the access-status check.
+This access status is driven by RA/FM availability state, not directly by each
+operation's acknowledgement stream.
 
 ```cpp
 // Replicator.cpp:889-908
@@ -454,9 +457,15 @@ return fup.HasMinReplicaSetAndWriteQuorum(fupLock, needsPC_)
 
 `HasMinReplicaSetAndWriteQuorum` requires BOTH:
 1. `ccFailoverReplicaSetSize >= MinReplicaSetSize` — enough replicas exist
-2. `ccReplicatorReplicaSetSize >= ccWriteQuorum` — enough are ACKing
+2. `ccReplicatorReplicaSetSize >= ccWriteQuorum` — enough described
+   replication members are Up/Ready
 
 **Source:** `FailoverUnitProxy.cpp:1399-1454`, `ReplicaManager.cpp:1351-1374`
+
+A replication-network failure can stop acknowledgements while RA still
+describes those replicas as available. In that interval WriteStatus may remain
+granted, and operations can remain pending in the replication queue until
+acknowledgements arrive or failure detection changes membership/access status.
 
 ### Quorum Loss Recovery (Without Data Loss)
 
@@ -589,9 +598,8 @@ FM declares data loss:
   │    │    Replicator resets replication queue to that LSN
   │    │    FM rebuilds all secondaries from new primary
   │    │
-  │    └─ FALSE: State provider discarded everything
-  │         Cold start — no state recovery needed
-  │         New primary starts fresh
+  │    └─ FALSE: Callback did not change state
+  │         Existing state-provider progress remains authoritative
   │
   └─ Primary transitions to Ready
      Writes resume with new epoch
@@ -735,9 +743,10 @@ detect or act on quorum loss:
    `WriteStatus = NoWriteQuorum` dynamically. The replicator reads this via
    `partition_.GetWriteStatus()`.
 
-2. **Replicator rejects writes.** `replicate()` calls `VerifyAccessGranted()`
-   which checks `GetWriteStatus()`. If not `Granted`, returns error
-   immediately — no buffering.
+2. **Replicator enforces access status.** `replicate()` calls
+   `VerifyAccessGranted()`. If WriteStatus is not `Granted`, it returns an
+   error immediately. If access remains granted but acknowledgements stop,
+   operations may remain pending instead.
 
 3. **FM controls data_loss_number.** The replicator never increments
    `data_loss_number` — it only stores and propagates the epoch that FM
@@ -761,7 +770,7 @@ MinReplicaSetSize: The minimum number of replicas that must participate
 
 WriteQuorumSize:   ⌊ReplicaCount/2⌋ + 1. The majority needed for quorum.
 
-Invariant:         MinReplicaSetSize ≤ WriteQuorumSize ≤ ReplicaCount
+No general ordering between MinReplicaSetSize and WriteQuorumSize is implied.
 ```
 
 Both are checked by `HasMinReplicaSetAndWriteQuorum`:
@@ -774,9 +783,11 @@ bool quorumCheck =
     ccReplicatorReplicaSetSize >= ccWriteQuorum;
 ```
 
-Writes are blocked if **either** condition fails:
+The two predicates are evaluated independently. Writes are blocked if **either**
+condition fails:
 - Not enough replicas in the configuration (`< MinReplicaSetSize`)
-- Not enough ACKing replicas for majority (`< WriteQuorumSize`)
+- Not enough Up/Ready replication members for the configured majority
+  (`< WriteQuorumSize`)
 
 The FM uses `MinReplicaSetSize` to decide whether to declare data loss
 when clearing configuration: if the configuration had `≥ MinReplicaSetSize`
@@ -793,4 +804,3 @@ the service may have been in a startup state with no committed data.
   recovery, but longer write outage)
 
 ---
-
