@@ -79,7 +79,7 @@ jobs:
         version: v0.30.0
         node_image: kindest/node:v1.34.0
         cluster_name: ${{ env.KIND_CLUSTER_NAME }}
-        config: deploy/kind-ci-config.yaml
+        config: deploy/kind-config.yaml
         kubeconfig: ${{ env.KUBECONFIG }}
 
     - name: Record and verify isolated KinD ownership
@@ -91,13 +91,13 @@ jobs:
           | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
         just verify-kind-context
 
-    - name: Verify scheduler failure domains
+    - name: Verify scheduler and maintenance failure domains
       run: |
         kubectl --context "${KUBE_CONTEXT}" wait --for=condition=Ready nodes --all --timeout=120s
         kubectl --context "${KUBE_CONTEXT}" get nodes -o json |
           jq -e '[.items[] | select(.spec.unschedulable != true) |
             .metadata.labels["kubernetes.io/hostname"] | select(. != null and . != "")] |
-            unique | length >= 2'
+            unique | length >= 3'
 
     - name: Build and load Docker images
       run: just images

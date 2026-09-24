@@ -171,5 +171,7 @@ metrics. Runtime-backed tests verify initial placement, durable failover and
 switchover, status-write failure, restart, data preservation, and cooldown.
 
 The scheduler integration test requires an explicitly owned isolated KinD
-fixture. CI uses two ready hostname domains to exercise real spreading and
-insufficient-domain cases without changing shared node labels or taints.
+fixture. CI uses the canonical three-node fixture shared with the maintenance
+lifecycle tests. The scheduler test selects two ready hostname domains to
+exercise real spreading and insufficient-domain cases without changing shared
+node labels or taints.

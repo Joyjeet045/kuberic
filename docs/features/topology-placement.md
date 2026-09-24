@@ -175,9 +175,10 @@ cargo test -p kuberic-tests topology_placement_k8s::test_topology_placement_k8s_
 
 The test owns a uniquely generated namespace and deletes it with a UID precondition
 even after scenario failure. It does not change node labels, taints, existing
-workloads, or cluster configuration. The single-node default KinD fixture exercises
-soft fallback and hard insufficient-domain behavior. A fixture with two ready,
-schedulable hostname-labeled nodes also exercises actual cross-node placement.
+workloads, or cluster configuration. A single-node fixture exercises soft fallback
+and hard insufficient-domain behavior. The canonical three-node CI fixture also
+exercises actual cross-node placement, with the scheduler test selecting two ready,
+schedulable hostname domains while maintenance tests use all three nodes.
 Only scheduler binding is required; container image readiness is not an assertion.
 
 ## Primary balancing

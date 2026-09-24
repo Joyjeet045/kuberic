@@ -80,9 +80,10 @@ just gateway-test
 
 The default cluster config is `deploy/kind-config.yaml`. `just kvstore-deploy`
 runs `just gateway-install`, deploying the Gateway and both KVStore sets.
-Run `cargo test --workspace --all-features` for the complete suite, including
-the Gateway scenario. CI uses `deploy/kind-ci-config.yaml` with an additional
-worker for topology-spreading tests, sharing that isolated cluster across tests.
+Run `cargo test --workspace --all-features` for the workspace suite, including
+the Gateway scenario. CI shares the same canonical three-node fixture across
+topology-spreading and real-replica maintenance tests. The maintenance lifecycle
+runs separately after the workspace suite because it restarts the operator.
 
 The Envoy NodePort explicitly uses `externalTrafficPolicy: Cluster`. The
 loopback host mapping enters the control-plane node, but Envoy may run on a

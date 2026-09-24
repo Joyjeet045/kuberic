@@ -36,3 +36,38 @@ fn primary_balancing_documentation_examples_match_the_api() {
     assert!(topology_keys.contains("kubernetes.io/hostname"));
     assert!(topology_keys.contains("topology.kubernetes.io/zone"));
 }
+
+#[test]
+fn ci_uses_the_canonical_three_node_kind_fixture() {
+    let workflow: serde_json::Value =
+        serde_saphyr::from_str(include_str!("../../.github/workflows/CI.yml")).unwrap();
+    let cluster = workflow["jobs"]["build"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|action| action.starts_with("helm/kind-action@"))
+        })
+        .unwrap();
+    assert_eq!(
+        cluster["with"]["config"], "deploy/kind-config.yaml",
+        "CI must share the canonical fixture with the real-replica maintenance test"
+    );
+
+    let config: serde_json::Value =
+        serde_saphyr::from_str(include_str!("../../deploy/kind-config.yaml")).unwrap();
+    let nodes = config["nodes"].as_array().unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node["role"] == "control-plane")
+            .count(),
+        1
+    );
+    assert!(
+        nodes.iter().filter(|node| node["role"] == "worker").count() >= 2,
+        "real-replica maintenance requires at least three nodes"
+    );
+}
