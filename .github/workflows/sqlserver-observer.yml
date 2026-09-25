@@ -1,0 +1,36 @@
+name: SQL Server observer
+
+on:
+  pull_request:
+    paths:
+      - "examples/sqlserver/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/sqlserver-observer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sqlserver-observer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server-free:
+    name: Server-free runtime tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          components: rustfmt, clippy
+          build-warnings: ""
+      - name: Check SQL Server formatting
+        run: cargo fmt -p sqlserver-replicated -- --check
+      - name: Check SQL Server runtime
+        run: cargo clippy --locked -p sqlserver-replicated --all-targets --all-features -- -D warnings
+      - name: Run SQL Server contract and runtime tests
+        run: cargo test --locked -p sqlserver-replicated --all-features

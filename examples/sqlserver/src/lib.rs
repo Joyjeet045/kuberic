@@ -1,6 +1,14 @@
 pub mod config;
 pub mod error;
+pub mod executor;
+pub mod instance;
+pub mod monitor;
+pub mod observation;
 pub mod operation;
+pub mod query;
+pub mod runtime_config;
+pub mod runtime_error;
+pub mod tds;
 pub mod types;
 
 pub use config::{

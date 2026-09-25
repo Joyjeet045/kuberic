@@ -1,5 +1,7 @@
 use std::fmt;
 
+use serde::{Serialize, Serializer};
+
 use crate::error::ContractError;
 
 /// `sysname` is `nvarchar(128)`, so SQL identifiers are bounded in UTF-16 code
@@ -25,7 +27,7 @@ const MAX_OPAQUE_ID_BYTES: usize = 256;
 /// <https://learn.microsoft.com/en-us/sql/t-sql/statements/create-availability-group-transact-sql>
 const MAX_EXTERNAL_AG_NAME_UTF16: usize = 64;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct SqlIdentifier(String);
 
 impl SqlIdentifier {
@@ -70,7 +72,7 @@ impl fmt::Display for SqlIdentifier {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct AvailabilityGroupName(SqlIdentifier);
 
 impl AvailabilityGroupName {
@@ -106,7 +108,7 @@ impl fmt::Display for AvailabilityGroupName {
 /// construction. Normalizing here rather than at each use keeps duplicate
 /// detection and canonical operation encoding from disagreeing about whether two
 /// spellings name the same instance.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ServerName(SqlIdentifier);
 
 impl ServerName {
@@ -131,7 +133,7 @@ impl fmt::Display for ServerName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct OpaqueId(String);
 
 impl OpaqueId {
@@ -152,7 +154,7 @@ impl fmt::Display for OpaqueId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Guid(String);
 
 impl Guid {
@@ -208,6 +210,12 @@ impl DecimalProgress {
 impl fmt::Display for DecimalProgress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+impl Serialize for DecimalProgress {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
     }
 }
 
@@ -314,7 +322,7 @@ impl SecretRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ReplicaIdentity {
     logical_id: OpaqueId,
     native_replica_id: Option<Guid>,
@@ -365,19 +373,19 @@ pub struct ReplicaDescriptor {
     pub endpoint: Endpoint,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AvailabilityGroupIdentity {
     pub name: AvailabilityGroupName,
     pub group_id: Guid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DatabaseIdentity {
     pub name: SqlIdentifier,
     pub group_database_id: Guid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DatabaseLineage {
     pub database: DatabaseIdentity,
     pub recovery_fork_id: Guid,
@@ -409,30 +417,47 @@ impl NativeRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Serialize for NativeRole {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Primary => "PRIMARY",
+            Self::Secondary => "SECONDARY",
+            Self::Resolving => "RESOLVING",
+            Self::NotJoined => "NOT_JOINED",
+            Self::Unknown(value) => value.as_str(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NativeProgress {
     pub hardened_block: Option<DecimalProgress>,
     pub redone_record: Option<DecimalProgress>,
     pub committed_record: Option<DecimalProgress>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ObservationFailureKind {
     Unreachable,
     PermissionDenied,
     TimedOut,
     Malformed,
     Unsupported,
+    Authentication,
+    Tls,
+    Inconsistent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObservationFailure {
     pub kind: ObservationFailureKind,
     pub message: String,
     pub observed_at_unix_millis: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum Observation<T> {
     Present {
         value: T,

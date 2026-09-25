@@ -1,7 +1,8 @@
 # SQL Server External-Replication Adapter
 
-> **Status:** Contract only. No SQL Server process, query, topology, or failover
-> effects are enabled by this change.
+> **Status:** Safety contract and observe-only runtime. Read-only TDS queries
+> are supported; SQL Server process management, topology mutations, and
+> failover effects are not enabled.
 >
 > **Support level:** Experimental. This is not a Microsoft-supported Kubernetes
 > high-availability solution.
@@ -52,8 +53,8 @@ the initial profile.
 
 ## Current Implementation
 
-The `examples/sqlserver` crate currently implements only the reviewable
-contract needed before database effects are introduced:
+The `examples/sqlserver` crate implements the safety contract and a standalone
+observe-only runtime:
 
 - validation of the supported SQL Server profile;
 - immutable image and Kubernetes Secret references;
@@ -65,25 +66,30 @@ contract needed before database effects are introduced:
 - observations that distinguish present, absent, stale, and failed evidence;
 - versioned operation envelopes with canonical SHA-256 input signatures;
 - explicit destructive approvals and fence references;
-- duplicate-operation and operation-ID-reuse classification.
+- duplicate-operation and operation-ID-reuse classification;
+- verified-TLS TDS execution with mounted observation credentials;
+- capability-checked, identity-bracketed native DMV snapshots; and
+- a freshness-aware monitor and observe-only JSON CLI.
 
-The crate does not yet connect to SQL Server, create an AG, seed a database,
-renew a write lease, change a role, or integrate with either Kuberic operator.
+The crate connects to already provisioned SQL Server instances. It does not
+create an AG, seed a database, renew a write lease, change a role, or integrate
+with either Kuberic operator.
 Mutation configuration is therefore only a contract for later stages, not an
 enabled execution path.
 
-Unlike the PostgreSQL and SQLite examples, `examples/sqlserver` is a pure
-library with no binary target and no dependency on `kuberic-core`. The contract
-is deliberately expressible and testable without the replication runtime, so
-that stage 2 can introduce a runtime against a contract that is already fixed.
+The crate has no dependency on `kuberic-core`. The `sqlserver-observer` binary
+and runtime remain independently testable without the replication runtime.
+See the [observe-only runtime guide](observation.md) for configuration,
+permissions, output semantics, and tests.
 
 Two capabilities named in this design are defined but not yet enforceable, and
 each is assigned to a later stage rather than half-built now:
 
 - **Encoding and decoding.** The canonical writer produces the bytes that the
-  input signature covers, but there is no reader and no `serde` support, so an
-  envelope cannot yet be persisted or sent between processes. Stage 2 owns the
-  decoder together with the durable result journal that needs it.
+  input signature covers, but there is no operation-envelope reader or `serde`
+  support, so an envelope cannot yet be persisted or sent between processes.
+  Stage 3 owns the decoder together with the durable result journal that needs
+  it. Observation JSON serialization does not change the operation contract.
   `OperationRequest::from_decoded_parts` exists as the seam that decoder will
   use, and is the only path on which the contract-version check is reachable.
 - **Proof validity and issuance.** `DestructiveApproval` and `FenceReference`
@@ -277,9 +283,9 @@ automatic Kubernetes failover.
 
 ## Delivery Sequence
 
-1. **Support and safety contract** — the current change: types, validation,
+1. **Support and safety contract** — implemented: types, validation,
    canonical operation identity, tests, and this design.
-2. **Runtime and observation** — a replaceable TDS executor, immutable DMV
+2. **Runtime and observation** — the current slice: a replaceable TDS executor, immutable DMV
    snapshots, freshness, startup capability checks, and an observe-only CLI.
 3. **Bootstrap, join, and reseed** — pure convergence decisions, one native
    effect at a time, durable SQL-specific result journal, and automatic-seeding
@@ -304,6 +310,10 @@ cover profile rejection, exact progress, malformed observations, canonical
 operation vectors, duplicate/reused operation IDs, epoch regression,
 destructive approval, and fence binding. They run in the ordinary CI job as
 `cargo test -p sqlserver-replicated`, alongside the other example crates.
+Runtime tests also cover typed DMV decoding, inconsistent snapshots,
+permissions, transport and sample deadlines, freshness, cancellation, CLI
+output, and credential redaction. A dedicated server-free observer workflow
+runs these without provisioning PostgreSQL or Kubernetes.
 
 Live tests require a separate explicit job because the current CI installs
 PostgreSQL but not SQL Server. That job must pin the engine, tools, and helper

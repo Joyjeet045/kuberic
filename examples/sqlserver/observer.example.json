@@ -1,0 +1,17 @@
+{
+  "mode": "observe_only",
+  "host": "sql-0.example.internal",
+  "port": 1433,
+  "availability_group": "kuberic-ag",
+  "expected_server_name": "sql-0",
+  "replica_id": "replica-0",
+  "incarnation": "replace-with-the-current-pod-uid",
+  "observer_username_file": "/run/secrets/sqlserver-observer/username",
+  "observer_password_file": "/run/secrets/sqlserver-observer/password",
+  "ca_certificate_file": "/run/secrets/sqlserver-observer/ca.crt",
+  "connect_timeout_ms": 5000,
+  "query_timeout_ms": 5000,
+  "sample_timeout_ms": 30000,
+  "poll_interval_ms": 1000,
+  "max_age_ms": 60000
+}
