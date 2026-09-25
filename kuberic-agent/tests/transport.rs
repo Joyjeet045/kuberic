@@ -189,3 +189,91 @@ fn reliable_transport_attaches_sessions_retires_acks_and_falls_back_to_copy() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn switchover_peer_session_matrix_preserves_exact_replay_across_role_reversal() {
+    for (sender, receiver) in [
+        (identity(1, "source"), identity(2, "target")),
+        (identity(2, "target"), identity(1, "source")),
+    ] {
+        for epoch in [2, 3] {
+            let receiver_registry = SessionRegistry::new(ProcessSessionId::new("receiver-new"));
+            receiver_registry
+                .register_peer(sender.clone(), ProcessSessionId::new("sender-old"))
+                .await;
+            receiver_registry
+                .register_peer(sender.clone(), ProcessSessionId::new("sender-new"))
+                .await;
+            let mut sender_transport =
+                ReliableTransport::new(ProcessSessionId::new("sender-new"), 2).unwrap();
+            sender_transport
+                .admit_peer(receiver.clone(), ProcessSessionId::new("receiver-new"))
+                .unwrap();
+            let payload = ReplicationItem {
+                sender: sender.clone(),
+                receiver: receiver.clone(),
+                epoch: Epoch::new(0, epoch),
+                previous_configuration_id: Some(ConfigurationId::new(format!(
+                    "configuration-{}",
+                    epoch - 1
+                ))),
+                current_configuration_id: ConfigurationId::new(format!("configuration-{epoch}")),
+                ..item(10)
+            };
+            sender_transport
+                .queue(OutboundOperation::Replication(payload.clone()))
+                .unwrap();
+            for sender_session in ["sender-old", "sender-new"] {
+                for receiver_session in ["receiver-old", "receiver-new"] {
+                    let lease = receiver_registry
+                        .validate_peer(&sender, sender_session, receiver_session)
+                        .await;
+                    assert_eq!(
+                        lease.is_ok(),
+                        sender_session == "sender-new" && receiver_session == "receiver-new"
+                    );
+                    // Failed session validation cannot consume the retained operation.
+                    let ResumeWindow::Retained(replayed) = sender_transport
+                        .reconnect_replication(&receiver, 10)
+                        .unwrap()
+                    else {
+                        panic!("handoff-boundary operation must remain replayable")
+                    };
+                    assert_eq!(replayed.len(), 1);
+                    assert_eq!(replayed[0].payload, payload);
+                }
+            }
+            for _ in 0..2 {
+                drop(
+                    receiver_registry
+                        .validate_peer(&sender, "sender-new", "receiver-new")
+                        .await
+                        .unwrap(),
+                );
+                let ResumeWindow::Retained(replayed) = sender_transport
+                    .reconnect_replication(&receiver, 10)
+                    .unwrap()
+                else {
+                    panic!("current-session replay")
+                };
+                assert_eq!(replayed[0].payload, payload);
+            }
+            let impostor = identity(sender.replica_id.value(), "replacement-incarnation");
+            assert!(
+                receiver_registry
+                    .validate_peer(&impostor, "sender-new", "receiver-new")
+                    .await
+                    .is_err()
+            );
+            sender_transport
+                .acknowledge_replication(&receiver, 10)
+                .unwrap();
+            assert!(matches!(
+                sender_transport
+                    .reconnect_replication(&receiver, 10)
+                    .unwrap(),
+                ResumeWindow::FullCopyRequired
+            ));
+        }
+    }
+}

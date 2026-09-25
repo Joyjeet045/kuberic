@@ -14,7 +14,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReferen
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client, Resource, ResourceExt};
 use kuberic_protocol::command::{
-    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, ProtocolCommand,
+    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
+    ProtocolCommand,
 };
 use kuberic_protocol::observation::ReplicaObservationKey;
 use kuberic_protocol::types::{
@@ -45,6 +46,10 @@ pub enum EffectRecord {
     DeleteScaffolding {
         pod_name: Option<String>,
         pvc_name: Option<String>,
+    },
+    DeleteExactPod {
+        pod_name: String,
+        pod_uid: PodUid,
     },
     EnsureWriteRoutingService,
     ReplaceStatus,
@@ -108,6 +113,13 @@ pub trait ClusterApi: Send + Sync {
         &self,
         observation: &RawObservation,
         identity: &ReplicaIdentity,
+    ) -> Result<()>;
+
+    async fn delete_exact_pod(
+        &self,
+        observation: &RawObservation,
+        pod_name: &str,
+        pod_uid: &PodUid,
     ) -> Result<()>;
 
     async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()>;
@@ -187,7 +199,7 @@ impl AgentApi for GrpcAgentApi {
             .await
             .map_err(|_| AgentRpcError::Unavailable("Execute timed out".to_string()))?
             .map(|response| response.into_inner())
-            .map_err(classify_status)
+            .map_err(classify_execute_status)
     }
 }
 
@@ -208,6 +220,16 @@ fn classify_status(status: tonic::Status) -> AgentRpcError {
             AgentRpcError::Unavailable(status.to_string())
         }
         _ => AgentRpcError::Invalid(status.to_string()),
+    }
+}
+
+fn classify_execute_status(status: tonic::Status) -> AgentRpcError {
+    // Session or authority may have advanced after GetStatus. A rejected
+    // dispatch is not a contradictory report and must be resolved by observing.
+    if matches!(status.code(), Code::FailedPrecondition | Code::Aborted) {
+        AgentRpcError::Unavailable(status.to_string())
+    } else {
+        classify_status(status)
     }
 }
 
@@ -577,6 +599,25 @@ where
         Ok(())
     }
 
+    async fn delete_exact_pod(
+        &self,
+        observation: &RawObservation,
+        pod_name: &str,
+        pod_uid: &PodUid,
+    ) -> Result<()> {
+        let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
+        match pods.delete(pod_name, &params).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+            Err(error) => Err(map_kube_effect_error(error)),
+        }
+    }
+
     async fn delete_replica_endpoint(
         &self,
         observation: &RawObservation,
@@ -735,12 +776,19 @@ where
             .set
             .uid()
             .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let expected_process_session_id =
+            observed_process_session(observation, replica_id, &target)?;
         let response = self
             .agents
             .execute(
                 &endpoint,
                 &self.bearer_token,
-                command_request(resource_uid, target, command.clone()),
+                command_request(
+                    resource_uid,
+                    target,
+                    expected_process_session_id,
+                    command.clone(),
+                ),
             )
             .await
             .map_err(map_agent_effect_error)?;
@@ -756,6 +804,20 @@ where
         })?;
         kuberic_wire::validate_agent_status_report(&report)
             .map_err(|error| ControllerError::InvalidAgentEvidence(error.to_string()))
+    }
+}
+
+fn observed_process_session(
+    observation: &RawObservation,
+    replica_id: ReplicaId,
+    target: &ReplicaIdentity,
+) -> Result<String> {
+    let observation_key = ReplicaObservationKey::new(replica_id, target.instance_id.clone());
+    match observation.agents.get(&observation_key) {
+        Some(RawAgentObservation::Report(report)) if !report.process_session_id.is_empty() => {
+            Ok(report.process_session_id.clone())
+        }
+        _ => Err(ControllerError::ObservationStale),
     }
 }
 
@@ -1494,10 +1556,27 @@ fn agent_endpoint(pod: &Pod) -> Option<String> {
 
 fn map_kube_effect_error(error: kube::Error) -> ControllerError {
     match error {
-        kube::Error::Api(response) if response.code == 409 || response.code == 422 => {
+        kube::Error::Api(response) if matches!(response.code, 409 | 412 | 422) => {
             ControllerError::ObservationStale
         }
         other => ControllerError::Effect(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn exact_pod_precondition_failures_require_reobservation() {
+    for code in [409, 412, 422] {
+        let error = kube::Error::Api(Box::new(kube::core::Status {
+            message: "precondition changed".into(),
+            reason: "Conflict".into(),
+            code,
+            ..Default::default()
+        }));
+        assert!(matches!(
+            map_kube_effect_error(error),
+            ControllerError::ObservationStale
+        ));
     }
 }
 
@@ -1533,6 +1612,9 @@ fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
             };
             (identity, command.local_replica_id)
         }
+        ProtocolCommand::PrepareSwitchover(command) => {
+            (command.source.clone(), command.local_replica_id)
+        }
         ProtocolCommand::EnsureReplicaBuild(command) => {
             let identity = ReplicaIdentity {
                 replica_id: command.local_replica_id,
@@ -1547,6 +1629,7 @@ fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
 fn command_request(
     resource_uid: String,
     target: ReplicaIdentity,
+    expected_process_session_id: String,
     command: ProtocolCommand,
 ) -> proto::ExecuteCommandRequest {
     let command = match command {
@@ -1556,7 +1639,14 @@ fn command_request(
             ))
         }
         ProtocolCommand::EnsureConfiguration(command) => {
-            proto::execute_command_request::Command::EnsureConfiguration(ensure_command(*command))
+            proto::execute_command_request::Command::EnsureConfiguration(Box::new(ensure_command(
+                *command,
+            )))
+        }
+        ProtocolCommand::PrepareSwitchover(command) => {
+            proto::execute_command_request::Command::PrepareSwitchover(prepare_switchover_command(
+                *command,
+            ))
         }
         ProtocolCommand::EnsureReplicaBuild(command) => {
             proto::execute_command_request::Command::EnsureReplicaBuild(ensure_build_command(
@@ -1568,6 +1658,7 @@ fn command_request(
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         resource_uid,
         target: Some(target.into()),
+        expected_process_session_id,
         command: Some(command),
     }
 }
@@ -1623,6 +1714,26 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
             .map(ToString::to_string)
             .collect(),
         failover_safe_lsn: command.failover_safe_lsn,
+        switchover_handoff: command.switchover_handoff.map(Into::into),
+        retire_switchover_preparation_ids: command
+            .retire_switchover_preparation_ids
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    }
+}
+
+fn prepare_switchover_command(command: PrepareSwitchover) -> proto::PrepareSwitchoverCommand {
+    proto::PrepareSwitchoverCommand {
+        preparation_generation: command.preparation_generation,
+        operation_id: command.operation_id.to_string(),
+        request_id: command.request_id.to_string(),
+        local_replica_id: command.local_replica_id.value(),
+        expected_instance_id: command.expected_instance_id.to_string(),
+        expected_agent_generation: command.expected_agent_generation.to_string(),
+        source: Some(command.source.into()),
+        target: Some(command.target.into()),
+        current_configuration: Some(command.current_configuration.into()),
     }
 }
 
@@ -1663,6 +1774,7 @@ fn transition_kind(kind: TransitionKind) -> proto::TransitionKind {
         TransitionKind::Bootstrap => proto::TransitionKind::Bootstrap,
         TransitionKind::Replacement => proto::TransitionKind::Replacement,
         TransitionKind::Failover => proto::TransitionKind::Failover,
+        TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
     }
 }
 
@@ -1860,6 +1972,38 @@ impl ClusterApi for InMemoryClusterApi {
         Ok(())
     }
 
+    async fn delete_exact_pod(
+        &self,
+        observation: &RawObservation,
+        pod_name: &str,
+        pod_uid: &PodUid,
+    ) -> Result<()> {
+        let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
+        let mut state = self.state.lock().await;
+        if let Some(pod) = state
+            .observation
+            .pods
+            .iter()
+            .find(|pod| pod.name_any() == pod_name)
+        {
+            let preconditions = params.preconditions.unwrap();
+            if pod.uid() != preconditions.uid
+                || pod.resource_version() != preconditions.resource_version
+            {
+                return Err(ControllerError::ObservationStale);
+            }
+            state
+                .observation
+                .pods
+                .retain(|pod| pod.uid().as_deref() != Some(pod_uid.as_str()));
+        }
+        state.effects.push(EffectRecord::DeleteExactPod {
+            pod_name: pod_name.to_string(),
+            pod_uid: pod_uid.clone(),
+        });
+        Ok(())
+    }
+
     async fn delete_replica_endpoint(
         &self,
         observation: &RawObservation,
@@ -2017,6 +2161,28 @@ impl ClusterApi for InMemoryClusterApi {
     }
 }
 
+fn exact_pod_delete_params(
+    observation: &RawObservation,
+    pod_name: &str,
+    pod_uid: &PodUid,
+) -> Result<DeleteParams> {
+    let pod = observation
+        .pods
+        .iter()
+        .find(|pod| pod.name_any() == pod_name && pod.uid().as_deref() == Some(pod_uid.as_str()))
+        .ok_or(ControllerError::ObservationStale)?;
+    let resource_version = pod
+        .resource_version()
+        .ok_or(ControllerError::ObservationStale)?;
+    Ok(DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(pod_uid.to_string()),
+            resource_version: Some(resource_version),
+        }),
+        ..Default::default()
+    })
+}
+
 #[allow(dead_code)]
 async fn delete_exact<K>(api: &Api<K>, name: &str, uid: &str) -> Result<()>
 where
@@ -2059,5 +2225,207 @@ fn role_label(role: ReplicaRole) -> &'static str {
         ReplicaRole::ActiveSecondary => "active-secondary",
         ReplicaRole::IdleSecondary => "idle-secondary",
         ReplicaRole::None => "none",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crd::KubericSetSpec;
+    use kuberic_protocol::command::{
+        EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
+    };
+    use kuberic_protocol::types::{
+        AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember,
+        EffectivePolicy, Epoch, InitializationId, OperationId, PodUid, PvcUid, SwitchoverRequestId,
+    };
+
+    fn identity(replica_id: i64) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: ReplicaId::new(replica_id),
+            instance_id: ReplicaInstanceId::new(format!("pod-{replica_id}")),
+            agent_generation: AgentGeneration::new(format!("generation-{replica_id}")),
+        }
+    }
+
+    #[test]
+    fn command_dispatch_uses_the_exact_observed_process_session() {
+        assert!(matches!(
+            classify_execute_status(tonic::Status::failed_precondition(
+                "command targets a stale agent process session"
+            )),
+            AgentRpcError::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_status(tonic::Status::failed_precondition("invalid durable status")),
+            AgentRpcError::Invalid(_)
+        ));
+        let source = identity(1);
+        let target = identity(2);
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            ReplicaObservationKey::new(source.replica_id, source.instance_id.clone()),
+            RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
+                process_session_id: "session-1".to_string(),
+                ..Default::default()
+            })),
+        );
+        let mut observation = RawObservation {
+            set: KubericSet::new(
+                "db",
+                KubericSetSpec {
+                    replicas: 2,
+                    image: "example/db:latest".to_string(),
+                    failover_delay_seconds: 30,
+                    switchover: None,
+                },
+            ),
+            pods: Vec::new(),
+            pvcs: Vec::new(),
+            services: Vec::new(),
+            secrets: Vec::new(),
+            agents,
+            failures: Vec::new(),
+            now_unix_seconds: 0,
+        };
+        observation.pods.push(Pod {
+            metadata: kube::core::ObjectMeta {
+                name: Some("exact-pod".to_string()),
+                uid: Some("pod-1".to_string()),
+                resource_version: Some("42".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let deletion =
+            exact_pod_delete_params(&observation, "exact-pod", &PodUid::new("pod-1")).unwrap();
+        let serialized = serde_json::to_value(deletion).unwrap();
+        assert_eq!(serialized["preconditions"]["uid"], "pod-1");
+        assert_eq!(serialized["preconditions"]["resourceVersion"], "42");
+        assert!(
+            exact_pod_delete_params(&observation, "exact-pod", &PodUid::new("replaced")).is_err()
+        );
+        let session = observed_process_session(&observation, source.replica_id, &source).unwrap();
+        assert_eq!(session, "session-1");
+
+        let configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            source.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        let preparation = ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
+            preparation_generation: 1,
+            operation_id: OperationId::new("prepare-1"),
+            request_id: SwitchoverRequestId::new("request-1"),
+            local_replica_id: source.replica_id,
+            expected_instance_id: source.instance_id.clone(),
+            expected_agent_generation: source.agent_generation.clone(),
+            source: source.clone(),
+            target: target.clone(),
+            current_configuration: configuration.clone(),
+        }));
+        let request = command_request(
+            "resource".to_string(),
+            source.clone(),
+            session,
+            preparation.clone(),
+        );
+        assert_eq!(request.expected_process_session_id, "session-1");
+        assert!(matches!(
+            &request.command,
+            Some(proto::execute_command_request::Command::PrepareSwitchover(
+                _
+            ))
+        ));
+        let RawAgentObservation::Report(report) = observation
+            .agents
+            .get_mut(&ReplicaObservationKey::new(
+                source.replica_id,
+                source.instance_id.clone(),
+            ))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        report.process_session_id = "session-restarted".to_string();
+        let replay = command_request(
+            "resource".to_string(),
+            source.clone(),
+            observed_process_session(&observation, source.replica_id, &source).unwrap(),
+            preparation,
+        );
+        assert_eq!(replay.expected_process_session_id, "session-restarted");
+        assert_eq!(replay.command, request.command);
+
+        let policy = EffectivePolicy::fixed(2, 30).unwrap();
+        let existing_commands = vec![
+            (
+                ProtocolCommand::InitializeAgentStore(Box::new(InitializeAgentStore {
+                    initialization_id: InitializationId::new("init-1"),
+                    resource_uid: ResourceUid::new("resource"),
+                    local_replica_id: source.replica_id,
+                    expected_instance_id: source.instance_id.clone(),
+                    expected_pod_uid: PodUid::new(source.instance_id.as_str()),
+                    expected_pvc_uid: PvcUid::new("pvc-1"),
+                    assigned_agent_generation: source.agent_generation.clone(),
+                    effective_policy: policy.clone(),
+                    bootstrap_configuration: configuration.clone(),
+                    provisioning: None,
+                })),
+                source.clone(),
+            ),
+            (
+                ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
+                    operation_id: OperationId::new("configuration-1"),
+                    previous_configuration: None,
+                    current_configuration: configuration.clone(),
+                    previous_epoch: None,
+                    current_epoch: configuration.epoch,
+                    effective_policy: policy,
+                    local_replica_id: source.replica_id,
+                    expected_instance_id: source.instance_id.clone(),
+                    expected_agent_generation: source.agent_generation.clone(),
+                    transition_kind: TransitionKind::Bootstrap,
+                    failover_safe_lsn: None,
+                    primary_write_status: AccessStatus::ReconfigurationPending,
+                    current_only: false,
+                    retire_build_ids: Vec::new(),
+                    switchover_handoff: None,
+                    retire_switchover_preparation_ids: Vec::new(),
+                })),
+                source.clone(),
+            ),
+            (
+                ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
+                    operation_id: OperationId::new("build-1"),
+                    local_replica_id: source.replica_id,
+                    expected_instance_id: source.instance_id.clone(),
+                    expected_agent_generation: source.agent_generation.clone(),
+                    target,
+                    authority: None,
+                    source_session_id: None,
+                })),
+                source,
+            ),
+        ];
+        for (command, target) in existing_commands {
+            let request = command_request(
+                "resource".to_string(),
+                target,
+                "session-current".to_string(),
+                command,
+            );
+            assert_eq!(request.expected_process_session_id, "session-current");
+        }
     }
 }

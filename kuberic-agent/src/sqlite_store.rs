@@ -6,13 +6,16 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use kuberic_protocol::command::EnsureConfiguration;
-use kuberic_protocol::types::{ConfigurationId, Epoch, FaultType, LoadMetric, OperationId};
+use kuberic_protocol::types::{
+    AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaRole,
+    SwitchoverHandoff,
+};
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityStore, BuildProgressStore,
     DurableBuildProgress, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
     ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
-use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
+use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
 use kuberic_runtime_internal::{ContractError, Result as ContractResult};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
@@ -225,6 +228,63 @@ impl AgentStore for SqliteStore {
             if let Some(configuration) = state.current_configuration.as_ref() {
                 state.highest_epoch = state.highest_epoch.max(configuration.epoch);
             }
+            if let RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            } = &pending.effect.action
+            {
+                let authority = result.postcondition.authority.as_ref().ok_or_else(|| {
+                    AgentError::EffectConflict(
+                        "planned switchover preparation omitted admitted authority".into(),
+                    )
+                })?;
+                if *preparation_generation == 0
+                    || result.postcondition.role != ReplicaRole::Primary
+                    || result.postcondition.write_status != AccessStatus::ReconfigurationPending
+                    || result.postcondition.current_progress < 0
+                    || result.postcondition.committed_lsn > result.postcondition.current_progress
+                    || authority.local_identity != *source
+                    || authority.current_configuration.configuration_id
+                        != *starting_configuration_id
+                    || authority.current_configuration.epoch != *starting_epoch
+                    || authority.primary_identity() != source
+                    || !authority
+                        .current_configuration
+                        .members
+                        .iter()
+                        .any(|member| {
+                            member.identity == *target && member.role != ReplicaRole::Primary
+                        })
+                {
+                    return Err(AgentError::EffectConflict(
+                        "planned switchover preparation returned an invalid postcondition".into(),
+                    ));
+                }
+                let handoff = SwitchoverHandoff {
+                    preparation_generation: *preparation_generation,
+                    preparation_operation_id: pending.effect.operation_id.clone(),
+                    request_id: request_id.clone(),
+                    source: source.clone(),
+                    target: target.clone(),
+                    starting_configuration_id: starting_configuration_id.clone(),
+                    starting_epoch: *starting_epoch,
+                    handoff_lsn: result.postcondition.current_progress,
+                };
+                if state
+                    .prepared_switchover
+                    .as_ref()
+                    .is_some_and(|existing| existing != &handoff)
+                {
+                    return Err(AgentError::EffectConflict(
+                        "another planned switchover preparation is retained".into(),
+                    ));
+                }
+                state.prepared_switchover = Some(handoff);
+            }
             state.retained_result = Some(RetainedResult {
                 operation_id: result.operation_id.clone(),
                 effect: pending.effect,
@@ -359,6 +419,86 @@ impl AgentStore for SqliteStore {
                 return Err(AgentError::EffectConflict(
                     "configuration command has not reached its terminal stage".into(),
                 ));
+            }
+            if !record.command.retire_switchover_preparation_ids.is_empty() {
+                let retirement_id = &record.command.retire_switchover_preparation_ids[0];
+                if record.command.is_switchover_restoration()
+                    && record.command.switchover_handoff.is_none()
+                {
+                    if state
+                        .prepared_switchover
+                        .as_ref()
+                        .is_some_and(|prepared| &prepared.preparation() != retirement_id)
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "restoration retires another preparation".into(),
+                        ));
+                    }
+                    if let Some(prepared) = state.prepared_switchover.take() {
+                        state.retired_switchover = Some(prepared);
+                    }
+                } else {
+                    let prepared = state
+                        .prepared_switchover
+                        .as_ref()
+                        .or(state.retired_switchover.as_ref())
+                        .ok_or_else(|| {
+                            AgentError::EffectConflict(
+                                "configuration retires missing switchover preparation".into(),
+                            )
+                        })?;
+                    if record.command.switchover_handoff.as_ref() != Some(prepared) {
+                        return Err(AgentError::EffectConflict(
+                            "configuration retires a changed switchover certificate".into(),
+                        ));
+                    }
+                    if record.command.retire_switchover_preparation_ids.len() != 1
+                        || record.command.retire_switchover_preparation_ids[0]
+                            != prepared.preparation()
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "configuration retires another switchover preparation".into(),
+                        ));
+                    }
+                    state.retired_switchover = Some(prepared.clone());
+                    state.prepared_switchover = None;
+                }
+                let (starting_epoch, starting_configuration_id) =
+                    record.command.switchover_handoff.as_ref().map_or(
+                        (
+                            record.command.current_epoch,
+                            record
+                                .command
+                                .current_configuration
+                                .configuration_id
+                                .clone(),
+                        ),
+                        |handoff| {
+                            (
+                                handoff.starting_epoch,
+                                handoff.starting_configuration_id.clone(),
+                            )
+                        },
+                    );
+                if state
+                    .preparation_retirement
+                    .as_ref()
+                    .is_some_and(|retired| {
+                        retired.starting_epoch > starting_epoch
+                            || (retired.starting_epoch == starting_epoch
+                                && (retired.starting_configuration_id != starting_configuration_id
+                                    || retired.generation > retirement_id.generation))
+                    })
+                {
+                    return Err(AgentError::EffectConflict(
+                        "preparation retirement regresses durable fencing".into(),
+                    ));
+                }
+                state.preparation_retirement = Some(crate::state::PreparationRetirement {
+                    starting_epoch,
+                    starting_configuration_id,
+                    generation: retirement_id.generation,
+                });
             }
             let result = RetainedCommandResult {
                 command: record.command,

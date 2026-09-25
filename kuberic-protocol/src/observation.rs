@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{
     AcceptedStatus, AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric,
-    OperationId, PodUid, ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
-    ReplicaRole, ResourceUid,
+    OperationId, PlannedSwitchoverRequest, PodUid, ProcessSessionId, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +17,8 @@ pub struct DesiredState {
     pub replicas: u32,
     pub image: String,
     pub failover_delay_seconds: u64,
+    #[serde(default)]
+    pub switchover: Option<PlannedSwitchoverRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +95,8 @@ pub struct AgentReport {
     pub retained_operation_id: Option<OperationId>,
     #[serde(default)]
     pub builds: Vec<AgentBuildReport>,
+    #[serde(default)]
+    pub prepared_switchover: Option<SwitchoverHandoff>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +146,7 @@ impl Default for AgentReport {
             pending_operation_id: None,
             retained_operation_id: None,
             builds: Vec::new(),
+            prepared_switchover: None,
         }
     }
 }

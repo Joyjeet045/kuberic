@@ -22,7 +22,7 @@ env:
   CARGO_BUILD_JOBS: 2
   CARGO_INCREMENTAL: 0
   KIND_CLUSTER_NAME: kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}
-  KUBECONFIG: /tmp/kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
+  KUBECONFIG: ${{ github.workspace }}/target/kind/level-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
   KUBE_CONTEXT: kind-kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}
   KUBERIC_AGENT_BEARER_TOKEN: level-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -65,7 +65,9 @@ jobs:
           -p kuberic-controller
           -p kvstore2
       - name: Compile isolated KinD tests
-        run: cargo test -p kuberic-level-tests --no-run
+        run: |
+          cargo test -p kuberic-level-tests --no-run
+          cargo test -p kuberic-level-tests
       - name: Verify source and dependency isolation
         run: |
           scripts/check_level_triggered_scope.sh origin/main
@@ -84,6 +86,8 @@ jobs:
           build-warnings: ""
       - uses: taiki-e/install-action@protoc
       - uses: taiki-e/install-action@just
+      - name: Prepare owned cluster directory outside the image build context
+        run: mkdir -p "$(dirname "$KUBECONFIG")"
       - name: Create isolated KinD cluster
         uses: helm/kind-action@v1
         with:
@@ -110,9 +114,20 @@ jobs:
         run: just level-triggered-kind-test replacement
       - name: Run failover scenario
         run: just level-triggered-kind-test failover
+      - name: Run healthy planned switchover
+        timeout-minutes: 10
+        run: just level-triggered-kind-test switchover
       - name: Collect diagnostics
         if: failure()
+        timeout-minutes: 3
         run: just level-triggered-diagnostics
+      - name: Delete owned cluster
+        if: always()
+        timeout-minutes: 3
+        run: |
+          if test -f "${KUBECONFIG}.kuberic-owner"; then
+            just delete-kind-cluster
+          fi
 
   full-kind:
     name: Full adversarial matrix (${{ matrix.run }})
@@ -131,6 +146,8 @@ jobs:
           build-warnings: ""
       - uses: taiki-e/install-action@protoc
       - uses: taiki-e/install-action@just
+      - name: Prepare owned cluster directory outside the image build context
+        run: mkdir -p "$(dirname "$KUBECONFIG")"
       - name: Create isolated KinD cluster
         uses: helm/kind-action@v1
         with:
@@ -151,8 +168,17 @@ jobs:
         run: just level-triggered-images
       - name: Install isolated stack
         run: just level-triggered-install
-      - name: Run full adversarial matrix
+      - name: Run full matrix including switchover restart and target-loss variants
+        timeout-minutes: 35
         run: just level-triggered-kind-test all
       - name: Collect diagnostics
         if: failure()
+        timeout-minutes: 3
         run: just level-triggered-diagnostics
+      - name: Delete owned cluster
+        if: always()
+        timeout-minutes: 3
+        run: |
+          if test -f "${KUBECONFIG}.kuberic-owner"; then
+            just delete-kind-cluster
+          fi

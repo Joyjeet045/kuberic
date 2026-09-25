@@ -33,6 +33,17 @@ pub struct KubericSetSpec {
     pub image: String,
     #[serde(default = "default_failover_delay_seconds")]
     pub failover_delay_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switchover: Option<PlannedSwitchoverRequestSpec>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedSwitchoverRequestSpec {
+    #[schemars(length(min = 1))]
+    pub request_id: String,
+    #[schemars(range(min = 1))]
+    pub target_replica_id: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
@@ -68,6 +79,10 @@ mod tests {
         let replicas = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
             ["properties"]["replicas"];
         assert_eq!(replicas["minimum"].as_f64(), Some(1.0));
+        let switchover = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["switchover"]["properties"];
+        assert_eq!(switchover["requestId"]["minLength"].as_u64(), Some(1));
+        assert_eq!(switchover["targetReplicaId"]["minimum"].as_f64(), Some(1.0));
 
         let status =
             &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"];
@@ -101,6 +116,7 @@ mod tests {
         );
         assert!(status["properties"].get("primaryFailure").is_some());
         assert!(status["properties"].get("quorumLoss").is_some());
+        assert!(status["properties"].get("lastSwitchover").is_some());
         assert!(
             status["properties"]["quorumLoss"]["properties"]
                 .get("startedAtUnixSeconds")
@@ -114,6 +130,11 @@ mod tests {
         assert!(
             status["properties"]["transition"]["properties"]
                 .get("electionLsn")
+                .is_some()
+        );
+        assert!(
+            status["properties"]["transition"]["properties"]
+                .get("switchover")
                 .is_some()
         );
         assert!(

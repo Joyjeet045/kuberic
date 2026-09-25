@@ -11,7 +11,7 @@ use crate::{AgentError, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryDecision {
     Idle,
-    Reissue(RuntimeEffect),
+    Reissue(Box<RuntimeEffect>),
     ReturnRetained(Box<RetainedResult>),
 }
 
@@ -26,7 +26,7 @@ pub async fn inspect_recovery<S: AgentStore>(
     }
     let state = store.load_state().await?;
     if let Some(pending) = state.pending_effect {
-        return Ok(RecoveryDecision::Reissue(pending.effect));
+        return Ok(RecoveryDecision::Reissue(Box::new(pending.effect)));
     }
     if let Some(retained) = state.retained_result {
         return Ok(RecoveryDecision::ReturnRetained(Box::new(retained)));
@@ -45,6 +45,6 @@ where
     match inspect_recovery(adapter.store().as_ref(), runtime).await? {
         RecoveryDecision::Idle => Ok(None),
         RecoveryDecision::ReturnRetained(retained) => Ok(Some(retained.result)),
-        RecoveryDecision::Reissue(effect) => adapter.execute(effect).await.map(Some),
+        RecoveryDecision::Reissue(effect) => adapter.execute(*effect).await.map(Some),
     }
 }

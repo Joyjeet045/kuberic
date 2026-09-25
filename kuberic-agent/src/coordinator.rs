@@ -3,16 +3,20 @@
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 
-use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
-use kuberic_protocol::types::{AccessStatus, Epoch, OperationId, ProcessSessionId, ReplicaRole};
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, PrepareSwitchover};
+use kuberic_protocol::types::{
+    AccessStatus, Epoch, OperationId, ProcessSessionId, ReplicaRole, SwitchoverHandoff,
+};
 use kuberic_runtime::application::OpenMode;
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
 
-use crate::Result;
-use crate::command::{admit_build, admit_configuration, admit_persisted_configuration};
+use crate::command::{
+    admit_build, admit_configuration, admit_persisted_configuration, admit_switchover_preparation,
+};
 use crate::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use crate::state::{CoordinatorStage, ReconfigurationRecord, RetainedCommandResult};
 use crate::store::{AgentStore, BeginConfiguration};
+use crate::{AgentError, Result};
 
 pub struct Coordinator<S, E> {
     store: Arc<S>,
@@ -70,6 +74,67 @@ where
             Some(command) => self.ensure_configuration(command).await.map(Some),
             None => Ok(None),
         }
+    }
+
+    pub async fn ensure_switchover_prepared(
+        &self,
+        command: PrepareSwitchover,
+    ) -> Result<SwitchoverHandoff> {
+        let _command = self.command_lock.lock().await;
+        let state = self.store.load_state().await?;
+        admit_switchover_preparation(&command, &state)?;
+        if let Some(prepared) = state.prepared_switchover {
+            return Ok(prepared);
+        }
+        let action = RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: command.preparation_generation,
+            request_id: command.request_id.clone(),
+            source: command.source.clone(),
+            target: command.target.clone(),
+            starting_configuration_id: command.current_configuration.configuration_id.clone(),
+            starting_epoch: command.current_configuration.epoch,
+        };
+        let effect = if let Some(pending) = state.pending_effect {
+            if pending.effect.operation_id != command.operation_id
+                || pending.effect.action != action
+            {
+                return Err(AgentError::EffectConflict(
+                    "another durable effect is pending".into(),
+                ));
+            }
+            pending.effect
+        } else if let Some(retained) = state.retained_result {
+            if retained.operation_id == command.operation_id {
+                if retained.effect.action != action {
+                    return Err(AgentError::EffectConflict(
+                        "operation ID was reused with another switchover preparation".into(),
+                    ));
+                }
+                retained.effect
+            } else {
+                RuntimeEffect {
+                    operation_id: command.operation_id,
+                    sequence: state.next_effect_sequence,
+                    action,
+                }
+            }
+        } else {
+            RuntimeEffect {
+                operation_id: command.operation_id,
+                sequence: state.next_effect_sequence,
+                action,
+            }
+        };
+        self.runtime.execute(effect).await?;
+        self.store
+            .load_state()
+            .await?
+            .prepared_switchover
+            .ok_or_else(|| {
+                AgentError::EffectConflict(
+                    "switchover preparation completed without durable handoff evidence".into(),
+                )
+            })
     }
 
     pub async fn ensure_configuration(
@@ -207,7 +272,9 @@ where
                         } else {
                             CoordinatorStage::Deactivate
                         }
-                    } else if state.role == ReplicaRole::Primary
+                    } else if record.command.transition_kind
+                        != kuberic_protocol::types::TransitionKind::PlannedSwitchover
+                        && state.role == ReplicaRole::Primary
                         && authority.local_role() != ReplicaRole::Primary
                     {
                         CoordinatorStage::Catchup
@@ -279,7 +346,9 @@ where
                     {
                         CoordinatorStage::GetLsn
                     } else if authority.local_role() == ReplicaRole::Primary
-                        && record.command.primary_write_status == AccessStatus::Granted
+                        && (record.command.primary_write_status == AccessStatus::Granted
+                            || record.command.transition_kind
+                                == kuberic_protocol::types::TransitionKind::PlannedSwitchover)
                     {
                         CoordinatorStage::Catchup
                     } else {
@@ -288,12 +357,14 @@ where
                     self.advance(&record, next, None).await?;
                 }
                 CoordinatorStage::Activate => {
-                    let provisional_failover_primary = authority.local_role()
-                        == ReplicaRole::Primary
-                        && record.command.transition_kind
-                            == kuberic_protocol::types::TransitionKind::Failover
+                    let provisional_primary = authority.local_role() == ReplicaRole::Primary
+                        && matches!(
+                            record.command.transition_kind,
+                            kuberic_protocol::types::TransitionKind::Failover
+                                | kuberic_protocol::types::TransitionKind::PlannedSwitchover
+                        )
                         && record.command.primary_write_status != AccessStatus::Granted;
-                    let read_status = if provisional_failover_primary {
+                    let read_status = if provisional_primary {
                         AccessStatus::ReconfigurationPending
                     } else if matches!(
                         authority.local_role(),
@@ -317,7 +388,9 @@ where
                         },
                     )
                     .await?;
-                    let next = if !record.command.retire_build_ids.is_empty() {
+                    let next = if !record.command.retire_build_ids.is_empty()
+                        || !record.command.retire_switchover_preparation_ids.is_empty()
+                    {
                         CoordinatorStage::RetireBuild
                     } else {
                         CoordinatorStage::Complete

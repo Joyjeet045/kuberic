@@ -6,3 +6,8 @@ spec:
   replicas: 3
   image: localhost/kvstore2:level-triggered-v1
   failoverDelaySeconds: 10
+  # Optional: submit only after Ready, selecting a committed non-primary ID.
+  # Use a fresh request ID for each movement; keep an active request unchanged.
+  # switchover:
+  #   requestId: move-to-replica-2-001
+  #   targetReplicaId: 2

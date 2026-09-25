@@ -125,6 +125,9 @@ async fn execute_change(
         KubernetesChange::DeleteReplicaEndpoint { identity } => {
             api.delete_replica_endpoint(observation, &identity).await
         }
+        KubernetesChange::DeleteExactPod { pod_name, pod_uid } => {
+            api.delete_exact_pod(observation, &pod_name, &pod_uid).await
+        }
         KubernetesChange::EnsureWriteRoutingService => {
             api.ensure_write_routing_service(observation).await
         }

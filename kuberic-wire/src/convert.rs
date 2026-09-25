@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 
 use kuberic_protocol::command::{
-    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, ProtocolCommand,
+    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
+    ProtocolCommand,
 };
 use kuberic_protocol::observation::{
     AgentBuildReport, AgentObservation, AgentReport, UninitializedAgentObservation,
@@ -12,7 +13,8 @@ use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
     ConfigurationId, ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId,
     PodUid, ProcessSessionId, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind, derive_agent_generation,
+    ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff, SwitchoverRequestId,
+    TransitionKind, derive_agent_generation,
 };
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
 use thiserror::Error;
@@ -89,6 +91,7 @@ pub struct CopyAcknowledgement {
 pub struct ExecuteEnvelope {
     pub resource_uid: ResourceUid,
     pub target: ReplicaIdentity,
+    pub expected_process_session_id: ProcessSessionId,
     pub command: ProtocolCommand,
 }
 
@@ -168,6 +171,7 @@ pub fn normalize_agent_status_report(
                 || !report.pending_operation_id.is_empty()
                 || !report.retained_operation_id.is_empty()
                 || !report.builds.is_empty()
+                || report.prepared_switchover.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "uninitialized status contains durable authority".to_string(),
@@ -287,6 +291,10 @@ pub fn normalize_agent_status_report(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let prepared_switchover = report
+                .prepared_switchover
+                .map(switchover_handoff_from_proto)
+                .transpose()?;
             if report.deactivated_lsn.is_some() != report.deactivation_epoch.is_some() {
                 return Err(WireError::InvalidAuthority(
                     "deactivation LSN and epoch must be reported together".into(),
@@ -337,6 +345,7 @@ pub fn normalize_agent_status_report(
                 retained_operation_id: (!report.retained_operation_id.is_empty())
                     .then(|| OperationId::new(report.retained_operation_id)),
                 builds,
+                prepared_switchover,
             })))
         }
         proto::AgentStorageState::Unsafe => {
@@ -352,6 +361,7 @@ pub fn normalize_agent_status_report(
                 || report.write_status != proto::AccessStatus::Unknown as i32
                 || !report.builds.is_empty()
                 || report.deactivation_epoch.is_some()
+                || report.prepared_switchover.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "unsafe storage report contains untrusted authority".to_string(),
@@ -369,6 +379,11 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
     ensure_supported_version(request.protocol_version)?;
     if request.resource_uid.is_empty() {
         return Err(WireError::MissingField("execute.resource_uid"));
+    }
+    if request.expected_process_session_id.is_empty() {
+        return Err(WireError::MissingField(
+            "execute.expected_process_session_id",
+        ));
     }
 
     let command = request
@@ -579,6 +594,37 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     "ensure target is outside Previous and Current Configuration".to_string(),
                 ));
             }
+            let restoration = transition_kind == TransitionKind::PlannedSwitchover
+                && !command.current_only
+                && previous.is_none()
+                && command.primary_write_status
+                    == proto::AccessStatus::ReconfigurationPending as i32
+                && command.failover_safe_lsn.is_none()
+                && command.retire_build_ids.is_empty()
+                && command.retire_build_id.is_empty()
+                && current.primary_id == target.replica_id
+                && command.retire_switchover_preparation_ids.len() == 1
+                && !command.retire_switchover_preparation_ids[0]
+                    .operation_id
+                    .is_empty()
+                && command.retire_switchover_preparation_ids[0].generation > 0
+                && command
+                    .switchover_handoff
+                    .clone()
+                    .map(switchover_handoff_from_proto)
+                    .transpose()?
+                    .is_none_or(|handoff| {
+                        current_epoch == handoff.starting_epoch
+                            && current.configuration_id == handoff.starting_configuration_id
+                            && current.primary_id == handoff.source.replica_id
+                            && target == handoff.source
+                            && current
+                                .members
+                                .iter()
+                                .any(|member| member.identity == handoff.target)
+                            && command.retire_switchover_preparation_ids
+                                == [handoff.preparation().into()]
+                    });
             if command.current_only {
                 if previous.is_some() || transition_kind == TransitionKind::Bootstrap {
                     return Err(WireError::InvalidAuthority(
@@ -594,7 +640,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                         "replacement current-only completion must retire its build".to_string(),
                     ));
                 }
-            } else {
+            } else if !restoration {
                 if !command.retire_build_id.is_empty() || !command.retire_build_ids.is_empty() {
                     return Err(WireError::InvalidAuthority(
                         "build retirement requires current-only completion".to_string(),
@@ -612,6 +658,156 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     },
                 )
                 .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+            }
+            if transition_kind == TransitionKind::PlannedSwitchover && !restoration {
+                let handoff = command
+                    .switchover_handoff
+                    .clone()
+                    .ok_or(WireError::MissingField(
+                        "ensure_configuration.switchover_handoff",
+                    ))
+                    .and_then(switchover_handoff_from_proto)?;
+                let current_contains_handoff_members = current
+                    .members
+                    .iter()
+                    .any(|member| member.identity == handoff.source)
+                    && current
+                        .members
+                        .iter()
+                        .any(|member| member.identity == handoff.target);
+                let previous_matches_handoff = previous.as_ref().is_none_or(|configuration| {
+                    let source_is_primary = configuration.members.iter().any(|member| {
+                        member.identity == handoff.source && member.role == ReplicaRole::Primary
+                    });
+                    let target_is_primary = configuration.members.iter().any(|member| {
+                        member.identity == handoff.target && member.role == ReplicaRole::Primary
+                    });
+                    let exact_members_present = configuration
+                        .members
+                        .iter()
+                        .any(|member| member.identity == handoff.source)
+                        && configuration
+                            .members
+                            .iter()
+                            .any(|member| member.identity == handoff.target);
+                    exact_members_present
+                        && if source_is_primary {
+                            configuration.configuration_id == handoff.starting_configuration_id
+                                && configuration.epoch == handoff.starting_epoch
+                        } else {
+                            target_is_primary
+                                && current.primary_id == handoff.source.replica_id
+                                && configuration.epoch.data_loss_number
+                                    == handoff.starting_epoch.data_loss_number
+                                && configuration.epoch.configuration_number
+                                    > handoff.starting_epoch.configuration_number
+                        }
+                });
+                let retirement_ids = command
+                    .retire_switchover_preparation_ids
+                    .iter()
+                    .map(|id| (&id.operation_id, id.generation))
+                    .collect::<BTreeSet<_>>();
+                if !current_contains_handoff_members
+                    || !previous_matches_handoff
+                    || retirement_ids.len() != command.retire_switchover_preparation_ids.len()
+                    || command
+                        .retire_switchover_preparation_ids
+                        .iter()
+                        .any(|id| id.operation_id.is_empty() || id.generation == 0)
+                    || (command.current_only
+                        && target == handoff.source
+                        && (command.retire_switchover_preparation_ids.len() != 1
+                            || command.retire_switchover_preparation_ids[0]
+                                != handoff.preparation().into()))
+                    || (command.current_only
+                        && target != handoff.source
+                        && !command.retire_switchover_preparation_ids.is_empty())
+                    || (!command.current_only
+                        && !restoration
+                        && !command.retire_switchover_preparation_ids.is_empty())
+                {
+                    return Err(WireError::InvalidAuthority(
+                        "planned switchover handoff or retirement differs from authority"
+                            .to_string(),
+                    ));
+                }
+            } else if transition_kind != TransitionKind::PlannedSwitchover
+                && (command.switchover_handoff.is_some()
+                    || !command.retire_switchover_preparation_ids.is_empty())
+            {
+                return Err(WireError::InvalidAuthority(
+                    "non-switchover configuration contains switchover evidence".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        proto::execute_command_request::Command::PrepareSwitchover(command) => {
+            let envelope_target: ReplicaIdentity = request
+                .target
+                .clone()
+                .ok_or(WireError::MissingField("execute.target"))?
+                .try_into()?;
+            for (field, value) in [
+                (
+                    "prepare_switchover.operation_id",
+                    command.operation_id.as_str(),
+                ),
+                ("prepare_switchover.request_id", command.request_id.as_str()),
+                (
+                    "prepare_switchover.expected_instance_id",
+                    command.expected_instance_id.as_str(),
+                ),
+                (
+                    "prepare_switchover.expected_agent_generation",
+                    command.expected_agent_generation.as_str(),
+                ),
+            ] {
+                if value.is_empty() {
+                    return Err(WireError::MissingField(field));
+                }
+            }
+            if command.preparation_generation == 0 {
+                return Err(WireError::InvalidAuthority(
+                    "preparation generation must be positive".into(),
+                ));
+            }
+            let source: ReplicaIdentity = command
+                .source
+                .clone()
+                .ok_or(WireError::MissingField("prepare_switchover.source"))?
+                .try_into()?;
+            let target: ReplicaIdentity = command
+                .target
+                .clone()
+                .ok_or(WireError::MissingField("prepare_switchover.target"))?
+                .try_into()?;
+            let current: ConfigurationDescriptor = command
+                .current_configuration
+                .clone()
+                .ok_or(WireError::MissingField(
+                    "prepare_switchover.current_configuration",
+                ))?
+                .try_into()?;
+            let current_primary = current
+                .members
+                .iter()
+                .find(|member| member.identity.replica_id == current.primary_id)
+                .expect("validated configuration has one primary");
+            if source != envelope_target
+                || source.replica_id != ReplicaId::new(command.local_replica_id)
+                || source.instance_id.as_str() != command.expected_instance_id
+                || source.agent_generation.as_str() != command.expected_agent_generation
+                || source != current_primary.identity
+                || target.replica_id == current.primary_id
+                || !current
+                    .members
+                    .iter()
+                    .any(|member| member.identity == target)
+            {
+                return Err(WireError::InvalidAuthority(
+                    "planned switchover preparation differs from current authority".to_string(),
+                ));
             }
             Ok(())
         }
@@ -672,6 +868,8 @@ pub fn normalize_execute_request(
     request: proto::ExecuteCommandRequest,
 ) -> Result<ExecuteEnvelope, WireError> {
     validate_execute_request(&request)?;
+    let expected_process_session_id =
+        ProcessSessionId::new(request.expected_process_session_id.clone());
     let target = request
         .target
         .ok_or(WireError::MissingField("execute.target"))?
@@ -707,6 +905,7 @@ pub fn normalize_execute_request(
             }))
         }
         proto::execute_command_request::Command::EnsureConfiguration(command) => {
+            let command = *command;
             let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
                 .map_err(|_| WireError::InvalidEnum {
                     field: "ensure.transition_kind",
@@ -767,6 +966,42 @@ pub fn normalize_execute_request(
                         .map(OperationId::new)
                         .collect()
                 },
+                switchover_handoff: command
+                    .switchover_handoff
+                    .map(switchover_handoff_from_proto)
+                    .transpose()?,
+                retire_switchover_preparation_ids: command
+                    .retire_switchover_preparation_ids
+                    .into_iter()
+                    .map(|id| kuberic_protocol::types::SwitchoverPreparationId {
+                        operation_id: OperationId::new(id.operation_id),
+                        generation: id.generation,
+                    })
+                    .collect(),
+            }))
+        }
+        proto::execute_command_request::Command::PrepareSwitchover(command) => {
+            ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
+                preparation_generation: command.preparation_generation,
+                operation_id: OperationId::new(command.operation_id),
+                request_id: SwitchoverRequestId::new(command.request_id),
+                local_replica_id: ReplicaId::new(command.local_replica_id),
+                expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
+                expected_agent_generation: AgentGeneration::new(command.expected_agent_generation),
+                source: command
+                    .source
+                    .ok_or(WireError::MissingField("prepare_switchover.source"))?
+                    .try_into()?,
+                target: command
+                    .target
+                    .ok_or(WireError::MissingField("prepare_switchover.target"))?
+                    .try_into()?,
+                current_configuration: command
+                    .current_configuration
+                    .ok_or(WireError::MissingField(
+                        "prepare_switchover.current_configuration",
+                    ))?
+                    .try_into()?,
             }))
         }
         proto::execute_command_request::Command::EnsureReplicaBuild(command) => {
@@ -791,6 +1026,7 @@ pub fn normalize_execute_request(
     Ok(ExecuteEnvelope {
         resource_uid: ResourceUid::new(request.resource_uid),
         target,
+        expected_process_session_id,
         command,
     })
 }
@@ -1137,6 +1373,78 @@ impl TryFrom<proto::BuildAuthority> for BuildAuthority {
     }
 }
 
+impl From<SwitchoverHandoff> for proto::SwitchoverHandoff {
+    fn from(handoff: SwitchoverHandoff) -> Self {
+        Self {
+            preparation_generation: handoff.preparation_generation,
+            preparation_operation_id: handoff.preparation_operation_id.to_string(),
+            request_id: handoff.request_id.to_string(),
+            source: Some(handoff.source.into()),
+            target: Some(handoff.target.into()),
+            starting_configuration_id: handoff.starting_configuration_id.to_string(),
+            handoff_lsn: handoff.handoff_lsn,
+            starting_epoch: Some(handoff.starting_epoch.into()),
+        }
+    }
+}
+
+impl From<kuberic_protocol::types::SwitchoverPreparationId> for proto::SwitchoverPreparationId {
+    fn from(id: kuberic_protocol::types::SwitchoverPreparationId) -> Self {
+        Self {
+            operation_id: id.operation_id.to_string(),
+            generation: id.generation,
+        }
+    }
+}
+
+impl TryFrom<proto::SwitchoverHandoff> for SwitchoverHandoff {
+    type Error = WireError;
+
+    fn try_from(handoff: proto::SwitchoverHandoff) -> Result<Self, Self::Error> {
+        switchover_handoff_from_proto(handoff)
+    }
+}
+
+fn switchover_handoff_from_proto(
+    handoff: proto::SwitchoverHandoff,
+) -> Result<SwitchoverHandoff, WireError> {
+    if handoff.preparation_generation == 0
+        || handoff.preparation_operation_id.is_empty()
+        || handoff.request_id.is_empty()
+        || handoff.starting_configuration_id.is_empty()
+        || handoff.handoff_lsn < 0
+    {
+        return Err(WireError::InvalidAuthority(
+            "planned switchover handoff contains invalid identifiers or progress".to_string(),
+        ));
+    }
+    let handoff = SwitchoverHandoff {
+        preparation_generation: handoff.preparation_generation,
+        preparation_operation_id: OperationId::new(handoff.preparation_operation_id),
+        request_id: SwitchoverRequestId::new(handoff.request_id),
+        source: handoff
+            .source
+            .ok_or(WireError::MissingField("switchover_handoff.source"))?
+            .try_into()?,
+        target: handoff
+            .target
+            .ok_or(WireError::MissingField("switchover_handoff.target"))?
+            .try_into()?,
+        starting_configuration_id: ConfigurationId::new(handoff.starting_configuration_id),
+        starting_epoch: handoff
+            .starting_epoch
+            .ok_or(WireError::MissingField("switchover_handoff.starting_epoch"))?
+            .into(),
+        handoff_lsn: handoff.handoff_lsn,
+    };
+    if handoff.source == handoff.target {
+        return Err(WireError::InvalidAuthority(
+            "planned switchover source and target must differ".to_string(),
+        ));
+    }
+    Ok(handoff)
+}
+
 fn build_authority_from_proto(
     authority: proto::BuildAuthority,
 ) -> Result<BuildAuthority, WireError> {
@@ -1236,6 +1544,7 @@ fn transition_kind_from_proto(kind: proto::TransitionKind) -> Result<TransitionK
         proto::TransitionKind::Bootstrap => Ok(TransitionKind::Bootstrap),
         proto::TransitionKind::Replacement => Ok(TransitionKind::Replacement),
         proto::TransitionKind::Failover => Ok(TransitionKind::Failover),
+        proto::TransitionKind::PlannedSwitchover => Ok(TransitionKind::PlannedSwitchover),
     }
 }
 

@@ -3,7 +3,7 @@ use bytes::Bytes;
 pub use kuberic_protocol::types::{BuildAuthority, BuildAuthorityKind};
 use kuberic_protocol::types::{
     ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, OperationId, ReplicaIdentity,
-    ReplicaRole, TransitionKind,
+    ReplicaRole, SwitchoverHandoff, TransitionKind,
 };
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,8 @@ pub struct AdmittedAuthority {
     pub transition_kind: Option<TransitionKind>,
     pub previous_configuration: Option<ConfigurationDescriptor>,
     pub current_configuration: ConfigurationDescriptor,
+    #[serde(default)]
+    pub switchover_handoff: Option<SwitchoverHandoff>,
 }
 
 impl AdmittedAuthority {
@@ -82,6 +84,7 @@ impl AdmittedAuthority {
             && existing.previous_configuration.is_some()
             && self.previous_configuration.is_none()
             && self.transition_kind.is_none()
+            && self.switchover_handoff == existing.switchover_handoff
     }
 
     pub fn fence(&self) -> AuthorityFence {
@@ -105,7 +108,11 @@ impl AdmittedAuthority {
         match (self.previous_configuration.as_ref(), self.transition_kind) {
             (
                 Some(previous),
-                Some(kind @ (TransitionKind::Replacement | TransitionKind::Failover)),
+                Some(
+                    kind @ (TransitionKind::Replacement
+                    | TransitionKind::Failover
+                    | TransitionKind::PlannedSwitchover),
+                ),
             ) => {
                 validate_transition_relationship(
                     kind,
@@ -118,7 +125,8 @@ impl AdmittedAuthority {
             (None, Some(TransitionKind::Bootstrap)) | (None, None) => {}
             (Some(_), _) => {
                 return Err(ContractError::AuthorityMismatch(
-                    "Previous Configuration requires replacement or failover authority".to_string(),
+                    "Previous Configuration requires replacement, failover, or planned switchover authority"
+                        .to_string(),
                 ));
             }
             (None, Some(_)) => {
@@ -126,6 +134,59 @@ impl AdmittedAuthority {
                     "non-bootstrap transition requires a Previous Configuration".to_string(),
                 ));
             }
+        }
+        if let Some(handoff) = &self.switchover_handoff {
+            let previous_relationship_valid =
+                self.previous_configuration.as_ref().is_none_or(|previous| {
+                    let source_is_primary = previous.members.iter().any(|member| {
+                        member.identity == handoff.source && member.role == ReplicaRole::Primary
+                    });
+                    let target_is_primary = previous.members.iter().any(|member| {
+                        member.identity == handoff.target && member.role == ReplicaRole::Primary
+                    });
+                    if source_is_primary {
+                        previous.configuration_id == handoff.starting_configuration_id
+                            && previous.epoch == handoff.starting_epoch
+                            && self.current_configuration.primary_id == handoff.target.replica_id
+                    } else {
+                        target_is_primary
+                            && self.current_configuration.primary_id == handoff.source.replica_id
+                            && previous.epoch.data_loss_number
+                                == handoff.starting_epoch.data_loss_number
+                            && previous.epoch.configuration_number
+                                > handoff.starting_epoch.configuration_number
+                    }
+                });
+            if (self.transition_kind != Some(TransitionKind::PlannedSwitchover)
+                && self.previous_configuration.is_some())
+                || handoff.preparation_generation == 0
+                || !previous_relationship_valid
+                || handoff.starting_epoch.data_loss_number
+                    != self.current_configuration.epoch.data_loss_number
+                || handoff.starting_epoch.configuration_number
+                    >= self.current_configuration.epoch.configuration_number
+                || handoff.source == handoff.target
+                || !self
+                    .current_configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == handoff.source)
+                || !self
+                    .current_configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == handoff.target)
+                || (self.current_configuration.primary_id != handoff.source.replica_id
+                    && self.current_configuration.primary_id != handoff.target.replica_id)
+            {
+                return Err(ContractError::AuthorityMismatch(
+                    "switchover handoff contradicts admitted authority".to_string(),
+                ));
+            }
+        } else if self.transition_kind == Some(TransitionKind::PlannedSwitchover) {
+            return Err(ContractError::AuthorityMismatch(
+                "planned switchover authority requires its handoff certificate".to_string(),
+            ));
         }
         if !self.contains_member(&self.local_identity) {
             return Err(ContractError::AuthorityMismatch(

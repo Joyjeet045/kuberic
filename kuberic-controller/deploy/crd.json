@@ -55,6 +55,25 @@
                     "format": "uint32",
                     "minimum": 1.0,
                     "type": "integer"
+                  },
+                  "switchover": {
+                    "nullable": true,
+                    "properties": {
+                      "requestId": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "targetReplicaId": {
+                        "format": "uint32",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "requestId",
+                      "targetReplicaId"
+                    ],
+                    "type": "object"
                   }
                 },
                 "required": [
@@ -133,6 +152,78 @@
                   },
                   "initialized": {
                     "type": "boolean"
+                  },
+                  "lastSwitchover": {
+                    "nullable": true,
+                    "properties": {
+                      "acceptedTarget": {
+                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                        "nullable": true,
+                        "properties": {
+                          "agentGeneration": {
+                            "type": "string"
+                          },
+                          "instanceId": {
+                            "type": "string"
+                          },
+                          "replicaId": {
+                            "format": "int64",
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "agentGeneration",
+                          "instanceId",
+                          "replicaId"
+                        ],
+                        "type": "object"
+                      },
+                      "outcome": {
+                        "enum": [
+                          "requestedTargetCompleted",
+                          "oldPrimaryRestored",
+                          "oldPrimaryCompensated",
+                          "rejected",
+                          "unsafe"
+                        ],
+                        "type": "string"
+                      },
+                      "requestId": {
+                        "type": "string"
+                      },
+                      "requestedTargetReplicaId": {
+                        "format": "int64",
+                        "type": "integer"
+                      },
+                      "resultingPrimary": {
+                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                        "nullable": true,
+                        "properties": {
+                          "agentGeneration": {
+                            "type": "string"
+                          },
+                          "instanceId": {
+                            "type": "string"
+                          },
+                          "replicaId": {
+                            "format": "int64",
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "agentGeneration",
+                          "instanceId",
+                          "replicaId"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "outcome",
+                      "requestId",
+                      "requestedTargetReplicaId"
+                    ],
+                    "type": "object"
                   },
                   "observedGeneration": {
                     "format": "uint64",
@@ -426,7 +517,8 @@
                         "enum": [
                           "bootstrap",
                           "replacement",
-                          "failover"
+                          "failover",
+                          "plannedSwitchover"
                         ],
                         "type": "string"
                       },
@@ -472,6 +564,246 @@
                         "format": "uint64",
                         "minimum": 0.0,
                         "type": "integer"
+                      },
+                      "switchover": {
+                        "nullable": true,
+                        "properties": {
+                          "handoff": {
+                            "nullable": true,
+                            "properties": {
+                              "handoffLsn": {
+                                "format": "int64",
+                                "type": "integer"
+                              },
+                              "preparationGeneration": {
+                                "format": "uint64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "preparationOperationId": {
+                                "type": "string"
+                              },
+                              "requestId": {
+                                "type": "string"
+                              },
+                              "source": {
+                                "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                "properties": {
+                                  "agentGeneration": {
+                                    "type": "string"
+                                  },
+                                  "instanceId": {
+                                    "type": "string"
+                                  },
+                                  "replicaId": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "agentGeneration",
+                                  "instanceId",
+                                  "replicaId"
+                                ],
+                                "type": "object"
+                              },
+                              "startingConfigurationId": {
+                                "type": "string"
+                              },
+                              "startingEpoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "target": {
+                                "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                "properties": {
+                                  "agentGeneration": {
+                                    "type": "string"
+                                  },
+                                  "instanceId": {
+                                    "type": "string"
+                                  },
+                                  "replicaId": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "agentGeneration",
+                                  "instanceId",
+                                  "replicaId"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "handoffLsn",
+                              "preparationGeneration",
+                              "preparationOperationId",
+                              "requestId",
+                              "source",
+                              "startingConfigurationId",
+                              "startingEpoch",
+                              "target"
+                            ],
+                            "type": "object"
+                          },
+                          "preparationGeneration": {
+                            "format": "uint64",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          },
+                          "requestId": {
+                            "type": "string"
+                          },
+                          "requestedConfiguration": {
+                            "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                            "properties": {
+                              "configurationId": {
+                                "type": "string"
+                              },
+                              "epoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "members": {
+                                "items": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "type": "integer"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationId",
+                              "epoch",
+                              "members",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
+                          "resolution": {
+                            "enum": [
+                              "requestedTarget",
+                              "restoringOldPrimary",
+                              "compensatingOldPrimary",
+                              "unsafe"
+                            ],
+                            "type": "string"
+                          },
+                          "source": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          },
+                          "target": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "preparationGeneration",
+                          "requestId",
+                          "requestedConfiguration",
+                          "resolution",
+                          "source",
+                          "target"
+                        ],
+                        "type": "object"
                       },
                       "transitionId": {
                         "type": "string"

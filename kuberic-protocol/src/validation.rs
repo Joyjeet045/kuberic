@@ -148,6 +148,22 @@ pub enum ValidationError {
     PrimaryFailureMismatch,
     #[error("quorum-loss observation does not match the accepted configuration")]
     QuorumLossMismatch,
+    #[error("non-switchover transition contains planned switchover authority")]
+    UnexpectedSwitchoverIntent,
+    #[error("planned switchover transition is missing its frozen request authority")]
+    MissingSwitchoverIntent,
+    #[error("planned switchover source is not the accepted exact primary")]
+    InvalidSwitchoverSource,
+    #[error("planned switchover target is not an accepted exact non-primary member")]
+    InvalidSwitchoverTarget,
+    #[error("planned switchover Current Configuration primary contradicts its resolution")]
+    InvalidSwitchoverResolution,
+    #[error("planned switchover contains unrelated election, build, or repair authority")]
+    InvalidSwitchoverEvidence,
+    #[error("planned switchover handoff certificate is malformed")]
+    InvalidSwitchoverHandoff,
+    #[error("planned switchover receipt is malformed")]
+    InvalidSwitchoverReceipt,
 }
 
 /// Validates accepted status and every observed exact replica incarnation.
@@ -321,7 +337,7 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
     Ok(())
 }
 
-fn validate_report_internal(
+pub(crate) fn validate_report_internal(
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
     if report.previous_configuration.is_some() && report.current_configuration.is_none() {
@@ -352,6 +368,12 @@ fn validate_report_internal(
         return Err(ValidationError::InvalidReplicaReportAuthority(
             report.identity.replica_id.value(),
         ));
+    }
+    if let Some(handoff) = &report.prepared_switchover {
+        validate_switchover_handoff(handoff)?;
+        if handoff.source != report.identity {
+            return Err(ValidationError::InvalidSwitchoverHandoff);
+        }
     }
     if let (Some(previous), Some(current)) = (
         report.previous_configuration.as_ref(),
@@ -487,6 +509,43 @@ fn validate_report_authority(
         }
     }
     if let Some(transition) = &snapshot.status.transition
+        && transition.kind == TransitionKind::PlannedSwitchover
+        && report.epoch > accepted.expect("planned transition has topology").epoch
+        && (report.write_status == AccessStatus::Granted
+            || transition
+                .switchover
+                .as_ref()
+                .is_none_or(|intent| intent.handoff.is_none()))
+    {
+        return Err(ValidationError::InvalidSwitchoverEvidence);
+    }
+    if let Some(intent) = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.switchover.as_ref())
+        && (accepted_exact || current_exact)
+        && let Some(reported) = report.current_configuration.as_ref()
+    {
+        if ![accepted, Some(&intent.requested_configuration), current]
+            .into_iter()
+            .flatten()
+            .any(|authorized| authorized == reported)
+        {
+            return Err(ValidationError::InvalidSwitchoverEvidence);
+        }
+        if reported == &intent.requested_configuration
+            && report
+                .previous_configuration
+                .as_ref()
+                .is_some_and(|previous| Some(previous) != accepted)
+        {
+            return Err(ValidationError::ReportedPreviousConfigurationMismatch(
+                report.identity.replica_id.value(),
+            ));
+        }
+    }
+    if let Some(transition) = &snapshot.status.transition
         && transition.kind != TransitionKind::Bootstrap
         && report.epoch == transition.current_configuration.epoch
         && report
@@ -497,8 +556,17 @@ fn validate_report_authority(
             })
         && let Some(reported_previous) = report.previous_configuration.as_ref()
     {
-        let accepted = accepted.expect("validated non-bootstrap transition has topology");
-        if reported_previous != accepted {
+        let previous = transition
+            .switchover
+            .as_ref()
+            .filter(|intent| {
+                intent.resolution
+                    == crate::types::PlannedSwitchoverResolution::CompensatingOldPrimary
+            })
+            .map(|intent| &intent.requested_configuration)
+            .or(accepted)
+            .expect("validated non-bootstrap transition has topology");
+        if reported_previous != previous {
             return Err(ValidationError::ReportedPreviousConfigurationMismatch(
                 report.identity.replica_id.value(),
             ));
@@ -550,7 +618,13 @@ fn validate_report_authority(
         });
     }
 
-    for configuration in [accepted, current].into_iter().flatten() {
+    let requested = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.switchover.as_ref())
+        .map(|intent| &intent.requested_configuration);
+    for configuration in [accepted, requested, current].into_iter().flatten() {
         if report.epoch == configuration.epoch
             && report
                 .current_configuration
@@ -594,6 +668,9 @@ fn observation_key_string(key: &ReplicaObservationKey) -> String {
 
 /// Validates durable topology, provisioning, and active transition intent.
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
+    if let Some(receipt) = &status.last_switchover {
+        validate_switchover_receipt(receipt)?;
+    }
     match (status.initialized, status.topology.as_ref()) {
         (true, None) => return Err(ValidationError::InitializedWithoutTopology),
         (false, Some(_)) => return Err(ValidationError::TopologyBeforeInitialization),
@@ -656,6 +733,9 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         )?;
         match transition.kind {
             TransitionKind::Bootstrap => {
+                if transition.switchover.is_some() {
+                    return Err(ValidationError::UnexpectedSwitchoverIntent);
+                }
                 if transition.previous_configuration_id.is_some() {
                     return Err(ValidationError::BootstrapHasPreviousConfiguration);
                 }
@@ -673,6 +753,9 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 }
             }
             TransitionKind::Replacement | TransitionKind::Failover => {
+                if transition.switchover.is_some() {
+                    return Err(ValidationError::UnexpectedSwitchoverIntent);
+                }
                 let topology = status
                     .topology
                     .as_ref()
@@ -731,6 +814,124 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                         if !valid_target {
                             return Err(ValidationError::InvalidFailoverRepairTarget);
                         }
+                    }
+                }
+            }
+            TransitionKind::PlannedSwitchover => {
+                let topology = status
+                    .topology
+                    .as_ref()
+                    .ok_or(ValidationError::TransitionWithoutTopology)?;
+                if transition.previous_configuration_id.as_ref()
+                    != Some(&topology.configuration.configuration_id)
+                {
+                    return Err(ValidationError::PreviousConfigurationMismatch {
+                        actual: transition
+                            .previous_configuration_id
+                            .as_ref()
+                            .map(ToString::to_string),
+                        expected: topology.configuration.configuration_id.to_string(),
+                    });
+                }
+                if transition.election_lsn.is_some()
+                    || transition.build_id.is_some()
+                    || transition.repair.is_some()
+                {
+                    return Err(ValidationError::InvalidSwitchoverEvidence);
+                }
+                let switchover = transition
+                    .switchover
+                    .as_ref()
+                    .ok_or(ValidationError::MissingSwitchoverIntent)?;
+                if switchover.request_id.is_empty()
+                    || switchover.preparation_generation == 0
+                    || switchover.preparation_generation != transition.spec_generation
+                {
+                    return Err(ValidationError::MissingSwitchoverIntent);
+                }
+                if status.last_switchover.as_ref().is_some_and(|receipt| {
+                    receipt.request_id == switchover.request_id
+                        && !(receipt.outcome == crate::types::PlannedSwitchoverOutcome::Unsafe
+                            && switchover.resolution
+                                == crate::types::PlannedSwitchoverResolution::Unsafe)
+                }) {
+                    return Err(ValidationError::InvalidSwitchoverReceipt);
+                }
+                let accepted_primary = topology
+                    .configuration
+                    .members
+                    .iter()
+                    .find(|member| member.identity.replica_id == topology.configuration.primary_id)
+                    .expect("validated topology has one primary");
+                if switchover.source != accepted_primary.identity {
+                    return Err(ValidationError::InvalidSwitchoverSource);
+                }
+                if switchover.target.replica_id == topology.configuration.primary_id
+                    || !topology
+                        .configuration
+                        .members
+                        .iter()
+                        .any(|member| member.identity == switchover.target)
+                {
+                    return Err(ValidationError::InvalidSwitchoverTarget);
+                }
+                validate_transition_relationship(
+                    transition.kind,
+                    Some(&topology.configuration),
+                    &switchover.requested_configuration,
+                    &transition.effective_policy,
+                )?;
+                if switchover.requested_configuration.primary_id != switchover.target.replica_id {
+                    return Err(ValidationError::InvalidSwitchoverResolution);
+                }
+                match switchover.resolution {
+                    crate::types::PlannedSwitchoverResolution::RequestedTarget
+                    | crate::types::PlannedSwitchoverResolution::RestoringOldPrimary => {
+                        if transition.current_configuration != switchover.requested_configuration {
+                            return Err(ValidationError::InvalidSwitchoverResolution);
+                        }
+                    }
+                    crate::types::PlannedSwitchoverResolution::CompensatingOldPrimary => {
+                        validate_transition_relationship(
+                            transition.kind,
+                            Some(&switchover.requested_configuration),
+                            &transition.current_configuration,
+                            &transition.effective_policy,
+                        )?;
+                        if transition.current_configuration.primary_id
+                            != switchover.source.replica_id
+                            || switchover.handoff.is_none()
+                        {
+                            return Err(ValidationError::InvalidSwitchoverResolution);
+                        }
+                    }
+                    crate::types::PlannedSwitchoverResolution::Unsafe => {
+                        if transition.current_configuration != switchover.requested_configuration {
+                            validate_transition_relationship(
+                                transition.kind,
+                                Some(&switchover.requested_configuration),
+                                &transition.current_configuration,
+                                &transition.effective_policy,
+                            )?;
+                            if transition.current_configuration.primary_id
+                                != switchover.source.replica_id
+                            {
+                                return Err(ValidationError::InvalidSwitchoverResolution);
+                            }
+                        }
+                    }
+                }
+                if let Some(handoff) = &switchover.handoff {
+                    validate_switchover_handoff(handoff)?;
+                    if handoff.preparation_generation != switchover.preparation_generation
+                        || handoff.request_id != switchover.request_id
+                        || handoff.source != switchover.source
+                        || handoff.target != switchover.target
+                        || handoff.starting_configuration_id
+                            != topology.configuration.configuration_id
+                        || handoff.starting_epoch != topology.configuration.epoch
+                    {
+                        return Err(ValidationError::InvalidSwitchoverHandoff);
                     }
                 }
             }
@@ -822,8 +1023,83 @@ pub fn validate_transition_relationship(
                 return Err(ValidationError::InvalidReplacementMembership);
             }
         }
+        TransitionKind::PlannedSwitchover => {
+            let previous_identities = exact_identities(previous);
+            let current_identities = exact_identities(current);
+            if previous_identities != current_identities {
+                return Err(ValidationError::FailoverMembershipChanged);
+            }
+        }
     }
     Ok(())
+}
+
+fn validate_switchover_handoff(
+    handoff: &crate::types::SwitchoverHandoff,
+) -> Result<(), ValidationError> {
+    if handoff.preparation_generation == 0
+        || handoff.preparation_operation_id.is_empty()
+        || handoff.request_id.is_empty()
+        || handoff.source == handoff.target
+        || !valid_exact_identity(&handoff.source)
+        || !valid_exact_identity(&handoff.target)
+        || handoff.starting_configuration_id.is_empty()
+        || handoff.starting_epoch.data_loss_number < 0
+        || handoff.starting_epoch.configuration_number < 0
+        || handoff.handoff_lsn < 0
+    {
+        return Err(ValidationError::InvalidSwitchoverHandoff);
+    }
+    Ok(())
+}
+
+fn validate_switchover_receipt(
+    receipt: &crate::types::PlannedSwitchoverReceipt,
+) -> Result<(), ValidationError> {
+    if receipt.request_id.is_empty() || receipt.requested_target_replica_id.value() <= 0 {
+        return Err(ValidationError::InvalidSwitchoverReceipt);
+    }
+    if receipt.accepted_target.as_ref().is_some_and(|target| {
+        !valid_exact_identity(target) || target.replica_id != receipt.requested_target_replica_id
+    }) || receipt
+        .resulting_primary
+        .as_ref()
+        .is_some_and(|identity| !valid_exact_identity(identity))
+    {
+        return Err(ValidationError::InvalidSwitchoverReceipt);
+    }
+    match receipt.outcome {
+        crate::types::PlannedSwitchoverOutcome::RequestedTargetCompleted => {
+            if receipt.accepted_target.is_none()
+                || receipt.resulting_primary.as_ref() != receipt.accepted_target.as_ref()
+            {
+                return Err(ValidationError::InvalidSwitchoverReceipt);
+            }
+        }
+        crate::types::PlannedSwitchoverOutcome::OldPrimaryRestored
+        | crate::types::PlannedSwitchoverOutcome::OldPrimaryCompensated => {
+            if receipt
+                .resulting_primary
+                .as_ref()
+                .is_none_or(|primary| primary.replica_id == receipt.requested_target_replica_id)
+            {
+                return Err(ValidationError::InvalidSwitchoverReceipt);
+            }
+        }
+        crate::types::PlannedSwitchoverOutcome::Rejected => {}
+        crate::types::PlannedSwitchoverOutcome::Unsafe => {
+            if receipt.resulting_primary.is_some() {
+                return Err(ValidationError::InvalidSwitchoverReceipt);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_exact_identity(identity: &ReplicaIdentity) -> bool {
+    identity.replica_id.value() > 0
+        && !identity.instance_id.is_empty()
+        && !identity.agent_generation.is_empty()
 }
 
 fn exact_identities(configuration: &ConfigurationDescriptor) -> BTreeSet<ReplicaIdentity> {

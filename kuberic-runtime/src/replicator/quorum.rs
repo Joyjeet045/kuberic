@@ -53,10 +53,12 @@ impl QuorumTracker {
             .or_insert(local_progress);
         self.highest_lsn = self.highest_lsn.max(local_progress);
         if !same_fence {
-            self.catch_up_boundary = authority
-                .previous_configuration
-                .as_ref()
-                .map(|_| self.highest_lsn);
+            self.catch_up_boundary = authority.previous_configuration.as_ref().map(|_| {
+                authority
+                    .switchover_handoff
+                    .as_ref()
+                    .map_or(self.highest_lsn, |handoff| handoff.handoff_lsn)
+            });
             self.must_catch_up = derive_must_catch_up(&authority);
         }
         self.authority = Some(authority);

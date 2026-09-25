@@ -35,6 +35,7 @@ enum TransitionKind {
   TRANSITION_KIND_BOOTSTRAP = 1;
   TRANSITION_KIND_REPLACEMENT = 2;
   TRANSITION_KIND_FAILOVER = 3;
+  TRANSITION_KIND_PLANNED_SWITCHOVER = 4;
 }
 
 enum FaultType {
@@ -54,6 +55,22 @@ message BuildStatus {
   uint64 last_sequence = 3;
   int64 durable_lsn = 4;
   bool completed = 5;
+}
+
+message SwitchoverHandoff {
+  string preparation_operation_id = 1;
+  string request_id = 2;
+  ReplicaIdentity source = 3;
+  ReplicaIdentity target = 4;
+  string starting_configuration_id = 5;
+  int64 handoff_lsn = 6;
+  Epoch starting_epoch = 7;
+  uint64 preparation_generation = 8;
+}
+
+message SwitchoverPreparationId {
+  string operation_id = 1;
+  uint64 generation = 2;
 }
 
 message ReplicaIdentity {
@@ -121,6 +138,7 @@ message AgentStatusReport {
   repeated BuildStatus builds = 29;
   Epoch deactivation_epoch = 30;
   optional int64 verified_replication_lsn = 31;
+  SwitchoverHandoff prepared_switchover = 32;
 }
 
 message InitializeAgentStoreCommand {
@@ -177,6 +195,20 @@ message EnsureConfigurationCommand {
   AccessStatus primary_write_status = 14;
   repeated string retire_build_ids = 15;
   optional int64 failover_safe_lsn = 16;
+  SwitchoverHandoff switchover_handoff = 17;
+  repeated SwitchoverPreparationId retire_switchover_preparation_ids = 18;
+}
+
+message PrepareSwitchoverCommand {
+  string operation_id = 1;
+  string request_id = 2;
+  int64 local_replica_id = 3;
+  string expected_instance_id = 4;
+  string expected_agent_generation = 5;
+  ReplicaIdentity source = 6;
+  ReplicaIdentity target = 7;
+  Configuration current_configuration = 8;
+  uint64 preparation_generation = 9;
 }
 
 message EnsureReplicaBuildCommand {
@@ -193,10 +225,12 @@ message ExecuteCommandRequest {
   uint32 protocol_version = 1;
   string resource_uid = 2;
   ReplicaIdentity target = 3;
+  string expected_process_session_id = 4;
   oneof command {
     InitializeAgentStoreCommand initialize_agent_store = 10;
     EnsureConfigurationCommand ensure_configuration = 11;
     EnsureReplicaBuildCommand ensure_replica_build = 12;
+    PrepareSwitchoverCommand prepare_switchover = 13;
   }
 }
 

@@ -63,6 +63,11 @@ from the Primary role.
 The built-in engine fences pending writes whenever access changes away from
 `Granted`, including `NoWriteQuorum`, while preserving the admitted epoch and
 configuration so returning quorum can restore access non-destructively.
+Before regranting access, it reconciles interrupted durable local writes while
+remaining closed: original operation/data identity must verify, and durable
+application commit evidence or selected-authority quorum completion must resolve
+the journal. Preparation includes reserved operations in its durable applied
+handoff prefix. Failed client completions do not erase these operations.
 During failover it records only the controller-selected election-safe prefix
 under the new authority fence; a replica cannot reuse an arbitrary
 previous-epoch suffix as verified progress.

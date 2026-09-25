@@ -157,6 +157,11 @@ impl InitializationService {
         }
         let envelope = normalize_execute_request(request)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if envelope.expected_process_session_id != *self.session.id() {
+            return Err(Status::failed_precondition(
+                "command targets a stale agent process session",
+            ));
+        }
         let ProtocolCommand::InitializeAgentStore(command) = envelope.command else {
             return Err(Status::failed_precondition(
                 "fresh storage accepts only InitializeAgentStore",
@@ -185,6 +190,7 @@ impl InitializationService {
             election_lsn: None,
             build_id: None,
             repair: None,
+            switchover: None,
         };
         let authority = command.provisioning.as_ref().map_or(
             InitializationAuthority::Bootstrap(&transition),
@@ -485,7 +491,13 @@ where
                 OpenMode::Existing,
                 state.role,
                 state.read_status,
-                state.write_status,
+                startup_write_status(
+                    state.write_status,
+                    state
+                        .pending_effect
+                        .as_ref()
+                        .map(|pending| &pending.effect.action),
+                ),
                 transition,
             )
             .await?;
@@ -575,6 +587,11 @@ where
     ) -> std::result::Result<proto::ExecuteCommandResponse, Status> {
         let command = normalize_execute_request(request)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if command.expected_process_session_id != *self.reporter.session().id() {
+            return Err(Status::failed_precondition(
+                "command targets a stale agent process session",
+            ));
+        }
         let state = self.store.load_state().await.map_err(status_from_agent)?;
         if command.resource_uid != state.identity.resource_uid
             || command.target != state.identity.local_identity
@@ -607,6 +624,12 @@ where
                     .await
                     .map_err(status_from_agent)?;
             }
+            ProtocolCommand::PrepareSwitchover(command) => {
+                self.coordinator
+                    .ensure_switchover_prepared(*command)
+                    .await
+                    .map_err(status_from_agent)?;
+            }
             ProtocolCommand::EnsureReplicaBuild(command) => {
                 if let (Some(authority), Some(source_session_id)) =
                     (&command.authority, &command.source_session_id)
@@ -630,6 +653,22 @@ where
                     .map_err(status_from_agent)?,
             ),
         })
+    }
+}
+
+fn startup_write_status(
+    persisted: kuberic_protocol::types::AccessStatus,
+    pending: Option<&kuberic_runtime_internal::effects::RuntimeEffectAction>,
+) -> kuberic_protocol::types::AccessStatus {
+    if pending.is_some_and(|action| {
+        matches!(
+            action,
+            kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover { .. }
+        )
+    }) {
+        kuberic_protocol::types::AccessStatus::ReconfigurationPending
+    } else {
+        persisted
     }
 }
 
@@ -894,7 +933,10 @@ fn status_from_runtime(error: kuberic_runtime::RuntimeError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuberic_protocol::types::{PodUid, PvcUid, ReplicaInstanceId, ResourceUid};
+    use kuberic_protocol::types::{
+        AgentGeneration, ConfigurationId, PodUid, PvcUid, ReplicaIdentity, ReplicaInstanceId,
+        ResourceUid, SwitchoverRequestId,
+    };
 
     #[test]
     fn uninitialized_report_is_unsafe_when_application_state_survives() {
@@ -921,5 +963,32 @@ mod tests {
             proto::AgentStorageState::Unsafe as i32
         );
         assert!(report.storage_error.contains("application state exists"));
+    }
+
+    #[test]
+    fn pending_switchover_preparation_reconstructs_write_closed() {
+        let action = kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: 1,
+            request_id: SwitchoverRequestId::new("request-1"),
+            source: ReplicaIdentity {
+                replica_id: ReplicaId::new(1),
+                instance_id: ReplicaInstanceId::new("pod-1"),
+                agent_generation: AgentGeneration::new("generation-1"),
+            },
+            target: ReplicaIdentity {
+                replica_id: ReplicaId::new(2),
+                instance_id: ReplicaInstanceId::new("pod-2"),
+                agent_generation: AgentGeneration::new("generation-2"),
+            },
+            starting_configuration_id: ConfigurationId::new("configuration-1"),
+            starting_epoch: kuberic_protocol::types::Epoch::new(0, 1),
+        };
+        assert_eq!(
+            startup_write_status(
+                kuberic_protocol::types::AccessStatus::Granted,
+                Some(&action)
+            ),
+            kuberic_protocol::types::AccessStatus::ReconfigurationPending
+        );
     }
 }

@@ -2,6 +2,7 @@ fn main() {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.ensure_configuration")
         .compile_protos(
             &["proto/kuberic.proto", "proto/replication.proto"],
             &["proto"],

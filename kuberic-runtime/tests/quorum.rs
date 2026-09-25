@@ -69,6 +69,7 @@ async fn two_incarnations_of_one_replica_receive_distinct_quorum_credit() {
         transition_kind: Some(TransitionKind::Replacement),
         previous_configuration: Some(previous),
         current_configuration: current,
+        switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
     tracker.configure(authority.clone(), 0).unwrap();
@@ -109,6 +110,7 @@ async fn stale_authority_ack_cannot_advance_progress_or_commit() {
         transition_kind: None,
         previous_configuration: None,
         current_configuration: current,
+        switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
     tracker.configure(authority.clone(), 0).unwrap();
@@ -155,6 +157,7 @@ async fn authority_change_fails_pending_writes_instead_of_rebinding_them() {
             members.clone(),
             2,
         ),
+        switchover_handoff: None,
     };
     let advanced = AdmittedAuthority {
         local_identity: primary,
@@ -166,6 +169,7 @@ async fn authority_change_fails_pending_writes_instead_of_rebinding_them() {
             members,
             2,
         ),
+        switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
     tracker.configure(initial, 0).unwrap();
@@ -196,6 +200,7 @@ fn authority_change_discards_remote_acknowledgement_credit() {
             ],
             2,
         ),
+        switchover_handoff: None,
     };
     let replacement = identity(3, "replacement");
     let previous = initial.current_configuration.clone();
@@ -214,6 +219,7 @@ fn authority_change_discards_remote_acknowledgement_credit() {
         transition_kind: Some(TransitionKind::Replacement),
         previous_configuration: Some(previous),
         current_configuration: current,
+        switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
     tracker.configure(initial.clone(), 10).unwrap();
@@ -258,6 +264,7 @@ fn catch_up_requires_recorded_cc_boundary() {
         transition_kind: Some(TransitionKind::Replacement),
         previous_configuration: Some(previous),
         current_configuration: current,
+        switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
     tracker.configure(authority.clone(), 10).unwrap();
@@ -304,6 +311,7 @@ fn catch_up_requires_each_derived_must_catch_up_member() {
         transition_kind: Some(TransitionKind::Failover),
         previous_configuration: Some(previous),
         current_configuration: current,
+        switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
     tracker.configure(authority.clone(), 5).unwrap();

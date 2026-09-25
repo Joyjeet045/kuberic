@@ -72,9 +72,12 @@ The operator watches `KubericSet` resources and manages the full lifecycle: pod 
 
 The independent level-triggered controller uses
 `operator.kuberic.io/v1alpha1` and distinct deployment assets. It currently
-supports fixed-cardinality bootstrap, replacement, ordinary failover, and
-non-destructive quorum-loss recovery for `kvstore2`; its images remain
-local/CI-only.
+supports fixed-cardinality bootstrap, replacement, ordinary failover, explicit
+named-target [planned switchover](docs/features/kuberic/level-triggered-operator.md#planned-switchover),
+and non-destructive quorum-loss recovery for `kvstore2`. Switchover may briefly
+interrupt writes and connections; it is not a zero-downtime guarantee. V2 images
+remain local/CI-only, and scaling and the SQLite/PostgreSQL ports remain future
+work.
 
 ## Continuous Delivery
 
@@ -98,6 +101,7 @@ such as `v0.1.0` also publishes the exact version tag.
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md) — independent stack deployment, authority, supported operations, and diagnostics
+- [V1 retirement plan](docs/proposal/v1-retirement-plan.md) — completed switchover workstream and remaining retirement gates
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
 
 ## License

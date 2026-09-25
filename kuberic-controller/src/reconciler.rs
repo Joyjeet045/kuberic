@@ -63,7 +63,33 @@ impl Reconciler {
                     kind: ReconcileKind::ObservationStale,
                 });
             }
-            Err(ControllerError::AgentUnavailable(_)) => {
+            Err(ControllerError::AgentUnavailable(message)) => {
+                if snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| {
+                        transition.kind
+                            == kuberic_protocol::types::TransitionKind::PlannedSwitchover
+                    })
+                {
+                    let status = snapshot.status.clone().with_condition(kuberic_protocol::types::StatusCondition {
+                        type_: "Progressing".to_string(),
+                        status: kuberic_protocol::types::ConditionStatus::True,
+                        reason: "SwitchoverReobservationRequired".to_string(),
+                        message: format!("Re-observe exact process-session authority; dispatch is not completion evidence: {message}"),
+                    });
+                    match self.api.replace_status(&raw, &status).await {
+                        Ok(()) => {}
+                        Err(ControllerError::ObservationStale) => {
+                            return Ok(ReconcileAction {
+                                requeue_after: Duration::ZERO,
+                                kind: ReconcileKind::ObservationStale,
+                            });
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 return Ok(ReconcileAction {
                     requeue_after: Duration::from_secs(self.evaluation.wait_requeue_seconds),
                     kind: ReconcileKind::Waiting,

@@ -10,13 +10,16 @@ use kuberic_protocol::observation::{
 use kuberic_protocol::plan::{Plan, UnsafeReason, WaitReason};
 use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
-    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PodUid, ProcessSessionId,
-    ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRepairIntent,
-    ReplicaRole, ResourceUid, TransitionIntent, TransitionKind, derive_agent_generation,
-    derive_initialization_id, derive_transition_id,
+    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PlannedSwitchoverIntent,
+    PlannedSwitchoverOutcome, PlannedSwitchoverReceipt, PlannedSwitchoverRequest,
+    PlannedSwitchoverResolution, PodUid, ProcessSessionId, ProvisioningIntent, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole, ResourceUid,
+    SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind,
+    derive_agent_generation, derive_initialization_id, derive_switchover_preparation_operation_id,
+    derive_transition_id,
 };
 use kuberic_protocol::validation::{
-    ValidationError, validate_configuration, validate_transition_relationship,
+    ValidationError, validate_configuration, validate_status, validate_transition_relationship,
 };
 
 fn identity(id: i64, instance: &str, generation: &str) -> ReplicaIdentity {
@@ -57,6 +60,7 @@ fn desired(replicas: u32) -> DesiredState {
         replicas,
         image: "example:v1".to_string(),
         failover_delay_seconds: 10,
+        switchover: None,
     }
 }
 
@@ -330,6 +334,1359 @@ fn replacement_relationship_requires_one_non_primary_incarnation_change() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn planned_switchover_relationship_preserves_exact_membership_and_changes_primary() {
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 5),
+        ReplicaId::new(1),
+        configuration().members,
+        2,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 6),
+        ReplicaId::new(2),
+        previous
+            .members
+            .iter()
+            .cloned()
+            .map(|mut member| {
+                member.role = if member.identity.replica_id == ReplicaId::new(2) {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                };
+                member
+            })
+            .collect(),
+        2,
+    );
+    let policy = EffectivePolicy::fixed(3, 10).unwrap();
+
+    assert!(
+        validate_transition_relationship(
+            TransitionKind::PlannedSwitchover,
+            Some(&previous),
+            &current,
+            &policy
+        )
+        .is_ok()
+    );
+
+    let mut changed_members = current.members.clone();
+    changed_members[2].identity = identity(3, "replacement-pod", "replacement-generation");
+    let changed =
+        ConfigurationDescriptor::new(Epoch::new(0, 6), ReplicaId::new(2), changed_members, 2);
+    assert!(
+        validate_transition_relationship(
+            TransitionKind::PlannedSwitchover,
+            Some(&previous),
+            &changed,
+            &policy
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn planned_switchover_status_binds_request_handoff_and_receipt() {
+    let resource_uid = ResourceUid::new("resource-uid");
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 5),
+        ReplicaId::new(1),
+        configuration().members,
+        2,
+    );
+    let source = previous.members[0].identity.clone();
+    let target = previous.members[1].identity.clone();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 6),
+        target.replica_id,
+        previous
+            .members
+            .iter()
+            .cloned()
+            .map(|mut member| {
+                member.role = if member.identity == target {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                };
+                member
+            })
+            .collect(),
+        2,
+    );
+    let request_id = SwitchoverRequestId::new("request-1");
+    let preparation_operation_id = derive_switchover_preparation_operation_id(
+        &resource_uid,
+        &request_id,
+        2,
+        &previous.configuration_id,
+        &source,
+        &target,
+    );
+    let handoff = SwitchoverHandoff {
+        preparation_generation: 2,
+        preparation_operation_id,
+        request_id: request_id.clone(),
+        source: source.clone(),
+        target: target.clone(),
+        starting_configuration_id: previous.configuration_id.clone(),
+        starting_epoch: previous.epoch,
+        handoff_lsn: 12,
+    };
+    let status = AcceptedStatus {
+        initialized: true,
+        observed_generation: 1,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
+        topology: Some(AcceptedTopology {
+            configuration: previous.clone(),
+        }),
+        transition: Some(TransitionIntent {
+            transition_id: derive_transition_id(
+                &resource_uid,
+                TransitionKind::PlannedSwitchover,
+                &current.configuration_id,
+            ),
+            kind: TransitionKind::PlannedSwitchover,
+            spec_generation: 2,
+            effective_policy: EffectivePolicy::fixed(3, 10).unwrap(),
+            previous_configuration_id: Some(previous.configuration_id.clone()),
+            current_configuration: current.clone(),
+            election_lsn: None,
+            build_id: None,
+            repair: None,
+            switchover: Some(PlannedSwitchoverIntent {
+                preparation_generation: 2,
+                request_id: request_id.clone(),
+                source,
+                target: target.clone(),
+                requested_configuration: current.clone(),
+                resolution: PlannedSwitchoverResolution::RequestedTarget,
+                handoff: Some(handoff),
+            }),
+        }),
+        last_switchover: Some(PlannedSwitchoverReceipt {
+            request_id: SwitchoverRequestId::new("request-0"),
+            requested_target_replica_id: target.replica_id,
+            accepted_target: Some(target.clone()),
+            resulting_primary: Some(target),
+            outcome: PlannedSwitchoverOutcome::RequestedTargetCompleted,
+        }),
+        ..AcceptedStatus::default()
+    };
+
+    assert!(validate_status(&status).is_ok());
+
+    let mut same_epoch_compensation = status.clone();
+    let transition = same_epoch_compensation.transition.as_mut().unwrap();
+    transition.switchover.as_mut().unwrap().resolution =
+        PlannedSwitchoverResolution::CompensatingOldPrimary;
+    transition.current_configuration = ConfigurationDescriptor::new(
+        transition.current_configuration.epoch,
+        previous.primary_id,
+        previous.members.clone(),
+        previous.write_quorum,
+    );
+    assert!(matches!(
+        validate_status(&same_epoch_compensation),
+        Err(ValidationError::TransitionEpochNotNewer)
+    ));
+
+    let mut malformed_receipt = status;
+    malformed_receipt.last_switchover = Some(PlannedSwitchoverReceipt {
+        request_id: SwitchoverRequestId::new("request-malformed"),
+        requested_target_replica_id: ReplicaId::new(2),
+        accepted_target: Some(identity(2, "pod-2", "generation-2")),
+        resulting_primary: Some(identity(-1, "", "")),
+        outcome: PlannedSwitchoverOutcome::OldPrimaryCompensated,
+    });
+    assert!(matches!(
+        validate_status(&malformed_receipt),
+        Err(ValidationError::InvalidSwitchoverReceipt)
+    ));
+}
+
+#[test]
+fn switchover_preparation_id_is_deterministic_and_exact_target_bound() {
+    let resource_uid = ResourceUid::new("resource-uid");
+    let request_id = SwitchoverRequestId::new("request-1");
+    let source = identity(1, "pod-1", "generation-1");
+    let target = identity(2, "pod-2", "generation-2");
+    let first = derive_switchover_preparation_operation_id(
+        &resource_uid,
+        &request_id,
+        2,
+        &configuration().configuration_id,
+        &source,
+        &target,
+    );
+    let second = derive_switchover_preparation_operation_id(
+        &resource_uid,
+        &request_id,
+        2,
+        &configuration().configuration_id,
+        &source,
+        &target,
+    );
+    let changed = derive_switchover_preparation_operation_id(
+        &resource_uid,
+        &request_id,
+        2,
+        &configuration().configuration_id,
+        &source,
+        &identity(2, "pod-2b", "generation-2b"),
+    );
+
+    assert_eq!(first, second);
+    assert_ne!(first, changed);
+    assert_ne!(
+        first,
+        derive_switchover_preparation_operation_id(
+            &resource_uid,
+            &request_id,
+            3,
+            &configuration().configuration_id,
+            &source,
+            &target
+        )
+    );
+    assert_ne!(
+        first,
+        derive_switchover_preparation_operation_id(
+            &resource_uid,
+            &request_id,
+            2,
+            &kuberic_protocol::types::ConfigurationId::new("other-authority"),
+            &source,
+            &target
+        )
+    );
+}
+
+#[test]
+fn unknown_switchover_target_does_not_mutate_accepted_authority() {
+    let configuration = configuration();
+    let policy = EffectivePolicy::fixed(3, 10).unwrap();
+    let mut snapshot = empty_snapshot(3);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        observed_generation: 1,
+        effective_policy: Some(policy),
+        topology: Some(AcceptedTopology {
+            configuration: configuration.clone(),
+        }),
+        ..AcceptedStatus::default()
+    };
+    snapshot.desired.switchover = Some(PlannedSwitchoverRequest {
+        request_id: SwitchoverRequestId::new("request-1"),
+        target_replica_id: ReplicaId::new(99),
+    });
+    attest_stable_topology(&mut snapshot, &configuration);
+
+    let status = match evaluate(&snapshot, &EvaluationConfig::default()) {
+        Plan::Apply { changes } => match changes.into_iter().next() {
+            Some(KubernetesChange::PersistStatus { status }) => *status,
+            _ => panic!("planned switchover request must only project status"),
+        },
+        Plan::Stable { status, .. } => status,
+        other => panic!("planned switchover request must not become unsafe: {other:?}"),
+    };
+    assert_eq!(status.topology, snapshot.status.topology);
+    assert!(status.conditions.iter().any(|condition| {
+        condition.type_ == "SwitchoverRejected" && condition.reason == "TargetNotMember"
+    }));
+}
+
+fn switchover_snapshot() -> ObservationSnapshot {
+    let configuration = configuration();
+    let mut snapshot = empty_snapshot(3);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        observed_generation: 1,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
+        topology: Some(AcceptedTopology {
+            configuration: configuration.clone(),
+        }),
+        ..AcceptedStatus::default()
+    };
+    snapshot.desired.generation = 2;
+    snapshot.desired.switchover = Some(PlannedSwitchoverRequest {
+        request_id: SwitchoverRequestId::new("move-1"),
+        target_replica_id: ReplicaId::new(2),
+    });
+    attest_stable_topology(&mut snapshot, &configuration);
+    for id in 1..=3 {
+        switchover_report(&mut snapshot, id).verified_replication_lsn = Some(10);
+    }
+    snapshot
+}
+
+fn switchover_report(snapshot: &mut ObservationSnapshot, id: i64) -> &mut AgentReport {
+    let AgentObservation::Report(report) = &mut snapshot
+        .replicas
+        .get_mut(&observation_key(id, &format!("pod-{id}")))
+        .unwrap()
+        .agent
+    else {
+        panic!("exact report")
+    };
+    report
+}
+
+fn apply_switchover_status(snapshot: &mut ObservationSnapshot) {
+    let plan = evaluate(snapshot, &EvaluationConfig::default());
+    let Plan::Apply { changes } = plan else {
+        panic!("expected Apply: {plan:?}")
+    };
+    for change in changes {
+        match change {
+            KubernetesChange::PersistStatus { status } => {
+                validate_status(&status).unwrap();
+                snapshot.status = *status;
+            }
+            KubernetesChange::RemoveWriteRouting => {
+                snapshot.routing.write_target = None;
+                snapshot.routing.unresolved_write_target = false;
+            }
+            other => panic!("unexpected change: {other:?}"),
+        }
+    }
+}
+
+fn prepared_switchover_snapshot() -> ObservationSnapshot {
+    let mut snapshot = switchover_snapshot();
+    apply_switchover_status(&mut snapshot);
+    apply_switchover_status(&mut snapshot);
+    let Plan::Execute {
+        command: ProtocolCommand::PrepareSwitchover(command),
+    } = evaluate(&snapshot, &EvaluationConfig::default())
+    else {
+        panic!("preparation command")
+    };
+    let source = switchover_report(&mut snapshot, 1);
+    source.write_status = AccessStatus::ReconfigurationPending;
+    source.prepared_switchover = Some(SwitchoverHandoff {
+        preparation_generation: command.preparation_generation,
+        preparation_operation_id: command.operation_id,
+        request_id: command.request_id,
+        source: command.source,
+        target: command.target,
+        starting_configuration_id: command.current_configuration.configuration_id,
+        starting_epoch: command.current_configuration.epoch,
+        handoff_lsn: 10,
+    });
+    apply_switchover_status(&mut snapshot);
+    snapshot
+}
+
+fn prepared_switchover_snapshot_with_size(replica_set_size: u32) -> ObservationSnapshot {
+    let write_quorum = replica_set_size / 2 + 1;
+    let configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        ReplicaId::new(1),
+        (1..=i64::from(replica_set_size))
+            .map(|id| {
+                member(
+                    id,
+                    if id == 1 {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                )
+            })
+            .collect(),
+        write_quorum,
+    );
+    let mut snapshot = empty_snapshot(replica_set_size);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        observed_generation: 1,
+        effective_policy: Some(EffectivePolicy::fixed(replica_set_size, 10).unwrap()),
+        topology: Some(AcceptedTopology {
+            configuration: configuration.clone(),
+        }),
+        ..AcceptedStatus::default()
+    };
+    snapshot.desired.generation = 2;
+    snapshot.desired.switchover = Some(PlannedSwitchoverRequest {
+        request_id: SwitchoverRequestId::new(format!("move-{replica_set_size}")),
+        target_replica_id: ReplicaId::new(2),
+    });
+    attest_stable_topology(&mut snapshot, &configuration);
+    for id in 1..=i64::from(replica_set_size) {
+        switchover_report(&mut snapshot, id).verified_replication_lsn = Some(10);
+    }
+    apply_switchover_status(&mut snapshot);
+    apply_switchover_status(&mut snapshot);
+    let Plan::Execute {
+        command: ProtocolCommand::PrepareSwitchover(command),
+    } = evaluate(&snapshot, &EvaluationConfig::default())
+    else {
+        panic!("preparation command")
+    };
+    let source = switchover_report(&mut snapshot, 1);
+    source.write_status = AccessStatus::ReconfigurationPending;
+    source.prepared_switchover = Some(SwitchoverHandoff {
+        preparation_generation: command.preparation_generation,
+        preparation_operation_id: command.operation_id,
+        request_id: command.request_id,
+        source: command.source,
+        target: command.target,
+        starting_configuration_id: command.current_configuration.configuration_id,
+        starting_epoch: command.current_configuration.epoch,
+        handoff_lsn: 10,
+    });
+    apply_switchover_status(&mut snapshot);
+    snapshot
+}
+
+fn lose_switchover_pod(snapshot: &mut ObservationSnapshot, id: i64) {
+    let observation = snapshot
+        .replicas
+        .get_mut(&observation_key(id, &format!("pod-{id}")))
+        .unwrap();
+    let pod = observation.kubernetes.as_mut().unwrap();
+    pod.pod_uid = None;
+    pod.pod_name.clear();
+    pod.pod_ready = false;
+    observation.agent = AgentObservation::Absent;
+}
+
+fn assert_switchover_safety_decision(snapshot: &ObservationSnapshot) {
+    let plan = evaluate(snapshot, &EvaluationConfig::default());
+    let Plan::Apply { changes } = plan else {
+        panic!("expected safety convergence, not terminal Unsafe: {plan:?}")
+    };
+    assert!(matches!(
+        changes.first(),
+        Some(KubernetesChange::RemoveWriteRouting)
+    ));
+    let KubernetesChange::PersistStatus { status } = changes.last().unwrap() else {
+        panic!("frozen failure")
+    };
+    assert_eq!(
+        status
+            .transition
+            .as_ref()
+            .unwrap()
+            .switchover
+            .as_ref()
+            .unwrap()
+            .resolution,
+        PlannedSwitchoverResolution::Unsafe
+    );
+    assert!(status.last_switchover.is_none());
+}
+
+#[test]
+fn switchover_target_loss_table_selects_restoration_compensation_or_forward_only() {
+    for boundary in [
+        "before-prepare",
+        "prepared",
+        "authority-admitted",
+        "source-demoted",
+        "target-role",
+        "current-only",
+        "accepted",
+    ] {
+        let mut snapshot = if boundary == "before-prepare" {
+            let mut snapshot = switchover_snapshot();
+            apply_switchover_status(&mut snapshot);
+            apply_switchover_status(&mut snapshot);
+            snapshot
+        } else {
+            prepared_switchover_snapshot()
+        };
+        let requested = snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .current_configuration
+            .clone();
+        let starting = snapshot.status.topology.clone().unwrap().configuration;
+        let count = match boundary {
+            "authority-admitted" | "source-demoted" => 1,
+            "target-role" => 3,
+            "current-only" | "accepted" => 6,
+            _ => 0,
+        };
+        for _ in 0..count {
+            observe_switchover_command(&mut snapshot);
+        }
+        if boundary == "authority-admitted" {
+            let source = switchover_report(&mut snapshot, 1);
+            source.role = ReplicaRole::Primary;
+            source.pending_operation_id = source.retained_operation_id.take();
+        }
+        if boundary == "accepted" {
+            apply_switchover_status(&mut snapshot);
+        }
+        lose_switchover_pod(&mut snapshot, 2);
+        if boundary == "accepted" {
+            let receipt = snapshot.status.last_switchover.clone();
+            apply_switchover_status(&mut snapshot);
+            assert_eq!(
+                snapshot.status.topology.as_ref().unwrap().configuration,
+                requested
+            );
+            assert_eq!(snapshot.status.last_switchover, receipt);
+            assert!(
+                snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_none_or(|transition| transition.kind != TransitionKind::PlannedSwitchover)
+            );
+            continue;
+        }
+        // Allocation/decision is status-only and replayable before any effect.
+        let first = evaluate(&snapshot, &EvaluationConfig::default());
+        assert_eq!(
+            first,
+            evaluate(&snapshot, &EvaluationConfig::default()),
+            "{boundary}"
+        );
+        apply_switchover_status(&mut snapshot);
+        let intent = snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .switchover
+            .as_ref()
+            .unwrap();
+        assert_eq!(intent.requested_configuration, requested);
+        if count == 0 {
+            assert_eq!(
+                intent.resolution,
+                PlannedSwitchoverResolution::RestoringOldPrimary
+            );
+            let retirement = observe_switchover_command(&mut snapshot);
+            assert!(retirement.is_switchover_restoration());
+            assert_eq!(retirement.current_configuration, starting);
+            assert_eq!(retirement.retire_switchover_preparation_ids.len(), 1);
+            assert_eq!(
+                retirement.switchover_handoff.is_some(),
+                boundary == "prepared"
+            );
+            apply_switchover_status(&mut snapshot);
+            assert_eq!(
+                snapshot.status.topology.as_ref().unwrap().configuration,
+                starting
+            );
+            assert_eq!(
+                snapshot.status.last_switchover.as_ref().unwrap().outcome,
+                PlannedSwitchoverOutcome::OldPrimaryRestored
+            );
+        } else {
+            assert_eq!(
+                intent.resolution,
+                PlannedSwitchoverResolution::CompensatingOldPrimary
+            );
+            let compensation = snapshot
+                .status
+                .transition
+                .as_ref()
+                .unwrap()
+                .current_configuration
+                .clone();
+            assert!(compensation.epoch.configuration_number > requested.epoch.configuration_number);
+            assert_eq!(
+                compensation.epoch.data_loss_number,
+                starting.epoch.data_loss_number
+            );
+            assert_eq!(compensation.members, starting.members);
+            assert_eq!(compensation.write_quorum, starting.write_quorum);
+            for (current_only, id) in [(false, 3), (false, 1), (true, 3), (true, 1)] {
+                let command = observe_switchover_command(&mut snapshot);
+                assert_eq!(command.local_replica_id, ReplicaId::new(id), "{boundary}");
+                assert_eq!(command.current_only, current_only);
+                assert_eq!(
+                    command.previous_configuration,
+                    (!current_only).then(|| requested.clone())
+                );
+                assert_eq!(
+                    command.primary_write_status,
+                    AccessStatus::ReconfigurationPending
+                );
+                assert_eq!(
+                    command.retire_switchover_preparation_ids.len(),
+                    usize::from(current_only && id == 1)
+                );
+            }
+            let receipt = evaluate(&snapshot, &EvaluationConfig::default());
+            assert_eq!(receipt, evaluate(&snapshot, &EvaluationConfig::default()));
+            apply_switchover_status(&mut snapshot);
+            assert_eq!(
+                snapshot.status.topology.as_ref().unwrap().configuration,
+                compensation
+            );
+            assert_eq!(
+                snapshot.status.last_switchover.as_ref().unwrap().outcome,
+                PlannedSwitchoverOutcome::OldPrimaryCompensated
+            );
+        }
+        assert!(snapshot.status.transition.is_none());
+        assert!(snapshot.status.primary_failure.is_none());
+        assert!(snapshot.status.provisioning.is_none());
+        // Normalize the deleted Pod's retained PVC as an orphan, as the real
+        // controller does. Availability must precede ordinary replacement.
+        let orphan = snapshot
+            .replicas
+            .remove(&observation_key(2, "pod-2"))
+            .unwrap();
+        snapshot
+            .replicas
+            .insert(observation_key(2, "orphan-pvc-2"), orphan);
+        let grant = observe_switchover_command(&mut snapshot);
+        assert_eq!(grant.primary_write_status, AccessStatus::Granted);
+        assert_eq!(grant.local_replica_id, ReplicaId::new(1));
+        assert!(
+            matches!(evaluate(&snapshot, &EvaluationConfig::default()), Plan::Apply { changes }
+            if matches!(&changes[0], KubernetesChange::PublishWriteRouting { primary } if primary.replica_id == ReplicaId::new(1)))
+        );
+    }
+}
+
+#[test]
+fn switchover_compensation_converges_returned_target_and_uninvolved_before_source_grant() {
+    let mut snapshot = prepared_switchover_snapshot();
+    observe_switchover_command(&mut snapshot);
+    switchover_report(&mut snapshot, 2).reported_fault =
+        Some(kuberic_protocol::types::FaultType::Permanent);
+    apply_switchover_status(&mut snapshot);
+    // Recovery is frozen: a healed target cannot switch the decision back.
+    switchover_report(&mut snapshot, 2).reported_fault = None;
+    let policy = snapshot.status.effective_policy.clone();
+    for current_only in [false, true] {
+        for id in [2, 3, 1] {
+            let command = observe_switchover_command(&mut snapshot);
+            assert_eq!(command.local_replica_id, ReplicaId::new(id));
+            assert_eq!(command.current_only, current_only);
+            assert_eq!(
+                command.retire_switchover_preparation_ids.len(),
+                usize::from(id == 1 && current_only)
+            );
+            assert!(snapshot.routing.write_target.is_none());
+        }
+    }
+    apply_switchover_status(&mut snapshot);
+    assert_eq!(snapshot.status.effective_policy, policy);
+    let grant = observe_switchover_command(&mut snapshot);
+    assert_eq!(grant.local_replica_id, ReplicaId::new(1));
+    assert_eq!(grant.primary_write_status, AccessStatus::Granted);
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("routing")
+    };
+    assert!(
+        matches!(&changes[0], KubernetesChange::PublishWriteRouting { primary } if primary.replica_id == ReplicaId::new(1))
+    );
+}
+
+#[test]
+fn switchover_compensation_fences_permanent_fault_before_survivor_commands() {
+    let mut snapshot = prepared_switchover_snapshot();
+    observe_switchover_command(&mut snapshot);
+    switchover_report(&mut snapshot, 2).reported_fault =
+        Some(kuberic_protocol::types::FaultType::Permanent);
+    apply_switchover_status(&mut snapshot);
+    let mut temporary = snapshot.clone();
+    temporary
+        .replicas
+        .get_mut(&observation_key(2, "pod-2"))
+        .unwrap()
+        .agent = AgentObservation::Unreachable {
+        message: "temporary restart".into(),
+    };
+    assert!(matches!(
+        evaluate(&temporary, &EvaluationConfig::default()),
+        Plan::Wait { .. }
+    ));
+    let expected = Plan::Apply {
+        changes: vec![KubernetesChange::DeleteExactPod {
+            pod_name: snapshot.replicas[&observation_key(2, "pod-2")]
+                .kubernetes
+                .as_ref()
+                .unwrap()
+                .pod_name
+                .clone(),
+            pod_uid: PodUid::new("pod-2"),
+        }],
+    };
+    // An extant failed participant never has to execute another lifecycle command.
+    for _ in 0..3 {
+        assert_eq!(evaluate(&snapshot, &EvaluationConfig::default()), expected);
+    }
+    lose_switchover_pod(&mut snapshot, 2);
+    for current_only in [false, true] {
+        for id in [3, 1] {
+            let command = observe_switchover_command(&mut snapshot);
+            assert_eq!(command.local_replica_id, ReplicaId::new(id));
+            assert_eq!(command.current_only, current_only);
+        }
+    }
+    apply_switchover_status(&mut snapshot);
+    let orphan = snapshot
+        .replicas
+        .remove(&observation_key(2, "pod-2"))
+        .unwrap();
+    snapshot
+        .replicas
+        .insert(observation_key(2, "orphan-pvc-2"), orphan);
+    let grant = observe_switchover_command(&mut snapshot);
+    assert_eq!(grant.local_replica_id, ReplicaId::new(1));
+    assert_eq!(grant.primary_write_status, AccessStatus::Granted);
+    assert_eq!(
+        snapshot.status.last_switchover.as_ref().unwrap().outcome,
+        PlannedSwitchoverOutcome::OldPrimaryCompensated
+    );
+}
+
+#[test]
+fn switchover_temporary_evidence_waits_but_definitive_source_loss_and_contradiction_close() {
+    for id in [1, 2, 3] {
+        for admitted in [false, true] {
+            let mut snapshot = prepared_switchover_snapshot();
+            if admitted {
+                observe_switchover_command(&mut snapshot);
+            }
+            snapshot
+                .replicas
+                .get_mut(&observation_key(id, &format!("pod-{id}")))
+                .unwrap()
+                .agent = AgentObservation::Unreachable {
+                message: "process restarting".into(),
+            };
+            let Plan::Wait {
+                status,
+                requeue_after_seconds,
+                ..
+            } = evaluate(&snapshot, &EvaluationConfig::default())
+            else {
+                panic!("temporary evidence for {id}, admitted={admitted}");
+            };
+            assert_eq!(requeue_after_seconds, 5);
+            assert!(status.transition.is_some());
+            assert!(status.primary_failure.is_none() && status.provisioning.is_none());
+            assert!(status.last_switchover.is_none());
+            assert!(
+                status
+                    .conditions
+                    .iter()
+                    .any(|condition| condition.type_ == "Progressing")
+            );
+        }
+    }
+    let mut lost = prepared_switchover_snapshot();
+    lose_switchover_pod(&mut lost, 1);
+    assert_switchover_safety_decision(&lost);
+    let mut replaced = prepared_switchover_snapshot();
+    switchover_report(&mut replaced, 1)
+        .identity
+        .agent_generation = AgentGeneration::new("replacement");
+    assert_switchover_safety_decision(&replaced);
+    let mut contradictory = prepared_switchover_snapshot();
+    observe_switchover_command(&mut contradictory);
+    switchover_report(&mut contradictory, 1)
+        .prepared_switchover
+        .as_mut()
+        .unwrap()
+        .handoff_lsn = 9;
+    lose_switchover_pod(&mut contradictory, 2);
+    assert_switchover_safety_decision(&contradictory);
+}
+
+#[test]
+fn switchover_compensation_waits_for_recoverable_read_quorum_and_never_restores_after_admission() {
+    let mut snapshot = prepared_switchover_snapshot();
+    observe_switchover_command(&mut snapshot);
+    lose_switchover_pod(&mut snapshot, 2);
+    snapshot
+        .replicas
+        .get_mut(&observation_key(3, "pod-3"))
+        .unwrap()
+        .agent = AgentObservation::Unreachable {
+        message: "partition".into(),
+    };
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Wait { .. }
+    ));
+    lose_switchover_pod(&mut snapshot, 3);
+    assert_switchover_safety_decision(&snapshot);
+}
+
+#[test]
+fn switchover_compensation_fails_closed_when_even_membership_cannot_regain_write_quorum() {
+    let mut two = prepared_switchover_snapshot_with_size(2);
+    observe_switchover_command(&mut two);
+    lose_switchover_pod(&mut two, 2);
+    assert_switchover_safety_decision(&two);
+
+    let mut four = prepared_switchover_snapshot_with_size(4);
+    observe_switchover_command(&mut four);
+    lose_switchover_pod(&mut four, 2);
+    lose_switchover_pod(&mut four, 4);
+    assert_switchover_safety_decision(&four);
+}
+
+#[test]
+fn switchover_any_requested_authority_admission_precludes_old_epoch_restoration() {
+    let mut snapshot = prepared_switchover_snapshot();
+    let starting = snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    let requested = snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .current_configuration
+        .clone();
+    let third = switchover_report(&mut snapshot, 3);
+    third.epoch = requested.epoch;
+    third.current_configuration = Some(requested.clone());
+    third.previous_configuration = Some(starting);
+    third.pending_operation_id = Some(OperationId::new("admitted-before-role-change"));
+    lose_switchover_pod(&mut snapshot, 2);
+    apply_switchover_status(&mut snapshot);
+    let transition = snapshot.status.transition.unwrap();
+    assert_eq!(
+        transition.switchover.unwrap().resolution,
+        PlannedSwitchoverResolution::CompensatingOldPrimary
+    );
+    assert!(transition.current_configuration.epoch > requested.epoch);
+}
+
+#[test]
+fn switchover_unsafe_waits_for_exact_pod_absence_or_observed_authority_closure() {
+    let mut snapshot = prepared_switchover_snapshot();
+    // Contradictory source plus an ambiguous possible writer: removing routing
+    // and issuing deletion are not evidence of runtime closure.
+    switchover_report(&mut snapshot, 1)
+        .identity
+        .agent_generation = AgentGeneration::new("wrong");
+    snapshot
+        .replicas
+        .get_mut(&observation_key(2, "pod-2"))
+        .unwrap()
+        .agent = AgentObservation::Unreachable {
+        message: "ambiguous writer".into(),
+    };
+    apply_switchover_status(&mut snapshot);
+    for id in [1, 2] {
+        let plan = evaluate(&snapshot, &EvaluationConfig::default());
+        assert_eq!(plan, evaluate(&snapshot, &EvaluationConfig::default()));
+        assert!(matches!(plan, Plan::Apply { ref changes }
+            if matches!(&changes[..], [KubernetesChange::DeleteExactPod { pod_uid, .. }] if pod_uid.as_str() == format!("pod-{id}"))));
+        assert!(snapshot.status.last_switchover.is_none());
+        // PVC-only observation remains after exact Pod absence is observed.
+        lose_switchover_pod(&mut snapshot, id);
+        assert!(
+            snapshot
+                .replicas
+                .get(&observation_key(id, &format!("pod-{id}")))
+                .unwrap()
+                .kubernetes
+                .as_ref()
+                .unwrap()
+                .pvc_uid
+                .is_some()
+        );
+    }
+    let Plan::Unsafe { status, .. } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("closed terminal")
+    };
+    validate_status(&status).unwrap();
+    assert_eq!(
+        status.last_switchover.as_ref().unwrap().outcome,
+        PlannedSwitchoverOutcome::Unsafe
+    );
+    snapshot.status = status;
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+    // Missing list evidence cannot prove terminal safety even on a later retry.
+    snapshot
+        .observation_failures
+        .push(kuberic_protocol::observation::ObservationFailure {
+            source: "pods".into(),
+            message: "list failed".into(),
+        });
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Wait { .. }
+    ));
+}
+
+#[test]
+fn switchover_safety_closes_live_starting_writer_before_terminal_receipt() {
+    let mut snapshot = switchover_snapshot();
+    apply_switchover_status(&mut snapshot);
+    switchover_report(&mut snapshot, 2)
+        .identity
+        .agent_generation = AgentGeneration::new("wrong");
+    apply_switchover_status(&mut snapshot);
+    let closure = observe_switchover_command(&mut snapshot);
+    assert_eq!(
+        closure.current_epoch,
+        snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .epoch
+    );
+    assert_eq!(
+        closure.primary_write_status,
+        AccessStatus::ReconfigurationPending
+    );
+    lose_switchover_pod(&mut snapshot, 2);
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+}
+
+#[test]
+fn switchover_accepted_target_replays_lost_status_grant_and_routing_forward_only() {
+    let mut snapshot = prepared_switchover_snapshot();
+    for _ in 0..6 {
+        observe_switchover_command(&mut snapshot);
+    }
+    let receipt = evaluate(&snapshot, &EvaluationConfig::default());
+    assert_eq!(receipt, evaluate(&snapshot, &EvaluationConfig::default()));
+    apply_switchover_status(&mut snapshot);
+    let accepted = snapshot.status.topology.clone();
+    let grant = evaluate(&snapshot, &EvaluationConfig::default());
+    assert_eq!(grant, evaluate(&snapshot, &EvaluationConfig::default()));
+    observe_switchover_command(&mut snapshot);
+    let routing = evaluate(&snapshot, &EvaluationConfig::default());
+    assert_eq!(routing, evaluate(&snapshot, &EvaluationConfig::default()));
+    assert_eq!(snapshot.status.topology, accepted);
+    assert_eq!(
+        snapshot.status.last_switchover.as_ref().unwrap().outcome,
+        PlannedSwitchoverOutcome::RequestedTargetCompleted
+    );
+}
+
+fn observe_switchover_command(
+    snapshot: &mut ObservationSnapshot,
+) -> kuberic_protocol::command::EnsureConfiguration {
+    let plan = evaluate(snapshot, &EvaluationConfig::default());
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(command),
+    } = plan
+    else {
+        panic!("expected configuration command: {plan:?}")
+    };
+    let report = switchover_report(snapshot, command.local_replica_id.value());
+    assert_eq!(command.expected_instance_id, report.identity.instance_id);
+    assert_eq!(
+        command.expected_agent_generation,
+        report.identity.agent_generation
+    );
+    report.epoch = command.current_epoch;
+    report.current_configuration = Some(command.current_configuration.clone());
+    report.previous_configuration = command.previous_configuration.clone();
+    report.role = command
+        .current_configuration
+        .members
+        .iter()
+        .find(|member| member.identity == report.identity)
+        .unwrap()
+        .role;
+    report.write_status = if report.role == ReplicaRole::Primary {
+        command.primary_write_status
+    } else {
+        AccessStatus::NotPrimary
+    };
+    report.retained_operation_id = Some(command.operation_id.clone());
+    report.pending_operation_id = None;
+    report.catch_up_complete = true;
+    report.catch_up_boundary = command.previous_configuration.as_ref().map(|_| 10);
+    report.current_configuration_quorum_progress = 10;
+    if !command.retire_switchover_preparation_ids.is_empty() {
+        report.prepared_switchover = None;
+    }
+    *command
+}
+
+#[test]
+fn invalid_switchover_requests_only_project_rejection() {
+    for (request_id, target, reason) in [
+        ("", 2, "MalformedRequest"),
+        ("  ", 2, "MalformedRequest"),
+        ("move-1", 0, "MalformedRequest"),
+        ("move-1", 1, "TargetAlreadyPrimary"),
+        ("move-1", 99, "TargetNotMember"),
+    ] {
+        let mut snapshot = switchover_snapshot();
+        snapshot.desired.switchover = Some(PlannedSwitchoverRequest {
+            request_id: SwitchoverRequestId::new(request_id),
+            target_replica_id: ReplicaId::new(target),
+        });
+        let before = snapshot.clone();
+        apply_switchover_status(&mut snapshot);
+        assert_eq!(snapshot.status.topology, before.status.topology);
+        assert_eq!(snapshot.routing, before.routing);
+        assert!(snapshot.status.transition.is_none());
+        assert!(
+            snapshot
+                .status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "SwitchoverRejected"
+                    && condition.reason == reason)
+        );
+    }
+    for changed in ["stale", "unavailable", "non-member", "busy"] {
+        let mut snapshot = switchover_snapshot();
+        match changed {
+            "stale" => {
+                let old = ConfigurationDescriptor::new(
+                    Epoch::new(0, 0),
+                    ReplicaId::new(1),
+                    configuration().members,
+                    2,
+                );
+                let report = switchover_report(&mut snapshot, 2);
+                report.epoch = old.epoch;
+                report.current_configuration = Some(old);
+            }
+            "unavailable" => switchover_report(&mut snapshot, 2).healthy = false,
+            "non-member" => {
+                let observation = snapshot
+                    .replicas
+                    .remove(&observation_key(2, "pod-2"))
+                    .unwrap();
+                let mut extra = observation;
+                let AgentObservation::Report(report) = &mut extra.agent else {
+                    unreachable!()
+                };
+                report.identity.instance_id = ReplicaInstanceId::new("other-pod-2");
+                extra.kubernetes.as_mut().unwrap().pod_uid = Some(PodUid::new("other-pod-2"));
+                snapshot
+                    .replicas
+                    .insert(observation_key(2, "other-pod-2"), extra);
+            }
+            "busy" => {
+                switchover_report(&mut snapshot, 2).pending_operation_id =
+                    Some(OperationId::new("other-work"))
+            }
+            _ => unreachable!(),
+        }
+        let topology = snapshot.status.topology.clone();
+        let routing = snapshot.routing.clone();
+        apply_switchover_status(&mut snapshot);
+        assert_eq!(snapshot.status.topology, topology, "{changed}");
+        assert_eq!(snapshot.routing, routing, "{changed}");
+        assert!(snapshot.status.transition.is_none(), "{changed}");
+        assert!(
+            snapshot
+                .status
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "TargetNotEligible"),
+            "{changed}"
+        );
+    }
+}
+
+#[test]
+fn switchover_freezes_deterministic_intent_before_removing_routing() {
+    let mut snapshot = switchover_snapshot();
+    let first = evaluate(&snapshot, &EvaluationConfig::default());
+    assert_eq!(first, evaluate(&snapshot, &EvaluationConfig::default()));
+    let previous = snapshot.status.topology.clone().unwrap().configuration;
+    let routing = snapshot.routing.clone();
+    apply_switchover_status(&mut snapshot);
+    assert_eq!(snapshot.routing, routing);
+    let transition = snapshot.status.transition.clone().unwrap();
+    let intent = transition.switchover.as_ref().unwrap();
+    assert_eq!(intent.source, previous.members[0].identity);
+    assert_eq!(intent.target, previous.members[1].identity);
+    assert_eq!(
+        intent.requested_configuration,
+        transition.current_configuration
+    );
+    assert_eq!(
+        intent.resolution,
+        PlannedSwitchoverResolution::RequestedTarget
+    );
+    assert_eq!(transition.current_configuration.epoch, Epoch::new(0, 2));
+    assert_eq!(
+        transition.effective_policy,
+        snapshot.status.effective_policy.clone().unwrap()
+    );
+    assert_eq!(
+        transition.current_configuration.members.len(),
+        previous.members.len()
+    );
+    assert!(intent.handoff.is_none());
+
+    apply_switchover_status(&mut snapshot);
+    assert!(snapshot.routing.write_target.is_none());
+    assert_eq!(snapshot.status.transition.as_ref(), Some(&transition));
+    let plan = evaluate(&snapshot, &EvaluationConfig::default());
+    let Plan::Execute {
+        command: ProtocolCommand::PrepareSwitchover(command),
+    } = plan
+    else {
+        panic!("preparation after routing removal")
+    };
+    assert_eq!(command.source, intent.source);
+    assert_eq!(command.target, intent.target);
+    assert_eq!(command.current_configuration, previous);
+    assert_eq!(
+        command.operation_id,
+        derive_switchover_preparation_operation_id(
+            &snapshot.resource_uid,
+            &intent.request_id,
+            intent.preparation_generation,
+            &snapshot
+                .status
+                .topology
+                .as_ref()
+                .unwrap()
+                .configuration
+                .configuration_id,
+            &intent.source,
+            &intent.target
+        )
+    );
+}
+
+#[test]
+fn switchover_requires_quiescent_accepted_authority() {
+    let mut snapshot = switchover_snapshot();
+    switchover_report(&mut snapshot, 3).pending_operation_id = Some(OperationId::new("pending"));
+    let Plan::Wait { status, .. } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("wait for stable authority")
+    };
+    assert!(status.transition.is_none());
+    assert_eq!(status.topology, snapshot.status.topology);
+}
+
+#[test]
+fn switchover_validates_preparation_and_requires_verified_target_progress() {
+    let mut snapshot = prepared_switchover_snapshot();
+    let handoff = snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .switchover
+        .as_ref()
+        .unwrap()
+        .handoff
+        .clone()
+        .unwrap();
+    assert_eq!(
+        handoff,
+        switchover_report(&mut snapshot, 1)
+            .prepared_switchover
+            .clone()
+            .unwrap()
+    );
+    for verified in [None, Some(9)] {
+        switchover_report(&mut snapshot, 2).verified_replication_lsn = verified;
+        let Plan::Wait { status, .. } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+            panic!("raw progress cannot satisfy catch-up")
+        };
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "SwitchoverTargetCatchupPending")
+        );
+    }
+    switchover_report(&mut snapshot, 2).verified_replication_lsn = Some(10);
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Execute { .. }
+    ));
+
+    snapshot
+        .status
+        .transition
+        .as_mut()
+        .unwrap()
+        .switchover
+        .as_mut()
+        .unwrap()
+        .handoff = None;
+    switchover_report(&mut snapshot, 1)
+        .prepared_switchover
+        .as_mut()
+        .unwrap()
+        .request_id = SwitchoverRequestId::new("wrong-request");
+    assert_switchover_safety_decision(&snapshot);
+}
+
+#[test]
+fn switchover_converges_every_member_closed_before_receipt_grant_and_exact_routing() {
+    let mut snapshot = prepared_switchover_snapshot();
+    let previous = snapshot.status.topology.clone();
+    for (current_only, ids) in [(false, [1, 3, 2]), (true, [1, 3, 2])] {
+        for id in ids {
+            let command = observe_switchover_command(&mut snapshot);
+            assert_eq!(command.local_replica_id, ReplicaId::new(id));
+            assert_eq!(command.current_only, current_only);
+            assert_eq!(
+                command.primary_write_status,
+                AccessStatus::ReconfigurationPending
+            );
+            assert!(command.switchover_handoff.is_some());
+            assert_eq!(
+                command.retire_switchover_preparation_ids.len(),
+                usize::from(current_only && id == 1)
+            );
+            assert_eq!(snapshot.status.topology, previous);
+            assert!(snapshot.routing.write_target.is_none());
+            assert!(snapshot.replicas.values().all(
+                |observation| matches!(&observation.agent, AgentObservation::Report(report)
+                    if report.write_status != AccessStatus::Granted)
+            ));
+        }
+    }
+    let transition = snapshot.status.transition.clone().unwrap();
+    let mut missing_retained = snapshot.clone();
+    switchover_report(&mut missing_retained, 3).retained_operation_id = None;
+    assert!(
+        matches!(evaluate(&missing_retained, &EvaluationConfig::default()),
+        Plan::Execute { command: ProtocolCommand::EnsureConfiguration(command) }
+        if command.current_only && command.local_replica_id == ReplicaId::new(3))
+    );
+    apply_switchover_status(&mut snapshot);
+    assert!(snapshot.status.transition.is_none());
+    assert_eq!(
+        snapshot.status.topology.as_ref().unwrap().configuration,
+        transition.current_configuration
+    );
+    assert_eq!(
+        snapshot.status.last_switchover.as_ref().unwrap().outcome,
+        PlannedSwitchoverOutcome::RequestedTargetCompleted
+    );
+    assert!(snapshot.status.primary_failure.is_none());
+    assert!(snapshot.status.quorum_loss.is_none());
+    assert!(snapshot.routing.write_target.is_none());
+    let grant = observe_switchover_command(&mut snapshot);
+    assert_eq!(grant.local_replica_id, ReplicaId::new(2));
+    assert_eq!(grant.primary_write_status, AccessStatus::Granted);
+    assert!(grant.switchover_handoff.is_none());
+    assert!(snapshot.routing.write_target.is_none());
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("publish only after observing target grant")
+    };
+    let target = switchover_report(&mut snapshot, 2).identity.clone();
+    assert!(
+        matches!(&changes[0], KubernetesChange::PublishWriteRouting { primary } if *primary == target)
+    );
+    snapshot.routing.write_target = Some(target);
+    for _ in 0..3 {
+        let Plan::Stable { status, .. } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+            panic!("unchanged completed request must be stable")
+        };
+        assert!(status.transition.is_none());
+        snapshot.status = status;
+    }
+    snapshot
+        .desired
+        .switchover
+        .as_mut()
+        .unwrap()
+        .target_replica_id = ReplicaId::new(3);
+    apply_switchover_status(&mut snapshot);
+    assert!(
+        snapshot
+            .status
+            .conditions
+            .iter()
+            .any(|condition| condition.reason == "RequestIdReused")
+    );
+}
+
+#[test]
+fn switchover_waits_for_all_reports_and_target_joint_catchup() {
+    let mut snapshot = prepared_switchover_snapshot();
+    observe_switchover_command(&mut snapshot);
+    let mut absent = snapshot.clone();
+    absent
+        .replicas
+        .get_mut(&observation_key(3, "pod-3"))
+        .unwrap()
+        .agent = AgentObservation::Absent;
+    assert!(matches!(
+        evaluate(&absent, &EvaluationConfig::default()),
+        Plan::Wait { .. }
+    ));
+    observe_switchover_command(&mut snapshot);
+    observe_switchover_command(&mut snapshot);
+    for fault in [
+        "catchup", "boundary", "quorum", "verified", "retained", "pending",
+    ] {
+        let mut waiting = snapshot.clone();
+        let target = switchover_report(&mut waiting, 2);
+        match fault {
+            "catchup" => target.catch_up_complete = false,
+            "boundary" => target.catch_up_boundary = Some(9),
+            "quorum" => target.current_configuration_quorum_progress = 9,
+            "verified" => target.verified_replication_lsn = None,
+            "retained" => target.retained_operation_id = None,
+            "pending" => target.pending_operation_id = Some(OperationId::new("pending")),
+            _ => unreachable!(),
+        }
+        let plan = evaluate(&waiting, &EvaluationConfig::default());
+        assert!(
+            matches!(plan, Plan::Wait { .. })
+                || matches!(plan, Plan::Execute { command: ProtocolCommand::EnsureConfiguration(command) }
+                if !command.current_only),
+            "{fault}"
+        );
+    }
+    let mut early_writer = snapshot;
+    switchover_report(&mut early_writer, 2).write_status = AccessStatus::Granted;
+    assert_switchover_safety_decision(&early_writer);
+}
+
+#[test]
+fn active_switchover_rejects_mutation_and_cancellation_without_retargeting() {
+    for request in [
+        None,
+        Some(PlannedSwitchoverRequest {
+            request_id: SwitchoverRequestId::new("another-request"),
+            target_replica_id: ReplicaId::new(3),
+        }),
+    ] {
+        let mut snapshot = prepared_switchover_snapshot();
+        let frozen = snapshot.status.transition.clone();
+        snapshot.desired.switchover = request;
+        snapshot.desired.replicas = 5;
+        apply_switchover_status(&mut snapshot);
+        assert_eq!(snapshot.status.transition, frozen);
+        assert!(
+            snapshot
+                .status
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "ActiveRequestImmutable")
+        );
+        let command = observe_switchover_command(&mut snapshot);
+        assert_eq!(command.current_configuration.primary_id, ReplicaId::new(2));
+        assert_eq!(command.effective_policy.replica_set_size, 3);
+    }
 }
 
 #[test]
@@ -877,6 +2234,7 @@ fn active_transition_keeps_frozen_policy_after_spec_change() {
         election_lsn: None,
         build_id: None,
         repair: None,
+        switchover: None,
     };
     let mut snapshot = empty_snapshot(5);
     snapshot.status.transition = Some(transition);
@@ -1145,6 +2503,7 @@ fn failover_corrects_provisional_candidate_with_a_newer_epoch() {
             election_lsn: Some(10),
             build_id: None,
             repair: None,
+            switchover: None,
         }),
         primary_failure: Some(kuberic_protocol::types::PrimaryFailureObservation {
             primary: previous.members[0].identity.clone(),
@@ -1409,6 +2768,7 @@ fn failover_authorizes_full_copy_when_primary_history_cannot_repair_a_member() {
             election_lsn: Some(20),
             build_id: None,
             repair: None,
+            switchover: None,
         }),
         primary_failure: Some(kuberic_protocol::types::PrimaryFailureObservation {
             primary: previous.members[0].identity.clone(),
@@ -1564,6 +2924,7 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
             election_lsn: Some(20),
             build_id: None,
             repair: Some(first_repair.clone()),
+            switchover: None,
         }),
         primary_failure: Some(kuberic_protocol::types::PrimaryFailureObservation {
             primary: previous.members[0].identity.clone(),
@@ -1711,6 +3072,7 @@ fn failover_current_only_keeps_secondary_write_access_non_primary() {
             election_lsn: Some(10),
             build_id: None,
             repair: None,
+            switchover: None,
         }),
         primary_failure: Some(kuberic_protocol::types::PrimaryFailureObservation {
             primary: previous.members[0].identity.clone(),
@@ -1840,6 +3202,7 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
             election_lsn: None,
             build_id: Some(replacement_build.clone()),
             repair: None,
+            switchover: None,
         }),
         primary_failure: Some(kuberic_protocol::types::PrimaryFailureObservation {
             primary: configuration_primary_for_test(&previous).identity.clone(),
@@ -2597,6 +3960,7 @@ fn transition_report_previous_configuration_must_match_frozen_topology() {
             election_lsn: None,
             build_id: Some(OperationId::new("replacement-build")),
             repair: None,
+            switchover: None,
         }),
         ..AcceptedStatus::default()
     };
@@ -2967,6 +4331,7 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
             election_lsn: None,
             build_id: Some(OperationId::new("replacement-build")),
             repair: None,
+            switchover: None,
         }),
         ..AcceptedStatus::default()
     };

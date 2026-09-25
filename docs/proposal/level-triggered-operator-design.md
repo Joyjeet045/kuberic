@@ -986,11 +986,18 @@ before status accepts and publishes the new topology. A returned stale former
 primary is admitted only as evidence for an exact newer-epoch correction; its
 old epoch cannot receive quorum credit.
 
-The level-triggered control protocol is version 3. `EnsureConfiguration`
+The level-triggered control protocol is version 5. `EnsureConfiguration`
 carries the intended primary access state rather than a write-grant boolean,
 allowing `ReconfigurationPending`, `NoWriteQuorum`, and `Granted` to remain
 distinct durable postconditions. Current-only completion can retire every
 build authority carried by replacement plus failover repair.
+Planned-switchover preparation carries the accepted spec generation through
+intent, deterministic identity, command, certificate, and retirement. The source
+persists a bounded authority-bound retirement high-water mark rather than
+forgetting earlier same-authority preparations. A recovered write grant waits
+for safe reconciliation of interrupted durable local operations. Compensation
+fences permanently faulted non-primary Pods with exact deletion and re-observes
+absence before survivor convergence, without deleting their PVCs.
 
 Phase 9 adds generated authority traces, process-termination persistence
 boundaries, ambiguous-command replay, bounded no-watch resynchronization, and

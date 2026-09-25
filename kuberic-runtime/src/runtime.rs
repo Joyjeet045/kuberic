@@ -274,13 +274,13 @@ impl DefaultReplicatorInner {
                 operation_id: durable.operation_id.clone(),
                 data: durable.data.clone(),
             };
-            let mut pending = self.begin_write(write.clone()).await?;
+            let mut pending = self.resume_local_write(write.clone()).await?;
             loop {
                 self.publish_replication(&pending).await?;
                 match pending.committed().await {
                     Ok(_) => break,
                     Err(RuntimeError::WriteCompletionClosed) => {
-                        pending = self.begin_write(write.clone()).await?;
+                        pending = self.resume_local_write(write.clone()).await?;
                     }
                     Err(error) => return Err(error),
                 }
@@ -876,6 +876,19 @@ impl DefaultReplicatorInner {
 
     pub async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
         let _guard = self.effect_lock.lock().await;
+        self.begin_write_locked(write, false).await
+    }
+
+    async fn resume_local_write(&self, write: ClientWrite) -> Result<PendingWrite> {
+        let _guard = self.effect_lock.lock().await;
+        self.begin_write_locked(write, true).await
+    }
+
+    async fn begin_write_locked(
+        &self,
+        write: ClientWrite,
+        recovering: bool,
+    ) -> Result<PendingWrite> {
         let _write = self.write_lock.lock().await;
         let write_generation = self.write_generation.load(Ordering::Acquire);
         self.check_aborted()?;
@@ -886,7 +899,7 @@ impl DefaultReplicatorInner {
         if state.role != ReplicaRole::Primary {
             return Err(RuntimeError::NotPrimary);
         }
-        if state.write_status != AccessStatus::Granted {
+        if state.write_status != AccessStatus::Granted && !recovering {
             return Err(RuntimeError::WriteClosed(state.write_status));
         }
         if state.outbound_builds.values().any(|build| {
@@ -926,6 +939,11 @@ impl DefaultReplicatorInner {
             }
             existing
         } else {
+            if recovering {
+                return Err(RuntimeError::LocalWritePending(
+                    write.operation_id.to_string(),
+                ));
+            }
             let mut replicator = self.replicator.lock().await;
             let committed_lsn = replicator.committed_lsn();
             let lsn = replicator.reserve_write(&write)?;
@@ -955,15 +973,17 @@ impl DefaultReplicatorInner {
             data: write.data.clone(),
         };
         if durable_write.phase == LocalWritePhase::Committed {
+            let progress = self.storage().await?.durable_progress().await?;
+            validate_durable_ack(progress.applied_lsn, lsn, progress)?;
             self.replicator
                 .lock()
                 .await
                 .restore_committed_write(&operation)?;
-            self.state
-                .write()
-                .await
-                .local_writes
-                .remove(&write.operation_id);
+            let mut state = self.state.write().await;
+            state.local_writes.remove(&write.operation_id);
+            state.current_progress = state.current_progress.max(progress.applied_lsn);
+            state.committed_lsn = state.committed_lsn.max(progress.committed_lsn);
+            drop(state);
             let (sender, completion) = oneshot::channel();
             let _ = sender.send(Ok(lsn));
             return Ok(PendingWrite {
@@ -994,7 +1014,33 @@ impl DefaultReplicatorInner {
         if self.write_generation.load(Ordering::Acquire) != write_generation {
             return Err(RuntimeError::DataLossFenced);
         }
-        validate_durable_ack(lsn, committed_lsn, durable_ack)?;
+        validate_durable_ack(lsn.max(progress.applied_lsn), committed_lsn, durable_ack)?;
+        if durable_ack.committed_lsn >= lsn {
+            self.local_write_journal
+                .record_local_write(&DurableLocalWrite {
+                    phase: LocalWritePhase::Committed,
+                    ..durable_write
+                })
+                .await?;
+            self.replicator
+                .lock()
+                .await
+                .restore_committed_write(&operation)?;
+            let mut state = self.state.write().await;
+            state.local_writes.remove(&write.operation_id);
+            state.current_progress = state.current_progress.max(durable_ack.applied_lsn);
+            state.committed_lsn = state.committed_lsn.max(durable_ack.committed_lsn);
+            drop(state);
+            let (sender, completion) = oneshot::channel();
+            let _ = sender.send(Ok(lsn));
+            return Ok(PendingWrite {
+                lsn,
+                replication_items: Vec::new(),
+                build_items: Vec::new(),
+                completion,
+                aborted: self.abort_signal.subscribe(),
+            });
+        }
         let build_operation = operation.clone();
         let prior_phase = durable_write.phase;
         let registered = DurableLocalWrite {
@@ -2384,6 +2430,83 @@ impl DefaultReplicatorInner {
                 }
                 self.state.write().await.write_status = write_status;
             }
+            RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            } => {
+                if preparation_generation == 0 || request_id.is_empty() {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "planned switchover requires a request ID and positive generation"
+                            .to_string(),
+                    ));
+                }
+                let state = self.state.read().await;
+                if !state.open {
+                    return Err(RuntimeError::NotOpen);
+                }
+                if state.role != ReplicaRole::Primary
+                    || !matches!(
+                        state.write_status,
+                        AccessStatus::Granted | AccessStatus::ReconfigurationPending
+                    )
+                {
+                    return Err(RuntimeError::NotPrimary);
+                }
+                let authority = state
+                    .authority
+                    .as_ref()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                let current = &authority.current_configuration;
+                let primary = current
+                    .members
+                    .iter()
+                    .find(|member| member.identity.replica_id == current.primary_id)
+                    .expect("validated authority has one primary");
+                if current.configuration_id != starting_configuration_id
+                    || current.epoch != starting_epoch
+                    || source != self.identity
+                    || primary.identity != source
+                    || target.replica_id == current.primary_id
+                    || !current.members.iter().any(|member| {
+                        member.identity == target && member.role != ReplicaRole::Primary
+                    })
+                {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "planned switchover preparation differs from admitted authority"
+                            .to_string(),
+                    ));
+                }
+                drop(state);
+                self.replicator.lock().await.fence_client_writes();
+                self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
+                // A reserved write must be part of the certified prefix even if its
+                // original application call failed before preparation.
+                let writes = self
+                    .state
+                    .read()
+                    .await
+                    .local_writes
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for durable in writes {
+                    let pending = self
+                        .begin_write_locked(
+                            ClientWrite {
+                                operation_id: durable.operation_id,
+                                data: durable.data,
+                            },
+                            true,
+                        )
+                        .await?;
+                    self.publish_replication(&pending).await?;
+                }
+                self.replicator.lock().await.fence_client_writes();
+            }
             RuntimeEffectAction::RefreshApplicationProgress => {
                 let progress = if let Some(storage) = self.storage.read().await.clone() {
                     storage.durable_progress().await?
@@ -2580,6 +2703,41 @@ impl DefaultReplicatorInner {
                 progress.verified_lsn = progress.verified_lsn.max(previous_progress.verified_lsn);
             }
         }
+        if let Some(handoff) = &authority.switchover_handoff {
+            let starting_fence = crate::authority::AuthorityFence {
+                epoch: handoff.starting_epoch,
+                previous_configuration_id: None,
+                current_configuration_id: handoff.starting_configuration_id.clone(),
+            };
+            let stored_progress = self
+                .replication_progress_store
+                .load_replication_progress(&starting_fence)
+                .await?
+                .map_or(0, |progress| progress.verified_lsn);
+            let configuration_progress = self
+                .replication_progress_store
+                .load_configuration_progress(
+                    handoff.starting_epoch,
+                    &handoff.starting_configuration_id,
+                )
+                .await?
+                .map_or(0, |progress| progress.verified_lsn);
+            let starting_progress = if self.identity == handoff.source {
+                self.state.read().await.current_progress
+            } else {
+                stored_progress.max(configuration_progress)
+            };
+            if self.identity == *authority.primary_identity()
+                && starting_progress < handoff.handoff_lsn
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "new switchover primary lacks the certified handoff prefix".to_string(),
+                ));
+            }
+            progress.verified_lsn = progress
+                .verified_lsn
+                .max(starting_progress.min(handoff.handoff_lsn));
+        }
         let handoff_lsn = self
             .state
             .read()
@@ -2667,8 +2825,24 @@ impl ManagedReplicator for DefaultReplicatorInner {
             self.changed.notify_waiters();
             return Ok(());
         }
+        let granting = matches!(
+            action,
+            RuntimeEffectAction::SetAccessStatus {
+                write: AccessStatus::Granted,
+                ..
+            } | RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+        );
+        let generation = self.fence_generation.load(Ordering::Acquire);
+        if granting && self.state.read().await.write_status != AccessStatus::Granted {
+            // Keep public access closed while replaying the original durable identity.
+            // Do not hold effect_lock across the quorum wait: ACKs need that lock.
+            self.recover_pending_local_writes().await?;
+        }
         let _guard = self.effect_lock.lock().await;
         self.check_aborted()?;
+        if granting && generation != self.fence_generation.load(Ordering::Acquire) {
+            return Err(RuntimeError::OperationCancelled);
+        }
         self.execute_action(action).await?;
         self.changed.notify_waiters();
         Ok(())

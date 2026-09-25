@@ -1,4 +1,6 @@
-use kuberic_protocol::types::{AccessStatus, OperationId, ReplicaIdentity, ReplicaRole};
+use kuberic_protocol::types::{
+    AccessStatus, ConfigurationId, OperationId, ReplicaIdentity, ReplicaRole, SwitchoverRequestId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::authority::{AdmittedAuthority, BuildAuthority};
@@ -43,6 +45,14 @@ pub enum RuntimeEffectAction {
     },
     SetReadStatus(AccessStatus),
     SetWriteStatus(AccessStatus),
+    PrepareSwitchover {
+        preparation_generation: u64,
+        request_id: SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: ConfigurationId,
+        starting_epoch: kuberic_protocol::types::Epoch,
+    },
     RefreshApplicationProgress,
     BuildReplica {
         build_id: OperationId,

@@ -224,7 +224,7 @@ where
         self.transport
             .lock()
             .await
-            .admit_peer(endpoint.identity.clone(), target_session)?;
+            .admit_peer(endpoint.identity.clone(), target_session.clone())?;
         let target_command = EnsureReplicaBuild {
             operation_id: endpoint.build_id.clone(),
             local_replica_id: endpoint.identity.replica_id,
@@ -242,14 +242,12 @@ where
         .await
         .map_err(|_| AgentError::SessionRejected("build target connection timed out".into()))?
         .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
-        let mut request = Request::new(proto::ExecuteCommandRequest {
-            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-            resource_uid: self.resource_uid.to_string(),
-            target: Some(endpoint.identity.clone().into()),
-            command: Some(proto::execute_command_request::Command::EnsureReplicaBuild(
-                ensure_build_to_proto(target_command),
-            )),
-        });
+        let mut request = Request::new(build_target_admission_request(
+            self.resource_uid.as_ref(),
+            &endpoint.identity,
+            &target_session,
+            target_command,
+        ));
         add_bearer_token(&mut request, &self.bearer_token)?;
         let response = tokio::time::timeout(self.deadline, control.execute(request))
             .await
@@ -429,6 +427,59 @@ fn ensure_build_to_proto(command: EnsureReplicaBuild) -> proto::EnsureReplicaBui
         source_session_id: command
             .source_session_id
             .map_or_else(String::new, |session| session.to_string()),
+    }
+}
+
+fn build_target_admission_request(
+    resource_uid: &str,
+    target: &ReplicaIdentity,
+    target_session: &ProcessSessionId,
+    command: EnsureReplicaBuild,
+) -> proto::ExecuteCommandRequest {
+    proto::ExecuteCommandRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: resource_uid.to_string(),
+        target: Some(target.clone().into()),
+        expected_process_session_id: target_session.to_string(),
+        command: Some(proto::execute_command_request::Command::EnsureReplicaBuild(
+            ensure_build_to_proto(command),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod build_request_tests {
+    use super::*;
+    use kuberic_protocol::types::{AgentGeneration, OperationId, ReplicaId, ReplicaInstanceId};
+
+    #[test]
+    fn agent_originated_build_targets_the_observed_peer_session() {
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            instance_id: ReplicaInstanceId::new("pod-2"),
+            agent_generation: AgentGeneration::new("generation-2"),
+        };
+        let session = ProcessSessionId::new("session-2");
+        let request = build_target_admission_request(
+            "resource",
+            &target,
+            &session,
+            EnsureReplicaBuild {
+                operation_id: OperationId::new("build-1"),
+                local_replica_id: target.replica_id,
+                expected_instance_id: target.instance_id.clone(),
+                expected_agent_generation: target.agent_generation.clone(),
+                target: target.clone(),
+                authority: None,
+                source_session_id: None,
+            },
+        );
+
+        assert_eq!(request.expected_process_session_id, "session-2");
+        assert_eq!(
+            request.target.unwrap().instance_id,
+            target.instance_id.as_str()
+        );
     }
 }
 

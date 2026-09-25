@@ -147,7 +147,7 @@ level-triggered-kind-test *scenarios: verify-kind-context
     expanded=()
     for scenario in "${requested[@]}"; do
       if [[ "$scenario" == "all" ]]; then
-        expanded+=(replacement quorum-loss adversarial)
+        expanded+=(replacement quorum-loss adversarial switchover switchover-adversarial)
       else
         expanded+=("$scenario")
       fi
@@ -159,6 +159,8 @@ level-triggered-kind-test *scenarios: verify-kind-context
         failover) test_name="level_triggered_k8s::failover_fences_old_primary_and_preserves_committed_data" ;;
         quorum-loss) test_name="level_triggered_k8s::quorum_loss_closes_writes_and_recovers_without_data_loss_epoch_change" ;;
         adversarial) test_name="level_triggered_k8s::adversarial_restart_partition_and_healing_preserve_single_writer" ;;
+        switchover) test_name="level_triggered_k8s::planned_switchover" ;;
+        switchover-adversarial) test_name="level_triggered_k8s::planned_switchover_adversarial" ;;
         *) echo "unknown level-triggered scenario: $scenario" >&2; exit 2 ;;
       esac
       cargo test -p kuberic-level-tests "$test_name" -- --ignored --exact --nocapture
@@ -166,6 +168,8 @@ level-triggered-kind-test *scenarios: verify-kind-context
 
 # Collect level-triggered controller, resource, and replica diagnostics.
 level-triggered-diagnostics: verify-kind-context
+    #!/usr/bin/env bash
+    set -uo pipefail
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n kuberic-system logs deployment/kuberic-controller --all-containers --tail=-1 || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
@@ -173,6 +177,19 @@ level-triggered-diagnostics: verify-kind-context
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n default get pods,pvc,services -o wide || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n default get pods,pvc,services -l operator.kuberic.io/set-name=kvstore2 -o yaml || true
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n default get events --sort-by=.lastTimestamp || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n default logs -l operator.kuberic.io/set-name=kvstore2 --all-containers --tail=-1 || true
+    # Replica /status combines durable agent identity/PC/CC/pending work with runtime progress/access.
+    for pod in $(kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+      -n default get pods -l operator.kuberic.io/set-name=kvstore2 -o name); do
+      echo "=== ${pod}: agent/runtime evidence ==="
+      timeout --kill-after=2s 15s kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n default exec "${pod}" -- curl --fail --silent --show-error --max-time 5 \
+        http://127.0.0.1:8080/status || true
+      echo
+      kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n default logs "${pod}" --all-containers --previous --tail=200 || true
+    done
