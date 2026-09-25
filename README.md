@@ -21,6 +21,7 @@ kuberic-operator/      K8s operator (reconciler, CRD, pod management)
 kuberic-dex/           Durable execution and deterministic replay kernel
 examples/kvstore/      Replicated key-value store (HashMap + WAL)
 examples/sqlite/       Replicated SQLite database (WAL frame shipping)
+examples/rustfs/       RustFS native-replication topology contract (iteration 1)
 
 kuberic-protocol/      Independent level-triggered domain model and evaluator
 kuberic-runtime/       Independent application and replication runtime
@@ -60,6 +61,14 @@ Replicated `HashMap<String, String>` with gRPC Put/Get/Delete API. Demonstrates 
 
 Replicated SQLite database with gRPC Execute/Query/ExecuteBatch API. Ships WAL frames (page-level) after each commit — no determinism requirements. Secondaries persist frames to a durable log and apply on promotion. 9 integration tests covering replication, failover, and switchover.
 
+### RustFS
+
+[RustFS](examples/rustfs/) begins with a dependency-free, fixed-topology contract
+for a native-replication example. RustFS owns data replication and quorum; the
+first iteration validates peer/drive configuration and rejects topology drift.
+It is not yet a runnable or operator-managed deployment. The
+[five-PR roadmap](docs/features/rustfs/design.md) covers the follow-up work.
+
 ## Kubernetes Deployment
 
 For local development and CI, use the [shared Gateway KinD setup](docs/features/envoy-gateway-kind.md).
@@ -98,6 +107,7 @@ such as `v0.1.0` also publishes the exact version tag.
 - [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
 - [SQL Server design](docs/features/sqlserver/design.md) — native AG contract and safety gates
 - [SQL Server observation](docs/features/sqlserver/observation.md) — observe-only runtime, configuration, and tests
+- [RustFS design](docs/features/rustfs/design.md) — native topology contract and incremental PR roadmap
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md) — independent stack deployment, authority, supported operations, and diagnostics

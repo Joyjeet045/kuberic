@@ -5,6 +5,7 @@ members = [
   "examples/kvstore",
   "examples/kvstore2",
   "examples/postgres",
+  "examples/rustfs",
   "examples/sqlserver",
   "examples/sqlite",
   "kuberic-protocol",

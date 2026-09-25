@@ -1,0 +1,9 @@
+[package]
+name = "rustfs-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fixed-topology contract for the RustFS native-replication example"
+rust-version.workspace = true
+publish = false
