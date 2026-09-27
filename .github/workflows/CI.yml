@@ -134,7 +134,7 @@ jobs:
       with:
         build-warnings: ""
 
-    - uses: taiki-e/install-action@757c7bc08f104fb182fa6182cf7a65c7ecf50e62 # protoc
+    - uses: taiki-e/install-action@31af9a7387ca3f2e3936844e5e44c3656575166b # protoc
 
     - name: Verify source ref is current
       run: |
