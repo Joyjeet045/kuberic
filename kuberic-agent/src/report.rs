@@ -1,5 +1,6 @@
 //! Durable agent status reporting.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kuberic_protocol::types::{AccessStatus, FaultType, ReplicaRole};
@@ -69,6 +70,28 @@ fn build_report(
     catch_up_capability: Option<i64>,
     reported_fault: Option<FaultType>,
 ) -> proto::AgentStatusReport {
+    let mut builds = snapshot
+        .builds
+        .into_iter()
+        .map(|build| (build.authority.build_id.clone(), build))
+        .collect::<BTreeMap<_, _>>();
+    for (build_id, command) in &state.build_commands {
+        if command.authority.is_none()
+            && !state.retired_builds.contains(build_id)
+            && !state.abandoned_builds.contains(build_id)
+            && let Some(progress) = state.build_progress.get(build_id)
+        {
+            builds.entry(build_id.clone()).or_insert_with(|| {
+                kuberic_runtime_internal::effects::BuildPostcondition {
+                    authority: progress.authority.clone(),
+                    last_sequence: progress.last_sequence,
+                    durable_lsn: progress.durable_lsn,
+                    completed: progress.completed,
+                    catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
+                }
+            });
+        }
+    }
     let pending_operation_id = state
         .reconfiguration
         .as_ref()
@@ -136,6 +159,9 @@ fn build_report(
             .collect(),
         reported_fault: fault_to_proto(state.reported_fault) as i32,
         pending_operation_id,
+        pending_configuration: state
+            .reconfiguration
+            .map(|record| kuberic_wire::configuration_command_to_proto(record.command)),
         retained_operation_id: retained_removal
             .map(|id| id.to_string())
             .unwrap_or_else(|| {
@@ -149,15 +175,16 @@ fn build_report(
                     |result| result.command.operation_id.to_string(),
                 )
             }),
-        builds: snapshot
-            .builds
-            .into_iter()
+        builds: builds
+            .into_values()
             .map(|build| proto::BuildStatus {
                 build_id: build.authority.build_id.to_string(),
                 target: Some(build.authority.target.into()),
                 last_sequence: build.last_sequence,
+                replication_boundary_lsn: build.authority.replication_boundary_lsn,
                 durable_lsn: build.durable_lsn,
                 completed: build.completed,
+                catch_up_boundary_lsn: build.catch_up_boundary_lsn,
             })
             .collect(),
         prepared_switchover: state.prepared_switchover.map(Into::into),
@@ -165,6 +192,9 @@ fn build_report(
         secondary_removal_evidence: state.secondary_removal_evidence.map(Into::into),
         retired_replica: state.retired_authority.map(|r| r.report.into()),
         accepted_secondary_removal: state.accepted_secondary_removal.map(Into::into),
+        scale_up_intent: state
+            .scale_up_evidence
+            .map(|evidence| evidence.intent().clone().into()),
     }
 }
 
@@ -176,6 +206,7 @@ fn snapshot_matches_state(
         Some(authority) => {
             authority.previous_configuration == state.previous_configuration
                 && Some(&authority.current_configuration) == state.current_configuration.as_ref()
+                && authority.scale_up == state.scale_up_evidence
         }
         None => state.previous_configuration.is_none() && state.current_configuration.is_none(),
     };

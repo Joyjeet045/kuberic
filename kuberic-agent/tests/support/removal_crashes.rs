@@ -85,6 +85,18 @@ impl AgentStore for CrashStore {
         self.hit("command");
         Ok(result)
     }
+    async fn journal_build(
+        &self,
+        command: &kuberic_protocol::command::EnsureReplicaBuild,
+    ) -> Result<kuberic_protocol::command::EnsureReplicaBuild> {
+        self.inner.journal_build(command).await
+    }
+    async fn abandon_build(
+        &self,
+        command: &kuberic_protocol::command::EnsureReplicaBuild,
+    ) -> Result<()> {
+        self.inner.abandon_build(command).await
+    }
     async fn advance_configuration(
         &self,
         id: &OperationId,
@@ -290,6 +302,7 @@ async fn writer() {
         previous_configuration: None,
         current_configuration: intent.previous_configuration.clone(),
         switchover_handoff: None,
+        scale_up: None,
         secondary_removal: None,
     };
     store.admit(&authority).await.unwrap();

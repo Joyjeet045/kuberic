@@ -319,8 +319,9 @@ impl PodRuntime {
         if !self.host.snapshot().await.open {
             self.host.open(mode).await?;
         }
-        if self.host.managed().is_ok() {
+        if let Ok(managed) = self.host.managed() {
             self.restore_authority().await?;
+            self.host.sync_access_projection(managed.as_ref()).await;
         }
         if let Some((target_role, epoch_completed, application_completed)) = transition {
             self.host.change_replicator_role(target_role).await?;
@@ -406,6 +407,13 @@ impl PodRuntime {
 
     pub async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         self.host.apply_effect(effect).await
+    }
+
+    pub(crate) async fn consume_cancelled_build_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectResult> {
+        self.host.consume_cancelled_build_effect(effect).await
     }
 
     pub async fn cancel_configuration_work(&self) -> Result<()> {
@@ -952,6 +960,64 @@ impl RuntimeHost {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
             postcondition: snapshot_postcondition(self.snapshot().await),
+        };
+        self.state.write().await.effects.insert(
+            result.sequence,
+            AppliedEffect {
+                effect,
+                result: result.clone(),
+            },
+        );
+        Ok(result)
+    }
+
+    async fn consume_cancelled_build_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectResult> {
+        let build_id = match &effect.action {
+            RuntimeEffectAction::BuildReplica { build_id, .. } => build_id,
+            _ => {
+                return Err(RuntimeError::Application(
+                    "only a build effect can be consumed as cancelled".into(),
+                ));
+            }
+        };
+        self.managed()?.cancel_outbound_build(build_id).await?;
+        let _guard = self.effect_lock.lock().await;
+        {
+            let state = self.state.read().await;
+            if let Some(previous) = state.effects.get(&effect.sequence) {
+                if effect == previous.effect {
+                    return Ok(previous.result.clone());
+                }
+                return Err(RuntimeError::EffectConflict {
+                    sequence: effect.sequence,
+                });
+            }
+            let expected = state
+                .effects
+                .last_key_value()
+                .map_or(effect.sequence, |(sequence, _)| sequence + 1);
+            if effect.sequence != expected {
+                return Err(RuntimeError::EffectOutOfOrder {
+                    expected,
+                    observed: effect.sequence,
+                });
+            }
+        }
+        let snapshot = self.snapshot().await;
+        if snapshot
+            .builds
+            .iter()
+            .any(|build| &build.authority.build_id == build_id)
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        let result = RuntimeEffectResult {
+            operation_id: effect.operation_id.clone(),
+            sequence: effect.sequence,
+            postcondition: snapshot_postcondition(snapshot),
         };
         self.state.write().await.effects.insert(
             result.sequence,

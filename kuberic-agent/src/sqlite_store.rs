@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaRole,
     SecondaryRemovalPreparation, SwitchoverHandoff, TransitionKind,
@@ -278,7 +278,15 @@ impl AgentStore for SqliteStore {
             }
             if let Some(authority) = &result.postcondition.authority {
                 state.secondary_removal_evidence = authority.secondary_removal.clone();
-                if let Some(evidence) = &authority.secondary_removal {
+                state.scale_up_evidence = authority.scale_up.clone();
+                if let Some(evidence) = authority.scale_up.as_deref() {
+                    let intent = evidence.intent();
+                    state.admitted_policy = Some(intent.current_policy.clone());
+                    state.previous_policy = authority
+                        .previous_configuration
+                        .as_ref()
+                        .map(|_| intent.previous_policy.clone());
+                } else if let Some(evidence) = &authority.secondary_removal {
                     state.admitted_policy =
                         Some(evidence.preparation.intent.current_policy.clone());
                     state.previous_policy = authority
@@ -408,8 +416,22 @@ impl AgentStore for SqliteStore {
                     state.highest_epoch = state.highest_epoch.max(retired.report.epoch);
                     state.previous_policy = None;
                     state.secondary_removal_evidence = None;
+                    state.scale_up_evidence = None;
                     state.accepted_secondary_removal = None;
                     state.prepared_secondary_removal = None;
+                }
+                RuntimeEffectAction::RetireBuild(build_id) => {
+                    if result
+                        .postcondition
+                        .builds
+                        .iter()
+                        .any(|build| &build.authority.build_id == build_id)
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "build retirement left the build active".into(),
+                        ));
+                    }
+                    state.retired_builds.insert(build_id.clone());
                 }
                 _ => {}
             }
@@ -575,6 +597,91 @@ impl AgentStore for SqliteStore {
         })
     }
 
+    async fn journal_build(&self, command: &EnsureReplicaBuild) -> Result<EnsureReplicaBuild> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            if state.retired_builds.contains(&command.operation_id)
+                || state.abandoned_builds.contains(&command.operation_id)
+            {
+                return Err(AgentError::CommandRejected(
+                    "abandoned or retired build authority cannot be reopened".into(),
+                ));
+            }
+            if let Some(existing) = state.build_commands.get(&command.operation_id) {
+                let immutable_matches = existing.operation_id == command.operation_id
+                    && existing.local_replica_id == command.local_replica_id
+                    && existing.expected_instance_id == command.expected_instance_id
+                    && existing.expected_agent_generation == command.expected_agent_generation
+                    && existing.target == command.target
+                    && existing.authority == command.authority
+                    && existing.retire == command.retire;
+                if !immutable_matches
+                    || (existing.authority.is_none()
+                        && existing.source_session_id != command.source_session_id)
+                {
+                    return Err(AgentError::EffectConflict(
+                        "build operation was reused with different immutable authority".into(),
+                    ));
+                }
+                if existing != command {
+                    state
+                        .build_commands
+                        .insert(command.operation_id.clone(), command.clone());
+                    write_agent_state(transaction, &state)?;
+                }
+                return Ok(command.clone());
+            }
+            state
+                .build_commands
+                .insert(command.operation_id.clone(), command.clone());
+            write_agent_state(transaction, &state)?;
+            Ok(command.clone())
+        })
+    }
+
+    async fn abandon_build(&self, command: &EnsureReplicaBuild) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            crate::command::admit_build(command, &state)?;
+            if state.retired_builds.contains(&command.operation_id) {
+                return Ok(());
+            }
+            if let Some(pending) = state.pending_effect.as_ref() {
+                let matching_build = matches!(
+                    &pending.effect.action,
+                    RuntimeEffectAction::BuildReplica {
+                        build_id,
+                        target,
+                        ..
+                    } if build_id == &command.operation_id
+                        && target == &command.target
+                        && pending.effect.operation_id
+                            == OperationId::new(format!(
+                                "{}:build-replica",
+                                command.operation_id
+                            ))
+                );
+                let matching_retirement = matches!(
+                    &pending.effect.action,
+                    RuntimeEffectAction::RetireBuild(build_id)
+                        if build_id == &command.operation_id
+                            && pending.effect.operation_id
+                                == OperationId::new(format!(
+                                    "{}:retire-abandoned-build",
+                                    command.operation_id
+                                ))
+                );
+                if !matching_build && !matching_retirement {
+                    return Err(AgentError::EffectConflict(
+                        "build abandonment conflicts with unrelated pending work".into(),
+                    ));
+                }
+            }
+            state.abandoned_builds.insert(command.operation_id.clone());
+            write_agent_state(transaction, &state)
+        })
+    }
+
     async fn advance_configuration(
         &self,
         operation_id: &OperationId,
@@ -714,6 +821,9 @@ impl AgentStore for SqliteStore {
                     .removal_commands
                     .insert(result.command.operation_id.clone(), result.clone());
             }
+            if result.command.current_only && result.command.scale_up_evidence.is_some() {
+                state.completed_scale_up = Some(Box::new(result.clone()));
+            }
             state.retained_command = Some(result.clone());
             write_agent_state(transaction, &state)?;
             Ok(result)
@@ -806,6 +916,7 @@ fn validate_acceptance_conversion(
             .clone(),
         switchover_handoff: None,
         secondary_removal: Some(command.committed.evidence.clone()),
+        scale_up: None,
     };
     let progress: Option<ReplicationProgress> = load_json_optional(
         transaction,
@@ -1304,6 +1415,11 @@ impl BuildAuthorityStore for SqliteStore {
         let connection = self.connection.lock().map_err(|_| {
             ContractError::Persistence("agent database connection mutex was poisoned".into())
         })?;
+        let state = load_state_from_connection(&connection)
+            .map_err(|error| ContractError::Persistence(error.to_string()))?;
+        if state.retired_builds.contains(build_id) {
+            return Ok(None);
+        }
         load_json_optional(
             &connection,
             "SELECT authority_json FROM build_authority WHERE build_id = ?1",
@@ -1316,6 +1432,13 @@ impl BuildAuthorityStore for SqliteStore {
             .validate()
             .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
         self.contract_transaction(|transaction| {
+            let state = load_state_from_connection(transaction)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
+            if state.retired_builds.contains(&authority.build_id) {
+                return Err(ContractError::AuthorityMismatch(
+                    "retired build authority cannot be admitted again".into(),
+                ));
+            }
             let existing: Option<BuildAuthority> = load_json_optional(
                 transaction,
                 "SELECT authority_json FROM build_authority WHERE build_id = ?1",
@@ -1378,6 +1501,8 @@ impl BuildProgressStore for SqliteStore {
                 progress.last_sequence < existing.last_sequence
                     || progress.durable_lsn < existing.durable_lsn
                     || (existing.completed && !progress.completed)
+                    || existing.catch_up_boundary_lsn.is_some()
+                        && progress.catch_up_boundary_lsn != existing.catch_up_boundary_lsn
             }) {
                 return Err(ContractError::AuthorityMismatch(
                     "build progress regressed".into(),
@@ -1391,6 +1516,13 @@ impl BuildProgressStore for SqliteStore {
                     params![progress.authority.build_id.as_str(), json],
                 )
                 .map_err(contract_sqlite_error)?;
+            let mut state = load_state_from_connection(transaction)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
+            state
+                .build_progress
+                .insert(progress.authority.build_id.clone(), progress.clone());
+            write_agent_state(transaction, &state)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
             Ok(())
         })
     }
@@ -1556,5 +1688,48 @@ fn phase_tag(phase: LocalWritePhase) -> i64 {
         LocalWritePhase::Reserved => 0,
         LocalWritePhase::Registered => 1,
         LocalWritePhase::Committed => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuberic_protocol::types::{
+        AgentGeneration, EffectivePolicy, InitializationId, PodUid, PvcUid, ReplicaId,
+        ReplicaIdentity, ReplicaInstanceId, ResourceUid,
+    };
+
+    fn identity() -> StorageIdentity {
+        StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("scale-up-set"),
+            pod_uid: PodUid::new("scale-up-pod"),
+            pvc_uid: PvcUid::new("scale-up-pvc"),
+            initialization_id: InitializationId::new("scale-up-init"),
+            local_identity: ReplicaIdentity {
+                replica_id: ReplicaId::new(2),
+                instance_id: ReplicaInstanceId::new("scale-up-pod"),
+                agent_generation: AgentGeneration::new("scale-up-generation"),
+            },
+            effective_policy: EffectivePolicy::fixed(2, 30).unwrap(),
+        }
+    }
+
+    #[test]
+    fn scale_up_schema_three_rejects_schema_two_without_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let expected = identity();
+        drop(SqliteStore::create_authorized(&path, AgentState::new(expected.clone())).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        drop(connection);
+        assert!(matches!(
+            SqliteStore::open_existing(&path, Some(&expected)),
+            Err(AgentError::SchemaMismatch {
+                expected: 3,
+                observed: 2
+            })
+        ));
     }
 }

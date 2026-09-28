@@ -6,6 +6,10 @@ use scale_down_model::fixture as scale_down_fixture;
 #[path = "support/scale_down_model.rs"]
 mod scale_down_model;
 
+#[allow(dead_code)]
+#[path = "support/scale_up_model.rs"]
+mod scale_up_model;
+
 #[test]
 fn scale_down_commit_boundary_rejects_generated_primary_evidence_corruption() {
     use scale_down_model::Model;
@@ -1634,6 +1638,8 @@ fn evaluator_scale_down_existing_transitions_and_provisioning_serialize() {
             switchover: None,
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
         });
         snapshots.push(model.snapshot);
     }
@@ -1649,7 +1655,7 @@ fn evaluator_scale_down_existing_transitions_and_provisioning_serialize() {
         .identity
         .clone();
     model.snapshot.status.provisioning = Some(ProvisioningIntent {
-        replaces: replacing,
+        purpose: ProvisioningPurpose::replacement(replacing),
         operation_id: OperationId::new("existing-provisioning"),
         pod_uid: PodUid::new("new-pod"),
         pvc_uid: PvcUid::new("new-pvc"),
@@ -1763,7 +1769,9 @@ fn evaluator_scale_down_local_commit_cannot_precede_status_commit_or_change_proo
     assert!(matches!(model.plan(), Plan::Unsafe { .. }));
 }
 
-use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, SafetyChange};
+use kuberic_protocol::command::{
+    KubernetesChange, ProtocolCommand, SafetyChange, ScaleDownResource,
+};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{
     AgentBuildReport, AgentObservation, AgentReport, DesiredState, KubernetesReplicaObservation,
@@ -1773,11 +1781,12 @@ use kuberic_protocol::observation::{
 use kuberic_protocol::plan::{Plan, UnsafeReason, WaitReason};
 use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
-    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PlannedSwitchoverIntent,
+    ConfigurationMember, EffectivePolicy, Epoch, FaultType, OperationId, PlannedSwitchoverIntent,
     PlannedSwitchoverOutcome, PlannedSwitchoverReceipt, PlannedSwitchoverRequest,
-    PlannedSwitchoverResolution, PodUid, ProcessSessionId, ProvisioningIntent, PvcUid, ReplicaId,
+    PlannedSwitchoverResolution, PodUid, PrimaryFailureObservation, ProcessSessionId,
+    ProvisioningIntent, ProvisioningPurpose, PvcUid, QuorumLossObservation, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole, ResourceUid,
-    SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind,
+    ScaleUpIntent, SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind,
     derive_agent_generation, derive_initialization_id, derive_switchover_preparation_operation_id,
     derive_transition_id,
 };
@@ -1868,7 +1877,7 @@ fn replacement_provenance_binds_ids_status_and_legacy_json_without_granting_clea
             configuration: accepted,
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: old.clone(),
+            purpose: ProvisioningPurpose::replacement(old.clone()),
             pod_uid: PodUid::new("new-pod"),
             pvc_uid: PvcUid::new("new-pvc"),
             operation_id: OperationId::new("unused"),
@@ -1908,8 +1917,8 @@ fn replacement_provenance_binds_ids_status_and_legacy_json_without_granting_clea
                 }
             }
             7 => {
-                changed.status.provisioning.as_mut().unwrap().replaces =
-                    identity(3, "other", "other")
+                changed.status.provisioning.as_mut().unwrap().purpose =
+                    ProvisioningPurpose::replacement(identity(3, "other", "other"))
             }
             _ => changed.status.last_replacement = Some(receipt.clone()),
         }
@@ -1974,6 +1983,195 @@ fn empty_snapshot(replicas: u32) -> ObservationSnapshot {
         observation_failures: Vec::new(),
         now_unix_seconds: 100,
     }
+}
+
+#[test]
+fn persisted_scale_up_authority_waits_without_dispatch_and_binds_resource_uid() {
+    let previous_policy = EffectivePolicy::fixed(1, 10).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 10).unwrap();
+    let primary = identity(1, "pod-1", "generation-1");
+    let target = identity(2, "pod-2", "generation-2");
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: ResourceUid::new("resource-uid"),
+        spec_generation: 2,
+        desired_replicas: 2,
+        previous_configuration: previous.clone(),
+        current_configuration: current.clone(),
+        previous_policy: previous_policy.clone(),
+        current_policy: current_policy.clone(),
+        primary,
+        target,
+        build_id: OperationId::new("build"),
+        snapshot_boundary_lsn: 0,
+        catch_up_boundary_lsn: 0,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let mut snapshot = empty_snapshot(2);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(previous_policy),
+        topology: Some(AcceptedTopology {
+            configuration: previous,
+        }),
+        transition: Some(TransitionIntent {
+            transition_id: intent.transition_id(TransitionKind::ScaleUp, &current),
+            kind: TransitionKind::ScaleUp,
+            spec_generation: intent.spec_generation,
+            effective_policy: current_policy,
+            previous_configuration_id: Some(intent.previous_configuration.configuration_id.clone()),
+            current_configuration: current,
+            election_lsn: None,
+            build_id: Some(intent.build_id.clone()),
+            repair: None,
+            switchover: None,
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
+            scale_up: Some(Box::new(intent.clone())),
+            scale_up_failover: None,
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe {
+            reason: UnsafeReason::InvalidAcceptedAuthority(_),
+            ..
+        }
+    ));
+
+    let mut different_attempt = intent.clone();
+    different_attempt.build_id = OperationId::new("different-build");
+    different_attempt.operation_id = different_attempt.expected_operation_id();
+    let retained_operation_id = different_attempt.command_operation_id(
+        kuberic_protocol::types::ScaleUpStage::PreviousCurrent,
+        &different_attempt.primary,
+        &different_attempt.current_configuration,
+    );
+    snapshot.replicas.insert(
+        observation_key(1, "pod-1"),
+        ReplicaObservation {
+            kubernetes: None,
+            agent: AgentObservation::Report(Box::new(AgentReport {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: snapshot.resource_uid.clone(),
+                identity: different_attempt.primary.clone(),
+                process_session_id: ProcessSessionId::new("session"),
+                report_sequence: 1,
+                role: ReplicaRole::Primary,
+                read_status: AccessStatus::Granted,
+                write_status: AccessStatus::Granted,
+                healthy: true,
+                epoch: different_attempt.current_configuration.epoch,
+                previous_configuration: Some(different_attempt.previous_configuration.clone()),
+                current_configuration: Some(different_attempt.current_configuration.clone()),
+                current_progress: 0,
+                verified_replication_lsn: Some(0),
+                committed_lsn: 0,
+                retained_operation_id: Some(retained_operation_id),
+                scale_up_intent: Some(Box::new(different_attempt)),
+                ..Default::default()
+            })),
+        },
+    );
+    assert!(kuberic_protocol::validation::validate_snapshot(&snapshot).is_err());
+    snapshot.replicas.clear();
+
+    snapshot.resource_uid = ResourceUid::new("other");
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+}
+
+#[test]
+fn secondary_removal_rejects_mixed_scale_up_transition_evidence() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2], 1, 1);
+    model.until(|model| {
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.kind == TransitionKind::SecondaryScaleDown)
+    });
+
+    let previous_policy = EffectivePolicy::fixed(1, 10).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 10).unwrap();
+    let primary = identity(1, "pod-1", "generation-1");
+    let target = identity(2, "pod-2", "generation-2");
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let mut scale_up = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: model.snapshot.resource_uid.clone(),
+        spec_generation: 2,
+        desired_replicas: 2,
+        previous_configuration: previous,
+        current_configuration: current,
+        previous_policy,
+        current_policy,
+        primary,
+        target,
+        build_id: OperationId::new("build"),
+        snapshot_boundary_lsn: 0,
+        catch_up_boundary_lsn: 0,
+    };
+    scale_up.operation_id = scale_up.expected_operation_id();
+    model.snapshot.status.transition.as_mut().unwrap().scale_up = Some(Box::new(scale_up));
+
+    assert!(kuberic_protocol::validation::validate_status(&model.snapshot.status).is_err());
+    assert!(matches!(
+        evaluate(&model.snapshot, &scale_down_model::config()),
+        Plan::Unsafe { .. }
+    ));
 }
 
 fn scaffolded_snapshot() -> ObservationSnapshot {
@@ -2946,6 +3144,8 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(
                 &resource_uid,
                 TransitionKind::PlannedSwitchover,
@@ -4273,6 +4473,7 @@ fn normalized_invalid_agent_evidence_is_unsafe() {
         .unwrap()
         .agent = AgentObservation::Invalid {
         message: "report sequence regressed".to_string(),
+        uninitialized_report: None,
     };
 
     assert!(matches!(
@@ -4601,7 +4802,7 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
             configuration: accepted.clone(),
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: old_identity.clone(),
+            purpose: ProvisioningPurpose::replacement(old_identity.clone()),
             pod_uid: PodUid::new("replacement-pod"),
             pvc_uid: PvcUid::new("replacement-pvc"),
             operation_id: OperationId::new("replacement-operation"),
@@ -4732,6 +4933,8 @@ fn active_transition_keeps_frozen_policy_after_spec_change() {
     let transition = TransitionIntent {
         secondary_scale_down: None,
         secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
         transition_id: derive_transition_id(
             &ResourceUid::new("resource-uid"),
             TransitionKind::Bootstrap,
@@ -5007,6 +5210,8 @@ fn failover_corrects_provisional_candidate_with_a_newer_epoch() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id,
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -5274,6 +5479,8 @@ fn failover_authorizes_full_copy_when_primary_history_cannot_repair_a_member() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id,
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -5432,6 +5639,8 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -5461,8 +5670,10 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
             build_id: first_repair.operation_id.clone(),
             target: first_target.clone(),
             last_sequence: 1,
+            replication_boundary_lsn: 0,
             durable_lsn: 20,
             completed: true,
+            catch_up_boundary_lsn: None,
         };
         snapshot.replicas.insert(
             ReplicaObservationKey::new(
@@ -5582,6 +5793,8 @@ fn failover_current_only_keeps_secondary_write_access_non_primary() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -5710,6 +5923,8 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Replacement,
@@ -6371,7 +6586,7 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
             })
             .expect("replacement provisioning status");
         let provisioning = provisioning_status.provisioning.clone().unwrap();
-        assert_eq!(provisioning.replaces, replacing);
+        assert_eq!(provisioning.replacement(), Some(&replacing));
         assert_eq!(provisioning.instance_id(), target.instance_id);
 
         snapshot.status = provisioning_status;
@@ -6386,8 +6601,10 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
             build_id: provisioning.operation_id.clone(),
             target: target.clone(),
             last_sequence: 1,
+            replication_boundary_lsn: 0,
             durable_lsn: 5,
             completed: true,
+            catch_up_boundary_lsn: None,
         };
         snapshot.replicas.insert(
             ReplicaObservationKey::new(primary.replica_id, primary.instance_id.clone()),
@@ -6499,6 +6716,8 @@ fn transition_report_previous_configuration_must_match_frozen_topology() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Replacement,
@@ -6773,7 +6992,10 @@ fn replacement_resources(
             },
         },
         pod: ExactResourceObservation::NotFound,
+        pod_allocation_operation_id: None,
+        pod_matches_allocation_metadata: false,
         pvc: ExactResourceObservation::NotFound,
+        pvc_allocation_operation_id: None,
         endpoint: ExactResourceObservation::NotFound,
     }
 }
@@ -6798,7 +7020,7 @@ fn replacement_target_loss_before_cc_clears_provisioning() {
             configuration: accepted,
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: replacing.clone(),
+            purpose: ProvisioningPurpose::replacement(replacing.clone()),
             pod_uid,
             pvc_uid,
             operation_id: OperationId::new("lost-build"),
@@ -6904,7 +7126,7 @@ fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
             configuration: accepted,
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: replacing.clone(),
+            purpose: ProvisioningPurpose::replacement(replacing.clone()),
             pod_uid: PodUid::new("abandoned-target"),
             pvc_uid: PvcUid::new("abandoned-target-pvc"),
             operation_id: OperationId::new("abandoned-build"),
@@ -6999,6 +7221,8 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Replacement,
             spec_generation: 1,
@@ -7261,4 +7485,5144 @@ fn bootstrap_replacement_supersedes_only_a_never_installed_incarnation() {
     let transition = transition.expect("superseded transition");
     assert_ne!(transition.current_configuration.members[1].identity, old);
     assert_eq!(transition.current_configuration.epoch, Epoch::new(0, 2));
+}
+
+#[test]
+fn scale_up_converges_sequentially_for_supported_cardinalities() {
+    use scale_up_model::Model;
+    for (accepted, desired) in [(1, 2), (2, 3), (3, 4)] {
+        let mut model = Model::new(accepted, desired);
+        model.run(80);
+        assert_eq!(model.accepted_count(), desired);
+        assert_eq!(model.accepted_history, vec![accepted, desired]);
+        assert!(model.snapshot.status.transition.is_none());
+        assert!(model.snapshot.status.provisioning.is_none());
+        assert!(model.snapshot.status.last_scale_up.is_some());
+    }
+
+    let mut sequential = Model::new(1, 3);
+    sequential.run(160);
+    assert_eq!(sequential.accepted_history, vec![1, 2, 3]);
+}
+
+#[test]
+fn scale_up_cancellation_and_failed_build_freeze_exact_cleanup() {
+    use scale_up_model::Model;
+    let mut cancelled = Model::new(1, 2);
+    while cancelled.snapshot.status.provisioning.is_none() {
+        cancelled.step();
+    }
+    cancelled.snapshot.desired.replicas = 1;
+    let Plan::Apply { changes } = cancelled.plan() else {
+        panic!("cancellation must persist exact cleanup");
+    };
+    let status = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(*status),
+        _ => None,
+    });
+    let status = status.expect("cleanup status");
+    assert!(status.provisioning.is_none());
+    assert!(status.scale_up_cleanup.is_some());
+    assert!(status.conditions.iter().any(|condition| {
+        condition.reason == "ScaleUpCancelledBeforeAdmission"
+            && condition.message.contains("phase=cleanup")
+            && condition.message.contains("accepted=1")
+            && condition.message.contains("desired=1")
+    }));
+    assert_eq!(
+        status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members
+            .len(),
+        1
+    );
+
+    let mut failed = Model::new(2, 3);
+    while failed.snapshot.status.provisioning.is_none() {
+        failed.step();
+    }
+    let target = failed
+        .snapshot
+        .status
+        .provisioning
+        .as_ref()
+        .unwrap()
+        .target_identity(&failed.snapshot.resource_uid);
+    let observation = failed
+        .snapshot
+        .observation_for_identity(&target)
+        .cloned()
+        .unwrap();
+    let mut report = AgentReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: failed.snapshot.resource_uid.clone(),
+        identity: target.clone(),
+        process_session_id: ProcessSessionId::new("failed-candidate"),
+        report_sequence: 2,
+        role: ReplicaRole::IdleSecondary,
+        healthy: false,
+        reported_fault: Some(FaultType::Permanent),
+        ..Default::default()
+    };
+    report.write_status = AccessStatus::NotPrimary;
+    failed
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            target.replica_id,
+            target.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent = AgentObservation::Report(Box::new(report));
+    assert!(observation.kubernetes.is_some());
+    assert!(matches!(
+        failed.plan(),
+        Plan::Apply { changes }
+            if changes.iter().any(|change| matches!(
+                change,
+                KubernetesChange::PersistStatus { status }
+                    if status.scale_up_cleanup.is_some()
+            ))
+    ));
+}
+
+#[test]
+fn scale_up_cleanup_retires_exact_source_build_before_service_restoration() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(1, 2);
+    let build = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } if !command.retire => {
+                model.execute(ProtocolCommand::EnsureReplicaBuild(command.clone()));
+                break command;
+            }
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("source build setup: {other:?}"),
+        }
+    };
+    let build_operation_id = OperationId::new(format!("{}:build-replica", build.operation_id));
+    let retirement_operation_id =
+        OperationId::new(format!("{}:retire-abandoned-build", build.operation_id));
+    model.snapshot.desired.replicas = 1;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("cancellation must freeze exact cleanup")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    assert!(model.snapshot.status.scale_up_cleanup.is_some());
+
+    let assert_retirement = |plan: Plan| {
+        let Plan::Execute {
+            command: ProtocolCommand::EnsureReplicaBuild(retirement),
+        } = plan
+        else {
+            panic!("cleanup must retire the exact source build before restoration")
+        };
+        assert!(retirement.retire);
+        assert_eq!(retirement.operation_id, build.operation_id);
+        assert_eq!(retirement.local_replica_id, build.local_replica_id);
+        assert_eq!(retirement.expected_instance_id, build.expected_instance_id);
+        assert_eq!(
+            retirement.expected_agent_generation,
+            build.expected_agent_generation
+        );
+        assert_eq!(retirement.target, build.target);
+        assert!(retirement.authority.is_none());
+        assert!(retirement.source_session_id.is_none());
+    };
+
+    let mut visible = model.fork();
+    visible
+        .report_mut(build.local_replica_id.value())
+        .write_status = AccessStatus::ReconfigurationPending;
+    assert_retirement(visible.plan());
+
+    let mut hidden_pending = model.fork();
+    hidden_pending
+        .report_mut(build.local_replica_id.value())
+        .builds
+        .clear();
+    assert_eq!(
+        hidden_pending
+            .report_mut(build.local_replica_id.value())
+            .pending_operation_id,
+        Some(build_operation_id.clone())
+    );
+    assert_retirement(hidden_pending.plan());
+
+    let mut hidden_consumed = hidden_pending.fork();
+    let source = hidden_consumed.report_mut(build.local_replica_id.value());
+    source.pending_operation_id = None;
+    source.retained_operation_id = Some(build_operation_id.clone());
+    assert_retirement(hidden_consumed.plan());
+
+    let mut pending_retirement = hidden_pending.fork();
+    pending_retirement
+        .report_mut(build.local_replica_id.value())
+        .pending_operation_id = Some(retirement_operation_id.clone());
+    assert_retirement(pending_retirement.plan());
+
+    let mut unrelated = hidden_pending.fork();
+    unrelated
+        .report_mut(build.local_replica_id.value())
+        .pending_operation_id = Some(OperationId::new("unrelated-pending"));
+    assert!(matches!(
+        unrelated.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                matches!(
+                    condition.reason.as_str(),
+                    "ScaleUpSourceBuildRetirementBlocked"
+                        | "ScaleUpHistoricalAcceptancePending"
+                ))
+    ));
+
+    let mut retired = hidden_pending;
+    let source = retired.report_mut(build.local_replica_id.value());
+    source.pending_operation_id = None;
+    source.retained_operation_id = Some(retirement_operation_id);
+    assert!(matches!(
+        retired.plan(),
+        Plan::Apply { changes }
+            if matches!(
+                changes.as_slice(),
+                [KubernetesChange::DeleteScaleDownResource {
+                    resource: ScaleDownResource::Endpoint,
+                    ..
+                }]
+            )
+    ));
+}
+
+#[test]
+fn scale_up_primary_loss_before_and_after_pc_cc_follow_distinct_paths() {
+    use scale_up_model::Model;
+    let mut before = Model::new(2, 3);
+    while before.snapshot.status.provisioning.is_none() {
+        before.step();
+    }
+    let primary = before
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .primary_id;
+    before.report_mut(primary.value()).reported_fault = Some(FaultType::Permanent);
+    before.report_mut(primary.value()).write_status = AccessStatus::ReconfigurationPending;
+    assert!(matches!(
+        before.plan(),
+        Plan::Apply { changes }
+            if changes.iter().any(|change| matches!(
+                change,
+                KubernetesChange::PersistStatus { status }
+                    if status.scale_up_cleanup.is_none()
+                        && status.provisioning.is_some()
+                        && status.primary_failure.is_some()
+            ))
+    ));
+
+    let mut after = Model::new(2, 3);
+    loop {
+        let plan = after.plan();
+        let pc_cc_primary_installed = after
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                after
+                    .snapshot
+                    .observation_for_identity(&intent.primary)
+                    .and_then(|observation| match &observation.agent {
+                        AgentObservation::Report(report) => Some(report),
+                        _ => None,
+                    })
+                    .is_some_and(|report| report.previous_configuration.is_some())
+            });
+        if pc_cc_primary_installed {
+            break;
+        }
+        match plan {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    after.apply(change);
+                }
+            }
+            Plan::Execute { command } => after.execute(command),
+            Plan::Wait { status, .. } => after.apply_wait(status),
+            other => panic!("unexpected pre-PC/CC plan: {other:?}"),
+        }
+    }
+    after.report_mut(1).reported_fault = Some(FaultType::Permanent);
+    after.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+    let Plan::Apply { changes } = after.plan() else {
+        panic!("post-PC/CC primary loss must persist carried failover");
+    };
+    let status = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(*status),
+        _ => None,
+    });
+    let status = status.expect("failover status");
+    assert!(status.scale_up_cleanup.is_none());
+    assert!(
+        status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up_failover.is_some())
+    );
+    assert!(status.conditions.iter().any(|condition| {
+        condition.reason == "ScaleUpFailoverPersisted"
+            && condition.message.contains("phase=failover-recovery")
+    }));
+    after.snapshot.status = status;
+    for _ in 0..40 {
+        match after.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    after.apply(change);
+                }
+            }
+            Plan::Execute { command } => after.execute(command),
+            Plan::Wait { status, .. } => after.apply_wait(status),
+            Plan::Stable { status, .. } => after.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("carried failover became unsafe: {reason:?}"),
+        }
+        if after.accepted_count() == 3 && after.snapshot.status.transition.is_none() {
+            break;
+        }
+    }
+    assert_eq!(after.accepted_count(), 3, "{:?}", after.plan());
+    assert!(after.snapshot.status.transition.is_none());
+}
+
+#[test]
+fn carried_failover_fences_before_selecting_the_acknowledged_tail() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(4, 5);
+    model.truncate_durable_history(8);
+    loop {
+        let pc_cc_complete = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                intent.current_configuration.members.iter().all(|member| {
+                    model
+                        .snapshot
+                        .observation_for_identity(&member.identity)
+                        .and_then(|observation| match &observation.agent {
+                            AgentObservation::Report(report) => Some(report.as_ref()),
+                            _ => None,
+                        })
+                        .is_some_and(|report| {
+                            report.previous_configuration.as_ref()
+                                == Some(&intent.previous_configuration)
+                                && report.current_configuration.as_ref()
+                                    == Some(&intent.current_configuration)
+                                && report.pending_operation_id.is_none()
+                        })
+                })
+            });
+        if pc_cc_complete {
+            break;
+        }
+        model.step();
+    }
+    assert_eq!(model.report_mut(2).current_progress, 10);
+    model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+    model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("primary failure must persist provisional carried failover")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    let provisional = model.snapshot.status.transition.as_ref().unwrap().clone();
+    assert_eq!(
+        provisional.current_configuration.primary_id,
+        ReplicaId::new(2)
+    );
+    assert_eq!(provisional.election_lsn, None);
+    assert!(model.snapshot.routing.write_target.is_none());
+
+    let acknowledged = model.acknowledge_old_scale_up_authority_write(41, 99, &[1, 3, 4]);
+    assert_eq!(acknowledged, 11);
+    assert_eq!(model.report_mut(2).current_progress, 10);
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(first_fence),
+    } = model.plan()
+    else {
+        panic!("delayed old-epoch acknowledgement bypassed provisional fencing")
+    };
+    assert_eq!(first_fence.transition_kind, TransitionKind::Failover);
+    assert_eq!(first_fence.failover_safe_lsn, None);
+    assert_eq!(
+        first_fence.primary_write_status,
+        AccessStatus::ReconfigurationPending
+    );
+    model.execute(ProtocolCommand::EnsureConfiguration(first_fence));
+
+    let finalized = loop {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                let finalized = changes.iter().find_map(|change| match change {
+                    KubernetesChange::PersistStatus { status } => status
+                        .transition
+                        .as_ref()
+                        .filter(|transition| transition.election_lsn.is_some())
+                        .cloned(),
+                    _ => None,
+                });
+                for change in changes {
+                    model.apply(change);
+                }
+                if let Some(finalized) = finalized {
+                    break finalized;
+                }
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } => {
+                assert_eq!(command.failover_safe_lsn, None);
+                assert_eq!(
+                    command.primary_write_status,
+                    AccessStatus::ReconfigurationPending
+                );
+                let local_replica_id = command.local_replica_id;
+                model.execute(ProtocolCommand::EnsureConfiguration(command));
+                if local_replica_id == ReplicaId::new(2) {
+                    model.report_mut(2).verified_replication_lsn = Some(0);
+                }
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("provisional fencing stalled: {other:?}"),
+        }
+    };
+    assert_eq!(
+        finalized.current_configuration.primary_id,
+        ReplicaId::new(3)
+    );
+    assert_eq!(finalized.election_lsn, Some(11));
+    assert!(finalized.current_configuration.epoch > provisional.current_configuration.epoch);
+
+    for _ in 0..160 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } => {
+                if command.primary_write_status == AccessStatus::Granted {
+                    assert!(command.current_only);
+                    assert_eq!(command.failover_safe_lsn, Some(11));
+                }
+                model.execute(ProtocolCommand::EnsureConfiguration(command));
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("fenced failover became unsafe: {reason:?}"),
+        }
+        let accepted_primary = model
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .and_then(|topology| {
+                topology
+                    .configuration
+                    .members
+                    .iter()
+                    .find(|member| member.role == ReplicaRole::Primary)
+            })
+            .map(|member| &member.identity);
+        if model.accepted_count() == 5
+            && model.snapshot.status.transition.is_none()
+            && model.snapshot.routing.write_target.as_ref() == accepted_primary
+            && matches!(model.plan(), Plan::Stable { .. })
+        {
+            break;
+        }
+    }
+    let receipt = model.snapshot.status.last_scale_up.as_ref().unwrap();
+    assert_eq!(receipt.failover_safe_lsn, Some(11));
+    assert_eq!(receipt.accepted_configuration.primary_id, ReplicaId::new(3));
+    let primary = receipt
+        .accepted_configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap();
+    assert!(
+        model
+            .validate_exact_durable_history(&primary.identity, acknowledged)
+            .unwrap()
+            >= acknowledged
+    );
+    assert_eq!(
+        model.snapshot.routing.write_target.as_ref(),
+        Some(&primary.identity)
+    );
+    model.assert_acknowledged_write_oracle();
+}
+
+#[test]
+fn carried_failover_keeps_the_provisional_nominee_when_fenced_progress_confirms_it() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(2, 3);
+    loop {
+        let pc_cc_complete = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                intent.current_configuration.members.iter().all(|member| {
+                    model
+                        .snapshot
+                        .observation_for_identity(&member.identity)
+                        .and_then(|observation| match &observation.agent {
+                            AgentObservation::Report(report) => Some(report.as_ref()),
+                            _ => None,
+                        })
+                        .is_some_and(|report| {
+                            report.previous_configuration.as_ref()
+                                == Some(&intent.previous_configuration)
+                                && report.current_configuration.as_ref()
+                                    == Some(&intent.current_configuration)
+                        })
+                })
+            });
+        if pc_cc_complete {
+            break;
+        }
+        model.step();
+    }
+    model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+    model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("primary failure must persist provisional failover")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    let provisional_primary = model
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .current_configuration
+        .primary_id;
+    assert_eq!(provisional_primary, ReplicaId::new(2));
+    let acknowledged = model.acknowledge_old_scale_up_authority_write(42, 1, &[1, 2]);
+
+    for _ in 0..80 {
+        let plan = model.plan();
+        let finalized = matches!(
+            &plan,
+            Plan::Apply { changes }
+                if changes.iter().any(|change| matches!(
+                    change,
+                    KubernetesChange::PersistStatus { status }
+                        if status.transition.as_ref().is_some_and(|transition|
+                            transition.election_lsn == Some(acknowledged)
+                                && transition.current_configuration.primary_id
+                                    == provisional_primary)
+                ))
+        );
+        match plan {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("provisional nominee confirmation stalled: {other:?}"),
+        }
+        if finalized {
+            return;
+        }
+    }
+    panic!("fresh fenced progress did not confirm the provisional nominee");
+}
+
+#[test]
+fn scale_up_carried_failover_corrects_returning_original_pc_cc_and_current_only_primary() {
+    use scale_up_model::Model;
+
+    fn carried_failover() -> (Model, ScaleUpIntent) {
+        let mut model = Model::new(2, 3);
+        loop {
+            let primary_pc_cc = model
+                .snapshot
+                .status
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.scale_up.as_deref())
+                .is_some_and(|intent| {
+                    model
+                        .snapshot
+                        .observation_for_identity(&intent.primary)
+                        .and_then(|observation| match &observation.agent {
+                            AgentObservation::Report(report) => Some(report.as_ref()),
+                            _ => None,
+                        })
+                        .is_some_and(|report| {
+                            report.previous_configuration.as_ref()
+                                == Some(&intent.previous_configuration)
+                                && report.current_configuration.as_ref()
+                                    == Some(&intent.current_configuration)
+                        })
+                });
+            if primary_pc_cc {
+                break;
+            }
+            model.step();
+        }
+        let intent = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .unwrap()
+            .clone();
+        let report = model.report_mut(intent.primary.replica_id.value());
+        report.reported_fault = Some(FaultType::Permanent);
+        report.write_status = AccessStatus::ReconfigurationPending;
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("primary failure must freeze carried failover")
+        };
+        let status = changes.into_iter().find_map(|change| match change {
+            KubernetesChange::PersistStatus { status }
+                if status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.scale_up_failover.is_some()) =>
+            {
+                Some(*status)
+            }
+            _ => None,
+        });
+        model.snapshot.status = status.expect("carried failover status");
+        (model, intent)
+    }
+
+    for current_only in [false, true] {
+        let (mut model, intent) = carried_failover();
+        let report = model.report_mut(intent.primary.replica_id.value());
+        report.healthy = true;
+        report.reported_fault = None;
+        report.role = ReplicaRole::Primary;
+        report.read_status = AccessStatus::Granted;
+        report.write_status = if current_only {
+            AccessStatus::Granted
+        } else {
+            // Same-primary scale-up deliberately preserves Granted writes while
+            // PC/CC is installed; failover must still recognize this exact
+            // retained command as the authorized returning original primary.
+            AccessStatus::Granted
+        };
+        report.epoch = intent.current_configuration.epoch;
+        report.previous_configuration =
+            (!current_only).then(|| intent.previous_configuration.clone());
+        report.current_configuration = Some(intent.current_configuration.clone());
+        report.scale_up_intent = Some(Box::new(intent.clone()));
+        report.pending_operation_id = None;
+        report.retained_operation_id = Some(intent.command_operation_id(
+            if current_only {
+                kuberic_protocol::types::ScaleUpStage::CurrentOnly
+            } else {
+                kuberic_protocol::types::ScaleUpStage::PreviousCurrent
+            },
+            &intent.primary,
+            &intent.current_configuration,
+        ));
+        report.report_sequence += 1;
+
+        if current_only {
+            let mut unrelated = model.fork();
+            unrelated
+                .report_mut(intent.primary.replica_id.value())
+                .retained_operation_id = Some(OperationId::new("unrelated-current-only"));
+            assert!(matches!(
+                unrelated.plan(),
+                Plan::Unsafe {
+                    safety_changes,
+                    ..
+                } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+            ));
+            let mut stale = model.fork();
+            stale
+                .report_mut(intent.primary.replica_id.value())
+                .scale_up_intent = None;
+            assert!(matches!(
+                stale.plan(),
+                Plan::Unsafe {
+                    safety_changes,
+                    ..
+                } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+            ));
+        }
+
+        let independent = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity != intent.primary)
+            .unwrap()
+            .identity
+            .clone();
+        let independent_key =
+            ReplicaObservationKey::new(independent.replica_id, independent.instance_id.clone());
+
+        let mut invalid_peer = model.fork();
+        invalid_peer
+            .snapshot
+            .replicas
+            .get_mut(&independent_key)
+            .unwrap()
+            .agent = AgentObservation::Invalid {
+            message: "independent invalid peer".into(),
+            uninitialized_report: None,
+        };
+        assert!(matches!(
+            invalid_peer.plan(),
+            Plan::Unsafe {
+                safety_changes,
+                ..
+            } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+        ));
+
+        let mut wrong_generation = model.fork();
+        wrong_generation
+            .report_mut(independent.replica_id.value())
+            .identity
+            .agent_generation = AgentGeneration::new("independent-wrong-generation");
+        assert!(matches!(
+            wrong_generation.plan(),
+            Plan::Unsafe {
+                safety_changes,
+                ..
+            } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+        ));
+
+        let mut incompatible_protocol = model.fork();
+        incompatible_protocol
+            .report_mut(independent.replica_id.value())
+            .protocol_version = kuberic_protocol::PROTOCOL_VERSION + 1;
+        assert!(matches!(
+            incompatible_protocol.plan(),
+            Plan::Unsafe {
+                reason: UnsafeReason::IncompatibleProtocolVersion {
+                    replica_id,
+                    ..
+                },
+                safety_changes,
+                ..
+            } if replica_id == independent.replica_id.value()
+                && safety_changes == vec![SafetyChange::RemoveWriteRouting]
+        ));
+
+        let mut observation_failure = model.fork();
+        observation_failure
+            .snapshot
+            .observation_failures
+            .push(ObservationFailure {
+                source: "independent-agent".into(),
+                message: "timeout".into(),
+            });
+        assert!(matches!(
+            observation_failure.plan(),
+            Plan::Wait {
+                reason: WaitReason::AgentUnavailable,
+                ..
+            }
+        ));
+
+        let Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command),
+        } = model.plan()
+        else {
+            panic!(
+                "surviving carried-failover participant must advance without the returning original {} authority: {:?}",
+                if current_only {
+                    "current-only"
+                } else {
+                    "PC/CC"
+                },
+                model.plan()
+            )
+        };
+        assert_ne!(command.local_replica_id, intent.primary.replica_id);
+        assert_eq!(command.transition_kind, TransitionKind::Failover);
+        assert!(!command.current_only);
+        assert!(
+            command.current_epoch > intent.current_configuration.epoch,
+            "carried failover correction must move authority monotonically forward"
+        );
+        model.execute(ProtocolCommand::EnsureConfiguration(command));
+        model.run(120);
+        assert_eq!(model.accepted_count(), 3);
+        assert!(model.snapshot.status.transition.is_none());
+        assert!(model.snapshot.status.last_scale_up.is_some());
+        let accepted = model
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .clone();
+        let returned = model.report_mut(intent.primary.replica_id.value());
+        assert_eq!(returned.previous_configuration, None);
+        assert_eq!(returned.current_configuration.as_ref(), Some(&accepted));
+        assert_eq!(
+            returned.role,
+            accepted
+                .members
+                .iter()
+                .find(|member| member.identity == intent.primary)
+                .unwrap()
+                .role
+        );
+    }
+}
+
+#[test]
+fn sequential_prior_receipt_cannot_reopen_during_newer_carried_failover() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(1, 3);
+    loop {
+        let second_pc_cc = model.accepted_count() == 2
+            && model
+                .snapshot
+                .status
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.scale_up.as_deref())
+                .is_some_and(|intent| {
+                    intent.current_configuration.members.iter().all(|member| {
+                        model
+                            .snapshot
+                            .observation_for_identity(&member.identity)
+                            .and_then(|observation| match &observation.agent {
+                                AgentObservation::Report(report) => Some(report.as_ref()),
+                                _ => None,
+                            })
+                            .is_some_and(|report| {
+                                report.previous_configuration.as_ref()
+                                    == Some(&intent.previous_configuration)
+                                    && report.current_configuration.as_ref()
+                                        == Some(&intent.current_configuration)
+                                    && report.pending_operation_id.is_none()
+                            })
+                    })
+                });
+        if second_pc_cc {
+            break;
+        }
+        model.step();
+    }
+    let prior_receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+    let intent = model
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .scale_up
+        .as_deref()
+        .unwrap()
+        .clone();
+    assert_ne!(prior_receipt.intent.operation_id, intent.operation_id);
+    let old_primary_key = ReplicaObservationKey::new(
+        intent.primary.replica_id,
+        intent.primary.instance_id.clone(),
+    );
+    let returning = model
+        .snapshot
+        .replicas
+        .get(&old_primary_key)
+        .unwrap()
+        .clone();
+    model
+        .report_mut(intent.primary.replica_id.value())
+        .reported_fault = Some(FaultType::Permanent);
+    model
+        .report_mut(intent.primary.replica_id.value())
+        .write_status = AccessStatus::ReconfigurationPending;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("newer carried failover was not persisted")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    model.snapshot.replicas.insert(old_primary_key, returning);
+
+    for _ in 0..160 {
+        let plan = model.plan();
+        assert!(
+            !matches!(&plan, Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                matches!(
+                    condition.reason.as_str(),
+                    "ScaleUpPriorReceiptPending"
+                        | "ScaleUpHistoricalAcceptancePending"
+                        | "ScaleUpCommittedDegraded"
+                ))),
+            "prior receipt reopened during exact newer failover: {plan:?}"
+        );
+        match plan {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("newer carried failover unsafe: {reason:?}"),
+        }
+        if model.accepted_count() == 3 && model.snapshot.status.transition.is_none() {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 3);
+    assert!(model.snapshot.status.transition.is_none());
+    assert_ne!(
+        model
+            .snapshot
+            .status
+            .last_scale_up
+            .as_ref()
+            .unwrap()
+            .intent
+            .operation_id,
+        prior_receipt.intent.operation_id
+    );
+}
+
+#[test]
+fn scale_up_retry_corrects_late_stale_failover_member_before_pc_cc() {
+    use scale_up_model::Model;
+
+    let mut seed = Model::new(3, 4);
+    let stale_configuration = seed
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    let members = stale_configuration
+        .members
+        .iter()
+        .map(|member| ConfigurationMember {
+            identity: member.identity.clone(),
+            role: if member.identity.replica_id == ReplicaId::new(2) {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            },
+        })
+        .collect::<Vec<_>>();
+    let accepted = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        ReplicaId::new(2),
+        members,
+        stale_configuration.write_quorum,
+    );
+    seed.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: accepted.clone(),
+    });
+    for observation in seed.snapshot.replicas.values_mut() {
+        let AgentObservation::Report(report) = &mut observation.agent else {
+            continue;
+        };
+        let member = accepted
+            .members
+            .iter()
+            .find(|member| member.identity == report.identity)
+            .unwrap();
+        report.role = member.role;
+        report.epoch = accepted.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(accepted.clone());
+        report.write_status = if member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+    }
+    seed.snapshot.routing.write_target = Some(
+        accepted
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .unwrap()
+            .identity
+            .clone(),
+    );
+    let mut model = Model::from_snapshot(seed.snapshot, vec![3]);
+    for _ in 0..100 {
+        if model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up.is_some())
+        {
+            break;
+        }
+        model.step();
+    }
+    assert!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up.is_some())
+    );
+
+    let stale = model.report_mut(1);
+    stale.role = ReplicaRole::Primary;
+    stale.epoch = stale_configuration.epoch;
+    stale.previous_configuration = None;
+    stale.current_configuration = Some(stale_configuration.clone());
+    stale.write_status = AccessStatus::Granted;
+    stale.pending_operation_id = None;
+    stale.pending_configuration = None;
+    assert_eq!(stale.identity, accepted.members[0].identity);
+    assert_eq!(stale.resource_uid.as_str(), "scale-up-model");
+    assert_ne!(stale.reported_fault, Some(FaultType::Permanent));
+    let correction_operation = OperationId::new(format!(
+        "scale-up-accepted-correction:{}:{}",
+        accepted.configuration_id,
+        ReplicaId::new(1)
+    ));
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(command),
+    } = model.plan()
+    else {
+        panic!(
+            "late stale retained member must receive accepted failover correction: {:?}",
+            model.plan()
+        )
+    };
+    assert_eq!(command.local_replica_id, ReplicaId::new(1));
+    assert_eq!(command.current_configuration, accepted);
+    assert_eq!(command.transition_kind, TransitionKind::Failover);
+    assert!(!command.current_only);
+    assert_eq!(command.operation_id, correction_operation);
+    assert_eq!(command.failover_safe_lsn, Some(0));
+    let correction = command.clone();
+    model.report_mut(1).current_progress += 1;
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(correction.clone())
+        },
+        "progress changes must not mutate accepted-member correction bytes"
+    );
+    {
+        let pending = model.report_mut(1);
+        pending.pending_operation_id = Some(correction.operation_id.clone());
+        pending.pending_configuration = Some(correction.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(correction.clone())
+        },
+        "matching durable pending PC/CC correction must replay byte-for-byte"
+    );
+    {
+        let installed = model.report_mut(1);
+        installed.role = ReplicaRole::ActiveSecondary;
+        installed.epoch = accepted.epoch;
+        installed.previous_configuration = Some(stale_configuration);
+        installed.current_configuration = Some(accepted.clone());
+        installed.write_status = AccessStatus::NotPrimary;
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(correction)
+        },
+        "pending PC/CC correction must remain replayable after authority installation"
+    );
+    {
+        let completed = model.report_mut(1);
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+    }
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(command),
+    } = model.plan()
+    else {
+        panic!("accepted correction PC/CC must collapse to current-only before scale-up")
+    };
+    assert_eq!(command.local_replica_id, ReplicaId::new(1));
+    assert_eq!(command.current_configuration, accepted);
+    assert_eq!(command.transition_kind, TransitionKind::Failover);
+    assert!(command.current_only);
+    assert_eq!(command.failover_safe_lsn, Some(0));
+    let current_only_operation = command.operation_id.clone();
+    model.report_mut(1).current_progress += 1;
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command.clone())
+        },
+        "progress changes must not mutate current-only correction bytes"
+    );
+    {
+        let pending = model.report_mut(1);
+        pending.pending_operation_id = Some(current_only_operation.clone());
+        pending.pending_configuration = Some(command.clone());
+        pending.previous_configuration = None;
+    }
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(replayed),
+    } = model.plan()
+    else {
+        panic!("matching frozen accepted current-only correction must replay")
+    };
+    assert_eq!(replayed, command);
+    assert_eq!(replayed.operation_id, current_only_operation);
+    {
+        let unrelated = model.report_mut(1);
+        unrelated.pending_operation_id = Some(OperationId::new("unrelated-accepted-correction"));
+        unrelated.pending_configuration = None;
+    }
+    let unrelated_plan = model.plan();
+    assert!(
+        matches!(
+            &unrelated_plan,
+            Plan::Unsafe {
+                safety_changes,
+                ..
+            } if safety_changes == &vec![SafetyChange::RemoveWriteRouting]
+        ),
+        "unrelated accepted correction was not fenced: {unrelated_plan:?}"
+    );
+    {
+        let pending = model.report_mut(1);
+        pending.pending_operation_id = Some(current_only_operation);
+        pending.pending_configuration = Some(command.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command)
+        },
+        "restoring exact pending evidence must restore exact replay"
+    );
+}
+
+#[test]
+fn scale_up_two_late_stale_members_correct_sequentially_with_pending_replay() {
+    use scale_up_model::Model;
+    let mut seed = Model::new(5, 6);
+    let previous = seed
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    let accepted = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        ReplicaId::new(2),
+        previous
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity.replica_id == ReplicaId::new(2) {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        previous.write_quorum,
+    );
+    seed.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: accepted.clone(),
+    });
+    for observation in seed.snapshot.replicas.values_mut() {
+        let AgentObservation::Report(report) = &mut observation.agent else {
+            continue;
+        };
+        let member = accepted
+            .members
+            .iter()
+            .find(|member| member.identity == report.identity)
+            .unwrap();
+        report.role = member.role;
+        report.epoch = accepted.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(accepted.clone());
+        report.write_status = if member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+    }
+    seed.snapshot.routing.write_target = Some(
+        accepted
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .unwrap()
+            .identity
+            .clone(),
+    );
+    let mut model = Model::from_snapshot(seed.snapshot, vec![5]);
+    for _ in 0..120 {
+        if model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up.is_some())
+        {
+            break;
+        }
+        model.step();
+    }
+    assert!(model.snapshot.status.transition.is_some());
+
+    for replica_id in [1, 3] {
+        let report = model.report_mut(replica_id);
+        let previous_member = previous
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == ReplicaId::new(replica_id))
+            .unwrap();
+        report.role = previous_member.role;
+        report.epoch = previous.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(previous.clone());
+        report.write_status = if previous_member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+        report.pending_operation_id = None;
+        report.pending_configuration = None;
+        report.scale_up_intent = None;
+    }
+
+    let mut wrong_identity = model.fork();
+    wrong_identity.report_mut(3).identity.agent_generation =
+        AgentGeneration::new("wrong-generation");
+    assert!(matches!(
+        wrong_identity.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    let mut wrong_session = model.fork();
+    let wrong_session_report = wrong_session.report_mut(3).clone();
+    wrong_session.snapshot.previous_report_watermarks.insert(
+        ReplicaObservationKey::new(
+            wrong_session_report.identity.replica_id,
+            wrong_session_report.identity.instance_id.clone(),
+        ),
+        ReportWatermark {
+            process_session_id: wrong_session_report.process_session_id,
+            report_sequence: wrong_session_report.report_sequence,
+        },
+    );
+    assert!(matches!(
+        wrong_session.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    let mut wrong_configuration = model.fork();
+    let mut unrelated_configuration = previous.clone();
+    unrelated_configuration.epoch.configuration_number += 10;
+    wrong_configuration.report_mut(3).current_configuration = Some(unrelated_configuration);
+    assert!(matches!(
+        wrong_configuration.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    let mut malformed_peer = model.fork();
+    let peer = accepted
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == ReplicaId::new(4))
+        .unwrap()
+        .identity
+        .clone();
+    malformed_peer
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            peer.replica_id,
+            peer.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent = AgentObservation::Invalid {
+        message: "independent malformed peer".into(),
+        uninitialized_report: None,
+    };
+    assert!(matches!(
+        malformed_peer.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(first),
+    } = model.plan()
+    else {
+        panic!("first deterministic stale correction was not dispatched")
+    };
+    assert_eq!(first.local_replica_id, ReplicaId::new(1));
+    {
+        let pending = model.report_mut(1);
+        pending.pending_operation_id = Some(first.operation_id.clone());
+        pending.pending_configuration = Some(first.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(first.clone())
+        },
+        "first pending correction must replay while another valid stale member remains"
+    );
+    model.execute(ProtocolCommand::EnsureConfiguration(first));
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(first_current_only),
+    } = model.plan()
+    else {
+        panic!("first stale member must collapse to current-only")
+    };
+    assert_eq!(first_current_only.local_replica_id, ReplicaId::new(1));
+    assert!(first_current_only.current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(first_current_only));
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(second),
+    } = model.plan()
+    else {
+        panic!("second stale member must be corrected after the first")
+    };
+    assert_eq!(second.local_replica_id, ReplicaId::new(3));
+    assert!(!second.current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(second));
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(second_current_only),
+    } = model.plan()
+    else {
+        panic!("second stale member must collapse to current-only")
+    };
+    assert_eq!(second_current_only.local_replica_id, ReplicaId::new(3));
+    assert!(second_current_only.current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(second_current_only));
+    assert_eq!(
+        model
+            .snapshot
+            .routing
+            .write_target
+            .as_ref()
+            .map(|identity| identity.replica_id),
+        Some(accepted.primary_id)
+    );
+    model.run(200);
+    assert_eq!(model.accepted_count(), 6);
+    assert!(matches!(model.plan(), Plan::Stable { .. }));
+}
+
+#[test]
+fn scale_up_stale_correction_preserves_validation_and_primary_failure_priority() {
+    use scale_up_model::Model;
+
+    let mut seed = Model::new(5, 6);
+    let stale_configuration = seed
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    let accepted = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        ReplicaId::new(2),
+        stale_configuration
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity.replica_id == ReplicaId::new(2) {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        stale_configuration.write_quorum,
+    );
+    seed.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: accepted.clone(),
+    });
+    for observation in seed.snapshot.replicas.values_mut() {
+        let AgentObservation::Report(report) = &mut observation.agent else {
+            continue;
+        };
+        let member = accepted
+            .members
+            .iter()
+            .find(|member| member.identity == report.identity)
+            .unwrap();
+        report.role = member.role;
+        report.epoch = accepted.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(accepted.clone());
+        report.write_status = if member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+        report.pending_operation_id = None;
+        report.pending_configuration = None;
+    }
+    seed.snapshot.routing.write_target = accepted
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .map(|member| member.identity.clone());
+    let mut model = Model::from_snapshot(seed.snapshot, vec![3]);
+    for _ in 0..100 {
+        if model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up.is_some())
+        {
+            break;
+        }
+        model.step();
+    }
+    assert!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up.is_some())
+    );
+    {
+        let stale = model.report_mut(1);
+        stale.role = ReplicaRole::Primary;
+        stale.epoch = stale_configuration.epoch;
+        stale.previous_configuration = None;
+        stale.current_configuration = Some(stale_configuration);
+        stale.write_status = AccessStatus::Granted;
+        stale.pending_operation_id = None;
+        stale.pending_configuration = None;
+    }
+
+    let exact = model.plan();
+    assert!(matches!(
+        exact,
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command)
+        } if command.local_replica_id == ReplicaId::new(1)
+            && !command.current_only
+            && command.failover_safe_lsn == Some(0)
+    ));
+
+    let mut malformed = model.fork();
+    malformed.report_mut(3).role = ReplicaRole::Primary;
+    malformed.report_mut(3).write_status = AccessStatus::Granted;
+    assert!(matches!(
+        malformed.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+
+    let mut unauthorized = model.fork();
+    unauthorized.report_mut(3).identity.agent_generation =
+        AgentGeneration::new("unauthorized-stale-session-generation");
+    assert!(matches!(
+        unauthorized.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+
+    let mut primary_failed = model.fork();
+    {
+        let primary = primary_failed.report_mut(2);
+        primary.healthy = false;
+        primary.reported_fault = Some(FaultType::Permanent);
+        primary.write_status = AccessStatus::ReconfigurationPending;
+        primary.report_sequence += 1;
+    }
+    let unavailable_identity = accepted
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == ReplicaId::new(5))
+        .unwrap()
+        .identity
+        .clone();
+    primary_failed
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            unavailable_identity.replica_id,
+            unavailable_identity.instance_id,
+        ))
+        .unwrap()
+        .agent = AgentObservation::Unreachable {
+        message: "bounded 3/5 quorum control".into(),
+    };
+    let priority = primary_failed.plan();
+    assert!(
+        matches!(
+            &priority,
+            Plan::Apply { changes }
+                if changes.iter().any(|change| matches!(change, KubernetesChange::RemoveWriteRouting))
+                    && changes.iter().any(|change| matches!(
+                        change,
+                        KubernetesChange::PersistStatus { status }
+                            if status.primary_failure.as_ref().is_some_and(|failure|
+                                failure.primary.replica_id == ReplicaId::new(2))
+                    ))
+        ),
+        "accepted primary failure did not arbitrate first: {priority:?}"
+    );
+
+    primary_failed.report_mut(1).healthy = false;
+    primary_failed.report_mut(1).reported_fault = Some(FaultType::Permanent);
+    let permanent_stale = primary_failed.plan();
+    assert!(
+        !matches!(
+            permanent_stale,
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command)
+            } if command.local_replica_id == ReplicaId::new(1)
+        ),
+        "permanently failed stale secondary preempted primary failover"
+    );
+}
+
+#[test]
+fn scale_up_commits_degraded_without_candidate_and_blocks_the_next_addition() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 4);
+    let mut candidate_current_only = None;
+    for _ in 0..100 {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only
+                && command.local_replica_id
+                    == model
+                        .snapshot
+                        .status
+                        .transition
+                        .as_ref()
+                        .and_then(|transition| transition.scale_up.as_deref())
+                        .unwrap()
+                        .target
+                        .replica_id =>
+            {
+                candidate_current_only =
+                    Some(ProtocolCommand::EnsureConfiguration(command.clone()));
+                model.remove_candidate_report();
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("unexpected unsafe plan: {reason:?}"),
+        }
+        if model.accepted_count() == 3 {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 3);
+    assert!(model.snapshot.status.scale_up_cleanup.is_none());
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    assert!(matches!(model.plan(), Plan::Wait { status, .. }
+    if status.conditions.iter().any(|condition| {
+        condition.reason == "ScaleUpCommittedDegraded"
+            && condition.message.contains("phase=local-convergence")
+            && condition.message.contains("accepted=3")
+            && condition.message.contains("desired=4")
+    })));
+
+    let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+    let target = receipt.intent.target.clone();
+    let key = ReplicaObservationKey::new(target.replica_id, target.instance_id.clone());
+    model.snapshot.replicas.get_mut(&key).unwrap().agent =
+        AgentObservation::Report(Box::new(AgentReport {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: model.snapshot.resource_uid.clone(),
+            identity: target.clone(),
+            process_session_id: ProcessSessionId::new("candidate-returned"),
+            report_sequence: 10,
+            role: ReplicaRole::ActiveSecondary,
+            read_status: AccessStatus::Granted,
+            write_status: AccessStatus::NotPrimary,
+            healthy: true,
+            epoch: receipt.intent.current_configuration.epoch,
+            previous_configuration: Some(receipt.intent.previous_configuration.clone()),
+            current_configuration: Some(receipt.intent.current_configuration.clone()),
+            current_progress: 10,
+            verified_replication_lsn: Some(10),
+            committed_lsn: 10,
+            scale_up_intent: Some(Box::new(receipt.intent.clone())),
+            ..Default::default()
+        }));
+    model.execute(candidate_current_only.expect("candidate correction command"));
+    assert!(!matches!(model.plan(), Plan::Wait { status, .. }
+        if status.conditions.iter().any(|condition| condition.reason == "ScaleUpCommittedDegraded")));
+}
+
+#[test]
+fn scale_up_restores_next_ordinal_with_fresh_deterministic_identity() {
+    use scale_up_model::Model;
+    let mut first = Model::new(2, 3);
+    let mut replay = Model::new(2, 3);
+    while first.snapshot.status.provisioning.is_none() {
+        first.step();
+        replay.step();
+    }
+    let left = first.snapshot.status.provisioning.as_ref().unwrap();
+    let right = replay.snapshot.status.provisioning.as_ref().unwrap();
+    assert_eq!(left, right);
+    assert_eq!(left.replica_id(), ReplicaId::new(3));
+    assert_eq!(
+        left.target_identity(&first.snapshot.resource_uid)
+            .instance_id,
+        ReplicaInstanceId::new("candidate-pod-3")
+    );
+    assert_ne!(
+        left.target_identity(&first.snapshot.resource_uid)
+            .agent_generation,
+        AgentGeneration::new("accepted-generation-3")
+    );
+}
+
+#[test]
+fn scale_up_desired_reduction_after_pc_cc_finishes_frozen_authority() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    loop {
+        let started = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                model.snapshot.replicas.values().any(|observation| {
+                    matches!(&observation.agent,
+                        AgentObservation::Report(report)
+                            if report.previous_configuration.as_ref()
+                                == Some(&intent.previous_configuration)
+                                && report.current_configuration.as_ref()
+                                    == Some(&intent.current_configuration))
+                })
+            });
+        if started {
+            break;
+        }
+        model.step();
+    }
+    model.snapshot.desired.replicas = 2;
+    for _ in 0..40 {
+        model.step();
+        if model.accepted_count() == 3 {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 3);
+    assert!(model.snapshot.status.scale_up_cleanup.is_none());
+}
+
+#[test]
+fn scale_up_rejects_mutated_source_receiver_boundaries_and_reports_diagnostics() {
+    use scale_up_model::Model;
+    let mut model = Model::new(1, 2);
+    while model.snapshot.status.provisioning.is_none() {
+        model.step();
+    }
+    let condition = model
+        .snapshot
+        .status
+        .conditions
+        .iter()
+        .find(|condition| condition.reason == "ScaleUpProvisioningAccepted")
+        .unwrap();
+    for field in ["accepted=1", "desired=2", "phase=provisioning", "attempt="] {
+        assert!(
+            condition.message.contains(field),
+            "{field}: {}",
+            condition.message
+        );
+    }
+    loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } => {
+                model.execute(ProtocolCommand::EnsureReplicaBuild(command));
+                break;
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            other => panic!("unexpected build preparation plan: {other:?}"),
+        }
+    }
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("build delivery must remain asynchronous")
+    };
+    model.apply_wait(status);
+    let target = model
+        .snapshot
+        .status
+        .provisioning
+        .as_ref()
+        .unwrap()
+        .target_identity(&model.snapshot.resource_uid);
+    let AgentObservation::Report(target_report) = &mut model
+        .snapshot
+        .observation_for_identity(&target)
+        .cloned()
+        .unwrap()
+        .agent
+    else {
+        unreachable!()
+    };
+    let mut broken = (**target_report).clone();
+    broken.builds[0].replication_boundary_lsn += 1;
+    model
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            target.replica_id,
+            target.instance_id,
+        ))
+        .unwrap()
+        .agent = AgentObservation::Report(Box::new(broken));
+    assert!(matches!(
+        model.plan(),
+        Plan::Unsafe {
+            reason: UnsafeReason::ContradictoryReplicaEvidence(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn scale_up_late_retained_member_blocks_receipt_supersession() {
+    use scale_up_model::Model;
+    let mut model = Model::new(1, 2);
+    model.run(80);
+    model.snapshot.desired.replicas = 3;
+    model.snapshot.desired.generation += 1;
+    let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+    let retained = receipt.intent.primary.clone();
+    let report = model.report_mut(retained.replica_id.value());
+    report.previous_configuration = Some(receipt.intent.previous_configuration.clone());
+    report.current_configuration = Some(receipt.intent.current_configuration.clone());
+    report.epoch = receipt.intent.current_configuration.epoch;
+    report.retained_operation_id = Some(receipt.intent.command_operation_id(
+        kuberic_protocol::types::ScaleUpStage::PreviousCurrent,
+        &retained,
+        &receipt.intent.current_configuration,
+    ));
+    report.pending_operation_id = None;
+    report.pending_configuration = None;
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(current_only),
+    } = model.plan()
+    else {
+        panic!("late retained member must receive current-only receipt correction")
+    };
+    assert!(current_only.current_only);
+    assert_eq!(current_only.local_replica_id, retained.replica_id);
+    assert!(
+        current_only
+            .scale_up_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.intent() == &receipt.intent)
+    );
+    {
+        let pending = model.report_mut(retained.replica_id.value());
+        pending.pending_operation_id = Some(current_only.operation_id.clone());
+        pending.pending_configuration = Some(current_only.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(current_only.clone())
+        },
+        "exact pending current-only receipt correction must replay before installation"
+    );
+    {
+        let installed = model.report_mut(retained.replica_id.value());
+        installed.previous_configuration = None;
+        installed.current_configuration = Some(receipt.accepted_configuration.clone());
+        installed.epoch = receipt.accepted_configuration.epoch;
+        installed.scale_up_intent = Some(Box::new(receipt.intent.clone()));
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(current_only.clone())
+        },
+        "installed authority cannot settle a still-pending receipt correction"
+    );
+    let mut mutated = model.fork();
+    let mutated_report = mutated.report_mut(retained.replica_id.value());
+    let mut changed = current_only.clone();
+    changed.primary_write_status = AccessStatus::ReconfigurationPending;
+    mutated_report.pending_configuration = Some(changed);
+    assert!(matches!(
+        mutated.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    let mut unrelated = model.fork();
+    let unrelated_report = unrelated.report_mut(retained.replica_id.value());
+    unrelated_report.pending_operation_id = Some(OperationId::new("unrelated-receipt-command"));
+    unrelated_report.pending_configuration = None;
+    assert!(matches!(
+        unrelated.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpHistoricalAcceptancePending")
+    ));
+    assert!(!matches!(model.plan(), Plan::Stable { .. }));
+    {
+        let completed = model.report_mut(retained.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(current_only.operation_id.clone());
+    }
+    assert!(model.snapshot.status.provisioning.is_none());
+}
+
+#[test]
+fn scale_up_receipt_replays_pending_pc_cc_before_advancing_to_current_only() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    model.run(120);
+    let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+    let retained = receipt.intent.primary.clone();
+    let previous_member = receipt
+        .intent
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.identity == retained)
+        .unwrap()
+        .clone();
+    let report = model.report_mut(retained.replica_id.value());
+    report.role = previous_member.role;
+    report.epoch = receipt.intent.previous_configuration.epoch;
+    report.previous_configuration = None;
+    report.current_configuration = Some(receipt.intent.previous_configuration.clone());
+    report.scale_up_intent = None;
+    report.pending_operation_id = None;
+    report.pending_configuration = None;
+    report.retained_operation_id = None;
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(pc_cc),
+    } = model.plan()
+    else {
+        panic!(
+            "late retained member must replay receipt PC/CC first: {:?}",
+            model.plan()
+        )
+    };
+    assert!(!pc_cc.current_only);
+    {
+        let pending = model.report_mut(retained.replica_id.value());
+        pending.pending_operation_id = Some(pc_cc.operation_id.clone());
+        pending.pending_configuration = Some(pc_cc.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(pc_cc.clone())
+        },
+        "exact pending receipt PC/CC must replay before authority installation"
+    );
+    {
+        let installed = model.report_mut(retained.replica_id.value());
+        installed.role = receipt
+            .accepted_configuration
+            .members
+            .iter()
+            .find(|member| member.identity == retained)
+            .unwrap()
+            .role;
+        installed.epoch = receipt.accepted_configuration.epoch;
+        installed.previous_configuration = Some(receipt.intent.previous_configuration.clone());
+        installed.current_configuration = Some(receipt.accepted_configuration.clone());
+        installed.scale_up_intent = Some(Box::new(receipt.intent.clone()));
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(pc_cc.clone())
+        },
+        "installed PC/CC cannot advance while the exact local command remains pending"
+    );
+    {
+        let completed = model.report_mut(retained.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(pc_cc.operation_id);
+    }
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(current_only),
+    } = model.plan()
+    else {
+        panic!("completed receipt PC/CC must advance to current-only")
+    };
+    assert!(current_only.current_only);
+    assert_eq!(current_only.local_replica_id, retained.replica_id);
+}
+
+#[test]
+fn previous_receipt_yields_to_exact_newer_build_retirement_then_resumes_correction() {
+    use scale_up_model::Model;
+
+    for permanent_candidate_failure in [false, true] {
+        let mut model = Model::new(1, 2);
+        model.run(80);
+        let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+        model.snapshot.desired.replicas = 3;
+        model.snapshot.desired.generation += 1;
+
+        let build = loop {
+            match model.plan() {
+                Plan::Execute {
+                    command: ProtocolCommand::EnsureReplicaBuild(command),
+                } if !command.retire => {
+                    let command = *command;
+                    model.execute(ProtocolCommand::EnsureReplicaBuild(Box::new(
+                        command.clone(),
+                    )));
+                    break command;
+                }
+                Plan::Apply { changes } => {
+                    for change in changes {
+                        model.apply(change);
+                    }
+                }
+                Plan::Execute { command } => model.execute(command),
+                Plan::Wait { status, .. } => model.apply_wait(status),
+                other => panic!("newer build setup stalled: {other:?}"),
+            }
+        };
+        assert!(model.has_pending_build());
+
+        let historical = receipt.intent.target.clone();
+        let historical_report = model.report_mut(historical.replica_id.value());
+        historical_report.previous_configuration =
+            Some(receipt.intent.previous_configuration.clone());
+        historical_report.current_configuration = Some(receipt.accepted_configuration.clone());
+        historical_report.epoch = receipt.accepted_configuration.epoch;
+        historical_report.scale_up_intent = Some(Box::new(receipt.intent.clone()));
+        historical_report.retained_operation_id = Some(receipt.intent.command_operation_id(
+            kuberic_protocol::types::ScaleUpStage::PreviousCurrent,
+            &historical,
+            &receipt.accepted_configuration,
+        ));
+        historical_report.pending_operation_id = None;
+        historical_report.pending_configuration = None;
+
+        if permanent_candidate_failure {
+            let candidate = build.target.clone();
+            let candidate_report = model.report_mut(candidate.replica_id.value());
+            candidate_report.healthy = false;
+            candidate_report.reported_fault = Some(FaultType::Permanent);
+        } else {
+            model.snapshot.desired.replicas = 2;
+            model.snapshot.desired.generation += 1;
+        }
+
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("newer exact attempt cancellation was preempted by the prior receipt")
+        };
+        assert!(changes.iter().any(|change| matches!(
+            change,
+            KubernetesChange::PersistStatus { status }
+                if status.scale_up_cleanup.as_ref().is_some_and(|cleanup|
+                    cleanup.provisioning.operation_id
+                        != receipt.intent.operation_id
+                        && cleanup.target == build.target)
+                    && status.last_scale_up.as_ref() == Some(&receipt)
+        )));
+        for change in changes {
+            model.apply(change);
+        }
+        let abandoned_attempt = model
+            .snapshot
+            .status
+            .scale_up_cleanup
+            .as_ref()
+            .unwrap()
+            .provisioning
+            .operation_id
+            .clone();
+        model = model.fork();
+
+        let source = model
+            .snapshot
+            .status
+            .scale_up_cleanup
+            .as_ref()
+            .unwrap()
+            .provisioning
+            .scale_up()
+            .unwrap()
+            .previous_configuration
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .unwrap()
+            .identity
+            .clone();
+        let mut unrelated = model.fork();
+        unrelated
+            .report_mut(source.replica_id.value())
+            .pending_operation_id = Some(OperationId::new("unrelated-newer-attempt-work"));
+        assert!(matches!(
+            unrelated.plan(),
+            Plan::Wait { status, .. }
+                if status.conditions.iter().any(|condition|
+                    matches!(
+                        condition.reason.as_str(),
+                        "ScaleUpSourceBuildRetirementBlocked"
+                            | "ScaleUpHistoricalAcceptancePending"
+                    ))
+        ));
+
+        let Plan::Execute {
+            command: ProtocolCommand::EnsureReplicaBuild(retirement),
+        } = model.plan()
+        else {
+            panic!("exact newer build retirement must precede cleanup")
+        };
+        assert!(retirement.retire);
+        assert_eq!(retirement.operation_id, build.operation_id);
+        assert_eq!(retirement.target, build.target);
+        model.execute(ProtocolCommand::EnsureReplicaBuild(retirement));
+        model = model.fork();
+
+        let Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(correction),
+        } = model.plan()
+        else {
+            panic!("genuine prior-receipt correction was not preserved after exact retirement")
+        };
+        assert!(correction.current_only);
+        assert_eq!(correction.local_replica_id, historical.replica_id);
+        assert!(
+            correction
+                .scale_up_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.intent() == &receipt.intent)
+        );
+        model.execute(ProtocolCommand::EnsureConfiguration(correction));
+        model = model.fork();
+
+        let mut deletes = Vec::new();
+        for _ in 0..12 {
+            match model.plan() {
+                Plan::Apply { changes } => {
+                    for change in changes {
+                        if let KubernetesChange::DeleteScaleDownResource { resource, .. } = &change
+                        {
+                            deletes.push(*resource);
+                        }
+                        model.apply(change);
+                    }
+                    model = model.fork();
+                }
+                Plan::Wait { status, .. } => model.apply_wait(status),
+                other => panic!("newer exact cleanup stalled: {other:?}"),
+            }
+            if model.snapshot.status.scale_up_cleanup.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            deletes,
+            vec![
+                ScaleDownResource::Endpoint,
+                ScaleDownResource::Pod,
+                ScaleDownResource::Pvc,
+            ]
+        );
+        assert_eq!(model.snapshot.status.last_scale_up.as_ref(), Some(&receipt));
+
+        if permanent_candidate_failure {
+            for _ in 0..20 {
+                let fresh = model
+                    .snapshot
+                    .status
+                    .scale_up_allocation
+                    .as_ref()
+                    .map(|allocation| &allocation.operation_id)
+                    .or_else(|| {
+                        model
+                            .snapshot
+                            .status
+                            .provisioning
+                            .as_ref()
+                            .map(|provisioning| &provisioning.operation_id)
+                    });
+                if fresh.is_some_and(|operation_id| operation_id != &abandoned_attempt) {
+                    break;
+                }
+                model.step();
+            }
+            assert!(
+                model.snapshot.status.scale_up_allocation.is_some()
+                    || model.snapshot.status.provisioning.is_some()
+            );
+            let fresh = model
+                .snapshot
+                .status
+                .scale_up_allocation
+                .as_ref()
+                .map(|allocation| &allocation.operation_id)
+                .or_else(|| {
+                    model
+                        .snapshot
+                        .status
+                        .provisioning
+                        .as_ref()
+                        .map(|provisioning| &provisioning.operation_id)
+                })
+                .unwrap();
+            assert_ne!(fresh, &abandoned_attempt);
+        } else {
+            assert!(matches!(model.plan(), Plan::Stable { .. }));
+        }
+    }
+}
+
+#[test]
+fn scale_up_failover_receipt_replays_immutable_election_lsn_after_later_progress() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(4, 5);
+    let intent = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only => {
+                break command
+                    .scale_up_evidence
+                    .as_deref()
+                    .expect("scale-up evidence")
+                    .intent()
+                    .clone();
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("4->5 failover setup stalled: {other:?}"),
+        }
+    };
+    for replica_id in 2..=5 {
+        let report = model.report_mut(replica_id);
+        report.current_progress = 12;
+        report.verified_replication_lsn = Some(12);
+    }
+    let failed_primary = intent.primary.replica_id.value();
+    model.report_mut(failed_primary).reported_fault = Some(FaultType::Permanent);
+    model.report_mut(failed_primary).write_status = AccessStatus::ReconfigurationPending;
+    let failure_plan = model.plan();
+    let Plan::Apply { changes } = failure_plan else {
+        panic!("post-admission primary failure must persist carried failover: {failure_plan:?}")
+    };
+    let status = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status }
+            if status
+                .transition
+                .as_ref()
+                .is_some_and(|transition| transition.scale_up_failover.is_some()) =>
+        {
+            Some(*status)
+        }
+        _ => None,
+    });
+    model.snapshot.status = status.expect("carried failover status");
+    for _ in 0..240 {
+        if model.snapshot.status.transition.is_none()
+            && model.snapshot.status.last_scale_up.is_some()
+        {
+            break;
+        }
+        match model.plan() {
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } | Plan::Stable { status, .. } => {
+                model.snapshot.status = status;
+            }
+            Plan::Unsafe { reason, .. } => panic!("carried failover became unsafe: {reason:?}"),
+        }
+    }
+    assert_eq!(model.accepted_count(), 5);
+    assert!(model.snapshot.status.transition.is_none());
+
+    let mut receipt = model
+        .snapshot
+        .status
+        .last_scale_up
+        .clone()
+        .expect("failover receipt");
+    let accepted_primary_id = receipt.accepted_configuration.primary_id;
+    let election = receipt
+        .failover_evidence
+        .as_ref()
+        .and_then(|evidence| {
+            evidence
+                .current_read_quorum
+                .iter()
+                .find(|witness| witness.identity.replica_id == accepted_primary_id)
+        })
+        .expect("frozen elected-primary witness");
+    assert_eq!(election.verified_replication_lsn, 12);
+    receipt
+        .current_only_write_quorum
+        .iter_mut()
+        .find(|witness| witness.identity.replica_id == accepted_primary_id)
+        .expect("completion primary witness")
+        .verified_replication_lsn = 13;
+    model.snapshot.status.last_scale_up = Some(receipt.clone());
+
+    let returning = intent.primary.clone();
+    let previous_member = intent
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.identity == returning)
+        .unwrap()
+        .clone();
+    {
+        let report = model.report_mut(returning.replica_id.value());
+        report.healthy = true;
+        report.reported_fault = None;
+        report.role = previous_member.role;
+        report.epoch = intent.previous_configuration.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(intent.previous_configuration.clone());
+        report.scale_up_intent = None;
+        report.pending_operation_id = None;
+        report.pending_configuration = None;
+        report.retained_operation_id = None;
+        report.report_sequence += 1;
+    }
+    let accepted_primary = receipt
+        .accepted_configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap()
+        .identity
+        .clone();
+    {
+        let primary = model.report_mut(accepted_primary.replica_id.value());
+        primary.reported_fault = None;
+        primary.healthy = true;
+        primary.write_status = AccessStatus::Granted;
+    }
+    model.snapshot.routing.service_present = true;
+    model.snapshot.routing.unresolved_write_target = false;
+    model.snapshot.routing.write_target = Some(accepted_primary);
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(pc_cc),
+    } = model.plan()
+    else {
+        panic!(
+            "returning carried-failover member must receive PC/CC correction: {:?}",
+            model.plan()
+        )
+    };
+    assert!(!pc_cc.current_only);
+    assert_eq!(pc_cc.failover_safe_lsn, Some(12));
+    {
+        let pending = model.report_mut(returning.replica_id.value());
+        pending.pending_operation_id = Some(pc_cc.operation_id.clone());
+        pending.pending_configuration = Some(pc_cc.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(pc_cc.clone())
+        }
+    );
+    {
+        let installed = model.report_mut(returning.replica_id.value());
+        let accepted_member = receipt
+            .accepted_configuration
+            .members
+            .iter()
+            .find(|member| member.identity == returning)
+            .unwrap();
+        installed.role = accepted_member.role;
+        installed.epoch = receipt.accepted_configuration.epoch;
+        installed.previous_configuration = Some(intent.previous_configuration.clone());
+        installed.current_configuration = Some(receipt.accepted_configuration.clone());
+        installed.scale_up_intent = Some(Box::new(intent.clone()));
+        installed.current_progress = 13;
+        installed.verified_replication_lsn = Some(13);
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(pc_cc.clone())
+        },
+        "later installed progress must not mutate a frozen pending PC/CC payload"
+    );
+    {
+        let completed = model.report_mut(returning.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(pc_cc.operation_id);
+    }
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(current_only),
+    } = model.plan()
+    else {
+        panic!("completed PC/CC must advance to current-only correction")
+    };
+    assert!(current_only.current_only);
+    assert_eq!(current_only.failover_safe_lsn, Some(12));
+    {
+        let pending = model.report_mut(returning.replica_id.value());
+        pending.previous_configuration = None;
+        pending.pending_operation_id = Some(current_only.operation_id.clone());
+        pending.pending_configuration = Some(current_only.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(current_only.clone())
+        },
+        "later progress must preserve exact current-only bytes and ID"
+    );
+    let mut mutated = model.fork();
+    mutated
+        .report_mut(returning.replica_id.value())
+        .pending_configuration
+        .as_mut()
+        .unwrap()
+        .failover_safe_lsn = Some(13);
+    assert!(matches!(
+        mutated.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    assert!(!matches!(model.plan(), Plan::Stable { .. }));
+    {
+        let completed = model.report_mut(returning.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(current_only.operation_id);
+    }
+    assert!(matches!(model.plan(), Plan::Stable { .. }));
+}
+
+#[test]
+fn scale_up_failover_accepts_mixed_pc_cc_and_current_only_recovery_witnesses() {
+    use scale_up_model::Model;
+    for accepted in [2, 3] {
+        let mut model = Model::new(accepted, accepted + 1);
+        let mut boundaries = 0;
+        for _ in 0..120 {
+            match model.plan() {
+                Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(command),
+                } if command.current_only => {
+                    model.execute(ProtocolCommand::EnsureConfiguration(command));
+                    boundaries += 1;
+                    let mut failed = model.fork();
+                    let primary_id = failed
+                        .snapshot
+                        .status
+                        .transition
+                        .as_ref()
+                        .unwrap()
+                        .scale_up
+                        .as_deref()
+                        .unwrap()
+                        .primary
+                        .replica_id;
+                    failed.report_mut(primary_id.value()).reported_fault =
+                        Some(FaultType::Permanent);
+                    failed.report_mut(primary_id.value()).write_status =
+                        AccessStatus::ReconfigurationPending;
+                    let Plan::Apply { changes } = failed.plan() else {
+                        panic!(
+                            "accepted={accepted} boundary={boundaries} stalled: {:?}",
+                            failed.plan()
+                        );
+                    };
+                    let status = changes.into_iter().find_map(|change| match change {
+                        KubernetesChange::PersistStatus { status } => Some(*status),
+                        _ => None,
+                    });
+                    let transition = status
+                        .as_ref()
+                        .and_then(|status| status.transition.as_ref())
+                        .expect("carried failover transition");
+                    assert!(transition.scale_up_failover.is_some());
+                }
+                Plan::Execute { command } => model.execute(command),
+                Plan::Apply { changes } => {
+                    for change in changes {
+                        model.apply(change);
+                    }
+                }
+                Plan::Wait { status, .. } => model.apply_wait(status),
+                Plan::Stable { status, .. } => {
+                    model.snapshot.status = status;
+                    break;
+                }
+                Plan::Unsafe { reason, .. } => panic!("unexpected unsafe plan: {reason:?}"),
+            }
+            if model.accepted_count() == accepted + 1 {
+                break;
+            }
+        }
+        assert_eq!(boundaries, accepted + 1);
+    }
+}
+
+#[test]
+fn scale_up_primary_failover_precedes_unsettled_receipt_recovery() {
+    use scale_up_model::Model;
+    let mut model = Model::new(3, 4);
+    for _ in 0..120 {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only && command.local_replica_id == ReplicaId::new(4) => {
+                model.remove_candidate_report();
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("unexpected unsafe plan: {reason:?}"),
+        }
+        if model.accepted_count() == 4 {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 4);
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+    model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("primary failure must outrank receipt recovery");
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    model.snapshot.now_unix_seconds += 10;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("sufficient surviving read quorum must allocate failover");
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    assert!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.kind == TransitionKind::Failover)
+    );
+    let mut failover_command = None;
+    for _ in 0..4 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.transition_kind == TransitionKind::Failover => {
+                failover_command = Some(command);
+                break;
+            }
+            other => panic!("receipt recovery preempted failover: {other:?}"),
+        }
+    }
+    assert!(failover_command.is_some());
+    assert!(model.snapshot.status.last_scale_up.is_some());
+}
+
+#[test]
+fn scale_up_reports_explicit_quorum_loss_during_pc_cc() {
+    use scale_up_model::Model;
+    let mut model = Model::new(3, 4);
+    loop {
+        let pc_cc_complete = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                intent.current_configuration.members.iter().all(|member| {
+                    model
+                        .snapshot
+                        .observation_for_identity(&member.identity)
+                        .and_then(|observation| match &observation.agent {
+                            AgentObservation::Report(report) => Some(report),
+                            _ => None,
+                        })
+                        .is_some_and(|report| {
+                            report.previous_configuration.as_ref()
+                                == Some(&intent.previous_configuration)
+                                && report.current_configuration.as_ref()
+                                    == Some(&intent.current_configuration)
+                        })
+                })
+            });
+        if pc_cc_complete {
+            break;
+        }
+        model.step();
+    }
+    for replica_id in [2, 3] {
+        let report = model.report_mut(replica_id);
+        report.healthy = false;
+        report.reported_fault = Some(FaultType::Transient);
+    }
+    assert!(matches!(
+        model.plan(),
+        Plan::Wait {
+            reason: WaitReason::QuorumLoss,
+            status,
+            ..
+        } if status.conditions.iter().any(|condition| {
+            condition.reason == "ScaleUpDualQuorumUnavailable"
+                && condition.message.contains("phase=pc-cc")
+                && condition.message.contains("accepted=3")
+                && condition.message.contains("desired=4")
+        })
+    ));
+}
+
+#[test]
+fn scale_up_diagnostics_cover_every_externally_visible_phase() {
+    use scale_up_model::Model;
+
+    fn assert_phase(status: &AcceptedStatus, reason: &str, phase: &str) {
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.reason == reason)
+            .unwrap_or_else(|| panic!("missing {reason}: {:?}", status.conditions));
+        for field in ["accepted=", "desired=", "target=", "attempt=", "blocking="] {
+            assert!(condition.message.contains(field), "{reason}: {field}");
+        }
+        assert!(
+            condition.message.contains(&format!("phase={phase}")),
+            "{reason}: {}",
+            condition.message
+        );
+    }
+
+    let mut model = Model::new(2, 3);
+    while model.snapshot.status.provisioning.is_none() {
+        model.step();
+    }
+    assert_phase(
+        &model.snapshot.status,
+        "ScaleUpProvisioningAccepted",
+        "provisioning",
+    );
+
+    let ProtocolCommand::InitializeAgentStore(command) = (match model.plan() {
+        Plan::Execute { command } => command,
+        other => panic!("initialization phase: {other:?}"),
+    }) else {
+        panic!("initialization command")
+    };
+    model.execute(ProtocolCommand::InitializeAgentStore(command));
+    let primary = model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members[0]
+        .identity
+        .clone();
+    model.snapshot.observation_for_identity(&primary).unwrap();
+    model
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            primary.replica_id,
+            primary.instance_id.clone(),
+        ))
+        .unwrap()
+        .kubernetes
+        .as_mut()
+        .unwrap()
+        .peer_endpoint_ready = false;
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("copying diagnostic")
+    };
+    assert_phase(&status, "ScaleUpSourceUnavailable", "copying");
+    model
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            primary.replica_id,
+            primary.instance_id,
+        ))
+        .unwrap()
+        .kubernetes
+        .as_mut()
+        .unwrap()
+        .peer_endpoint_ready = true;
+
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("copying phase publication")
+    };
+    let copying = changes.iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(status.as_ref()),
+        _ => None,
+    });
+    assert_phase(copying.unwrap(), "ScaleUpCopying", "copying");
+    for change in changes {
+        model.apply(change);
+    }
+    let ProtocolCommand::EnsureReplicaBuild(command) = (match model.plan() {
+        Plan::Execute { command } => command,
+        other => panic!("build phase: {other:?}"),
+    }) else {
+        panic!("build command")
+    };
+    model.execute(ProtocolCommand::EnsureReplicaBuild(command));
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("boundary propagation diagnostic")
+    };
+    assert_phase(&status, "ScaleUpBoundaryPropagationPending", "catch-up");
+    model.apply_wait(status);
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("catch-up boundary diagnostic")
+    };
+    assert_phase(&status, "ScaleUpBoundaryPending", "catch-up");
+    model.apply_wait(status);
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("receiver boundary propagation diagnostic")
+    };
+    assert_phase(&status, "ScaleUpBoundaryPropagationPending", "catch-up");
+    model.apply_wait(status);
+
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("PC/CC persistence")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("admission-start fence persistence")
+    };
+    let admission = changes.iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(status.as_ref()),
+        _ => None,
+    });
+    assert_phase(admission.unwrap(), "ScaleUpAdmissionStarted", "pc-cc");
+    for change in changes {
+        model.apply(change);
+    }
+    let ProtocolCommand::EnsureConfiguration(command) = (match model.plan() {
+        Plan::Execute { command } => command,
+        other => panic!("PC/CC command: {other:?}"),
+    }) else {
+        panic!("configuration command")
+    };
+    let target = ReplicaIdentity {
+        replica_id: command.local_replica_id,
+        instance_id: command.expected_instance_id.clone(),
+        agent_generation: command.expected_agent_generation.clone(),
+    };
+    let AgentObservation::Report(report) = &mut model
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            target.replica_id,
+            target.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent
+    else {
+        panic!("PC/CC target report")
+    };
+    let pending_operation = command.operation_id.clone();
+    report.pending_operation_id = Some(pending_operation.clone());
+    report.pending_configuration = Some(command.clone());
+    report.report_sequence += 1;
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(replayed),
+    } = model.plan()
+    else {
+        panic!("PC/CC matching pending command must be replayed")
+    };
+    assert_eq!(replayed.operation_id, pending_operation);
+
+    let mut current_only = Model::new(2, 3);
+    loop {
+        match current_only.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only => {
+                current_only.execute(ProtocolCommand::EnsureConfiguration(command));
+                break;
+            }
+            Plan::Execute { command } => current_only.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    current_only.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => current_only.apply_wait(status),
+            other => panic!("current-only setup: {other:?}"),
+        }
+    }
+    let completed_id = current_only
+        .snapshot
+        .replicas
+        .values()
+        .filter_map(|observation| match &observation.agent {
+            AgentObservation::Report(report) if report.previous_configuration.is_none() => {
+                Some(report.identity.replica_id)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap();
+    for observation in current_only.snapshot.replicas.values_mut() {
+        if let AgentObservation::Report(report) = &mut observation.agent
+            && report.identity.replica_id != completed_id
+        {
+            report.pending_operation_id = Some(OperationId::new("held-current-only"));
+        }
+    }
+    let Plan::Wait { status, .. } = current_only.plan() else {
+        panic!("current-only diagnostic: {:?}", current_only.plan())
+    };
+    assert_phase(&status, "ScaleUpCurrentOnlyQuorumPending", "current-only");
+
+    let mut stable = Model::new(1, 2);
+    stable.run(80);
+    let Plan::Stable { status, .. } = stable.plan() else {
+        panic!("stable phase")
+    };
+    assert_phase(&status, "ScaleUpStable", "stable");
+}
+
+#[test]
+fn scale_up_replays_exact_pending_current_only_before_and_after_authority_install() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(2, 3);
+    let current_only = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only => break command,
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("current-only setup: {other:?}"),
+        }
+    };
+    let target = current_only.local_replica_id.value();
+    model.report_mut(target).pending_operation_id = Some(current_only.operation_id.clone());
+    model.report_mut(target).pending_configuration = Some(current_only.clone());
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(replayed_before_install),
+    } = model.plan()
+    else {
+        panic!(
+            "exact pending current-only command before authority installation must be replayed: {:?}",
+            model.plan()
+        )
+    };
+    assert_eq!(replayed_before_install, current_only);
+
+    let mut unrelated = model.fork();
+    unrelated.report_mut(target).pending_operation_id =
+        Some(OperationId::new("unrelated-current-only"));
+    unrelated.report_mut(target).pending_configuration = None;
+    assert!(matches!(
+        unrelated.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpCommandPending")
+    ));
+
+    model.execute(ProtocolCommand::EnsureConfiguration(current_only.clone()));
+    model.report_mut(target).pending_operation_id = Some(current_only.operation_id.clone());
+    model.report_mut(target).pending_configuration = Some(current_only.clone());
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(replayed_after_install),
+    } = model.plan()
+    else {
+        panic!(
+            "exact pending current-only command after authority installation must be replayed: {:?}",
+            model.plan()
+        )
+    };
+    assert_eq!(replayed_after_install, current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(current_only));
+    model.run(100);
+    assert_eq!(model.accepted_count(), 3);
+    assert!(model.snapshot.status.last_scale_up.is_some());
+}
+
+#[test]
+fn scale_up_fresh_admission_yields_to_write_and_routing_restoration() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    let configuration = model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    model.snapshot.status.quorum_loss = Some(QuorumLossObservation {
+        configuration_id: configuration.configuration_id.clone(),
+    });
+    model.report_mut(1).write_status = AccessStatus::NoWriteQuorum;
+    assert!(matches!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command)
+        } if command.primary_write_status == AccessStatus::Granted
+            && command.scale_up_evidence.is_none()
+    ));
+    model.report_mut(1).write_status = AccessStatus::Granted;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("quorum-loss marker must clear before scale-up")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    model.snapshot.routing.write_target = None;
+    assert!(matches!(
+        model.plan(),
+        Plan::Apply { changes }
+            if matches!(
+                changes.as_slice(),
+                [
+                    KubernetesChange::PublishWriteRouting { .. },
+                    KubernetesChange::PersistStatus { .. }
+                ]
+            )
+    ));
+    assert!(model.snapshot.status.provisioning.is_none());
+}
+
+#[test]
+fn scale_up_waits_for_one_sided_boundary_propagation_without_unsafe() {
+    use scale_up_model::Model;
+    let mut model = Model::new(1, 2);
+    loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } => {
+                model.execute(ProtocolCommand::EnsureReplicaBuild(command));
+                break;
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            other => panic!("build setup: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        model.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition| {
+                condition.reason == "ScaleUpBoundaryPropagationPending"
+                    && condition.message.contains("phase=catch-up")
+            })
+    ));
+}
+
+#[test]
+fn scale_up_transition_without_provisioning_provenance_is_rejected_without_panic() {
+    use scale_up_model::Model;
+    let mut model = Model::new(1, 2);
+    while model.snapshot.status.transition.is_none() {
+        model.step();
+    }
+
+    fn scale_up_frozen_cleanup_failover_delay_keeps_full_context() {
+        use scale_up_model::Model;
+        let mut model = Model::new(3, 4);
+        while model.snapshot.status.provisioning.is_none() {
+            model.step();
+        }
+        model.snapshot.desired.replicas = 3;
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("freeze cleanup")
+        };
+        for change in changes {
+            model.apply(change);
+        }
+        model.snapshot.secondary_scale_down_resources.clear();
+        for replica_id in [1, 3] {
+            model.report_mut(replica_id).healthy = false;
+            model.report_mut(replica_id).reported_fault = Some(FaultType::Permanent);
+            model.report_mut(replica_id).write_status = AccessStatus::ReconfigurationPending;
+        }
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("persist primary failure")
+        };
+        for change in changes {
+            model.apply(change);
+        }
+        let Plan::Wait { status, .. } = model.plan() else {
+            panic!("failover delay")
+        };
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.reason == "FailoverDelay")
+            .unwrap();
+        for field in [
+            "accepted=3",
+            "desired=3",
+            "target=4@",
+            "attempt=scale-up-provisioning-",
+            "phase=failover-recovery",
+            "blocking=",
+        ] {
+            assert!(
+                condition.message.contains(field),
+                "{field}: {}",
+                condition.message
+            );
+        }
+    }
+    scale_up_frozen_cleanup_failover_delay_keeps_full_context();
+    model.snapshot.status.provisioning = None;
+    assert!(kuberic_protocol::validation::validate_snapshot(&model.snapshot).is_err());
+    assert!(matches!(
+        evaluate(&model.snapshot, &scale_up_model::config()),
+        Plan::Unsafe {
+            reason: UnsafeReason::InvalidAcceptedAuthority(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn scale_up_admission_fence_prevents_cleanup_after_candidate_pc_cc_disappears() {
+    use scale_up_model::Model;
+    let mut model = Model::new(1, 2);
+    loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if !command.current_only && command.local_replica_id == ReplicaId::new(2) => {
+                model.execute(ProtocolCommand::EnsureConfiguration(command));
+                break;
+            }
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("admission-fence setup: {other:?}"),
+        }
+    }
+    let intent = model
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.scale_up.as_deref())
+        .unwrap()
+        .clone();
+    assert_eq!(
+        model.snapshot.status.scale_up_admission_started.as_ref(),
+        Some(&intent.operation_id)
+    );
+    model.remove_candidate_report();
+    model.snapshot.desired.replicas = 1;
+    assert!(matches!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command)
+        } if command.local_replica_id == intent.primary.replica_id
+            && !command.current_only
+    ));
+    assert!(model.snapshot.status.scale_up_cleanup.is_none());
+    assert!(model.snapshot.status.transition.is_some());
+}
+
+#[test]
+fn scale_up_diagnostics_republish_exact_desired_count_after_churn() {
+    use scale_up_model::Model;
+    let mut copying = Model::new(1, 2);
+    loop {
+        match copying.plan() {
+            Plan::Apply { changes }
+                if changes.iter().any(|change| {
+                    matches!(
+                        change,
+                        KubernetesChange::PersistStatus { status }
+                            if status.conditions.iter().any(|condition|
+                                condition.reason == "ScaleUpCopying")
+                    )
+                }) =>
+            {
+                for change in changes {
+                    copying.apply(change);
+                }
+                break;
+            }
+            Plan::Apply { changes } => {
+                for change in changes {
+                    copying.apply(change);
+                }
+            }
+            Plan::Execute { command } => copying.execute(command),
+            Plan::Wait { status, .. } => copying.apply_wait(status),
+            other => panic!("copy diagnostic setup: {other:?}"),
+        }
+    }
+    copying.snapshot.desired.replicas = 3;
+    copying.snapshot.desired.generation += 1;
+    let Plan::Apply { changes } = copying.plan() else {
+        panic!("copy diagnostics must republish desired churn")
+    };
+    assert!(changes.iter().any(|change| matches!(
+        change,
+        KubernetesChange::PersistStatus { status }
+            if status.conditions.iter().any(|condition| {
+                condition.reason == "ScaleUpCopying"
+                    && condition.message.contains("desired=3")
+            })
+    )));
+
+    let mut current_only = Model::new(2, 3);
+    loop {
+        match current_only.plan() {
+            Plan::Apply { changes }
+                if changes.iter().any(|change| {
+                    matches!(
+                        change,
+                        KubernetesChange::PersistStatus { status }
+                            if status.conditions.iter().any(|condition|
+                                condition.reason == "ScaleUpCurrentOnlyInstalling")
+                    )
+                }) =>
+            {
+                for change in changes {
+                    current_only.apply(change);
+                }
+                break;
+            }
+            Plan::Apply { changes } => {
+                for change in changes {
+                    current_only.apply(change);
+                }
+            }
+            Plan::Execute { command } => current_only.execute(command),
+            Plan::Wait { status, .. } => current_only.apply_wait(status),
+            other => panic!("current-only diagnostic setup: {other:?}"),
+        }
+    }
+    current_only.snapshot.desired.replicas = 4;
+    current_only.snapshot.desired.generation += 1;
+    let Plan::Apply { changes } = current_only.plan() else {
+        panic!("current-only diagnostics must republish desired churn")
+    };
+    assert!(changes.iter().any(|change| matches!(
+        change,
+        KubernetesChange::PersistStatus { status }
+            if status.conditions.iter().any(|condition| {
+                condition.reason == "ScaleUpCurrentOnlyInstalling"
+                    && condition.message.contains("desired=4")
+            })
+    )));
+}
+
+#[test]
+fn scale_up_receipt_repairs_member_that_missed_pc_cc_before_next_addition() {
+    use scale_up_model::Model;
+    let mut model = Model::new(3, 5);
+    while model.snapshot.status.scale_up_admission_started.is_none() {
+        model.step();
+    }
+
+    fn scale_up_admission_fence_recovers_primary_loss_at_every_pc_cc_dispatch_cut() {
+        use scale_up_model::Model;
+        let mut model = Model::new(2, 3);
+        while model.snapshot.status.scale_up_admission_started.is_none() {
+            model.step();
+        }
+
+        fn scale_up_transient_pre_admission_primary_failure_clears_before_fencing() {
+            use scale_up_model::Model;
+            let mut model = Model::new(2, 3);
+            while model.snapshot.status.transition.is_none() {
+                model.step();
+            }
+            assert!(model.snapshot.status.scale_up_admission_started.is_none());
+            model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+            model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+            let Plan::Apply { changes } = model.plan() else {
+                panic!("primary failure observation")
+            };
+            for change in changes {
+                if let KubernetesChange::PersistStatus { status } = &change {
+                    kuberic_protocol::validation::validate_status(status).unwrap();
+                }
+                model.apply(change);
+            }
+            assert!(model.snapshot.status.primary_failure.is_some());
+
+            model.report_mut(1).reported_fault = None;
+            model.report_mut(1).write_status = AccessStatus::Granted;
+            let Plan::Apply { changes } = model.plan() else {
+                panic!("primary recovery persistence")
+            };
+            for change in changes {
+                if let KubernetesChange::PersistStatus { status } = &change {
+                    kuberic_protocol::validation::validate_status(status).unwrap();
+                }
+                model.apply(change);
+            }
+            assert!(model.snapshot.status.primary_failure.is_none());
+
+            for _ in 0..4 {
+                let Plan::Apply { changes } = model.plan() else {
+                    panic!("service restoration/fence status")
+                };
+                let mut fenced = false;
+                for change in changes {
+                    if let KubernetesChange::PersistStatus { status } = &change {
+                        kuberic_protocol::validation::validate_status(status).unwrap();
+                        fenced |= status.scale_up_admission_started.is_some();
+                    }
+                    model.apply(change);
+                }
+                if fenced {
+                    break;
+                }
+            }
+            assert!(model.snapshot.status.primary_failure.is_none());
+            assert!(model.snapshot.status.scale_up_admission_started.is_some());
+        }
+
+        fn scale_up_frozen_cleanup_restores_service_before_waiting_for_observations() {
+            use scale_up_model::Model;
+            let mut model = Model::new(3, 4);
+            while model.snapshot.status.provisioning.is_none() {
+                model.step();
+            }
+            model.snapshot.desired.replicas = 3;
+            let Plan::Apply { changes } = model.plan() else {
+                panic!("freeze cancellation cleanup")
+            };
+            for change in changes {
+                model.apply(change);
+            }
+            assert!(model.snapshot.status.scale_up_cleanup.is_some());
+            let exact = model.snapshot.secondary_scale_down_resources.clone();
+            model.snapshot.secondary_scale_down_resources.clear();
+            for replica_id in [2, 3] {
+                model.report_mut(replica_id).healthy = false;
+                model.report_mut(replica_id).reported_fault = Some(FaultType::Transient);
+            }
+            let Plan::Wait { status, .. } = model.plan() else {
+                panic!("cleanup quorum diagnostics")
+            };
+            let condition = status
+                .conditions
+                .iter()
+                .find(|condition| condition.reason == "ScaleUpFailoverWriteQuorumPending")
+                .unwrap();
+            for field in [
+                "accepted=3",
+                "desired=3",
+                "target=4@",
+                "attempt=",
+                "phase=cleanup",
+                "blocking=",
+            ] {
+                assert!(
+                    condition.message.contains(field),
+                    "{field}: {}",
+                    condition.message
+                );
+            }
+            for replica_id in [2, 3] {
+                model.report_mut(replica_id).healthy = true;
+                model.report_mut(replica_id).reported_fault = None;
+            }
+            model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+            model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+
+            for _ in 0..100 {
+                match model.plan() {
+                    Plan::Apply { changes } => {
+                        for change in changes {
+                            model.apply(change);
+                        }
+                    }
+                    Plan::Execute { command } => model.execute(command),
+                    Plan::Wait {
+                        reason: WaitReason::FailoverDelay,
+                        status,
+                        ..
+                    } => {
+                        model.apply_wait(status);
+                        model.snapshot.now_unix_seconds += 10;
+                    }
+                    Plan::Wait { status, .. } => model.apply_wait(status),
+                    Plan::Stable { status, .. } => model.snapshot.status = status,
+                    Plan::Unsafe { reason, .. } => {
+                        panic!("frozen cleanup failover unsafe: {reason:?}")
+                    }
+                }
+                let accepted = &model
+                    .snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration;
+                if model.snapshot.status.transition.is_none()
+                    && accepted.primary_id != ReplicaId::new(1)
+                    && model
+                        .snapshot
+                        .routing
+                        .write_target
+                        .as_ref()
+                        .map(|identity| identity.replica_id)
+                        == Some(accepted.primary_id)
+                {
+                    break;
+                }
+            }
+            let accepted = &model
+                .snapshot
+                .status
+                .topology
+                .as_ref()
+                .unwrap()
+                .configuration;
+            assert_ne!(accepted.primary_id, ReplicaId::new(1));
+            assert_eq!(
+                model
+                    .snapshot
+                    .routing
+                    .write_target
+                    .as_ref()
+                    .map(|identity| identity.replica_id),
+                Some(accepted.primary_id)
+            );
+            assert!(matches!(
+                model.plan(),
+                Plan::Wait { status, .. }
+                    if status.conditions.iter().any(|condition|
+                        condition.reason == "ScaleUpCleanupObservationPending")
+            ));
+            model.snapshot.secondary_scale_down_resources = exact;
+            for _ in 0..8 {
+                match model.plan() {
+                    Plan::Apply { changes } => {
+                        for change in changes {
+                            model.apply(change);
+                        }
+                    }
+                    Plan::Wait { status, .. } => model.apply_wait(status),
+                    other => panic!("frozen cleanup convergence: {other:?}"),
+                }
+                if model.snapshot.status.scale_up_cleanup.is_none() {
+                    break;
+                }
+            }
+            assert!(model.snapshot.status.scale_up_cleanup.is_none());
+        }
+        scale_up_transient_pre_admission_primary_failure_clears_before_fencing();
+        scale_up_frozen_cleanup_restores_service_before_waiting_for_observations();
+        let mut cuts = vec![model.fork()];
+        while cuts.len() < 3 {
+            match model.plan() {
+                Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(command),
+                } if !command.current_only && command.local_replica_id != ReplicaId::new(1) => {
+                    model.execute(ProtocolCommand::EnsureConfiguration(command));
+                    cuts.push(model.fork());
+                }
+                Plan::Apply { changes } => {
+                    for change in changes {
+                        model.apply(change);
+                    }
+                }
+                Plan::Execute { command } => model.execute(command),
+                Plan::Wait { status, .. } => model.apply_wait(status),
+                other => panic!("PC/CC cut setup: {other:?}"),
+            }
+        }
+
+        for (index, mut cut) in cuts.into_iter().enumerate() {
+            cut.report_mut(1).reported_fault = Some(FaultType::Permanent);
+            cut.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+            for _ in 0..30 {
+                match cut.plan() {
+                    Plan::Apply { changes } => {
+                        for change in changes {
+                            cut.apply(change);
+                        }
+                    }
+                    Plan::Execute { command } => cut.execute(command),
+                    Plan::Wait { status, .. } => cut.apply_wait(status),
+                    Plan::Stable { status, .. } => cut.snapshot.status = status,
+                    Plan::Unsafe { reason, .. } => {
+                        panic!("cut {index} became unsafe: {reason:?}")
+                    }
+                }
+                if cut
+                    .snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.scale_up_failover.is_some())
+                {
+                    break;
+                }
+            }
+            assert!(
+                cut.snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.scale_up_failover.is_some())
+            );
+            assert!(cut.snapshot.status.scale_up_cleanup.is_none());
+        }
+    }
+    scale_up_admission_fence_recovers_primary_loss_at_every_pc_cc_dispatch_cut();
+    let key = model
+        .snapshot
+        .replicas
+        .iter()
+        .find_map(|(key, observation)| match &observation.agent {
+            AgentObservation::Report(report) if report.identity.replica_id == ReplicaId::new(2) => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let saved = model.snapshot.replicas.get(&key).unwrap().clone();
+    model.snapshot.replicas.get_mut(&key).unwrap().agent = AgentObservation::Absent;
+    for _ in 0..100 {
+        model.step();
+        if model.accepted_count() == 4 && model.snapshot.status.transition.is_none() {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 4);
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    model.snapshot.replicas.insert(key, saved);
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(pc_cc),
+    } = model.plan()
+    else {
+        panic!("returning retained member must receive receipt-backed PC/CC")
+    };
+    assert!(!pc_cc.current_only);
+    assert_eq!(pc_cc.local_replica_id, ReplicaId::new(2));
+    model.execute(ProtocolCommand::EnsureConfiguration(pc_cc));
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(current_only),
+    } = model.plan()
+    else {
+        panic!("returning retained member must receive receipt-backed current-only")
+    };
+    assert!(current_only.current_only);
+    assert_eq!(current_only.local_replica_id, ReplicaId::new(2));
+    model.execute(ProtocolCommand::EnsureConfiguration(current_only));
+
+    for _ in 0..20 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("receipt repair unsafe: {reason:?}"),
+        }
+        if model.snapshot.status.provisioning.is_some()
+            || model.snapshot.status.transition.is_some()
+        {
+            break;
+        }
+    }
+    assert!(
+        model.snapshot.status.provisioning.is_some() || model.snapshot.status.transition.is_some(),
+        "next sequential addition did not begin after receipt repair"
+    );
+}
+
+#[test]
+fn scale_up_primary_failover_completes_before_deferred_exact_cleanup() {
+    use scale_up_model::Model;
+    let mut model = Model::new(3, 4);
+    while model.snapshot.status.provisioning.is_none() {
+        model.step();
+    }
+    model.snapshot.desired.replicas = 3;
+    let exact = model.snapshot.secondary_scale_down_resources.clone();
+    model.snapshot.secondary_scale_down_resources.clear();
+    model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+    model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+
+    for _ in 0..100 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait {
+                reason: WaitReason::FailoverDelay,
+                status,
+                ..
+            } => {
+                model.snapshot.status = status;
+                model.snapshot.now_unix_seconds += 10;
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("deferred cleanup trace unsafe: {reason:?}"),
+        }
+        let accepted = &model
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration;
+        if model.snapshot.status.transition.is_none() && accepted.primary_id != ReplicaId::new(1) {
+            break;
+        }
+    }
+    let accepted = model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    assert_ne!(accepted.primary_id, ReplicaId::new(1), "{:?}", model.plan());
+    assert!(model.snapshot.status.provisioning.is_some());
+    assert!(model.snapshot.status.scale_up_cleanup.is_none());
+
+    for _ in 0..4 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => {
+                model.snapshot.status = status;
+                break;
+            }
+            Plan::Execute { command } => model.execute(command),
+            other => panic!("service restoration before cleanup: {other:?}"),
+        }
+    }
+    assert_eq!(
+        model
+            .snapshot
+            .routing
+            .write_target
+            .as_ref()
+            .map(|identity| identity.replica_id),
+        Some(accepted.primary_id)
+    );
+    assert!(matches!(
+        model.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpExactCleanupEvidencePending")
+    ));
+
+    model.snapshot.secondary_scale_down_resources = exact;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("exact cleanup must freeze after failover restoration")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    assert!(model.snapshot.status.scale_up_cleanup.is_some());
+    assert!(model.snapshot.status.provisioning.is_none());
+    for _ in 0..8 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("cleanup convergence: {other:?}"),
+        }
+        if model.snapshot.status.scale_up_cleanup.is_none() {
+            break;
+        }
+    }
+    assert!(model.snapshot.status.scale_up_cleanup.is_none());
+}
+
+#[test]
+fn scale_up_late_carried_failover_member_reaches_stable_convergence() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    loop {
+        let pc_cc_primary_installed = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                model
+                    .snapshot
+                    .observation_for_identity(&intent.primary)
+                    .and_then(|observation| match &observation.agent {
+                        AgentObservation::Report(report) => Some(report),
+                        _ => None,
+                    })
+                    .is_some_and(|report| report.previous_configuration.is_some())
+            });
+        if pc_cc_primary_installed {
+            break;
+        }
+        model.step();
+    }
+    model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+    model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+    for _ in 0..80 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("carried failover unsafe: {reason:?}"),
+        }
+        if model.accepted_count() == 3 && model.snapshot.status.transition.is_none() {
+            break;
+        }
+    }
+    let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+    let old_primary = receipt.intent.primary.clone();
+    let report = model.report_mut(old_primary.replica_id.value());
+    report.healthy = true;
+    report.reported_fault = None;
+    report.role = ReplicaRole::Primary;
+    report.read_status = AccessStatus::ReconfigurationPending;
+    report.write_status = AccessStatus::ReconfigurationPending;
+    report.epoch = receipt.intent.current_configuration.epoch;
+    report.previous_configuration = Some(receipt.intent.previous_configuration.clone());
+    report.current_configuration = Some(receipt.intent.current_configuration.clone());
+    report.current_progress = receipt.intent.catch_up_boundary_lsn;
+    report.verified_replication_lsn = Some(receipt.intent.catch_up_boundary_lsn);
+    report.committed_lsn = receipt.intent.catch_up_boundary_lsn;
+    report.pending_operation_id = None;
+    report.retained_operation_id = Some(receipt.intent.command_operation_id(
+        kuberic_protocol::types::ScaleUpStage::PreviousCurrent,
+        &old_primary,
+        &receipt.intent.current_configuration,
+    ));
+    report.scale_up_intent = Some(Box::new(receipt.intent.clone()));
+    report.report_sequence += 1;
+
+    let mut correction = None;
+    for _ in 0..4 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } => {
+                correction = Some(command);
+                break;
+            }
+            other => panic!(
+                "late carried member must receive exact failover PC/CC correction: {other:?}"
+            ),
+        }
+    }
+    let command = correction.expect("failover PC/CC correction");
+    assert!(!command.current_only);
+    assert_eq!(command.transition_kind, TransitionKind::Failover);
+    assert!(command.failover_safe_lsn.is_some());
+    {
+        let pending = model.report_mut(old_primary.replica_id.value());
+        pending.pending_operation_id = Some(command.operation_id.clone());
+        pending.pending_configuration = Some(command.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command.clone())
+        },
+        "carried failover PC/CC must replay byte-identically before installation"
+    );
+    {
+        let installed = model.report_mut(old_primary.replica_id.value());
+        installed.epoch = command.current_epoch;
+        installed.previous_configuration = command.previous_configuration.clone();
+        installed.current_configuration = Some(command.current_configuration.clone());
+        installed.role = command
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity == old_primary)
+            .unwrap()
+            .role;
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command.clone())
+        },
+        "installed carried failover PC/CC remains pending until local completion"
+    );
+    let mut mutated = model.fork();
+    let mutated_report = mutated.report_mut(old_primary.replica_id.value());
+    let mut mutated_command = command.clone();
+    mutated_command.failover_safe_lsn = mutated_command.failover_safe_lsn.map(|lsn| lsn + 1);
+    mutated_report.pending_configuration = Some(mutated_command);
+    assert!(matches!(
+        mutated.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    {
+        let completed = model.report_mut(old_primary.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(command.operation_id.clone());
+    }
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(current_only),
+    } = model.plan()
+    else {
+        panic!("late carried member must receive exact current-only correction")
+    };
+    assert!(current_only.current_only);
+    assert_eq!(current_only.transition_kind, TransitionKind::Failover);
+    assert_eq!(current_only.failover_safe_lsn, command.failover_safe_lsn);
+    {
+        let pending = model.report_mut(old_primary.replica_id.value());
+        pending.pending_operation_id = Some(current_only.operation_id.clone());
+        pending.pending_configuration = Some(current_only.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(current_only.clone())
+        }
+    );
+    {
+        let installed = model.report_mut(old_primary.replica_id.value());
+        installed.previous_configuration = None;
+        installed.current_configuration = Some(current_only.current_configuration.clone());
+        installed.epoch = current_only.current_epoch;
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(current_only.clone())
+        },
+        "installed carried current-only authority cannot settle a pending receipt"
+    );
+    assert!(!matches!(model.plan(), Plan::Stable { .. }));
+    {
+        let completed = model.report_mut(old_primary.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(current_only.operation_id);
+    }
+
+    for _ in 0..20 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => {
+                model.snapshot.status = status;
+                break;
+            }
+            Plan::Unsafe { reason, .. } => panic!("late convergence unsafe: {reason:?}"),
+        }
+    }
+    assert!(matches!(
+        model.plan(),
+        Plan::Stable { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpStable")
+    ));
+}
+
+#[test]
+fn scale_up_real_three_to_two_to_three_restores_fresh_ordinal() {
+    let mut reduced = scale_down_model::Model::new(&[1, 2, 3], 1, 2);
+    reduced.finish();
+    let removed = reduced.removed.first().cloned().expect("removed ordinal");
+    assert_eq!(removed.replica_id, ReplicaId::new(3));
+    let mut restored = scale_up_model::Model::from_snapshot(reduced.snapshot.clone(), vec![2]);
+    restored.snapshot.desired.replicas = 3;
+    restored.snapshot.desired.generation += 1;
+    restored.run(120);
+    let receipt = restored.snapshot.status.last_scale_up.as_ref().unwrap();
+    assert_eq!(receipt.intent.target.replica_id, ReplicaId::new(3));
+    assert_ne!(receipt.intent.target.instance_id, removed.instance_id);
+    assert_ne!(
+        receipt.intent.target.agent_generation,
+        removed.agent_generation
+    );
+}
+
+#[test]
+fn scale_up_copy_model_closes_concurrent_writes_across_source_and_candidate_restarts() {
+    use scale_up_model::Model;
+    let mut model = Model::new(1, 2);
+    let build_command = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } => break command,
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            other => panic!("copy setup: {other:?}"),
+        }
+    };
+    let target = build_command.target.clone();
+    model.restart(build_command.local_replica_id.value());
+    model.restart(target.replica_id.value());
+    assert!(matches!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureReplicaBuild(replayed)
+        } if replayed == build_command
+    ));
+    model.execute(ProtocolCommand::EnsureReplicaBuild(build_command.clone()));
+    let source = model
+        .report_mut(build_command.local_replica_id.value())
+        .clone();
+    let source_build = source
+        .builds
+        .iter()
+        .find(|build| build.build_id == build_command.operation_id)
+        .unwrap();
+    assert_eq!(source_build.replication_boundary_lsn, 10);
+    assert_eq!(source_build.catch_up_boundary_lsn, None);
+    assert!(!source_build.completed);
+    assert!(
+        model
+            .report_mut(target.replica_id.value())
+            .builds
+            .is_empty()
+    );
+
+    model.restart(build_command.local_replica_id.value());
+    model.restart(target.replica_id.value());
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureReplicaBuild(replayed),
+    } = model.plan()
+    else {
+        panic!("source-only durable build evidence must reissue the exact command")
+    };
+    assert_eq!(*replayed, *build_command);
+    model.execute(ProtocolCommand::EnsureReplicaBuild(replayed));
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("an active exact build must not be dispatched twice")
+    };
+    model.apply_wait(status);
+    let candidate = model.report_mut(target.replica_id.value()).clone();
+    let target_build = candidate
+        .builds
+        .iter()
+        .find(|build| build.build_id == build_command.operation_id)
+        .unwrap();
+    assert_eq!(target_build.catch_up_boundary_lsn, None);
+    assert!(!target_build.completed);
+
+    model.restart(target.replica_id.value());
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("enumeration must remain incomplete")
+    };
+    model.apply_wait(status);
+    let source = model
+        .report_mut(build_command.local_replica_id.value())
+        .clone();
+    assert_eq!(source.current_progress, 12);
+    assert_eq!(source.builds[0].catch_up_boundary_lsn, Some(12));
+    assert!(source.builds[0].completed);
+    let candidate = model.report_mut(target.replica_id.value()).clone();
+    assert_eq!(candidate.builds[0].catch_up_boundary_lsn, None);
+
+    model.restart(build_command.local_replica_id.value());
+    let frozen_snapshot_boundary = source.builds[0].replication_boundary_lsn;
+    let frozen_catch_up_boundary = source.builds[0].catch_up_boundary_lsn;
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureReplicaBuild(replayed),
+    } = model.plan()
+    else {
+        panic!("cancelled catch-up delivery must reissue the exact command")
+    };
+    assert_eq!(*replayed, *build_command);
+    model.execute(ProtocolCommand::EnsureReplicaBuild(replayed));
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("resumed exact build must remain single-dispatch")
+    };
+    model.apply_wait(status);
+    let source = model
+        .report_mut(build_command.local_replica_id.value())
+        .clone();
+    assert_eq!(
+        source.builds[0].replication_boundary_lsn,
+        frozen_snapshot_boundary
+    );
+    assert_eq!(
+        source.builds[0].catch_up_boundary_lsn,
+        frozen_catch_up_boundary
+    );
+    let candidate = model.report_mut(target.replica_id.value()).clone();
+    assert_eq!(candidate.current_progress, 12);
+    assert_eq!(candidate.builds[0].durable_lsn, 12);
+    assert_eq!(candidate.builds[0].catch_up_boundary_lsn, Some(12));
+    assert!(candidate.builds[0].completed);
+    let copied = model
+        .durable_receivers
+        .get(&target.replica_id.value())
+        .unwrap();
+    for lsn in 1..=12 {
+        assert_eq!(copied.get(&lsn), model.durable_source.get(&lsn));
+    }
+
+    let build_operation = OperationId::new(format!("{}:build-replica", build_command.operation_id));
+    model
+        .report_mut(build_command.local_replica_id.value())
+        .pending_operation_id = Some(build_operation);
+    assert!(matches!(
+        model.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpBuildSettlementPending")
+    ));
+    model
+        .report_mut(build_command.local_replica_id.value())
+        .pending_operation_id = None;
+
+    let before = model.plan();
+    assert_eq!(before, model.plan());
+    let Plan::Apply { changes } = before else {
+        panic!("durable completed build must freeze PC/CC after restart")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    model.run(80);
+    assert_eq!(model.accepted_count(), 2);
+}
+
+#[test]
+fn scale_up_partial_copy_with_ambiguous_source_operation_freezes_exact_cleanup() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    let build_command = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } => break command,
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            other => panic!("copy setup: {other:?}"),
+        }
+    };
+    let target = build_command.target.clone();
+    model.execute(ProtocolCommand::EnsureReplicaBuild(build_command.clone()));
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("active source build should wait")
+    };
+    model.apply_wait(status);
+    assert!(
+        !model
+            .report_mut(target.replica_id.value())
+            .builds
+            .is_empty(),
+        "receiver must retain partial durable evidence"
+    );
+    model
+        .report_mut(build_command.local_replica_id.value())
+        .pending_operation_id = Some(OperationId::new("unrelated-source-operation"));
+
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("ambiguous partial copy must freeze exact cleanup")
+    };
+    let cleanup = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => status.scale_up_cleanup.map(|c| *c),
+        _ => None,
+    });
+    let cleanup = cleanup.expect("exact authorized cleanup");
+    assert_eq!(cleanup.target, target);
+    assert_eq!(cleanup.provisioning.operation_id, {
+        let provisioning = model.snapshot.status.provisioning.as_ref().unwrap();
+        provisioning.operation_id.clone()
+    });
+}
+
+#[test]
+fn scale_up_permanent_candidate_failure_before_fence_freezes_cleanup() {
+    use scale_up_model::Model;
+    let mut model = Model::new(3, 4);
+    while model.snapshot.status.transition.is_none() {
+        model.step();
+    }
+    assert!(model.snapshot.status.scale_up_admission_started.is_none());
+    model.report_mut(4).healthy = false;
+    model.report_mut(4).reported_fault = Some(FaultType::Permanent);
+    let failed_target = model.report_mut(4).identity.clone();
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("permanent pre-admission candidate failure must freeze cleanup")
+    };
+    let status = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(*status),
+        _ => None,
+    });
+    let status = status.expect("cleanup status");
+    assert!(status.scale_up_cleanup.is_some());
+    assert!(status.scale_up_admission_started.is_none());
+    assert!(status.transition.is_none());
+    assert_eq!(
+        status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members
+            .len(),
+        3
+    );
+    model.snapshot.status = status;
+    model.run(120);
+    let replacement = model.snapshot.status.last_scale_up.as_ref().unwrap();
+    assert_eq!(
+        replacement.intent.target.replica_id,
+        failed_target.replica_id
+    );
+    assert_ne!(
+        replacement.intent.target.instance_id,
+        failed_target.instance_id
+    );
+}
+
+#[test]
+fn scale_up_exact_invalid_unadmitted_candidate_cleans_and_retries_fresh() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    let target = loop {
+        if let Some(provisioning) = model.snapshot.status.provisioning.as_ref() {
+            let target = provisioning.target_identity(&model.snapshot.resource_uid);
+            if model
+                .snapshot
+                .observation_for_identity(&target)
+                .is_some_and(|observation| {
+                    matches!(
+                        &observation.agent,
+                        AgentObservation::Report(report)
+                            if report.role == ReplicaRole::None && report.builds.is_empty()
+                    )
+                })
+            {
+                break target;
+            }
+        }
+        model.step();
+    };
+    let target_key = ReplicaObservationKey::new(target.replica_id, target.instance_id.clone());
+    model.snapshot.replicas.get_mut(&target_key).unwrap().agent = AgentObservation::Invalid {
+        message: "candidate storage is corrupt".into(),
+        uninitialized_report: None,
+    };
+
+    let mut accepted_invalid = model.fork();
+    let accepted = accepted_invalid
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members[0]
+        .identity
+        .clone();
+    accepted_invalid
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            accepted.replica_id,
+            accepted.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent = AgentObservation::Invalid {
+        message: "accepted storage is corrupt".into(),
+        uninitialized_report: None,
+    };
+    assert!(matches!(
+        accepted_invalid.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+
+    let mut unrelated_invalid = model.fork();
+    unrelated_invalid.snapshot.replicas.insert(
+        ReplicaObservationKey::new(target.replica_id, ReplicaInstanceId::new("unrelated-pod")),
+        ReplicaObservation {
+            kubernetes: None,
+            agent: AgentObservation::Invalid {
+                message: "unrelated invalid process".into(),
+                uninitialized_report: None,
+            },
+        },
+    );
+    assert!(matches!(
+        unrelated_invalid.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("exact invalid unadmitted candidate must freeze candidate-local cleanup")
+    };
+    let status = changes.iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(status.as_ref()),
+        _ => None,
+    });
+    assert!(status.is_some_and(|status| status.scale_up_cleanup.is_some()));
+    assert_eq!(
+        model
+            .snapshot
+            .routing
+            .write_target
+            .as_ref()
+            .map(|identity| identity.replica_id),
+        Some(ReplicaId::new(1))
+    );
+    for change in changes {
+        model.apply(change);
+    }
+    model.run(200);
+    assert_eq!(model.accepted_count(), 3);
+    let fresh = model
+        .snapshot
+        .status
+        .last_scale_up
+        .as_ref()
+        .unwrap()
+        .intent
+        .target
+        .clone();
+    assert_eq!(fresh.replica_id, target.replica_id);
+    assert_ne!(fresh.instance_id, target.instance_id);
+    assert!(matches!(model.plan(), Plan::Stable { .. }));
+}
+
+#[test]
+fn scale_up_invalid_candidate_exemption_ends_at_admission_boundaries() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(2, 3);
+    let (pre_fence, fenced, target) = loop {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                let admission = changes.iter().find_map(|change| match change {
+                    KubernetesChange::PersistStatus { status }
+                        if status.scale_up_admission_started.is_some() =>
+                    {
+                        Some(status.as_ref().clone())
+                    }
+                    _ => None,
+                });
+                if let Some(status) = admission {
+                    let pre_fence = model.fork();
+                    let target = status
+                        .transition
+                        .as_ref()
+                        .and_then(|transition| transition.scale_up.as_deref())
+                        .expect("active scale-up intent")
+                        .target
+                        .clone();
+                    model.snapshot.status = status;
+                    break (pre_fence, model.fork(), target);
+                }
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("admission-fence setup stalled: {other:?}"),
+        }
+    };
+
+    let invalidate = |model: &mut Model| {
+        let key = ReplicaObservationKey::new(target.replica_id, target.instance_id.clone());
+        model.snapshot.replicas.get_mut(&key).unwrap().agent = AgentObservation::Invalid {
+            message: "candidate storage is corrupt".into(),
+            uninitialized_report: None,
+        };
+    };
+
+    let mut cancelled = pre_fence;
+    cancelled.snapshot.desired.replicas = 2;
+    invalidate(&mut cancelled);
+    assert!(matches!(
+        cancelled.plan(),
+        Plan::Apply { changes }
+            if changes.iter().any(|change| matches!(
+                change,
+                KubernetesChange::PersistStatus { status }
+                    if status.scale_up_cleanup.is_some()
+                        && status.scale_up_admission_started.is_none()
+            ))
+    ));
+
+    let mut fenced_invalid = fenced.fork();
+    invalidate(&mut fenced_invalid);
+    let fenced_plan = fenced_invalid.plan();
+    assert!(
+        matches!(
+            &fenced_plan,
+            Plan::Unsafe {
+                safety_changes,
+                ..
+            } if safety_changes == &vec![SafetyChange::RemoveWriteRouting]
+        ),
+        "fenced invalid candidate was not globally unsafe: {fenced_plan:?}"
+    );
+
+    let mut installed = fenced;
+    let pc_cc = loop {
+        match installed.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if !command.current_only => break command,
+            Plan::Execute { command } => installed.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    installed.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => installed.apply_wait(status),
+            other => panic!("PC/CC boundary setup stalled: {other:?}"),
+        }
+    };
+    installed.execute(ProtocolCommand::EnsureConfiguration(pc_cc));
+    installed.snapshot.status.scale_up_admission_started = None;
+    invalidate(&mut installed);
+    assert!(matches!(
+        installed.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+
+    let mut accepted = Model::new(2, 3);
+    accepted.run(160);
+    let accepted_target = accepted
+        .snapshot
+        .status
+        .last_scale_up
+        .as_ref()
+        .unwrap()
+        .intent
+        .target
+        .clone();
+    accepted
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            accepted_target.replica_id,
+            accepted_target.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent = AgentObservation::Invalid {
+        message: "accepted candidate storage is corrupt".into(),
+        uninitialized_report: None,
+    };
+    assert!(matches!(
+        accepted.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+}
+
+fn assert_scale_up_receipt_allows_full_replacement(replica_id: i64) {
+    use kuberic_protocol::command::ScaleDownResource;
+    use kuberic_protocol::observation::{
+        ExactResourceObservation, SecondaryScaleDownResourceObservation,
+    };
+    use kuberic_protocol::types::{
+        CleanupResourceIdentity, ReplicaCleanupIdentity, derive_replica_endpoint_name,
+    };
+    use scale_up_model::Model as ScaleUpModel;
+
+    let mut scale_up = ScaleUpModel::new(2, 3);
+    scale_up.run(120);
+    assert_eq!(scale_up.accepted_history, vec![2, 3]);
+    assert!(matches!(scale_up.plan(), Plan::Stable { .. }));
+    assert!(scale_up.snapshot.status.provisioning.is_none());
+    assert!(scale_up.snapshot.status.transition.is_none());
+    assert!(scale_up.snapshot.status.scale_up_cleanup.is_none());
+    let receipt = scale_up
+        .snapshot
+        .status
+        .last_scale_up
+        .clone()
+        .expect("stable 2->3 receipt");
+    let old = scale_up
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == ReplicaId::new(replica_id))
+        .expect("accepted member")
+        .identity
+        .clone();
+
+    if !scale_up
+        .snapshot
+        .secondary_scale_down_resources
+        .iter()
+        .any(|resources| resources.target == old)
+    {
+        let kubernetes = scale_up
+            .snapshot
+            .observation_for_identity(&old)
+            .and_then(|observation| observation.kubernetes.as_ref())
+            .expect("accepted member Kubernetes provenance")
+            .clone();
+        scale_up.snapshot.secondary_scale_down_resources.push(
+            SecondaryScaleDownResourceObservation {
+                resource_uid: scale_up.snapshot.resource_uid.clone(),
+                target: old.clone(),
+                identity: ReplicaCleanupIdentity {
+                    pod: CleanupResourceIdentity::Present {
+                        name: kubernetes.pod_name,
+                        uid: kubernetes.pod_uid.unwrap().to_string(),
+                    },
+                    pvc: CleanupResourceIdentity::Present {
+                        name: kubernetes.pvc_name,
+                        uid: kubernetes.pvc_uid.unwrap().to_string(),
+                    },
+                    endpoint: CleanupResourceIdentity::Present {
+                        name: derive_replica_endpoint_name(&scale_up.snapshot.resource_uid, &old),
+                        uid: format!("accepted-endpoint-{}", old.replica_id),
+                    },
+                },
+                pod: ExactResourceObservation::NotFound,
+                pod_allocation_operation_id: None,
+                pod_matches_allocation_metadata: false,
+                pvc: ExactResourceObservation::NotFound,
+                pvc_allocation_operation_id: None,
+                endpoint: ExactResourceObservation::NotFound,
+            },
+        );
+    }
+    let exact = scale_up
+        .snapshot
+        .secondary_scale_down_resources
+        .iter_mut()
+        .find(|resources| resources.target == old)
+        .expect("exact old-member resource provenance");
+    exact.endpoint = ExactResourceObservation::FrozenUidPresent {
+        resource_version: "old-endpoint-rv".into(),
+    };
+    exact.pod = ExactResourceObservation::FrozenUidPresent {
+        resource_version: "old-pod-rv".into(),
+    };
+    exact.pvc = ExactResourceObservation::FrozenUidPresent {
+        resource_version: "old-pvc-rv".into(),
+    };
+    let exact = exact.clone();
+    let exact_uid = |identity: &CleanupResourceIdentity| match identity {
+        CleanupResourceIdentity::Present { uid, .. } => uid.clone(),
+        CleanupResourceIdentity::Absent { .. } => {
+            panic!("replacement cleanup must retain exact UID provenance")
+        }
+    };
+    let expected_deletes = vec![
+        (
+            ScaleDownResource::Endpoint,
+            exact_uid(&exact.identity.endpoint),
+        ),
+        (ScaleDownResource::Pod, exact_uid(&exact.identity.pod)),
+        (ScaleDownResource::Pvc, exact_uid(&exact.identity.pvc)),
+    ];
+
+    let failed_report = scale_up.report_mut(replica_id);
+    failed_report.reported_fault = Some(FaultType::Permanent);
+    failed_report.healthy = false;
+    failed_report.report_sequence += 1;
+    let mut replacement = scale_down_model::Model {
+        snapshot: scale_up.snapshot,
+        commands: Vec::new(),
+        removed: Vec::new(),
+        deletes: Vec::new(),
+        inflight: BTreeMap::new(),
+        applied_effects: BTreeMap::new(),
+    };
+
+    for _ in 0..30 {
+        assert!(
+            replacement.snapshot.status.scale_up_cleanup.is_none(),
+            "an admitted member must never enter pre-admission scale-up cleanup"
+        );
+        if replacement
+            .snapshot
+            .status
+            .pending_replacement_cleanup
+            .is_some()
+        {
+            break;
+        }
+        let plan = evaluate(&replacement.snapshot, &scale_up_model::config());
+        assert_eq!(
+            plan,
+            evaluate(&replacement.snapshot, &scale_up_model::config())
+        );
+        replacement.apply(plan);
+    }
+    let frozen = replacement
+        .snapshot
+        .status
+        .pending_replacement_cleanup
+        .clone()
+        .unwrap_or_else(|| {
+            panic!(
+                "evaluator-produced replacement cleanup; final plan: {:?}",
+                evaluate(&replacement.snapshot, &scale_up_model::config())
+            )
+        });
+    assert_eq!(frozen.target, old);
+    assert_eq!(frozen.resources, exact.identity);
+    assert_eq!(
+        replacement.snapshot.status.last_scale_up,
+        Some(receipt.clone())
+    );
+
+    replacement.controller_restart();
+    assert_eq!(
+        replacement.snapshot.status.pending_replacement_cleanup,
+        Some(frozen)
+    );
+    assert_eq!(
+        replacement.snapshot.status.last_scale_up,
+        Some(receipt.clone())
+    );
+
+    let failed_key = replacement
+        .snapshot
+        .replicas
+        .iter()
+        .find_map(|(key, observation)| match &observation.agent {
+            AgentObservation::Report(report) if report.identity == old => Some(key.clone()),
+            _ => None,
+        })
+        .expect("failed member report");
+    replacement
+        .snapshot
+        .replicas
+        .get_mut(&failed_key)
+        .unwrap()
+        .agent = AgentObservation::Absent;
+
+    let mut saw_scaffolding = false;
+    let mut saw_initialization = false;
+    let mut saw_build = false;
+    let mut saw_pc_cc = false;
+    let mut saw_current_only = false;
+    let mut saw_build_retirement = false;
+    let mut saw_stable = false;
+    let mut replacement_build_id = None;
+    for _ in 0..250 {
+        let plan = evaluate(&replacement.snapshot, &scale_up_model::config());
+        assert_eq!(
+            plan,
+            evaluate(&replacement.snapshot, &scale_up_model::config())
+        );
+        assert!(
+            !matches!(&plan, Plan::Wait { status, .. }
+                if status.conditions.iter().any(|condition|
+                    condition.reason == "ScaleUpCommittedDegraded")),
+            "persisted replacement cleanup must prevent a ScaleUpCommittedDegraded deadlock"
+        );
+        match &plan {
+            Plan::Apply { changes } => {
+                saw_scaffolding |= changes.iter().any(|change| {
+                    matches!(change, KubernetesChange::EnsureReplacementScaffolding {
+                        replica_id: target,
+                        replacing,
+                    } if *target == old.replica_id && replacing == &old)
+                });
+            }
+            Plan::Execute { command } => match command {
+                ProtocolCommand::InitializeAgentStore(command) => {
+                    saw_initialization |= command.local_replica_id == old.replica_id;
+                }
+                ProtocolCommand::EnsureReplicaBuild(command) => {
+                    saw_build |= command.target.replica_id == old.replica_id;
+                    replacement_build_id = Some(command.operation_id.clone());
+                }
+                ProtocolCommand::EnsureConfiguration(command)
+                    if command.transition_kind == TransitionKind::Replacement =>
+                {
+                    saw_pc_cc |= !command.current_only;
+                    saw_current_only |= command.current_only;
+                    saw_build_retirement |=
+                        command.current_only && !command.retire_build_ids.is_empty();
+                }
+                _ => {}
+            },
+            Plan::Stable { .. } => saw_stable = true,
+            Plan::Wait { .. } | Plan::Unsafe { .. } => {}
+        }
+        let stable = matches!(plan, Plan::Stable { .. });
+        replacement.apply(plan);
+        assert!(
+            replacement.snapshot.status.scale_up_cleanup.is_none(),
+            "an admitted member must never enter pre-admission scale-up cleanup"
+        );
+        if stable {
+            break;
+        }
+    }
+
+    assert!(saw_scaffolding, "replacement scaffolding decision");
+    assert!(saw_initialization, "replacement initialization decision");
+    assert!(saw_build, "replacement build decision");
+    assert!(saw_pc_cc, "replacement PC/CC configuration decisions");
+    assert!(saw_current_only, "replacement current-only decisions");
+    assert!(
+        saw_build_retirement,
+        "completed replacement build retirement"
+    );
+    assert!(saw_stable, "replacement must converge to Stable");
+    let replacement_build_id = replacement_build_id.expect("replacement build operation");
+    assert_eq!(replacement.deletes, expected_deletes);
+    assert!(
+        replacement
+            .snapshot
+            .status
+            .pending_replacement_cleanup
+            .is_none()
+    );
+    assert!(replacement.snapshot.status.last_replacement.is_none());
+    assert_eq!(
+        replacement.snapshot.status.last_scale_up,
+        Some(receipt.clone())
+    );
+
+    let accepted = &replacement
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration;
+    let fresh = accepted
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == old.replica_id)
+        .expect("fresh accepted incarnation");
+    assert_ne!(fresh.identity, old);
+    assert!(
+        accepted.members.iter().all(|member| member.identity != old),
+        "failed incarnation must be retired from accepted membership"
+    );
+    assert!(
+        !replacement
+            .snapshot
+            .replicas
+            .contains_key(&ReplicaObservationKey::new(
+                old.replica_id,
+                old.instance_id.clone()
+            )),
+        "exact old Pod cleanup must remove the failed process observation"
+    );
+    for member in &accepted.members {
+        let observation = replacement
+            .snapshot
+            .observation_for_identity(&member.identity)
+            .expect("accepted member observation");
+        let AgentObservation::Report(report) = &observation.agent else {
+            panic!("accepted member report")
+        };
+        assert!(report.healthy);
+        assert_eq!(report.role, member.role);
+        assert_eq!(report.previous_configuration, None);
+        assert_eq!(report.current_configuration.as_ref(), Some(accepted));
+        assert_eq!(report.read_status, AccessStatus::Granted);
+        assert!(
+            report
+                .builds
+                .iter()
+                .all(|build| build.build_id != replacement_build_id),
+            "replacement build must be retired from every accepted member"
+        );
+        if member.identity.replica_id == accepted.primary_id {
+            assert_eq!(report.write_status, AccessStatus::Granted);
+        } else {
+            assert_eq!(report.write_status, AccessStatus::NotPrimary);
+        }
+    }
+    assert_eq!(
+        replacement.snapshot.routing.write_target.as_ref(),
+        accepted
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == accepted.primary_id)
+            .map(|member| &member.identity)
+    );
+    assert!(matches!(
+        evaluate(&replacement.snapshot, &scale_up_model::config()),
+        Plan::Stable { .. }
+    ));
+}
+
+#[test]
+fn scale_up_newly_admitted_member_permanently_fails_after_stable_two_to_three_and_replacement_converges()
+ {
+    assert_scale_up_receipt_allows_full_replacement(3);
+}
+
+#[test]
+fn scale_up_retained_secondary_permanently_fails_after_stable_two_to_three_and_replacement_converges()
+ {
+    assert_scale_up_receipt_allows_full_replacement(2);
+}
+
+#[test]
+fn scale_up_historical_receipt_does_not_block_ready_after_replacement_and_failover() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(2, 3);
+    model.run(120);
+    let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+    let accepted = model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    let former_primary = accepted
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap()
+        .identity
+        .clone();
+    let new_primary = accepted
+        .members
+        .iter()
+        .find(|member| member.identity != former_primary)
+        .unwrap()
+        .identity
+        .clone();
+    let failover = ConfigurationDescriptor::new(
+        Epoch::new(
+            accepted.epoch.data_loss_number,
+            accepted.epoch.configuration_number + 1,
+        ),
+        new_primary.replica_id,
+        accepted
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity == new_primary {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        accepted.write_quorum,
+    );
+    let mut failed_former_primary = model.fork();
+    failed_former_primary.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: failover.clone(),
+    });
+    failed_former_primary.snapshot.routing.write_target = Some(new_primary.clone());
+    for member in &failover.members {
+        let key = ReplicaObservationKey::new(
+            member.identity.replica_id,
+            member.identity.instance_id.clone(),
+        );
+        if member.identity == former_primary {
+            failed_former_primary
+                .snapshot
+                .replicas
+                .get_mut(&key)
+                .unwrap()
+                .agent = AgentObservation::Absent;
+            continue;
+        }
+        let report = failed_former_primary.report_mut(member.identity.replica_id.value());
+        report.role = member.role;
+        report.epoch = failover.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(failover.clone());
+        report.read_status = AccessStatus::Granted;
+        report.write_status = if member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+        report.pending_operation_id = None;
+        report.pending_configuration = None;
+    }
+    let failover_plan = failed_former_primary.plan();
+    assert!(
+        !matches!(&failover_plan, Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpCommittedDegraded")),
+        "failed former primary blocked replacement after accepted failover: {failover_plan:?}"
+    );
+    let mut returning_former_primary = model.fork();
+    returning_former_primary.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: failover.clone(),
+    });
+    returning_former_primary.snapshot.routing.write_target = Some(new_primary.clone());
+    for member in &failover.members {
+        let report = returning_former_primary.report_mut(member.identity.replica_id.value());
+        if member.identity == former_primary {
+            report.role = ReplicaRole::ActiveSecondary;
+            report.write_status = AccessStatus::NotPrimary;
+            report.healthy = true;
+            report.reported_fault = None;
+            report.pending_operation_id = None;
+            report.pending_configuration = None;
+            continue;
+        }
+        report.role = member.role;
+        report.epoch = failover.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(failover.clone());
+        report.read_status = AccessStatus::Granted;
+        report.write_status = if member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+    }
+    let returning_plan = returning_former_primary.plan();
+    assert!(
+        matches!(
+            returning_plan,
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command)
+            } if command.local_replica_id == former_primary.replica_id
+                && command.current_configuration == failover
+        ),
+        "reachable stale former primary was not delegated to accepted-authority correction"
+    );
+
+    let replacement_identity = ReplicaIdentity {
+        replica_id: former_primary.replica_id,
+        instance_id: ReplicaInstanceId::new("post-failover-replacement-pod"),
+        agent_generation: AgentGeneration::new("post-failover-replacement-generation"),
+    };
+    let settled = ConfigurationDescriptor::new(
+        Epoch::new(
+            failover.epoch.data_loss_number,
+            failover.epoch.configuration_number + 1,
+        ),
+        new_primary.replica_id,
+        failover
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: if member.identity == former_primary {
+                    replacement_identity.clone()
+                } else {
+                    member.identity.clone()
+                },
+                role: if member.identity == new_primary {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        failover.write_quorum,
+    );
+    let old_key = ReplicaObservationKey::new(
+        former_primary.replica_id,
+        former_primary.instance_id.clone(),
+    );
+    let old_observation = model.snapshot.replicas.get_mut(&old_key).unwrap();
+    old_observation.kubernetes = None;
+    let AgentObservation::Report(old_report) = &mut old_observation.agent else {
+        panic!("former primary report")
+    };
+    old_report.role = ReplicaRole::ActiveSecondary;
+    old_report.write_status = AccessStatus::NotPrimary;
+    old_report.healthy = false;
+    old_report.reported_fault = Some(FaultType::Permanent);
+    old_report.epoch = failover.epoch;
+    old_report.previous_configuration = None;
+    old_report.current_configuration = Some(failover);
+    old_report.pending_operation_id = None;
+    old_report.pending_configuration = None;
+
+    for member in &settled.members {
+        if member.identity == replacement_identity {
+            model.snapshot.replicas.insert(
+                ReplicaObservationKey::new(
+                    replacement_identity.replica_id,
+                    replacement_identity.instance_id.clone(),
+                ),
+                ReplicaObservation {
+                    kubernetes: Some(KubernetesReplicaObservation {
+                        replica_id: replacement_identity.replica_id,
+                        pod_name: format!("kvstore2-{}", replacement_identity.replica_id),
+                        pod_uid: Some(PodUid::new(replacement_identity.instance_id.as_str())),
+                        pvc_name: format!("kvstore2-{}-data", replacement_identity.replica_id),
+                        pvc_uid: Some(PvcUid::new("post-failover-replacement-pvc")),
+                        image: Some(model.snapshot.desired.image.clone()),
+                        pod_ready: true,
+                        peer_endpoint_ready: true,
+                    }),
+                    agent: AgentObservation::Report(Box::new(AgentReport {
+                        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                        resource_uid: model.snapshot.resource_uid.clone(),
+                        identity: replacement_identity.clone(),
+                        process_session_id: ProcessSessionId::new(
+                            "post-failover-replacement-session",
+                        ),
+                        report_sequence: 1,
+                        role: member.role,
+                        read_status: AccessStatus::Granted,
+                        write_status: AccessStatus::NotPrimary,
+                        healthy: true,
+                        epoch: settled.epoch,
+                        current_configuration: Some(settled.clone()),
+                        current_progress: 12,
+                        verified_replication_lsn: Some(12),
+                        committed_lsn: 12,
+                        ..Default::default()
+                    })),
+                },
+            );
+            continue;
+        }
+        let report = model.report_mut(member.identity.replica_id.value());
+        report.role = member.role;
+        report.epoch = settled.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(settled.clone());
+        report.scale_up_intent = None;
+        report.pending_operation_id = None;
+        report.pending_configuration = None;
+        report.retained_operation_id = Some(OperationId::new(format!(
+            "settled-authority-{}",
+            member.identity.replica_id
+        )));
+        report.read_status = AccessStatus::Granted;
+        report.write_status = if member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+    }
+    model.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: settled.clone(),
+    });
+    model.snapshot.status.transition = None;
+    model.snapshot.status.primary_failure = None;
+    model.snapshot.status.pending_replacement_cleanup = None;
+    model.snapshot.status.last_replacement = None;
+    model.snapshot.status.last_scale_up = Some(receipt.clone());
+    model.snapshot.routing.write_target = Some(new_primary.clone());
+
+    let mut ordinary_failover = model.fork();
+    ordinary_failover
+        .snapshot
+        .replicas
+        .get_mut(&old_key)
+        .unwrap()
+        .agent = AgentObservation::Absent;
+    let failed_primary = settled
+        .members
+        .iter()
+        .find(|member| member.identity == new_primary)
+        .unwrap()
+        .identity
+        .clone();
+    let elected_primary = settled
+        .members
+        .iter()
+        .find(|member| member.identity != failed_primary)
+        .unwrap()
+        .identity
+        .clone();
+    let failover_configuration = ConfigurationDescriptor::new(
+        Epoch::new(
+            settled.epoch.data_loss_number,
+            settled.epoch.configuration_number + 1,
+        ),
+        elected_primary.replica_id,
+        settled
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity == elected_primary {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        settled.write_quorum,
+    );
+    let transition_id = derive_transition_id(
+        &ordinary_failover.snapshot.resource_uid,
+        TransitionKind::Failover,
+        &failover_configuration.configuration_id,
+    );
+    ordinary_failover.snapshot.status.primary_failure = Some(PrimaryFailureObservation {
+        primary: failed_primary.clone(),
+        started_at_unix_seconds: ordinary_failover.snapshot.now_unix_seconds - 10,
+    });
+    ordinary_failover.snapshot.status.transition = Some(TransitionIntent {
+        transition_id,
+        kind: TransitionKind::Failover,
+        spec_generation: ordinary_failover.snapshot.desired.generation,
+        effective_policy: ordinary_failover
+            .snapshot
+            .status
+            .effective_policy
+            .clone()
+            .unwrap(),
+        previous_configuration_id: Some(settled.configuration_id.clone()),
+        current_configuration: failover_configuration.clone(),
+        election_lsn: Some(12),
+        build_id: None,
+        repair: None,
+        switchover: None,
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
+    });
+    for member in &settled.members {
+        let report = ordinary_failover.report_mut(member.identity.replica_id.value());
+        report.current_progress = 10;
+        report.verified_replication_lsn = Some(10);
+        report.committed_lsn = 10;
+        report.current_configuration_quorum_progress = 10;
+    }
+    let failed_report = ordinary_failover.report_mut(failed_primary.replica_id.value());
+    failed_report.healthy = false;
+    failed_report.reported_fault = Some(FaultType::Permanent);
+    failed_report.write_status = AccessStatus::ReconfigurationPending;
+    failed_report.report_sequence += 1;
+
+    fn apply_composed_plan(model: &mut scale_up_model::Model, plan: Plan) {
+        match plan {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("composed failover became unsafe: {reason:?}"),
+        }
+    }
+
+    let mut composed = scale_up_model::Model::from_snapshot(ordinary_failover.snapshot, vec![2, 3]);
+    let mut installed_pc_cc = false;
+    for _ in 0..20 {
+        let plan = evaluate(&composed.snapshot, &scale_up_model::config());
+        assert!(
+            !matches!(&plan, Plan::Wait { status, .. }
+                if status.conditions.iter().any(|condition|
+                    condition.reason == "ScaleUpCommittedDegraded")),
+            "superseded receipt identity blocked ordinary failover before PC/CC: {plan:?}"
+        );
+        installed_pc_cc |= matches!(
+            &plan,
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.transition_kind == TransitionKind::Failover && !command.current_only
+        );
+        apply_composed_plan(&mut composed, plan);
+        if installed_pc_cc {
+            break;
+        }
+    }
+    assert!(installed_pc_cc, "ordinary failover PC/CC was not installed");
+    let after_pc_cc = evaluate(&composed.snapshot, &scale_up_model::config());
+    assert!(
+        !matches!(&after_pc_cc, Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpCommittedDegraded")),
+        "superseded historical incarnation blocked failover after retained-member PC/CC: \
+         {after_pc_cc:?}"
+    );
+    apply_composed_plan(&mut composed, after_pc_cc);
+    let mut converged = false;
+    for _ in 0..80 {
+        let plan = evaluate(&composed.snapshot, &scale_up_model::config());
+        assert!(
+            !matches!(&plan, Plan::Wait { status, .. }
+                if status.conditions.iter().any(|condition|
+                    condition.reason == "ScaleUpCommittedDegraded")),
+            "historical receipt blocked composed failover convergence: {plan:?}"
+        );
+        apply_composed_plan(&mut composed, plan);
+        converged = composed.snapshot.status.transition.is_none()
+            && composed.snapshot.status.last_scale_up.as_ref() == Some(&receipt)
+            && composed
+                .snapshot
+                .status
+                .topology
+                .as_ref()
+                .is_some_and(|topology| topology.configuration == failover_configuration);
+        if converged {
+            break;
+        }
+    }
+    assert!(
+        converged,
+        "scale-up -> replacement -> ordinary failover transition did not converge with receipt \
+         retained: {:?}",
+        evaluate(&composed.snapshot, &scale_up_model::config())
+    );
+
+    let plan = model.plan();
+    assert!(
+        matches!(&plan, Plan::Stable { status, .. }
+            if status.last_scale_up.as_ref() == Some(&receipt)),
+        "superseded historical consumer blocked Ready or erased receipt: {plan:?}"
+    );
+}
+
+#[test]
+fn scale_up_provisioning_and_prefence_failover_delays_keep_context() {
+    use scale_up_model::Model;
+    for transition_persisted in [false, true] {
+        let mut model = Model::new(3, 4);
+        if transition_persisted {
+            while model.snapshot.status.transition.is_none() {
+                model.step();
+            }
+            assert!(model.snapshot.status.scale_up_admission_started.is_none());
+        } else {
+            while model.snapshot.status.provisioning.is_none() {
+                model.step();
+            }
+        }
+        for replica_id in [1, 3] {
+            model.report_mut(replica_id).healthy = false;
+            model.report_mut(replica_id).reported_fault = Some(FaultType::Permanent);
+            model.report_mut(replica_id).write_status = AccessStatus::ReconfigurationPending;
+        }
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("persist primary failure")
+        };
+        for change in changes {
+            model.apply(change);
+        }
+        let Plan::Wait { status, .. } = model.plan() else {
+            panic!("contextual failover delay")
+        };
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.reason == "FailoverDelay")
+            .unwrap();
+        for field in [
+            "accepted=3",
+            "desired=4",
+            "target=4@",
+            "attempt=",
+            "phase=failover-recovery",
+            "blocking=",
+        ] {
+            assert!(
+                condition.message.contains(field),
+                "transition={transition_persisted} {field}: {}",
+                condition.message
+            );
+        }
+    }
 }

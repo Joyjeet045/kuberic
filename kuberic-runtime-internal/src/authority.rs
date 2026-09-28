@@ -3,7 +3,7 @@ use bytes::Bytes;
 pub use kuberic_protocol::types::{BuildAuthority, BuildAuthorityKind};
 use kuberic_protocol::types::{
     ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, OperationId, ReplicaIdentity,
-    ReplicaRole, SwitchoverHandoff, TransitionKind,
+    ReplicaRole, ScaleUpConfigurationEvidence, SwitchoverHandoff, TransitionKind,
 };
 use kuberic_protocol::types::{
     ReplicaRetirementReport, SecondaryRemovalEvidence, SecondaryRemovalPreparation,
@@ -11,7 +11,8 @@ use kuberic_protocol::types::{
 };
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
 use kuberic_protocol::validation::{
-    validate_replica_retirement, validate_secondary_removal_evidence,
+    validate_replica_retirement, validate_scale_up, validate_scale_up_failover_evidence,
+    validate_scale_up_failover_transition, validate_secondary_removal_evidence,
     validate_secondary_removal_preparation, validate_secondary_scale_down_cleanup,
 };
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,15 @@ pub fn validate_build_envelope(authority: &BuildAuthority, envelope: &CopyItem) 
     {
         return Err(ContractError::AuthorityMismatch(
             "copy item does not match durable build authority".to_string(),
+        ));
+    }
+    if (envelope.final_item != envelope.catch_up_boundary_lsn.is_some())
+        || envelope
+            .catch_up_boundary_lsn
+            .is_some_and(|boundary| boundary < authority.replication_boundary_lsn)
+    {
+        return Err(ContractError::AuthorityMismatch(
+            "copy item has invalid post-enumeration catch-up authority".to_string(),
         ));
     }
     Ok(())
@@ -56,6 +66,8 @@ pub struct DurableBuildProgress {
     pub last_sequence: u64,
     pub durable_lsn: i64,
     pub completed: bool,
+    #[serde(default)]
+    pub catch_up_boundary_lsn: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +97,8 @@ pub struct AdmittedAuthority {
     pub switchover_handoff: Option<SwitchoverHandoff>,
     #[serde(default)]
     pub secondary_removal: Option<SecondaryRemovalEvidence>,
+    #[serde(default)]
+    pub scale_up: Option<Box<ScaleUpConfigurationEvidence>>,
 }
 
 impl AdmittedAuthority {
@@ -95,6 +109,7 @@ impl AdmittedAuthority {
             && self.previous_configuration.is_none()
             && self.transition_kind.is_none()
             && self.switchover_handoff == existing.switchover_handoff
+            && self.scale_up == existing.scale_up
             && match (&self.secondary_removal, &existing.secondary_removal) {
                 (Some(next), Some(old)) => {
                     next.preparation == old.preparation
@@ -136,6 +151,7 @@ impl AdmittedAuthority {
                         .as_ref()
                         .map(|_| TransitionKind::SecondaryScaleDown)
                 || self.switchover_handoff.is_some()
+                || self.scale_up.is_some()
                 || !intent
                     .current_configuration
                     .members
@@ -144,6 +160,72 @@ impl AdmittedAuthority {
             {
                 return Err(ContractError::AuthorityMismatch(
                     "reduction differs from exact prepared authority".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(evidence) = self.scale_up.as_deref() {
+            let intent = evidence.intent();
+            validate_scale_up(intent)
+                .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
+            if self.secondary_removal.is_some() || self.switchover_handoff.is_some() {
+                return Err(ContractError::AuthorityMismatch(
+                    "scale-up authority cannot carry removal or switchover evidence".into(),
+                ));
+            }
+            match evidence {
+                ScaleUpConfigurationEvidence::Admission { .. } => {
+                    if self.current_configuration != intent.current_configuration
+                        || self.previous_configuration.as_ref()
+                            != self
+                                .previous_configuration
+                                .as_ref()
+                                .map(|_| &intent.previous_configuration)
+                        || self.transition_kind
+                            != self
+                                .previous_configuration
+                                .as_ref()
+                                .map(|_| TransitionKind::ScaleUp)
+                    {
+                        return Err(ContractError::AuthorityMismatch(
+                            "admitted authority differs from exact scale-up intent".into(),
+                        ));
+                    }
+                }
+                ScaleUpConfigurationEvidence::Failover { evidence } => {
+                    validate_scale_up_failover_evidence(evidence)
+                        .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
+                    validate_scale_up_failover_transition(
+                        evidence,
+                        &self.current_configuration,
+                        &intent.current_policy,
+                    )
+                    .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
+                    if self.previous_configuration.as_ref()
+                        != self
+                            .previous_configuration
+                            .as_ref()
+                            .map(|_| &intent.previous_configuration)
+                        || self.transition_kind
+                            != self
+                                .previous_configuration
+                                .as_ref()
+                                .map(|_| TransitionKind::Failover)
+                    {
+                        return Err(ContractError::AuthorityMismatch(
+                            "admitted failover differs from carried scale-up intent".into(),
+                        ));
+                    }
+                }
+            }
+            if !self
+                .current_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == self.local_identity)
+            {
+                return Err(ContractError::AuthorityMismatch(
+                    "local identity is outside admitted scale-up authority".into(),
                 ));
             }
             return Ok(());
@@ -512,6 +594,160 @@ mod removal_fixture;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuberic_protocol::types::{
+        AccessStatus, ProcessSessionId, ScaleUpFailoverEvidence, ScaleUpStage, ScaleUpWitness,
+    };
+
+    fn identity(id: i64) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: kuberic_protocol::types::ReplicaId::new(id),
+            instance_id: kuberic_protocol::types::ReplicaInstanceId::new(format!("pod-{id}")),
+            agent_generation: kuberic_protocol::types::AgentGeneration::new(format!("gen-{id}")),
+        }
+    }
+
+    fn scale_up_authority() -> AdmittedAuthority {
+        let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+        let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+        let primary = identity(1);
+        let target = identity(2);
+        let previous = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            primary.replica_id,
+            vec![kuberic_protocol::types::ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            previous_policy.write_quorum,
+        );
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            primary.replica_id,
+            vec![
+                kuberic_protocol::types::ConfigurationMember {
+                    identity: primary.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                kuberic_protocol::types::ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            current_policy.write_quorum,
+        );
+        let mut intent = kuberic_protocol::types::ScaleUpIntent {
+            operation_id: OperationId::default(),
+            resource_uid: kuberic_protocol::types::ResourceUid::new("set"),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            current_configuration: current.clone(),
+            previous_policy,
+            current_policy,
+            primary: primary.clone(),
+            target,
+            build_id: OperationId::new("build"),
+            snapshot_boundary_lsn: 0,
+            catch_up_boundary_lsn: 2,
+        };
+        intent.operation_id = intent.expected_operation_id();
+        AdmittedAuthority {
+            local_identity: primary,
+            transition_kind: Some(TransitionKind::ScaleUp),
+            previous_configuration: Some(previous),
+            current_configuration: current,
+            switchover_handoff: None,
+            secondary_removal: None,
+            scale_up: Some(Box::new(ScaleUpConfigurationEvidence::Admission { intent })),
+        }
+    }
+
+    #[test]
+    fn scale_up_authority_preserves_dual_policy_and_current_only_completion() {
+        let authority = scale_up_authority();
+        authority.validate().unwrap();
+        let mut completed = authority.clone();
+        completed.previous_configuration = None;
+        completed.transition_kind = None;
+        completed.validate().unwrap();
+        assert!(completed.is_current_only_completion_of(&authority));
+
+        let mut wrong = authority;
+        wrong.current_configuration.members.pop();
+        assert!(wrong.validate().is_err());
+    }
+
+    #[test]
+    fn scale_up_failover_preserves_both_recovery_configurations() {
+        let authority = scale_up_authority();
+        let ScaleUpConfigurationEvidence::Admission { intent } =
+            *authority.scale_up.clone().unwrap()
+        else {
+            unreachable!()
+        };
+        let witness = |identity: ReplicaIdentity, sequence: u64| ScaleUpWitness {
+            resource_uid: intent.resource_uid.clone(),
+            role: intent
+                .current_configuration
+                .members
+                .iter()
+                .find(|member| member.identity == identity)
+                .unwrap()
+                .role,
+            retained_operation_id: Some(intent.command_operation_id(
+                ScaleUpStage::PreviousCurrent,
+                &identity,
+                &intent.current_configuration,
+            )),
+            identity,
+            process_session_id: ProcessSessionId::new(format!("session-{sequence}")),
+            report_sequence: sequence,
+            epoch: intent.current_configuration.epoch,
+            previous_configuration_id: Some(intent.previous_configuration.configuration_id.clone()),
+            current_configuration_id: intent.current_configuration.configuration_id.clone(),
+            verified_replication_lsn: intent.catch_up_boundary_lsn,
+            write_status: AccessStatus::ReconfigurationPending,
+            pending_operation_id: None,
+        };
+        let mut members = intent.current_configuration.members.clone();
+        for member in &mut members {
+            member.role = if member.identity == intent.target {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            };
+        }
+        let failover = ConfigurationDescriptor::new(
+            Epoch::new(0, 3),
+            intent.target.replica_id,
+            members,
+            intent.current_policy.write_quorum,
+        );
+        let evidence = ScaleUpFailoverEvidence {
+            provisional_configuration: failover.clone(),
+            previous_read_quorum: vec![witness(intent.primary.clone(), 1)],
+            current_read_quorum: vec![witness(intent.target.clone(), 2)],
+            final_election: None,
+            intent: intent.clone(),
+        };
+        let authority = AdmittedAuthority {
+            local_identity: intent.target.clone(),
+            transition_kind: Some(TransitionKind::Failover),
+            previous_configuration: Some(intent.previous_configuration.clone()),
+            current_configuration: failover,
+            switchover_handoff: None,
+            secondary_removal: None,
+            scale_up: Some(Box::new(ScaleUpConfigurationEvidence::Failover {
+                evidence,
+            })),
+        };
+        authority.validate().unwrap();
+        let mut completed = authority.clone();
+        completed.previous_configuration = None;
+        completed.transition_kind = None;
+        completed.validate().unwrap();
+        assert!(completed.is_current_only_completion_of(&authority));
+    }
 
     #[test]
     fn reduction_requires_independent_policies_and_frozen_old_read_evidence() {
@@ -526,6 +762,7 @@ mod tests {
                 current_configuration: intent.current_configuration.clone(),
                 switchover_handoff: None,
                 secondary_removal: Some(evidence),
+                scale_up: None,
             };
             authority.validate().unwrap();
             let good = authority.clone();

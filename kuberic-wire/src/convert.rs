@@ -12,11 +12,13 @@ use kuberic_protocol::observation::{
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
     ConfigurationId, ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId,
-    PodUid, ProcessSessionId, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff, SwitchoverRequestId,
-    TransitionKind, derive_agent_generation,
+    PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningKind, ProvisioningPurpose, PvcUid,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff,
+    SwitchoverRequestId, TransitionKind, derive_agent_generation,
 };
-use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
+use kuberic_protocol::validation::{
+    validate_configuration, validate_scale_up_provisioning, validate_transition_relationship,
+};
 use thiserror::Error;
 
 use crate::proto;
@@ -68,6 +70,7 @@ pub struct CopyEnvelope {
     pub lsn: i64,
     pub committed_lsn: i64,
     pub replication_boundary_lsn: i64,
+    pub catch_up_boundary_lsn: Option<i64>,
     pub final_item: bool,
     pub snapshot_chunk: bool,
     pub data: Vec<u8>,
@@ -83,6 +86,7 @@ pub struct CopyAcknowledgement {
     pub sequence: u64,
     pub durable_lsn: i64,
     pub replication_boundary_lsn: i64,
+    pub catch_up_boundary_lsn: Option<i64>,
     pub final_item: bool,
     pub snapshot_chunk: bool,
 }
@@ -93,6 +97,59 @@ pub struct ExecuteEnvelope {
     pub target: ReplicaIdentity,
     pub expected_process_session_id: ProcessSessionId,
     pub command: ProtocolCommand,
+}
+
+pub fn configuration_command_to_proto(
+    command: EnsureConfiguration,
+) -> proto::EnsureConfigurationCommand {
+    let transition_kind = match command.transition_kind {
+        TransitionKind::Bootstrap => proto::TransitionKind::Bootstrap,
+        TransitionKind::Replacement => proto::TransitionKind::Replacement,
+        TransitionKind::Failover => proto::TransitionKind::Failover,
+        TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
+        TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
+        TransitionKind::ScaleUp => proto::TransitionKind::ScaleUp,
+    };
+    let primary_write_status = match command.primary_write_status {
+        AccessStatus::Granted => proto::AccessStatus::Granted,
+        AccessStatus::ReconfigurationPending => proto::AccessStatus::ReconfigurationPending,
+        AccessStatus::NotPrimary => proto::AccessStatus::NotPrimary,
+        AccessStatus::NoWriteQuorum => proto::AccessStatus::NoWriteQuorum,
+    };
+    proto::EnsureConfigurationCommand {
+        previous_policy: command.previous_policy.map(Into::into),
+        secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
+        scale_up_evidence: command.scale_up_evidence.map(|evidence| (*evidence).into()),
+        operation_id: command.operation_id.to_string(),
+        previous_configuration: command.previous_configuration.map(Into::into),
+        current_configuration: Some(command.current_configuration.into()),
+        previous_epoch: command.previous_epoch.map(Into::into),
+        current_epoch: Some(command.current_epoch.into()),
+        effective_policy: Some(command.effective_policy.into()),
+        local_replica_id: command.local_replica_id.value(),
+        expected_instance_id: command.expected_instance_id.to_string(),
+        expected_agent_generation: command.expected_agent_generation.to_string(),
+        transition_kind: transition_kind as i32,
+        grant_write: command.primary_write_status == AccessStatus::Granted,
+        current_only: command.current_only,
+        retire_build_id: command
+            .retire_build_ids
+            .first()
+            .map_or_else(String::new, ToString::to_string),
+        primary_write_status: primary_write_status as i32,
+        retire_build_ids: command
+            .retire_build_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        failover_safe_lsn: command.failover_safe_lsn,
+        switchover_handoff: command.switchover_handoff.map(Into::into),
+        retire_switchover_preparation_ids: command
+            .retire_switchover_preparation_ids
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    }
 }
 
 /// Requires an exact protocol-version match; negotiation is intentionally unsupported.
@@ -176,6 +233,8 @@ pub fn normalize_agent_status_report(
                 || report.secondary_removal_evidence.is_some()
                 || report.retired_replica.is_some()
                 || report.accepted_secondary_removal.is_some()
+                || report.scale_up_intent.is_some()
+                || report.pending_configuration.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "uninitialized status contains durable authority".to_string(),
@@ -276,7 +335,11 @@ pub fn normalize_agent_status_report(
                 .into_iter()
                 .map(|build| {
                     if build.build_id.is_empty()
+                        || build.replication_boundary_lsn < 0
                         || build.durable_lsn < 0
+                        || build
+                            .catch_up_boundary_lsn
+                            .is_some_and(|boundary| boundary < 0)
                         || !build_ids.insert(build.build_id.clone())
                     {
                         return Err(WireError::InvalidAuthority(
@@ -290,8 +353,10 @@ pub fn normalize_agent_status_report(
                             .ok_or(WireError::MissingField("build_status.target"))?
                             .try_into()?,
                         last_sequence: build.last_sequence,
+                        replication_boundary_lsn: build.replication_boundary_lsn,
                         durable_lsn: build.durable_lsn,
                         completed: build.completed,
+                        catch_up_boundary_lsn: build.catch_up_boundary_lsn,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -319,13 +384,43 @@ pub fn normalize_agent_status_report(
                 role,
                 read_status,
                 write_status,
-                report.secondary_removal_evidence.is_some(),
+                ReportConfigurationEvidence {
+                    secondary_removal: report.secondary_removal_evidence.is_some(),
+                    scale_up: report.scale_up_intent.is_some(),
+                },
             )?;
+            let pending_configuration = report
+                .pending_configuration
+                .map(|command| {
+                    normalize_execute_request(proto::ExecuteCommandRequest {
+                        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                        resource_uid: report.resource_uid.clone(),
+                        target: Some(identity.clone().into()),
+                        expected_process_session_id: report.process_session_id.clone(),
+                        command: Some(
+                            proto::execute_command_request::Command::EnsureConfiguration(Box::new(
+                                command,
+                            )),
+                        ),
+                    })
+                    .and_then(|envelope| match envelope.command {
+                        ProtocolCommand::EnsureConfiguration(command) => Ok(command),
+                        _ => Err(WireError::InvalidAuthority(
+                            "pending configuration decoded as another command".into(),
+                        )),
+                    })
+                })
+                .transpose()?;
             let report = AgentReport {
                 accepted_secondary_removal: report
                     .accepted_secondary_removal
                     .map(TryInto::try_into)
                     .transpose()?,
+                scale_up_intent: report
+                    .scale_up_intent
+                    .map(TryInto::try_into)
+                    .transpose()?
+                    .map(Box::new),
                 protocol_version: report.protocol_version,
                 resource_uid: ResourceUid::new(report.resource_uid),
                 identity,
@@ -351,6 +446,7 @@ pub fn normalize_agent_status_report(
                 reported_fault,
                 pending_operation_id: (!report.pending_operation_id.is_empty())
                     .then(|| OperationId::new(report.pending_operation_id)),
+                pending_configuration,
                 retained_operation_id: (!report.retained_operation_id.is_empty())
                     .then(|| OperationId::new(report.retained_operation_id)),
                 builds,
@@ -365,7 +461,7 @@ pub fn normalize_agent_status_report(
                     .transpose()?,
                 retired_replica: report.retired_replica.map(TryInto::try_into).transpose()?,
             };
-            kuberic_protocol::validation::validate_secondary_removal_report(&report)
+            kuberic_protocol::validation::validate_report_internal(&report)
                 .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
             Ok(AgentObservation::Report(Box::new(report)))
         }
@@ -387,6 +483,7 @@ pub fn normalize_agent_status_report(
                 || report.secondary_removal_evidence.is_some()
                 || report.retired_replica.is_some()
                 || report.accepted_secondary_removal.is_some()
+                || report.scale_up_intent.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "unsafe storage report contains untrusted authority".to_string(),
@@ -394,6 +491,7 @@ pub fn normalize_agent_status_report(
             }
             Ok(AgentObservation::Invalid {
                 message: report.storage_error,
+                uninitialized_report: None,
             })
         }
     }
@@ -511,34 +609,66 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 read_quorum: policy.read_quorum,
                 failover_delay_seconds: policy.failover_delay_seconds,
             };
-            validate_transition_relationship(
-                TransitionKind::Bootstrap,
-                None,
-                &bootstrap_configuration,
-                &effective_policy,
-            )
-            .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
             let target: ReplicaIdentity = request
                 .target
                 .clone()
                 .ok_or(WireError::MissingField("execute.target"))?
                 .try_into()?;
-            if let Some(provisioning) = command.provisioning.clone() {
-                let provisioning = provisioning_from_proto(provisioning)?;
+            let provisioning = command
+                .provisioning
+                .clone()
+                .map(provisioning_from_proto)
+                .transpose()?;
+            if let Some(provisioning) = provisioning {
                 let resource_uid = ResourceUid::new(&request.resource_uid);
                 if provisioning.target_identity(&resource_uid) != target {
                     return Err(WireError::InvalidAuthority(
-                        "initialize target differs from replacement provisioning".to_string(),
+                        "initialize target differs from exact provisioning".to_string(),
                     ));
+                }
+                if let Some(scale_up) = provisioning.scale_up() {
+                    validate_scale_up_provisioning(&provisioning)
+                        .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+                    if bootstrap_configuration != scale_up.previous_configuration
+                        || effective_policy != scale_up.current_policy
+                    {
+                        return Err(WireError::InvalidAuthority(
+                            "initialize authority differs from frozen scale-up provisioning"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    validate_transition_relationship(
+                        TransitionKind::Bootstrap,
+                        None,
+                        &bootstrap_configuration,
+                        &effective_policy,
+                    )
+                    .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
                 }
             } else if !bootstrap_configuration
                 .members
                 .iter()
                 .any(|member| member.identity == target)
             {
+                validate_transition_relationship(
+                    TransitionKind::Bootstrap,
+                    None,
+                    &bootstrap_configuration,
+                    &effective_policy,
+                )
+                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
                 return Err(WireError::InvalidAuthority(
                     "initialize target is not an exact genesis member".to_string(),
                 ));
+            } else {
+                validate_transition_relationship(
+                    TransitionKind::Bootstrap,
+                    None,
+                    &bootstrap_configuration,
+                    &effective_policy,
+                )
+                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
             }
             Ok(())
         }
@@ -684,7 +814,17 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     .intent;
                 return validate_removal_envelope(request, &intent.resource_uid, &target);
             }
+            if transition_kind == TransitionKind::ScaleUp || command.scale_up_evidence.is_some() {
+                let normalized = crate::scale_up::configuration_from_proto((**command).clone())?;
+                let intent = normalized
+                    .scale_up_evidence
+                    .as_ref()
+                    .expect("validated evidence")
+                    .intent();
+                return validate_removal_envelope(request, &intent.resource_uid, &target);
+            }
             if command.secondary_removal_evidence.is_some()
+                || command.scale_up_evidence.is_some()
                 || command
                     .previous_policy
                     .as_ref()
@@ -892,6 +1032,13 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
             {
                 return Err(WireError::MissingField("ensure_build.fence"));
             }
+            if command.retire
+                && (command.authority.is_some() || !command.source_session_id.is_empty())
+            {
+                return Err(WireError::InvalidAuthority(
+                    "build retirement cannot carry delivery authority".to_string(),
+                ));
+            }
             if target.replica_id != ReplicaId::new(command.local_replica_id)
                 || target.instance_id.as_str() != command.expected_instance_id
                 || target.agent_generation.as_str() != command.expected_agent_generation
@@ -988,6 +1135,12 @@ pub fn normalize_execute_request(
                 ProtocolCommand::EnsureConfiguration(Box::new(
                     crate::scale_down::configuration_from_proto(command)?,
                 ))
+            } else if command.transition_kind == proto::TransitionKind::ScaleUp as i32
+                || command.scale_up_evidence.is_some()
+            {
+                ProtocolCommand::EnsureConfiguration(Box::new(
+                    crate::scale_up::configuration_from_proto(command)?,
+                ))
             } else {
                 let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
                     .map_err(|_| WireError::InvalidEnum {
@@ -1017,6 +1170,7 @@ pub fn normalize_execute_request(
                     )?,
                     previous_policy: command.previous_policy.map(policy_from_proto).transpose()?,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     local_replica_id: ReplicaId::new(command.local_replica_id),
                     expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
                     expected_agent_generation: AgentGeneration::new(
@@ -1108,6 +1262,7 @@ pub fn normalize_execute_request(
                     .transpose()?,
                 source_session_id: (!command.source_session_id.is_empty())
                     .then(|| ProcessSessionId::new(command.source_session_id)),
+                retire: command.retire,
             }))
         }
     };
@@ -1247,6 +1402,10 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
     if item.sequence == 0
         || item.replication_boundary_lsn < 0
         || item.committed_lsn < 0
+        || item.final_item != item.catch_up_boundary_lsn.is_some()
+        || item
+            .catch_up_boundary_lsn
+            .is_some_and(|boundary| boundary < item.replication_boundary_lsn)
         || if item.final_item {
             item.lsn != item.replication_boundary_lsn
                 || item.committed_lsn > item.replication_boundary_lsn
@@ -1272,6 +1431,7 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
         lsn: item.lsn,
         committed_lsn: item.committed_lsn,
         replication_boundary_lsn: item.replication_boundary_lsn,
+        catch_up_boundary_lsn: item.catch_up_boundary_lsn,
         final_item: item.final_item,
         snapshot_chunk: item.snapshot_chunk,
         data: item.data,
@@ -1301,6 +1461,10 @@ pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, Wi
     if ack.sequence == 0
         || ack.durable_lsn < 0
         || ack.replication_boundary_lsn < 0
+        || ack.final_item != ack.catch_up_boundary_lsn.is_some()
+        || ack
+            .catch_up_boundary_lsn
+            .is_some_and(|boundary| boundary < ack.replication_boundary_lsn)
         || (ack.final_item
             && (ack.snapshot_chunk || ack.durable_lsn != ack.replication_boundary_lsn))
         || (ack.snapshot_chunk && (ack.final_item || ack.durable_lsn != 0))
@@ -1318,6 +1482,7 @@ pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, Wi
         sequence: ack.sequence,
         durable_lsn: ack.durable_lsn,
         replication_boundary_lsn: ack.replication_boundary_lsn,
+        catch_up_boundary_lsn: ack.catch_up_boundary_lsn,
         final_item: ack.final_item,
         snapshot_chunk: ack.snapshot_chunk,
     })
@@ -1576,29 +1741,62 @@ fn build_authority_from_proto(
     Ok(authority)
 }
 
-fn provisioning_from_proto(
+pub(crate) fn provisioning_from_proto(
     provisioning: proto::ProvisioningIntent,
 ) -> Result<ProvisioningIntent, WireError> {
+    use proto::provisioning_intent::Purpose;
     let intent = ProvisioningIntent {
-        replaces: provisioning
-            .replaces
-            .ok_or(WireError::MissingField("provisioning.replaces"))?
-            .try_into()?,
+        purpose: match provisioning
+            .purpose
+            .ok_or(WireError::MissingField("provisioning.purpose"))?
+        {
+            Purpose::Replaces(replaces) => ProvisioningPurpose::replacement(replaces.try_into()?),
+            Purpose::ScaleUp(scale_up) => ProvisioningPurpose::scale_up(scale_up.try_into()?),
+        },
         pod_uid: PodUid::new(provisioning.pod_uid),
         pvc_uid: PvcUid::new(provisioning.pvc_uid),
         operation_id: OperationId::new(provisioning.operation_id),
     };
-    if intent.operation_id.is_empty()
-        || intent.pod_uid.is_empty()
-        || intent.pvc_uid.is_empty()
-        || intent.replaces.instance_id.is_empty()
-        || intent.replaces.agent_generation.is_empty()
+    if intent.operation_id.is_empty() || intent.pod_uid.is_empty() || intent.pvc_uid.is_empty() {
+        return Err(WireError::InvalidAuthority(
+            "provisioning identifiers must not be empty".to_string(),
+        ));
+    }
+    if let Some(replaces) = intent.replacement()
+        && (replaces.instance_id.is_empty() || replaces.agent_generation.is_empty())
     {
         return Err(WireError::InvalidAuthority(
             "replacement provisioning identifiers must not be empty".to_string(),
         ));
     }
+    kuberic_protocol::validation::validate_scale_up_provisioning(&intent)
+        .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
     Ok(intent)
+}
+
+pub(crate) fn provisioning_to_proto(provisioning: ProvisioningIntent) -> proto::ProvisioningIntent {
+    use proto::provisioning_intent::Purpose;
+    proto::ProvisioningIntent {
+        purpose: Some(match provisioning.purpose.kind {
+            ProvisioningKind::Replacement => Purpose::Replaces(
+                provisioning
+                    .purpose
+                    .replaces
+                    .expect("validated replacement provisioning")
+                    .into(),
+            ),
+            ProvisioningKind::ScaleUp => Purpose::ScaleUp(
+                provisioning
+                    .purpose
+                    .scale_up
+                    .expect("validated scale-up provisioning")
+                    .into(),
+            ),
+        }),
+        pod_uid: provisioning.pod_uid.to_string(),
+        pvc_uid: provisioning.pvc_uid.to_string(),
+        operation_id: provisioning.operation_id.to_string(),
+    }
 }
 
 pub(crate) fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
@@ -1607,6 +1805,15 @@ pub(crate) fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
         ReplicaRole::ActiveSecondary => proto::ReplicaRole::ActiveSecondary,
         ReplicaRole::IdleSecondary => proto::ReplicaRole::IdleSecondary,
         ReplicaRole::None => proto::ReplicaRole::None,
+    }
+}
+
+pub(crate) fn access_status_to_proto(status: AccessStatus) -> proto::AccessStatus {
+    match status {
+        AccessStatus::Granted => proto::AccessStatus::Granted,
+        AccessStatus::ReconfigurationPending => proto::AccessStatus::ReconfigurationPending,
+        AccessStatus::NotPrimary => proto::AccessStatus::NotPrimary,
+        AccessStatus::NoWriteQuorum => proto::AccessStatus::NoWriteQuorum,
     }
 }
 
@@ -1634,6 +1841,7 @@ fn transition_kind_from_proto(kind: proto::TransitionKind) -> Result<TransitionK
         proto::TransitionKind::Failover => Ok(TransitionKind::Failover),
         proto::TransitionKind::PlannedSwitchover => Ok(TransitionKind::PlannedSwitchover),
         proto::TransitionKind::SecondaryScaleDown => Ok(TransitionKind::SecondaryScaleDown),
+        proto::TransitionKind::ScaleUp => Ok(TransitionKind::ScaleUp),
     }
 }
 
@@ -1652,6 +1860,12 @@ pub(crate) fn access_status_from_proto(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ReportConfigurationEvidence {
+    secondary_removal: bool,
+    scale_up: bool,
+}
+
 fn validate_report_configurations(
     epoch: Epoch,
     previous: Option<&ConfigurationDescriptor>,
@@ -1659,7 +1873,7 @@ fn validate_report_configurations(
     role: ReplicaRole,
     read_status: AccessStatus,
     write_status: AccessStatus,
-    secondary_removal: bool,
+    evidence: ReportConfigurationEvidence,
 ) -> Result<(), WireError> {
     if previous.is_some() && current.is_none() {
         return Err(WireError::InvalidAuthority(
@@ -1686,7 +1900,8 @@ fn validate_report_configurations(
             .collect::<BTreeSet<_>>();
         if previous.epoch.data_loss_number != current.epoch.data_loss_number
             || previous.epoch.configuration_number >= current.epoch.configuration_number
-            || (!secondary_removal
+            || (!evidence.secondary_removal
+                && !evidence.scale_up
                 && (previous_ids != current_ids || previous.write_quorum != current.write_quorum))
         {
             return Err(WireError::InvalidAuthority(

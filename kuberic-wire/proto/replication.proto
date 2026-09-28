@@ -48,6 +48,7 @@ message CopyItem {
   bool snapshot_chunk = 13;
   string sender_session_id = 14;
   string receiver_session_id = 15;
+  optional int64 catch_up_boundary_lsn = 16;
 }
 
 message CopyAck {
@@ -64,6 +65,7 @@ message CopyAck {
   bool snapshot_chunk = 11;
   string sender_session_id = 12;
   string receiver_session_id = 13;
+  optional int64 catch_up_boundary_lsn = 14;
 }
 
 service ReplicationData {

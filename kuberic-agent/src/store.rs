@@ -1,7 +1,7 @@
 //! Narrow agent store operations.
 
 use async_trait::async_trait;
-use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::types::{FaultType, LoadMetric, OperationId};
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
 
@@ -44,6 +44,10 @@ pub trait AgentStore: Send + Sync {
         &self,
         command: &EnsureConfiguration,
     ) -> Result<BeginConfiguration>;
+
+    async fn journal_build(&self, command: &EnsureReplicaBuild) -> Result<EnsureReplicaBuild>;
+
+    async fn abandon_build(&self, command: &EnsureReplicaBuild) -> Result<()>;
 
     async fn advance_configuration(
         &self,

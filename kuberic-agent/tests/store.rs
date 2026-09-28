@@ -9,20 +9,21 @@ use kuberic_agent::provisioning::{
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, CoordinatorStage, ReconfigurationRecord, SCHEMA_VERSION};
 use kuberic_agent::state::{EffectStage, PendingEffect, RetainedResult};
-use kuberic_agent::store::AgentStore;
-use kuberic_agent::store::BeginEffect;
+use kuberic_agent::store::{AgentStore, BeginConfiguration, BeginEffect};
 use kuberic_protocol::command::AcceptSecondaryRemovalCommit;
-use kuberic_protocol::command::{EnsureConfiguration, InitializeAgentStore};
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore};
 use kuberic_protocol::types::{AccessStatus, SecondaryRemovalStage};
 use kuberic_protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
-    OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
-    ReplicaRole, ResourceUid, SwitchoverHandoff, SwitchoverRequestId, TransitionId,
-    TransitionIntent, TransitionKind, derive_agent_generation, derive_initialization_id,
+    OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpProvisioning,
+    SwitchoverHandoff, SwitchoverRequestId, TransitionId, TransitionIntent, TransitionKind,
+    derive_agent_generation, derive_initialization_id,
 };
 use kuberic_runtime_internal::authority::{
-    AdmittedAuthority, AuthorityFence, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
-    ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
+    AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
+    BuildProgressStore, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
+    LocalWritePhase, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use kuberic_runtime_internal::effects::{
     RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
@@ -97,6 +98,7 @@ fn pending_acceptance_fixture() -> (
                 previous_configuration: None,
                 current_configuration: intent.current_configuration,
                 switchover_handoff: None,
+                scale_up: None,
                 secondary_removal: Some(committed.evidence.clone()),
             }),
             prepared_secondary_removal: None,
@@ -325,7 +327,7 @@ async fn pending_acceptance_conversion_rejects_mutation_and_incompatible_durable
 }
 
 #[tokio::test]
-async fn schema_one_is_rejected_without_migration_or_provenance_changes() {
+async fn schema_two_is_rejected_without_migration_or_provenance_changes() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let (command, observed, transition) = bootstrap_fixture();
@@ -336,25 +338,25 @@ async fn schema_one_is_rejected_without_migration_or_provenance_changes() {
     )
     .unwrap();
     let store = SqliteStore::create_authorized(&path, AgentState::new(identity.clone())).unwrap();
-    assert!(store.migrate_schema(1, 2).await.is_err());
+    assert!(store.migrate_schema(2, 3).await.is_err());
     drop(store);
     let connection = Connection::open(&path).unwrap();
-    connection.pragma_update(None, "user_version", 1).unwrap();
+    connection.pragma_update(None, "user_version", 2).unwrap();
     let original: String = connection
         .query_row("SELECT state_json FROM agent_state", [], |r| r.get(0))
         .unwrap();
     assert!(matches!(
         SqliteStore::open_existing(&path, None),
         Err(AgentError::SchemaMismatch {
-            expected: 2,
-            observed: 1
+            expected: 3,
+            observed: 2
         })
     ));
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         connection
@@ -388,6 +390,7 @@ async fn durable_retirement_rejects_active_authority_and_mutated_tombstones() {
         previous_configuration: None,
         current_configuration: intent.previous_configuration.clone(),
         switchover_handoff: None,
+        scale_up: None,
         secondary_removal: None,
     };
     store.admit(&active).await.unwrap();
@@ -517,6 +520,8 @@ fn bootstrap_fixture() -> (
     let transition = TransitionIntent {
         secondary_scale_down: None,
         secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
         transition_id: TransitionId::new("bootstrap-1"),
         kind: TransitionKind::Bootstrap,
         spec_generation: 1,
@@ -573,11 +578,11 @@ fn fresh_bootstrap_store_requires_exact_persisted_authority() {
 fn fresh_replacement_store_requires_matching_provisioning_intent() {
     let (command, observed, _) = bootstrap_fixture();
     let provisioning = ProvisioningIntent {
-        replaces: ReplicaIdentity {
+        purpose: kuberic_protocol::types::ProvisioningPurpose::replacement(ReplicaIdentity {
             replica_id: command.local_replica_id,
             instance_id: ReplicaInstanceId::new("old-pod"),
             agent_generation: AgentGeneration::new("old-generation"),
-        },
+        }),
         pod_uid: command.expected_pod_uid.clone(),
         pvc_uid: command.expected_pvc_uid.clone(),
         operation_id: OperationId::new("replace-1"),
@@ -588,6 +593,289 @@ fn fresh_replacement_store_requires_matching_provisioning_intent() {
         InitializationAuthority::Replacement(&provisioning),
     )
     .unwrap();
+}
+
+fn scale_up_initialization_fixture() -> (
+    InitializeAgentStore,
+    ObservedStorageIdentity,
+    ProvisioningIntent,
+) {
+    let resource_uid = ResourceUid::new("scale-up-set");
+    let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let primary = identity(1, "primary-pod", "primary-generation");
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary,
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let mut provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            previous_policy,
+            current_policy: current_policy.clone(),
+            target_replica_id: ReplicaId::new(2),
+        }),
+        pod_uid: PodUid::new("candidate-pod"),
+        pvc_uid: PvcUid::new("candidate-pvc"),
+        operation_id: OperationId::default(),
+    };
+    provisioning.operation_id = provisioning.expected_operation_id();
+    let target = provisioning.target_identity(&resource_uid);
+    let command = InitializeAgentStore {
+        initialization_id: provisioning.initialization_id(&resource_uid),
+        resource_uid: resource_uid.clone(),
+        local_replica_id: target.replica_id,
+        expected_instance_id: target.instance_id.clone(),
+        expected_pod_uid: provisioning.pod_uid.clone(),
+        expected_pvc_uid: provisioning.pvc_uid.clone(),
+        assigned_agent_generation: target.agent_generation,
+        effective_policy: current_policy,
+        bootstrap_configuration: previous,
+        provisioning: Some(provisioning.clone()),
+    };
+    let observed = ObservedStorageIdentity {
+        resource_uid,
+        pod_uid: command.expected_pod_uid.clone(),
+        pvc_uid: command.expected_pvc_uid.clone(),
+        instance_id: command.expected_instance_id.clone(),
+    };
+    (command, observed, provisioning)
+}
+
+#[test]
+fn fresh_scale_up_store_requires_exact_frozen_authority() {
+    let (command, observed, provisioning) = scale_up_initialization_fixture();
+    let identity = authorize_initialization(
+        &command,
+        &observed,
+        InitializationAuthority::ScaleUp(&provisioning),
+    )
+    .unwrap();
+    assert_eq!(identity.schema_version, 3);
+
+    for mutation in 0..6 {
+        let mut stale = command.clone();
+        match mutation {
+            0 => stale.expected_pod_uid = PodUid::new("reused-pod"),
+            1 => stale.expected_pvc_uid = PvcUid::new("reused-pvc"),
+            2 => stale.local_replica_id = ReplicaId::new(3),
+            3 => stale.effective_policy = EffectivePolicy::fixed(3, 30).unwrap(),
+            4 => stale.bootstrap_configuration.epoch = Epoch::new(0, 2),
+            _ => stale.assigned_agent_generation = AgentGeneration::new("retired-generation"),
+        }
+        assert!(matches!(
+            authorize_initialization(
+                &stale,
+                &observed,
+                InitializationAuthority::ScaleUp(&provisioning)
+            ),
+            Err(AgentError::InitializationNotAuthorized(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn scale_up_build_journal_replays_current_session_and_fences_retirement() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (initialize, observed, provisioning) = scale_up_initialization_fixture();
+    let identity = authorize_initialization(
+        &initialize,
+        &observed,
+        InitializationAuthority::ScaleUp(&provisioning),
+    )
+    .unwrap();
+    let mut state = AgentState::new(identity.clone());
+    state.scale_up_initialization = Some(provisioning.clone());
+    let store = SqliteStore::create_authorized(&path, state).unwrap();
+    let source = initialize.bootstrap_configuration.members[0]
+        .identity
+        .clone();
+    let authority = BuildAuthority {
+        build_id: provisioning
+            .scale_up_build_id(&initialize.resource_uid)
+            .unwrap(),
+        kind: BuildAuthorityKind::Provisioning,
+        source,
+        target: identity.local_identity.clone(),
+        current_configuration: initialize.bootstrap_configuration.clone(),
+        replication_boundary_lsn: 7,
+    };
+    let mut command = EnsureReplicaBuild {
+        operation_id: authority.build_id.clone(),
+        local_replica_id: identity.local_identity.replica_id,
+        expected_instance_id: identity.local_identity.instance_id.clone(),
+        expected_agent_generation: identity.local_identity.agent_generation.clone(),
+        target: identity.local_identity.clone(),
+        authority: Some(authority),
+        source_session_id: Some(kuberic_protocol::types::ProcessSessionId::new("source-1")),
+        retire: false,
+    };
+    store.journal_build(&command).await.unwrap();
+    command.source_session_id = Some(kuberic_protocol::types::ProcessSessionId::new("source-2"));
+    store.journal_build(&command).await.unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open_existing(&path, Some(&identity)).unwrap();
+    assert_eq!(
+        reopened
+            .load_state()
+            .await
+            .unwrap()
+            .build_commands
+            .get(&command.operation_id),
+        Some(&command)
+    );
+    let mut retired = reopened.load_state().await.unwrap();
+    retired.retired_builds.insert(command.operation_id.clone());
+    drop(reopened);
+    let replacement_path = directory.path().join("retired-agent.db");
+    let retired_store = SqliteStore::create_authorized(&replacement_path, retired).unwrap();
+    assert!(retired_store.journal_build(&command).await.is_err());
+}
+
+#[tokio::test]
+async fn source_build_abandonment_resolves_only_the_exact_pending_copy_effect() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (initialize, observed, transition) = bootstrap_fixture();
+    let identity = authorize_initialization(
+        &initialize,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let store = SqliteStore::create_authorized(&path, AgentState::new(identity.clone())).unwrap();
+    let target = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("candidate-pod"),
+        agent_generation: AgentGeneration::new("candidate-generation"),
+    };
+    let build_id = OperationId::new("source-build");
+    let build = EnsureReplicaBuild {
+        operation_id: build_id.clone(),
+        local_replica_id: identity.local_identity.replica_id,
+        expected_instance_id: identity.local_identity.instance_id.clone(),
+        expected_agent_generation: identity.local_identity.agent_generation.clone(),
+        target: target.clone(),
+        authority: None,
+        source_session_id: None,
+        retire: false,
+    };
+    store.journal_build(&build).await.unwrap();
+    let pending = RuntimeEffect {
+        operation_id: OperationId::new("source-build:build-replica"),
+        sequence: 7,
+        action: RuntimeEffectAction::BuildReplica {
+            build_id: build_id.clone(),
+            target: target.clone(),
+            replication_address: String::new(),
+        },
+    };
+    assert_eq!(
+        store.begin_effect(&pending).await.unwrap(),
+        BeginEffect::Execute(pending.clone())
+    );
+    let retirement = EnsureReplicaBuild {
+        retire: true,
+        ..build.clone()
+    };
+    store.abandon_build(&retirement).await.unwrap();
+    let abandoned = store.load_state().await.unwrap();
+    assert_eq!(
+        abandoned
+            .pending_effect
+            .as_ref()
+            .map(|pending| &pending.effect),
+        Some(&pending)
+    );
+    assert!(abandoned.abandoned_builds.contains(&build_id));
+    assert_eq!(abandoned.next_effect_sequence, 1);
+    assert!(store.journal_build(&build).await.is_err());
+
+    let unrelated_path = directory.path().join("unrelated.db");
+    let unrelated =
+        SqliteStore::create_authorized(&unrelated_path, AgentState::new(identity)).unwrap();
+    unrelated.journal_build(&build).await.unwrap();
+    let other = RuntimeEffect {
+        operation_id: OperationId::new("unrelated"),
+        sequence: 1,
+        action: RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    };
+    unrelated.begin_effect(&other).await.unwrap();
+    assert!(matches!(
+        unrelated.abandon_build(&retirement).await,
+        Err(AgentError::EffectConflict(_))
+    ));
+    let fenced = unrelated.load_state().await.unwrap();
+    assert_eq!(
+        fenced
+            .pending_effect
+            .as_ref()
+            .map(|pending| &pending.effect),
+        Some(&other)
+    );
+    assert!(!fenced.abandoned_builds.contains(&build_id));
+}
+
+#[tokio::test]
+async fn durable_build_catch_up_boundary_is_write_once() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (command, observed, transition) = bootstrap_fixture();
+    let storage_identity = authorize_initialization(
+        &command,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let store =
+        SqliteStore::create_authorized(&path, AgentState::new(storage_identity.clone())).unwrap();
+    let authority = BuildAuthority {
+        build_id: OperationId::new("boundary-build"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: storage_identity.local_identity.clone(),
+        target: identity(2, "target", "target-generation"),
+        current_configuration: transition.current_configuration,
+        replication_boundary_lsn: 0,
+    };
+    store.admit_build(&authority).await.unwrap();
+    let progress = DurableBuildProgress {
+        authority,
+        last_sequence: 1,
+        durable_lsn: 0,
+        completed: true,
+        catch_up_boundary_lsn: Some(2),
+    };
+    store.record_build_progress(&progress).await.unwrap();
+
+    let mut advanced = progress.clone();
+    advanced.last_sequence = 2;
+    advanced.durable_lsn = 2;
+    store.record_build_progress(&advanced).await.unwrap();
+    assert_eq!(
+        store
+            .load_state()
+            .await
+            .unwrap()
+            .build_progress
+            .get(&advanced.authority.build_id),
+        Some(&advanced)
+    );
+
+    let mut changed = advanced.clone();
+    changed.catch_up_boundary_lsn = Some(3);
+    assert!(store.record_build_progress(&changed).await.is_err());
+    changed.catch_up_boundary_lsn = None;
+    assert!(store.record_build_progress(&changed).await.is_err());
 }
 
 #[tokio::test]
@@ -605,6 +893,7 @@ async fn sqlite_store_reopens_with_identity_authority_and_progress() {
     let store = SqliteStore::create_authorized(&path, state).unwrap();
 
     let authority = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: storage_identity.local_identity.clone(),
         transition_kind: Some(TransitionKind::Bootstrap),
@@ -744,6 +1033,7 @@ async fn current_only_completion_retires_exact_switchover_preparation() {
     let command = EnsureConfiguration {
         previous_policy: None,
         secondary_removal_evidence: None,
+        scale_up_evidence: None,
         operation_id: OperationId::new("current-only-1"),
         previous_configuration: None,
         current_configuration: current.clone(),
@@ -792,6 +1082,113 @@ async fn current_only_completion_retires_exact_switchover_preparation() {
 }
 
 #[tokio::test]
+async fn sqlite_configuration_journal_replays_exact_installed_commands_and_rejects_mutation() {
+    let directory = tempdir().unwrap();
+    let (initialize, observed, transition) = bootstrap_fixture();
+    let storage_identity = authorize_initialization(
+        &initialize,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let previous = initialize.bootstrap_configuration.clone();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        previous.primary_id,
+        previous.members.clone(),
+        previous.write_quorum,
+    );
+    let pc_cc = EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
+        scale_up_evidence: None,
+        operation_id: OperationId::new("accepted-correction-pc-cc"),
+        previous_configuration: Some(previous.clone()),
+        current_configuration: current.clone(),
+        previous_epoch: Some(previous.epoch),
+        current_epoch: current.epoch,
+        effective_policy: storage_identity.effective_policy.clone(),
+        local_replica_id: storage_identity.local_identity.replica_id,
+        expected_instance_id: storage_identity.local_identity.instance_id.clone(),
+        expected_agent_generation: storage_identity.local_identity.agent_generation.clone(),
+        transition_kind: TransitionKind::Failover,
+        failover_safe_lsn: Some(12),
+        primary_write_status: AccessStatus::ReconfigurationPending,
+        current_only: false,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    let store = SqliteStore::create_authorized(
+        SqliteStore::metadata_database_path(directory.path()),
+        AgentState::new(storage_identity.clone()),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.begin_configuration(&pc_cc).await.unwrap(),
+        BeginConfiguration::Execute(_)
+    ));
+    store
+        .admit(&AdmittedAuthority {
+            local_identity: storage_identity.local_identity.clone(),
+            transition_kind: Some(TransitionKind::Failover),
+            previous_configuration: Some(previous),
+            current_configuration: current.clone(),
+            switchover_handoff: None,
+            secondary_removal: None,
+            scale_up: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.begin_configuration(&pc_cc).await.unwrap(),
+        BeginConfiguration::Pending(record) if record.command == pc_cc
+    ));
+    let mut mutated = pc_cc.clone();
+    mutated.failover_safe_lsn = Some(13);
+    assert!(matches!(
+        store.begin_configuration(&mutated).await,
+        Err(AgentError::EffectConflict(_))
+    ));
+
+    let current_only = EnsureConfiguration {
+        operation_id: OperationId::new("accepted-correction-current-only"),
+        previous_configuration: None,
+        previous_epoch: None,
+        current_only: true,
+        ..pc_cc
+    };
+    let mut installed = AgentState::new(storage_identity);
+    installed.highest_epoch = current.epoch;
+    installed.current_configuration = Some(current);
+    installed.role = ReplicaRole::Primary;
+    installed.reconfiguration = Some(ReconfigurationRecord {
+        command: current_only.clone(),
+        stage: CoordinatorStage::Activate,
+        observed_lsn: Some(13),
+    });
+    fs::create_dir(directory.path().join("current-only")).unwrap();
+    let current_only_store = SqliteStore::create_authorized(
+        SqliteStore::metadata_database_path(&directory.path().join("current-only")),
+        installed,
+    )
+    .unwrap();
+    assert!(matches!(
+        current_only_store
+            .begin_configuration(&current_only)
+            .await
+            .unwrap(),
+        BeginConfiguration::Pending(record) if record.command == current_only
+    ));
+    let mut mutated = current_only.clone();
+    mutated.failover_safe_lsn = Some(13);
+    assert!(matches!(
+        current_only_store.begin_configuration(&mutated).await,
+        Err(AgentError::EffectConflict(_))
+    ));
+}
+
+#[tokio::test]
 async fn additive_handoff_fields_default_when_reopening_legacy_json() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
@@ -803,6 +1200,7 @@ async fn additive_handoff_fields_default_when_reopening_legacy_json() {
     )
     .unwrap();
     let authority = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: storage_identity.local_identity.clone(),
         transition_kind: Some(TransitionKind::Bootstrap),

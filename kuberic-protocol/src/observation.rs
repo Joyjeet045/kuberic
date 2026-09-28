@@ -92,6 +92,8 @@ pub struct AgentReport {
     #[serde(default)]
     pub pending_operation_id: Option<OperationId>,
     #[serde(default)]
+    pub pending_configuration: Option<Box<crate::command::EnsureConfiguration>>,
+    #[serde(default)]
     pub retained_operation_id: Option<OperationId>,
     #[serde(default)]
     pub builds: Vec<AgentBuildReport>,
@@ -105,6 +107,8 @@ pub struct AgentReport {
     pub retired_replica: Option<crate::types::ReplicaRetirementReport>,
     #[serde(default)]
     pub accepted_secondary_removal: Option<crate::types::SecondaryScaleDownCleanup>,
+    #[serde(default)]
+    pub scale_up_intent: Option<Box<crate::types::ScaleUpIntent>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,8 +117,11 @@ pub struct AgentBuildReport {
     pub build_id: OperationId,
     pub target: ReplicaIdentity,
     pub last_sequence: u64,
+    pub replication_boundary_lsn: i64,
     pub durable_lsn: i64,
     pub completed: bool,
+    #[serde(default)]
+    pub catch_up_boundary_lsn: Option<i64>,
 }
 
 fn default_access_status() -> AccessStatus {
@@ -152,6 +159,7 @@ impl Default for AgentReport {
             load_metrics: Vec::new(),
             reported_fault: None,
             pending_operation_id: None,
+            pending_configuration: None,
             retained_operation_id: None,
             builds: Vec::new(),
             prepared_switchover: None,
@@ -159,6 +167,7 @@ impl Default for AgentReport {
             secondary_removal_evidence: None,
             retired_replica: None,
             accepted_secondary_removal: None,
+            scale_up_intent: None,
         }
     }
 }
@@ -188,7 +197,13 @@ pub struct SecondaryScaleDownResourceObservation {
     pub target: ReplicaIdentity,
     pub identity: crate::types::ReplicaCleanupIdentity,
     pub pod: ExactResourceObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_allocation_operation_id: Option<OperationId>,
+    #[serde(default)]
+    pub pod_matches_allocation_metadata: bool,
     pub pvc: ExactResourceObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc_allocation_operation_id: Option<OperationId>,
     pub endpoint: ExactResourceObservation,
 }
 
@@ -213,8 +228,14 @@ impl ReplicaObservationKey {
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum AgentObservation {
     Absent,
-    Unreachable { message: String },
-    Invalid { message: String },
+    Unreachable {
+        message: String,
+    },
+    Invalid {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uninitialized_report: Option<Box<UninitializedAgentObservation>>,
+    },
     Uninitialized(UninitializedAgentObservation),
     Report(Box<AgentReport>),
 }

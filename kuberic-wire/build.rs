@@ -6,6 +6,8 @@ fn main() {
         .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.prepare_secondary_removal")
         .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.retire_replica")
         .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.accept_secondary_removal_commit")
+        .boxed(".kuberic.level.v1.ScaleUpConfigurationEvidence.evidence.admission")
+        .boxed(".kuberic.level.v1.ScaleUpConfigurationEvidence.evidence.failover")
         .compile_protos(
             &["proto/kuberic.proto", "proto/replication.proto"],
             &["proto"],

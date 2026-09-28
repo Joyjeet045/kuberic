@@ -18,7 +18,8 @@ dependencies. Controllers and agents exchange these canonical types through
 transport adapters such as `kuberic-wire`.
 
 The evaluator covers write-closed bootstrap, same-cardinality replacement,
-ordinary failover, planned switchover, secondary scale-down, and quorum loss.
+ordinary failover, planned switchover, secondary scale-down, sequential
+scale-up, and quorum loss.
 Failover persists exact failure timing, fences routing before newer authority, requires PC and
 outstanding-CC read quorum, selects from epoch-fenced deactivation/progress evidence, authorizes
 only the elected safe prefix under the new fence, performs retained-history or
@@ -40,8 +41,8 @@ application progress.
 
 The supported evaluator contract is full-set bootstrap,
 same-cardinality replacement, ordinary failover, planned switchover,
-secondary-only scale-down, and non-destructive quorum loss/recovery. Scale-up,
-primary removal, timed replica dropping, destructive data-loss recovery, and
+secondary-only scale-down, sequential scale-up, and non-destructive quorum
+loss/recovery. Primary removal, timed replica dropping, destructive data-loss recovery, and
 mixed-version negotiation remain fail-closed.
 
 Protocol 6 defines secondary scale-down, with pure evaluation available behind
@@ -60,7 +61,9 @@ credit. Cleanup freezes Pod, PVC, and endpoint names and UIDs, or explicit
 authoritative exact-name absence, separately from accepted topology.
 
 Lowering `spec.replicas` requests sequential single-secondary removal; the desired
-count is target and minimum, down to one. Increasing accepted membership is unsupported.
+count is target and minimum, down to one. Increasing it requests protocol-8
+sequential scale-up when `EvaluationConfig::allow_scale_up` is enabled; the
+production controller enables that path.
 This `spec.replicas` target=min coupling is Kuberic policy, not general SF
 semantics; SF target and minimum are independently configurable.
 Before freezing intent, removing routing, or closing writes, retained exact
@@ -137,8 +140,34 @@ Scale-down progress projects stable reasons for pre-admission retained quorum
 (`ScaleDownPreviousReadQuorumUnavailable`), reduced write quorum and verified
 catch-up (`ScaleDownReducedWriteQuorumUnavailable`, `ScaleDownReducedCatchUpPending`),
 current-only quorum, exact primary recovery (`ScaleDownPrimaryUnavailable`),
-retirement, exact Pod fencing/absence, and cleanup. `ScaleUpUnsupported` and
-`SpecDriftUnsupported` leave the latest desired generation unsatisfied.
+retirement, exact Pod fencing/absence, and cleanup. `SpecDriftUnsupported`
+leaves combined count/image/delay drift unsatisfied.
+
+Protocol 8 scale-up persists one recoverable allocation before resource
+creation, selects the first missing positive ordinal, and admits one fresh
+candidate at a time. Carried primary failure installs a provisional election
+epoch write-closed, collects fresh independently sufficient PC/CC progress,
+then persists a separate exact post-fence election certificate containing the
+final primary, final epoch, report sessions/progress, and safe LSN before
+catch-up/current-only activation. The certificate is compact and structural:
+one typed witness table is referenced by the PC/CC quorum replica IDs, while
+exact incarnations, roles, epochs, configuration IDs, policy, and deterministic
+fence-operation bindings are reconstructed and validated against the frozen
+intent and provisional authority. The completion receipt retains the original
+recovery witnesses, a provisional-primary reference, and the final election so
+an exact returning provisional member is corrected through final PC/CC and
+current-only without re-embedding the full intent or configuration.
+The canonical PVC is operation-annotated and frozen before
+the Pod; same-name resources without exact provenance are not adopted. The
+candidate remains outside accepted membership until snapshot copy and
+contiguous replication reach a separately frozen post-enumeration boundary,
+then typed scale-up PC/CC independently enforces previous and expanded policies.
+Pre-admission cancellation/failure freezes endpoint→Pod→PVC cleanup. After
+admission begins, authority rolls forward, including carried failover or
+committed-degraded local convergence. One latest receipt gates late-member
+acceptance before a subsequent addition. This is Service Fabric-inspired
+replica-add behavior, not placement/scaling parity or a maximum-cardinality
+contract.
 
 Switchover requires a nonempty request ID and a committed logical secondary
 ID. Identical active or latest-receipted requests are idempotent; cancellation,
@@ -175,8 +204,10 @@ UID/resourceVersion-fenced, and preserves PVCs. The terminal unsafe receipt is
 published only after that proof; it never starts ordinary failover or replacement.
 
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
+plus [sequential scale-up](../docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
 and [secondary scale-down](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
-for usage, target/minimum risks, and the protocol-6/schema-2 fresh-deployment contract.
+for usage, target/minimum risks, recovery, and the protocol 8 / schema 3
+fresh-deployment contract.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 separate status/API redesign, mechanical helper refactors, and new recovery protocols.
 

@@ -18,9 +18,11 @@ Helm charts.
 
 For the independent `operator.kuberic.io/v1alpha1` stack, follow the
 [level-triggered deployment and testing guide](features/kuberic/level-triggered-operator.md#local-deployment).
-Use fresh protocol-6/schema-2 storage and an owned cluster. The live
+Use fresh protocol-8/schema-3 storage and an owned cluster. The live
 `just level-triggered-kind-test scale-down` and `scale-down-adversarial`
-selectors exercise secondary removal; `all` runs the seven-scenario matrix
-from fresh bootstrap. Standalone failover needs a separate fresh cluster.
+selectors exercise secondary removal; `scale-up`, `scale-up-multi`, and
+`scale-up-adversarial` exercise sequential membership increase and recovery.
+`all` runs the ten-scenario matrix from fresh bootstrap. Standalone failover
+needs a separate fresh cluster.
 See [tests and diagnostics](features/kuberic/level-triggered-operator.md#tests-and-diagnostics)
 for CI tiers, measurements, and cleanup.

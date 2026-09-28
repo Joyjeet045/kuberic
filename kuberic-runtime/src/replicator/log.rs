@@ -309,8 +309,18 @@ impl ReplicationLog {
         &mut self,
         authority: AdmittedAuthority,
         local_progress: Lsn,
+        preserve_write_access: bool,
     ) -> Result<()> {
-        self.update_epoch(authority.current_configuration.epoch)?;
+        if preserve_write_access {
+            if authority.current_configuration.epoch < self.epoch {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "replicator epoch cannot regress".to_string(),
+                ));
+            }
+            self.epoch = authority.current_configuration.epoch;
+        } else {
+            self.update_epoch(authority.current_configuration.epoch)?;
+        }
         self.configure(authority, local_progress)
     }
 

@@ -10,6 +10,8 @@ pub const SET_UID_LABEL: &str = "operator.kuberic.io/set-uid";
 pub const REPLICA_ID_LABEL: &str = "operator.kuberic.io/replica-id";
 pub const INSTANCE_LABEL: &str = "operator.kuberic.io/instance";
 pub const CONTROL_ADDRESS_ANNOTATION: &str = "operator.kuberic.io/control-address";
+pub const SCALE_UP_ALLOCATION_ANNOTATION: &str =
+    "operator.kuberic.io/scale-up-allocation-operation";
 
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[kube(
@@ -132,6 +134,165 @@ mod tests {
     }
 
     #[test]
+    fn scale_up_status_schema_is_typed_and_zero_boundaries_are_allowed() {
+        let schema = serde_json::to_value(KubericSet::crd()).unwrap();
+        let status = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"];
+        let transition = &status["transition"]["properties"];
+        assert!(
+            transition["kind"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("scaleUp"))
+        );
+        let intent = &transition["scaleUp"]["properties"];
+        for field in [
+            "operationId",
+            "resourceUid",
+            "specGeneration",
+            "desiredReplicas",
+            "previousConfiguration",
+            "currentConfiguration",
+            "previousPolicy",
+            "currentPolicy",
+            "primary",
+            "target",
+            "buildId",
+            "snapshotBoundaryLsn",
+            "catchUpBoundaryLsn",
+        ] {
+            assert!(intent.get(field).is_some(), "{field}");
+        }
+        assert_eq!(intent["snapshotBoundaryLsn"]["minimum"], 0.0);
+        assert_eq!(intent["catchUpBoundaryLsn"]["minimum"], 0.0);
+        assert_eq!(intent["target"]["properties"]["replicaId"]["minimum"], 1.0);
+        for policy in ["previousPolicy", "currentPolicy"] {
+            for field in ["replicaSetSize", "writeQuorum", "readQuorum"] {
+                assert_eq!(intent[policy]["properties"][field]["minimum"], 1.0);
+            }
+        }
+        assert!(status.get("scaleUpCleanup").is_some());
+        assert!(status.get("lastScaleUp").is_some());
+        let failover = &transition["scaleUpFailover"]["properties"];
+        for field in [
+            "intent",
+            "provisionalConfiguration",
+            "previousReadQuorum",
+            "currentReadQuorum",
+            "finalElection",
+        ] {
+            assert!(failover.get(field).is_some(), "{field}");
+        }
+        let final_election = &failover["finalElection"]["properties"];
+        for field in [
+            "selectedPrimaryReplicaId",
+            "witnesses",
+            "previousReadQuorum",
+            "currentReadQuorum",
+        ] {
+            assert!(final_election.get(field).is_some(), "{field}");
+        }
+        assert!(final_election.get("finalConfiguration").is_none());
+        assert_eq!(final_election["selectedPrimaryReplicaId"]["minimum"], 1.0);
+        let final_witness = &final_election["witnesses"]["items"]["properties"];
+        for field in [
+            "replicaId",
+            "processSessionId",
+            "reportSequence",
+            "currentProgress",
+            "committedLsn",
+            "deactivatedLsn",
+            "fenceOperationId",
+        ] {
+            assert!(final_witness.get(field).is_some(), "{field}");
+        }
+        for duplicated in [
+            "resourceUid",
+            "identity",
+            "role",
+            "epoch",
+            "previousConfigurationId",
+            "currentConfigurationId",
+            "deactivationEpoch",
+            "writeStatus",
+            "writeClosed",
+            "pendingOperationId",
+            "retainedOperationId",
+        ] {
+            assert!(final_witness.get(duplicated).is_none(), "{duplicated}");
+        }
+        assert_eq!(final_witness["replicaId"]["minimum"], 1.0);
+        assert_eq!(final_witness["reportSequence"]["minimum"], 1.0);
+        assert_eq!(final_witness["currentProgress"]["minimum"], 0.0);
+        assert_eq!(final_witness["committedLsn"]["minimum"], 0.0);
+        assert_eq!(final_witness["deactivatedLsn"]["minimum"], 0.0);
+        for quorum in ["previousReadQuorum", "currentReadQuorum"] {
+            assert_eq!(final_election[quorum]["items"]["minimum"], 1.0);
+        }
+        let receipt_failover =
+            &status["lastScaleUp"]["properties"]["failoverEvidence"]["properties"];
+        for field in [
+            "provisionalPrimaryReplicaId",
+            "previousReadQuorum",
+            "currentReadQuorum",
+            "finalElection",
+        ] {
+            assert!(receipt_failover.get(field).is_some(), "{field}");
+        }
+        assert!(receipt_failover.get("intent").is_none());
+        assert!(receipt_failover.get("provisionalConfiguration").is_none());
+        assert_eq!(
+            receipt_failover["provisionalPrimaryReplicaId"]["minimum"],
+            1.0
+        );
+        let allocation = &status["scaleUpAllocation"]["properties"];
+        for field in [
+            "resourceUid",
+            "specGeneration",
+            "desiredReplicas",
+            "previousConfigurationId",
+            "acceptedConfigurationId",
+            "targetReplicaId",
+            "operationId",
+            "previousOperationId",
+            "scaffoldingRequested",
+            "podUid",
+            "pvcUid",
+            "cancellationStarted",
+        ] {
+            assert!(allocation.get(field).is_some(), "{field}");
+        }
+        assert_eq!(allocation["targetReplicaId"]["minimum"], 1.0);
+
+        let provisioning = &status["provisioning"]["properties"]["purpose"]["properties"];
+        assert_eq!(
+            provisioning["kind"]["enum"],
+            json!(["replacement", "scaleUp"])
+        );
+        assert!(
+            provisioning["scaleUp"]["properties"]
+                .get("targetReplicaId")
+                .is_some()
+        );
+        assert_eq!(
+            provisioning["scaleUp"]["properties"]["targetReplicaId"]["minimum"],
+            1.0
+        );
+
+        let generated = serde_json::to_string_pretty(&KubericSet::crd()).unwrap();
+        assert!(
+            generated.len() < 350_000,
+            "generated CRD unexpectedly grew to {} bytes",
+            generated.len()
+        );
+        assert!(
+            generated.len() <= 345_000,
+            "compact final-election schema lost its reviewed headroom at {} bytes",
+            generated.len()
+        );
+    }
+
+    #[test]
     fn crd_uses_only_the_level_triggered_api_group() {
         let crd = KubericSet::crd();
         assert_eq!(crd.spec.group, API_GROUP);
@@ -174,8 +335,12 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<std::collections::BTreeSet<_>>(),
-            std::collections::BTreeSet::from(["operationId", "podUid", "pvcUid", "replaces"])
+            std::collections::BTreeSet::from(["operationId", "podUid", "purpose", "pvcUid"])
         );
+        let purpose = &provisioning["purpose"]["properties"];
+        assert_eq!(purpose["kind"]["enum"], json!(["replacement", "scaleUp"]));
+        assert!(purpose.get("replaces").is_some());
+        assert!(purpose.get("scaleUp").is_some());
         assert!(
             status["properties"]["transition"]["properties"]
                 .get("startedAtUnixSeconds")

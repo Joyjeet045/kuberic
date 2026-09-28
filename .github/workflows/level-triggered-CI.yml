@@ -66,6 +66,10 @@ jobs:
           -p kuberic-agent
           -p kuberic-controller
           -p kvstore2
+      - name: Run classic v1 scale-up regressions
+        run: |
+          cargo test -p kvstore --test reconciler test_reconciler_scale_up -- --exact
+          cargo test -p kvstore --test reconciler test_scale_up_replays_writes_buffered_during_copy -- --exact
       - name: Compile isolated KinD tests
         run: |
           cargo test -p kuberic-level-tests --no-run
@@ -122,6 +126,9 @@ jobs:
       - name: Run healthy secondary scale-down
         timeout-minutes: 12
         run: just level-triggered-kind-test scale-down
+      - name: Run healthy sequential scale-up
+        timeout-minutes: 15
+        run: just level-triggered-kind-test scale-up
       - name: Collect diagnostics
         if: failure()
         timeout-minutes: 3
@@ -182,8 +189,8 @@ jobs:
         run: just level-triggered-images
       - name: Install isolated stack
         run: just level-triggered-install
-      - name: Run full matrix including switchover and scale-down fault variants
-        timeout-minutes: 65
+      - name: Run full matrix including scale-up, switchover, and scale-down fault variants
+        timeout-minutes: 95
         run: just level-triggered-kind-test all
       - name: Collect diagnostics
         if: failure()

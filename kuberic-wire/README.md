@@ -48,6 +48,14 @@ commands retain the existing exact process-session envelope fence. Controller,
 agent, and runtime execution is enabled; current-only admission alone does not
 grant writes without separate accepted-commit evidence.
 
+Protocol version 7 added sequential scale-up provisioning, copy/build progress,
+PC/CC and current-only admission evidence, carried failover evidence, and
+bounded completion receipts. Protocol version 8 adds a write-closed provisional
+election epoch, fresh fenced PC/CC progress selection, and the exact final
+failover-safe LSN in the receipt. Candidate identities remain outside accepted
+authority until admission, and exact allocation/cleanup provenance is durable
+before controller-created storage.
+
 `kuberic-wire` contains transport definitions only; protocol decisions remain
 in `kuberic-protocol`.
 
@@ -65,13 +73,13 @@ configurations cannot relabel historical evidence.
 
 ## Integration boundary
 
-This crate does not negotiate or downgrade versions. Protocol version 6 is an
+This crate does not negotiate or downgrade versions. Protocol version 8 is an
 exact coordinated-deployment boundary; incompatible controller, agent, or
 replica peers are rejected. Authentication, DNS resolution, retry policy, and
 session registration are agent-owned transport concerns around these schemas.
-Protocol 5 is rejected; the protobuf package remains `kuberic.level.v1` and
+Protocol 6 is rejected; the protobuf package remains `kuberic.level.v1` and
 existing field/enum numbers are unchanged. Use a fresh coordinated v2 deployment,
-not mixed-version operation. Agent storage uses schema 2 and rejects schema 1;
+not mixed-version operation. Agent storage uses schema 3 and rejects schema 2;
 there is no metadata conversion or data migration.
 Version 4 switchover-bearing persistent records lack the generation proof
 (including retired certificates). No in-place migration of those records is

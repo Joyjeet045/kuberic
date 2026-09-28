@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{Stream, StreamExt};
-use kuberic_protocol::command::ProtocolCommand;
+use kuberic_protocol::command::{EnsureReplicaBuild, ProtocolCommand};
 use kuberic_protocol::types::{
     ProcessSessionId, ReplicaId, ReplicaIdentity, TransitionIntent, TransitionKind,
     derive_transition_id,
@@ -179,6 +179,8 @@ impl InitializationService {
         let transition = TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(
                 &command.resource_uid,
                 TransitionKind::Bootstrap,
@@ -196,12 +198,22 @@ impl InitializationService {
         };
         let authority = command.provisioning.as_ref().map_or(
             InitializationAuthority::Bootstrap(&transition),
-            InitializationAuthority::Replacement,
+            |provisioning| {
+                if provisioning.scale_up().is_some() {
+                    InitializationAuthority::ScaleUp(provisioning)
+                } else {
+                    InitializationAuthority::Replacement(provisioning)
+                }
+            },
         );
         let identity = crate::command::admit_initialization(&command, &self.observed, authority)
             .map_err(status_from_agent)?;
-        match SqliteStore::create_authorized(&self.database_path, AgentState::new(identity.clone()))
-        {
+        let mut state = AgentState::new(identity.clone());
+        state.scale_up_initialization = command
+            .provisioning
+            .clone()
+            .filter(|provisioning| provisioning.scale_up().is_some());
+        match SqliteStore::create_authorized(&self.database_path, state) {
             Ok(store) => drop(store),
             Err(AgentError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 SqliteStore::open_existing(&self.database_path, Some(&identity))
@@ -580,14 +592,6 @@ where
                 })
                 .await?;
         }
-        if let Some(retained) = state.retained_result.as_ref()
-            && matches!(
-                retained.effect.action,
-                kuberic_runtime_internal::effects::RuntimeEffectAction::AdmitBuildAuthority(_)
-            )
-        {
-            self.runtime.apply_effect(retained.effect.clone()).await?;
-        }
         let pending_acceptance = state.pending_effect.as_ref().is_some_and(|pending| {
             matches!(pending.effect.action,
                 kuberic_runtime_internal::effects::RuntimeEffectAction::AcceptSecondaryRemovalCommit(_))
@@ -598,7 +602,17 @@ where
                 kuberic_runtime_internal::effects::RuntimeEffectAction::WaitForCatchup
             )
         });
+        let pending_abandoned_build = state.pending_effect.as_ref().is_some_and(|pending| {
+            matches!(
+                &pending.effect.action,
+                kuberic_runtime_internal::effects::RuntimeEffectAction::BuildReplica {
+                    build_id,
+                    ..
+                } if state.abandoned_builds.contains(build_id)
+            )
+        });
         if !pending_catchup
+            && !pending_abandoned_build
             && let Err(error) = self.coordinator.resume_pending().await
             && !(pending_acceptance
                 && matches!(
@@ -607,6 +621,38 @@ where
                 ))
         {
             return Err(error);
+        }
+        let build_recovery = self.store.load_state().await?;
+        if let Some(retained) = build_recovery.retained_result.as_ref()
+            && let kuberic_runtime_internal::effects::RuntimeEffectAction::AdmitBuildAuthority(
+                authority,
+            ) = &retained.effect.action
+            && !build_recovery.retired_builds.contains(&authority.build_id)
+        {
+            self.runtime.apply_effect(retained.effect.clone()).await?;
+        }
+        for command in build_recovery.build_commands.values().cloned() {
+            if !build_recovery
+                .retired_builds
+                .contains(&command.operation_id)
+            {
+                if build_recovery
+                    .abandoned_builds
+                    .contains(&command.operation_id)
+                {
+                    self.coordinator
+                        .ensure_build(EnsureReplicaBuild {
+                            retire: true,
+                            ..command
+                        })
+                        .await?;
+                    continue;
+                }
+                if command.authority.is_none() {
+                    continue;
+                }
+                self.coordinator.ensure_build(command).await?;
+            }
         }
         Ok(())
     }
@@ -712,6 +758,11 @@ where
                     || initialization.assigned_agent_generation
                         != state.identity.local_identity.agent_generation
                     || initialization.effective_policy != state.identity.effective_policy
+                    || initialization
+                        .provisioning
+                        .as_ref()
+                        .filter(|provisioning| provisioning.scale_up().is_some())
+                        != state.scale_up_initialization.as_ref()
                 {
                     return Err(Status::already_exists(
                         "agent store is initialized with different authority",
@@ -744,14 +795,16 @@ where
                     .map_err(status_from_agent)?;
             }
         }
+        let observation = self
+            .reporter
+            .report(&self.runtime)
+            .await
+            .map_err(status_from_agent)?;
+        kuberic_wire::validate_agent_status_report(&observation)
+            .map_err(|error| Status::internal(error.to_string()))?;
         Ok(proto::ExecuteCommandResponse {
             protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-            observation: Some(
-                self.reporter
-                    .report(&self.runtime)
-                    .await
-                    .map_err(status_from_agent)?,
-            ),
+            observation: Some(observation),
         })
     }
 }
@@ -1036,8 +1089,10 @@ fn status_from_runtime(error: kuberic_runtime::RuntimeError) -> Status {
 mod tests {
     use super::*;
     use kuberic_protocol::types::{
-        AgentGeneration, ConfigurationId, PodUid, PvcUid, ReplicaIdentity, ReplicaInstanceId,
-        ResourceUid, SwitchoverRequestId,
+        AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId,
+        ConfigurationMember, EffectivePolicy, Epoch, OperationId, PodUid, ProcessSessionId, PvcUid,
+        ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence,
+        ScaleUpIntent, SwitchoverRequestId, TransitionKind,
     };
 
     #[test]
@@ -1091,6 +1146,124 @@ mod tests {
                 Some(&action)
             ),
             kuberic_protocol::types::AccessStatus::ReconfigurationPending
+        );
+    }
+
+    #[test]
+    fn scale_up_pending_admission_preserves_the_persisted_write_grant() {
+        let primary = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("pod-1"),
+            agent_generation: AgentGeneration::new("generation-1"),
+        };
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            instance_id: ReplicaInstanceId::new("pod-2"),
+            agent_generation: AgentGeneration::new("generation-2"),
+        };
+        let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+        let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+        let previous = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            primary.replica_id,
+            vec![ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            previous_policy.write_quorum,
+        );
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            primary.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: primary.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            current_policy.write_quorum,
+        );
+        let mut intent = ScaleUpIntent {
+            operation_id: OperationId::default(),
+            resource_uid: ResourceUid::new("set"),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            current_configuration: current.clone(),
+            previous_policy,
+            current_policy,
+            primary: primary.clone(),
+            target,
+            build_id: OperationId::new("build"),
+            snapshot_boundary_lsn: 0,
+            catch_up_boundary_lsn: 0,
+        };
+        intent.operation_id = intent.expected_operation_id();
+        let pending = kuberic_runtime_internal::effects::RuntimeEffectAction::AdmitAuthority(
+            Box::new(kuberic_runtime_internal::authority::AdmittedAuthority {
+                local_identity: primary,
+                transition_kind: Some(TransitionKind::ScaleUp),
+                previous_configuration: Some(previous),
+                current_configuration: current,
+                switchover_handoff: None,
+                secondary_removal: None,
+                scale_up: Some(Box::new(ScaleUpConfigurationEvidence::Admission { intent })),
+            }),
+        );
+        assert_eq!(
+            startup_write_status(AccessStatus::Granted, Some(&pending)),
+            AccessStatus::Granted
+        );
+    }
+
+    #[tokio::test]
+    async fn scale_up_carried_failover_rejects_old_primary_and_receiver_sessions() {
+        let old_primary = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("old-primary"),
+            agent_generation: AgentGeneration::new("old-primary-generation"),
+        };
+        let new_primary = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            instance_id: ReplicaInstanceId::new("new-primary"),
+            agent_generation: AgentGeneration::new("new-primary-generation"),
+        };
+        let registry = SessionRegistry::new(ProcessSessionId::new("receiver-current"));
+        registry
+            .register_peer(
+                new_primary.clone(),
+                ProcessSessionId::new("new-primary-current"),
+            )
+            .await;
+        assert!(
+            registry
+                .validate_peer(
+                    &old_primary,
+                    "old-primary-retired",
+                    registry.local_session().as_str()
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_peer(&new_primary, "new-primary-current", "receiver-retired")
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_peer(
+                    &new_primary,
+                    "new-primary-current",
+                    registry.local_session().as_str()
+                )
+                .await
+                .is_ok()
         );
     }
 }

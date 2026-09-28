@@ -86,7 +86,12 @@ PVC object deletion has no retention or import path, not a physical-erasure
 guarantee. After admission, frozen-primary loss can block recovery indefinitely.
 Reconfiguration may interrupt writes and connections with no duration guarantee.
 V2 images remain local/CI-only;
-scale-up, primary removal, and the SQLite/PostgreSQL ports remain future work.
+the production v2 controller configuration enables
+[sequential scale-up](docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
+one fresh incarnation at a time. Classic v1 remains unchanged. Primary removal,
+an independent minimum replica count, a validated maximum replica count, and
+the SQLite/PostgreSQL ports remain future work. Protocol 8 / agent schema 3
+require a fresh coordinated v2 deployment.
 
 ## Continuous Delivery
 
@@ -111,7 +116,8 @@ such as `v0.1.0` also publishes the exact version tag.
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md) — independent stack deployment, authority, supported operations, and diagnostics
 - [Secondary scale-down](docs/features/kuberic/level-triggered-operator.md#secondary-scale-down) — lower desired membership, singleton risks, and exact permanent cleanup
-- [V1 retirement plan](docs/proposal/v1-retirement-plan.md) — completed switchover, partial scaling, and remaining retirement gates
+- [Sequential scale-up](docs/features/kuberic/level-triggered-operator.md#sequential-scale-up) — add or restore one fresh ordinal at a time through copy, catch-up, and PC/CC admission
+- [V1 retirement plan](docs/proposal/v1-retirement-plan.md) — completed switchover and scaling subsets, plus remaining primary-removal and retirement gates
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
 
 ## License

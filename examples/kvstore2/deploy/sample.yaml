@@ -4,10 +4,12 @@ metadata:
   name: kvstore2
 spec:
   replicas: 3
-  # Protocol 6 / agent store schema 2: use a fresh coordinated deployment.
+  # Protocol 8 / agent store schema 3: use a fresh coordinated deployment.
   # After Ready, lower replicas to 2, then 1 for secondary-only scale-down.
   # PVC object deletion: no retention/import path; not a physical-erasure guarantee.
-  # A singleton has no redundancy; scale-up and active cancellation are unsupported.
+  # A singleton has no redundancy; raise replicas to restore one fresh ordinal at a time.
+  # Scale-up creates/freezes the PVC before the Pod and retries failed candidates fresh.
+  # The test-only live copy gate is intentionally absent from this user manifest.
   image: localhost/kvstore2:level-triggered-v1
   failoverDelaySeconds: 10
   # Optional: submit only after Ready, selecting a committed non-primary ID.

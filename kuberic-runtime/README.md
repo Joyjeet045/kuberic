@@ -118,7 +118,7 @@ After process termination, a started record is finalized without Open: terminati
 already closed the prior host. The pending agent effect then completes its exact
 durable receipt normally. Failed finalization keeps reconstruction closed.
 Preparation, acceptance, and retirement postconditions are unpublished managed
-contracts, not additions to the SF-shaped application traits. Agent schema-2
+contracts, not additions to the SF-shaped application traits. Agent schema-3
 storage persists preparation, accepted-current-only, and retirement evidence.
 Recovery revalidates accepted evidence before restoring previously granted
 access; preparation and current-only coordination by themselves stay closed.
@@ -133,7 +133,14 @@ cleanup identity. PVC object deletion has no retention or import path, not a
 physical storage erasure guarantee. Frozen-primary loss during removal/cleanup
 can cause indefinite outage. Sequential cleanup and each retained member's
 original completed current-only witness or fresh completed local acceptance
-gate replacement of the bounded receipt. Scale-up remains absent.
+gate replacement of the bounded receipt. Sequential scale-up uses the same
+authority-validated runtime boundary without moving desired policy or cleanup
+authority into the runtime. It freezes a separate post-enumeration catch-up
+boundary, admits the candidate through independently validated previous and
+expanded policies, and may preserve same-primary writes only while both
+configurations remain writable. Candidate readiness/copy completion alone never
+grants membership or quorum credit. Protocol 8/schema 3 require a fresh
+coordinated v2 deployment; classic v1 remains unchanged.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 include separating replication proof from Kubernetes cleanup obligations; neither
 desired policy nor Kubernetes deletion authority belongs in the runtime.

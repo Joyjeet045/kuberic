@@ -9,8 +9,9 @@ pub mod evaluator;
 pub mod observation;
 pub mod plan;
 mod scale_down;
+mod scale_up;
 pub mod types;
 pub mod validation;
 
 /// Exact protocol version supported by the current minimum contract.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 8;

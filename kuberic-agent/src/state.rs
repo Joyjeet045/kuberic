@@ -1,18 +1,19 @@
 //! Durable replica-agent state.
 
 use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_protocol::command::EnsureReplicaBuild;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, FaultType,
-    InitializationId, LoadMetric, OperationId, PodUid, PvcUid, ReplicaIdentity, ReplicaRole,
-    ResourceUid, SecondaryRemovalEvidence, SecondaryRemovalPreparation, SecondaryScaleDownCleanup,
-    SwitchoverHandoff,
+    InitializationId, LoadMetric, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaIdentity,
+    ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence, SecondaryRemovalEvidence,
+    SecondaryRemovalPreparation, SecondaryScaleDownCleanup, SwitchoverHandoff,
 };
-use kuberic_runtime_internal::authority::RetiredAuthority;
+use kuberic_runtime_internal::authority::{DurableBuildProgress, RetiredAuthority};
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,6 +109,8 @@ pub struct PreparationRetirement {
 #[serde(rename_all = "camelCase")]
 pub struct AgentState {
     pub identity: StorageIdentity,
+    #[serde(default)]
+    pub scale_up_initialization: Option<ProvisioningIntent>,
     pub admitted_policy: Option<EffectivePolicy>,
     pub previous_policy: Option<EffectivePolicy>,
     pub prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
@@ -129,6 +132,18 @@ pub struct AgentState {
     pub reconfiguration: Option<ReconfigurationRecord>,
     #[serde(default)]
     pub retained_command: Option<RetainedCommandResult>,
+    #[serde(default)]
+    pub completed_scale_up: Option<Box<RetainedCommandResult>>,
+    #[serde(default)]
+    pub scale_up_evidence: Option<Box<ScaleUpConfigurationEvidence>>,
+    #[serde(default)]
+    pub build_commands: BTreeMap<OperationId, EnsureReplicaBuild>,
+    #[serde(default)]
+    pub build_progress: BTreeMap<OperationId, DurableBuildProgress>,
+    #[serde(default)]
+    pub retired_builds: BTreeSet<OperationId>,
+    #[serde(default)]
+    pub abandoned_builds: BTreeSet<OperationId>,
     #[serde(default = "initial_effect_sequence")]
     pub next_effect_sequence: u64,
     #[serde(default)]
@@ -149,6 +164,7 @@ impl AgentState {
     pub fn new(identity: StorageIdentity) -> Self {
         Self {
             identity,
+            scale_up_initialization: None,
             admitted_policy: None,
             previous_policy: None,
             prepared_secondary_removal: None,
@@ -167,6 +183,12 @@ impl AgentState {
             reconfiguration_data: None,
             reconfiguration: None,
             retained_command: None,
+            completed_scale_up: None,
+            scale_up_evidence: None,
+            build_commands: BTreeMap::new(),
+            build_progress: BTreeMap::new(),
+            retired_builds: BTreeSet::new(),
+            abandoned_builds: BTreeSet::new(),
             next_effect_sequence: 1,
             load_metrics: Vec::new(),
             reported_fault: None,

@@ -4,7 +4,9 @@ use kuberic_protocol::command::{
     EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
 };
 use kuberic_protocol::types::{AccessStatus, ReplicaRole, TransitionKind};
-use kuberic_protocol::validation::validate_transition_relationship;
+use kuberic_protocol::validation::{
+    validate_scale_up_configuration, validate_transition_relationship,
+};
 use kuberic_runtime_internal::authority::AdmittedAuthority;
 
 use crate::provisioning::{
@@ -172,6 +174,9 @@ fn admit_configuration_with_replay(
             "prepared removal may only roll forward".into(),
         ));
     }
+    if command.scale_up_evidence.is_some() || command.transition_kind == TransitionKind::ScaleUp {
+        return admit_scale_up_configuration(command, state, persisted_exact_replay);
+    }
     if command.secondary_removal_evidence.is_some()
         || command
             .previous_policy
@@ -290,6 +295,7 @@ fn admit_configuration_with_replay(
         }
         return Ok(AdmittedAuthority {
             secondary_removal: None,
+            scale_up: None,
             local_identity: identity.clone(),
             transition_kind: None,
             previous_configuration: None,
@@ -486,6 +492,9 @@ fn admit_configuration_with_replay(
         secondary_removal: is_access_only_configuration(command, state)
             .then(|| state.secondary_removal_evidence.clone())
             .flatten(),
+        scale_up: is_access_only_configuration(command, state)
+            .then(|| state.scale_up_evidence.clone())
+            .flatten(),
         local_identity: identity.clone(),
         transition_kind: (!command.current_only && !is_access_only_configuration(command, state))
             .then_some(command.transition_kind),
@@ -506,6 +515,335 @@ fn admit_configuration_with_replay(
     Ok(admitted)
 }
 
+fn admit_scale_up_configuration(
+    command: &EnsureConfiguration,
+    state: &AgentState,
+    persisted_exact_replay: bool,
+) -> Result<AdmittedAuthority> {
+    validate_scale_up_configuration(command)
+        .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+    let evidence = command
+        .scale_up_evidence
+        .as_ref()
+        .expect("validated scale-up command has evidence");
+    let intent = evidence.intent();
+    let identity = &state.identity.local_identity;
+    if intent.resource_uid != state.identity.resource_uid
+        || command.local_replica_id != identity.replica_id
+        || command.expected_instance_id != identity.instance_id
+        || command.expected_agent_generation != identity.agent_generation
+        || command.current_epoch < state.highest_epoch
+    {
+        return Err(AgentError::CommandRejected(
+            "scale-up command target or epoch differs from durable identity".into(),
+        ));
+    }
+    let sequential_supersession = state.scale_up_evidence.as_deref().is_some_and(|existing| {
+        existing.intent() != intent
+            && state.previous_configuration.is_none()
+            && state.current_configuration.as_ref() == Some(&intent.previous_configuration)
+            && state.admitted_policy.as_ref() == Some(&intent.previous_policy)
+            && state.retired_builds.contains(&existing.intent().build_id)
+            && state.completed_scale_up.as_ref().is_some_and(|retained| {
+                retained.command.current_only
+                    && retained.command.scale_up_evidence.as_deref() == Some(existing)
+                    && retained.command.current_configuration == intent.previous_configuration
+            })
+    });
+    if let Some(existing) = state.scale_up_evidence.as_deref()
+        && existing.intent() != intent
+        && !sequential_supersession
+    {
+        return Err(AgentError::CommandRejected(
+            "scale-up command conflicts with incomplete durable attempt authority".into(),
+        ));
+    }
+    let mut historical_failover_current_only = false;
+    let mut original_failover_basis = false;
+    let mut exact_failover_progression = false;
+    if let kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover { evidence } =
+        evidence.as_ref()
+    {
+        let new_primary = command
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| {
+                member.identity.replica_id == command.current_configuration.primary_id
+                    && member.role == ReplicaRole::Primary
+            })
+            .expect("validated failover configuration has one primary");
+        let has_new_primary_witness = if command.failover_safe_lsn.is_none() {
+            evidence
+                .current_read_quorum
+                .iter()
+                .any(|witness| witness.identity == new_primary.identity)
+        } else {
+            evidence
+                .final_election
+                .as_deref()
+                .is_some_and(|final_election| {
+                    final_election
+                        .final_configuration(&evidence.provisional_configuration)
+                        .as_ref()
+                        == Some(&command.current_configuration)
+                        && command.failover_safe_lsn == final_election.safe_lsn()
+                        && final_election
+                            .witness(new_primary.identity.replica_id)
+                            .is_some_and(|witness| {
+                                final_election
+                                    .current_read_quorum
+                                    .contains(&new_primary.identity.replica_id)
+                                    && Some(witness.current_progress.min(witness.deactivated_lsn))
+                                        == final_election.safe_lsn()
+                            })
+                })
+        };
+        let original_attempt_installed = matches!(
+            state.scale_up_evidence.as_deref(),
+            Some(
+                kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission {
+                    intent: durable_intent
+                }
+            ) if durable_intent == intent
+        ) && state.current_configuration.as_ref()
+            == Some(&intent.current_configuration)
+            && (state.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+                || state.previous_configuration.is_none());
+        let original_authority_failover = !command.current_only
+            && state.previous_configuration.is_none()
+            && state.current_configuration.as_ref() == Some(&intent.previous_configuration)
+            && state.highest_epoch == intent.previous_configuration.epoch
+            && state.admitted_policy.as_ref() == Some(&intent.previous_policy)
+            && intent
+                .previous_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == *identity && member.role == state.role);
+        original_failover_basis = original_attempt_installed || original_authority_failover;
+        let first_failover_admission = !command.current_only && original_attempt_installed;
+        historical_failover_current_only = command.current_only
+            && original_attempt_installed
+            && state.current_configuration.as_ref() != Some(&command.current_configuration);
+        let exact_failover_pc_cc =
+            !command.current_only && state.previous_configuration == command.previous_configuration;
+        let exact_failover_current_only = command.current_only
+            && (state.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+                || (persisted_exact_replay && state.previous_configuration.is_none()));
+        let exact_installed_failover = state.scale_up_evidence.as_deref()
+            == Some(
+                command
+                    .scale_up_evidence
+                    .as_deref()
+                    .expect("validated evidence"),
+            )
+            && state.current_configuration.as_ref() == Some(&command.current_configuration)
+            && (exact_failover_pc_cc || exact_failover_current_only);
+        let fenced_failover_progression = !command.current_only
+            && state.scale_up_evidence.as_deref() == command.scale_up_evidence.as_deref()
+            && state.highest_epoch < command.current_epoch
+            && state
+                .current_configuration
+                .as_ref()
+                .is_some_and(|configuration| {
+                    kuberic_protocol::validation::validate_scale_up_failover_transition(
+                        evidence,
+                        configuration,
+                        &intent.current_policy,
+                    )
+                    .is_ok()
+                });
+        let exact_provisional_return = !command.current_only
+            && command.failover_safe_lsn.is_some()
+            && state.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+            && state.current_configuration.as_ref() == Some(&evidence.provisional_configuration)
+            && state.highest_epoch == evidence.provisional_configuration.epoch
+            && matches!(
+                state.scale_up_evidence.as_deref(),
+                Some(
+                    kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover {
+                        evidence: installed
+                    }
+                ) if installed.final_election.is_none()
+                    && installed.same_provisional_authority(evidence)
+            );
+        exact_failover_progression =
+            exact_installed_failover || fenced_failover_progression || exact_provisional_return;
+        if !has_new_primary_witness
+            || (!first_failover_admission
+                && !original_authority_failover
+                && !historical_failover_current_only
+                && !fenced_failover_progression
+                && !exact_provisional_return
+                && !(exact_installed_failover && (command.current_only || persisted_exact_replay)))
+        {
+            return Err(AgentError::CommandRejected(
+                "carried scale-up failover lacks durable PC/CC authority or a new-primary witness"
+                    .into(),
+            ));
+        }
+    }
+    if *identity == intent.target {
+        let provisioning = state.scale_up_initialization.as_ref().ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate lacks durable scale-up initialization authority".into(),
+            )
+        })?;
+        let initialized = provisioning.scale_up().ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate initialization is not tagged for scale-up".into(),
+            )
+        })?;
+        if initialized.resource_uid != intent.resource_uid
+            || initialized.spec_generation != intent.spec_generation
+            || initialized.desired_replicas != intent.desired_replicas
+            || initialized.previous_configuration != intent.previous_configuration
+            || initialized.previous_policy != intent.previous_policy
+            || initialized.current_policy != intent.current_policy
+            || provisioning.target_identity(&intent.resource_uid) != intent.target
+            || provisioning
+                .scale_up_build_id(&intent.resource_uid)
+                .as_ref()
+                != Some(&intent.build_id)
+        {
+            return Err(AgentError::CommandRejected(
+                "candidate authority differs from durable scale-up initialization".into(),
+            ));
+        }
+        let build = state.build_commands.get(&intent.build_id).ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate has not durably admitted the exact scale-up build".into(),
+            )
+        })?;
+        let authority = build.authority.as_ref().ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate build command lacks immutable receiver authority".into(),
+            )
+        })?;
+        let progress = state.build_progress.get(&intent.build_id).ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate lacks durable exact scale-up build progress".into(),
+            )
+        })?;
+        if (state.retired_builds.contains(&intent.build_id)
+            && !(command.current_only
+                && (persisted_exact_replay || historical_failover_current_only))
+            && !original_failover_basis
+            && !exact_failover_progression)
+            || build.target != intent.target
+            || authority.build_id != intent.build_id
+            || authority.source != intent.primary
+            || authority.target != intent.target
+            || authority.current_configuration != intent.previous_configuration
+            || authority.replication_boundary_lsn != intent.snapshot_boundary_lsn
+            || progress.authority != *authority
+            || !progress.completed
+            || progress.catch_up_boundary_lsn != Some(intent.catch_up_boundary_lsn)
+            || progress.durable_lsn < intent.catch_up_boundary_lsn
+        {
+            return Err(AgentError::CommandRejected(
+                "candidate requires exact completed build progress through the frozen boundary"
+                    .into(),
+            ));
+        }
+    }
+
+    let completed_current_only_replay = persisted_exact_replay
+        && command.current_only
+        && state.current_configuration.as_ref() == Some(&command.current_configuration)
+        && state.previous_configuration.is_none();
+    if command.current_only {
+        if !completed_current_only_replay
+            && !historical_failover_current_only
+            && (state.current_configuration.as_ref() != Some(&command.current_configuration)
+                || state.previous_configuration.as_ref() != Some(&intent.previous_configuration))
+        {
+            return Err(AgentError::CommandRejected(
+                "scale-up current-only completion lacks durable PC/CC authority".into(),
+            ));
+        }
+    } else {
+        let prior_member = intent
+            .previous_configuration
+            .members
+            .iter()
+            .any(|member| member.identity == *identity);
+        let same_attempt_replay = state.current_configuration.as_ref()
+            == Some(&command.current_configuration)
+            && state.previous_configuration.as_ref() == Some(&intent.previous_configuration);
+        let admission_start = prior_member
+            && state.current_configuration.as_ref() == Some(&intent.previous_configuration)
+            && state.previous_configuration.is_none();
+        let candidate_start = *identity == intent.target
+            && state.current_configuration.is_none()
+            && state.previous_configuration.is_none();
+        let carried_failover = matches!(
+            evidence.as_ref(),
+            kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover { .. }
+        ) && state.current_configuration.as_ref().is_some_and(
+            |configuration| {
+                configuration == &intent.current_configuration
+                || configuration == &command.current_configuration
+                || matches!(
+                    (
+                        state.scale_up_evidence.as_deref(),
+                        evidence.as_ref(),
+                    ),
+                    (
+                        Some(
+                            kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover {
+                                evidence: installed
+                            }
+                        ),
+                        kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover {
+                            evidence: commanded
+                        },
+                    ) if configuration == &commanded.provisional_configuration
+                        && installed.final_election.is_none()
+                        && installed.same_provisional_authority(commanded)
+                )
+                || (state.scale_up_evidence.as_deref() == Some(evidence.as_ref())
+                    && state.highest_epoch < command.current_epoch
+                    && kuberic_protocol::validation::validate_scale_up_failover_transition(
+                        match evidence.as_ref() {
+                            kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover {
+                                evidence,
+                            } => evidence,
+                            _ => unreachable!(),
+                        },
+                        configuration,
+                        &intent.current_policy,
+                    )
+                    .is_ok())
+            },
+        );
+        if !same_attempt_replay && !admission_start && !candidate_start && !carried_failover {
+            return Err(AgentError::CommandRejected(
+                "scale-up PC/CC command does not extend durable accepted authority".into(),
+            ));
+        }
+    }
+
+    let admitted = AdmittedAuthority {
+        secondary_removal: None,
+        scale_up: Some(evidence.clone()),
+        local_identity: identity.clone(),
+        transition_kind: (!command.current_only).then_some(command.transition_kind),
+        previous_configuration: command.previous_configuration.clone(),
+        current_configuration: command.current_configuration.clone(),
+        switchover_handoff: None,
+    };
+    admitted
+        .validate()
+        .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+    if admitted.local_role() == ReplicaRole::None {
+        return Err(AgentError::CommandRejected(
+            "scale-up authority does not assign the local replica".into(),
+        ));
+    }
+    Ok(admitted)
+}
+
 pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<()> {
     if state.retired_authority.is_some() || state.removal_pending() {
         return Err(AgentError::CommandRejected(
@@ -513,6 +851,40 @@ pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<(
         ));
     }
     let identity = &state.identity.local_identity;
+    if command.retire {
+        if command.authority.is_some() || command.source_session_id.is_some() {
+            return Err(AgentError::CommandRejected(
+                "build retirement cannot carry delivery authority".into(),
+            ));
+        }
+        let existing = state
+            .build_commands
+            .get(&command.operation_id)
+            .ok_or_else(|| {
+                AgentError::CommandRejected(
+                    "build retirement requires exact durable build authority".into(),
+                )
+            })?;
+        if existing.retire
+            || existing.local_replica_id != command.local_replica_id
+            || existing.expected_instance_id != command.expected_instance_id
+            || existing.expected_agent_generation != command.expected_agent_generation
+            || existing.target != command.target
+            || existing.authority.is_some()
+        {
+            return Err(AgentError::CommandRejected(
+                "build retirement differs from exact durable source authority".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if state.retired_builds.contains(&command.operation_id)
+        || state.abandoned_builds.contains(&command.operation_id)
+    {
+        return Err(AgentError::CommandRejected(
+            "abandoned or retired build authority cannot be reopened".into(),
+        ));
+    }
     if command.operation_id.is_empty()
         || command.local_replica_id != identity.replica_id
         || command.expected_instance_id != identity.instance_id
@@ -529,7 +901,10 @@ pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<(
         if authority.build_id != command.operation_id
             || authority.target != command.target
             || authority.target != *identity
-            || command.source_session_id.is_none()
+            || command
+                .source_session_id
+                .as_ref()
+                .is_none_or(|session| session.is_empty())
         {
             return Err(AgentError::CommandRejected(
                 "target build command differs from admitted build authority".into(),

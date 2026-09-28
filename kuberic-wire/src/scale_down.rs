@@ -189,6 +189,7 @@ pub(crate) fn configuration_from_proto(
         || !value.retire_build_ids.is_empty()
         || value.switchover_handoff.is_some()
         || !value.retire_switchover_preparation_ids.is_empty()
+        || value.scale_up_evidence.is_some()
     {
         return Err(WireError::InvalidAuthority(
             "removal cannot carry write grants or unrelated retirements".into(),
@@ -222,6 +223,7 @@ pub(crate) fn configuration_from_proto(
             )?
             .try_into()?,
         ),
+        scale_up_evidence: None,
         local_replica_id: ReplicaId::new(value.local_replica_id),
         expected_instance_id: ReplicaInstanceId::new(value.expected_instance_id),
         expected_agent_generation: AgentGeneration::new(value.expected_agent_generation),

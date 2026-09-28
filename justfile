@@ -133,8 +133,9 @@ level-triggered-install: verify-kind-context
         controller=localhost/kuberic-controller:level-triggered-v1
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n kuberic-system rollout status deployment/kuberic-controller --timeout=180s
-    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        apply -f examples/kvstore2/deploy/sample.yaml
+    awk '1; /^metadata:$/ { print "  annotations:"; print "    testing.kuberic.io/live-copy-gate: enabled" }' \
+        examples/kvstore2/deploy/sample.yaml | \
+        kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" apply -f -
 
 # Run one or more explicit isolated level-triggered KinD scenarios.
 level-triggered-kind-test *scenarios: verify-kind-context
@@ -147,7 +148,9 @@ level-triggered-kind-test *scenarios: verify-kind-context
     expanded=()
     for scenario in "${requested[@]}"; do
       if [[ "$scenario" == "all" ]]; then
-        expanded+=(replacement quorum-loss adversarial switchover switchover-adversarial scale-down scale-down-adversarial)
+        expanded+=(replacement quorum-loss adversarial switchover switchover-adversarial scale-down scale-down-adversarial scale-up scale-up-multi scale-up-adversarial)
+      elif [[ "$scenario" == "scale-up-full" ]]; then
+        expanded+=(scale-up scale-up-multi scale-up-adversarial)
       else
         expanded+=("$scenario")
       fi
@@ -163,6 +166,9 @@ level-triggered-kind-test *scenarios: verify-kind-context
         switchover-adversarial) test_name="level_triggered_k8s::planned_switchover_adversarial" ;;
         scale-down) test_name="level_triggered_k8s::scale_down" ;;
         scale-down-adversarial) test_name="level_triggered_k8s::scale_down_adversarial" ;;
+        scale-up) test_name="level_triggered_k8s::scale_up" ;;
+        scale-up-multi) test_name="level_triggered_k8s::scale_up_multi" ;;
+        scale-up-adversarial) test_name="level_triggered_k8s::scale_up_adversarial" ;;
         *) echo "unknown level-triggered scenario: $scenario" >&2; exit 2 ;;
       esac
       started=$SECONDS
@@ -179,6 +185,10 @@ level-triggered-diagnostics: verify-kind-context
         -n kuberic-system logs deployment/kuberic-controller --all-containers --tail=-1 || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n default get kubericset kvstore2 -o yaml || true
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n default get kubericset kvstore2 \
+        -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}' || true
+    echo
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n default get pods,pvc,services -o wide || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
@@ -197,4 +207,8 @@ level-triggered-diagnostics: verify-kind-context
       echo
       kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n default logs "${pod}" --all-containers --previous --tail=200 || true
+      echo "=== ${pod}: storage layout ==="
+      timeout --kill-after=2s 15s kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n default exec "${pod}" -- sh -c \
+        'find /var/lib/kuberic -maxdepth 4 -printf "%y %s %p\n" 2>/dev/null | sort; du -ah /var/lib/kuberic 2>/dev/null | sort -h | tail -100' || true
     done

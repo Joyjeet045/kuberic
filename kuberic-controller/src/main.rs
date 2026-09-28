@@ -11,7 +11,6 @@ use kube::runtime::watcher;
 use kuberic_controller::cluster_api::{GrpcAgentApi, KubeClusterApi};
 use kuberic_controller::crd::KubericSet;
 use kuberic_controller::reconciler::Reconciler;
-use kuberic_protocol::evaluator::EvaluationConfig;
 
 #[derive(Debug, Parser)]
 struct Config {
@@ -42,13 +41,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?);
     let reconciler = Arc::new(Reconciler::new(
         api,
-        EvaluationConfig {
-            enable_secondary_scale_down: true,
-            supported_protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-            stable_resync_seconds: config.stable_resync_seconds,
-            wait_requeue_seconds: config.wait_requeue_seconds,
-            unsafe_requeue_seconds: config.unsafe_requeue_seconds,
-        },
+        kuberic_controller::production_evaluation_config(
+            config.stable_resync_seconds,
+            config.wait_requeue_seconds,
+            config.unsafe_requeue_seconds,
+        ),
     ));
     let sets = Api::<KubericSet>::all(client.clone());
     let pods = Api::<Pod>::all(client.clone());

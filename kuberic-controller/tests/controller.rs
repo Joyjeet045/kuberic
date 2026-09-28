@@ -31,12 +31,15 @@ const UID: &str = "set-uid";
 const POD_UID: &str = "pod-uid-1";
 const PVC_UID: &str = "pvc-uid-1";
 
+#[path = "support/scale_up.rs"]
+mod scale_up;
 #[path = "support/secondary_scale_down.rs"]
 mod secondary_scale_down;
 
 fn config() -> EvaluationConfig {
     EvaluationConfig {
         enable_secondary_scale_down: false,
+        allow_scale_up: false,
         supported_protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         stable_resync_seconds: 11,
         wait_requeue_seconds: 3,

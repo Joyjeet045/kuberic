@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -215,6 +216,78 @@ fn stop_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Res
             String::from_utf8_lossy(&stopped.stderr)
         );
     }
+    Ok(())
+}
+
+fn kill_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Result<()> {
+    let pod = pod_for_replica(kubeconfig, context, replica_id)?;
+    let node = kubectl(
+        kubeconfig,
+        context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            &pod,
+            "-o",
+            "jsonpath={.spec.nodeName}",
+        ],
+    )?
+    .trim()
+    .to_string();
+    let container = Command::new("docker")
+        .args([
+            "exec",
+            &node,
+            "crictl",
+            "ps",
+            "--label",
+            &format!("io.kubernetes.pod.name={pod}"),
+            "-q",
+        ])
+        .output()
+        .context("resolving exact replica container for forced restart")?;
+    ensure!(
+        container.status.success(),
+        "cannot resolve replica {replica_id} container: {}",
+        String::from_utf8_lossy(&container.stderr)
+    );
+    let containers = String::from_utf8(container.stdout)?;
+    let container_id = containers
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .context("running replica container")?;
+    ensure!(
+        containers
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            == 1,
+        "expected one exact replica container, observed {containers:?}"
+    );
+    let inspection = Command::new("docker")
+        .args(["exec", &node, "crictl", "inspect", container_id])
+        .output()
+        .context("inspecting exact replica container for forced restart")?;
+    ensure!(
+        inspection.status.success(),
+        "cannot inspect replica {replica_id} container: {}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    let inspection: Value = serde_json::from_slice(&inspection.stdout)?;
+    let pid = inspection["info"]["pid"]
+        .as_i64()
+        .context("exact replica host PID")?;
+    let killed = Command::new("docker")
+        .args(["exec", &node, "kill", "-KILL", &pid.to_string()])
+        .output()
+        .context("force-restarting exact replica process")?;
+    ensure!(
+        killed.status.success(),
+        "cannot force-restart replica {replica_id}: {}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
     Ok(())
 }
 
@@ -543,6 +616,16 @@ struct DirectClient {
 
 impl DirectClient {
     fn connect(cluster: &SwitchoverCluster, pod: &str, deadline: Instant) -> Result<Self> {
+        Self::connect_port(cluster, pod, 8080, deadline)
+    }
+
+    fn connect_port(
+        cluster: &SwitchoverCluster,
+        pod: &str,
+        remote_port: u16,
+        deadline: Instant,
+    ) -> Result<Self> {
+        let port_mapping = format!(":{remote_port}");
         let mut forward = OwnedChild(
             Command::new("kubectl")
                 .args([
@@ -551,14 +634,8 @@ impl DirectClient {
                     "--context",
                     &cluster.context,
                 ])
-                .args([
-                    "-n",
-                    "default",
-                    "port-forward",
-                    "--address=127.0.0.1",
-                    pod,
-                    ":8080",
-                ])
+                .args(["-n", "default", "port-forward", "--address=127.0.0.1", pod])
+                .arg(port_mapping)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()?,
@@ -812,6 +889,7 @@ fn retains_acknowledged_prefix(
         && report["pendingOperation"].is_null()
 }
 
+#[derive(Clone)]
 struct SwitchoverCluster {
     kubeconfig: String,
     context: String,
@@ -993,6 +1071,27 @@ fn routing_instance(service: &Value) -> Option<&str> {
     service["spec"]["selector"]["operator.kuberic.io/instance"].as_str()
 }
 
+fn validate_routed_service(service: &Value, primary: &Value) -> Result<()> {
+    ensure!(
+        service["metadata"]["name"] == "kvstore2-write",
+        "unexpected routed Service: {service}"
+    );
+    ensure!(
+        routing_instance(service) == primary["instanceId"].as_str(),
+        "routing lost exact primary: {service}"
+    );
+    let ports = service["spec"]["ports"]
+        .as_array()
+        .context("routed Service ports")?;
+    ensure!(
+        ports.len() == 1
+            && ports[0]["port"].as_i64() == Some(80)
+            && ports[0]["targetPort"].as_i64() == Some(8080),
+        "routed Service did not expose exact application targetPort: {ports:?}"
+    );
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum RoutedWriteOutcome {
     Acknowledged,
@@ -1087,10 +1186,11 @@ fn routed_kubectl(cluster: &SwitchoverCluster, deadline: Instant, args: &[&str])
         "routed Service deadline expired before kubectl {args:?}"
     );
     // Bound exec and API discovery by the scenario deadline, not a fresh timeout.
+    let attempt_timeout = remaining.min(Duration::from_secs(15));
     Command::new("timeout")
         .args([
-            "--signal=KILL",
-            &format!("{}s", remaining.as_secs_f64()),
+            "--kill-after=2s",
+            &format!("{}s", attempt_timeout.as_secs_f64()),
             "kubectl",
         ])
         .args([
@@ -1105,6 +1205,144 @@ fn routed_kubectl(cluster: &SwitchoverCluster, deadline: Instant, args: &[&str])
         .with_context(|| format!("routed kubectl {args:?}"))
 }
 
+fn transient_routed_lookup_failure(output: &Output) -> bool {
+    if output.status.success() {
+        return false;
+    }
+    if output.status.code() == Some(124) {
+        return true;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    [
+        "Unable to connect to the server",
+        "The connection to the server",
+        "context deadline exceeded",
+        "i/o timeout",
+        "TLS handshake timeout",
+        "connection refused",
+        "connection reset by peer",
+        "EOF",
+        "ServiceUnavailable",
+        "Too Many Requests",
+    ]
+    .iter()
+    .any(|transient| stderr.contains(transient))
+}
+
+fn require_routed_lookup(output: Output, resource: &str) -> Result<Option<Output>> {
+    if output.status.success() {
+        return Ok(Some(output));
+    }
+    if transient_routed_lookup_failure(&output) {
+        return Ok(None);
+    }
+    bail!(
+        "nonretryable routed Service {resource} lookup failed: exit={:?}, stdout={:?}, stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn routed_service_client_pod(
+    cluster: &SwitchoverCluster,
+    primary: &Value,
+    deadline: Instant,
+) -> Result<Option<String>> {
+    let service = routed_kubectl(
+        cluster,
+        deadline,
+        &[
+            "-n",
+            "default",
+            "get",
+            "service",
+            "kvstore2-write",
+            "-o",
+            "json",
+        ],
+    )?;
+    let Some(service) = require_routed_lookup(service, "Service")? else {
+        return Ok(None);
+    };
+    let service: Value = serde_json::from_slice(&service.stdout)?;
+    if routing_instance(&service) == Some("disabled") {
+        return Ok(None);
+    }
+    validate_routed_service(&service, primary)?;
+    let endpoints = routed_kubectl(
+        cluster,
+        deadline,
+        &[
+            "-n",
+            "default",
+            "get",
+            "endpoints",
+            "kvstore2-write",
+            "-o",
+            "json",
+        ],
+    )?;
+    let Some(endpoints) = require_routed_lookup(endpoints, "Endpoints")? else {
+        return Ok(None);
+    };
+    let endpoints: Value = serde_json::from_slice(&endpoints.stdout)?;
+    let ready = endpoints["subsets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|subset| {
+            subset["addresses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .filter(|address| address["targetRef"]["uid"] == primary["instanceId"])
+        .count();
+    let not_ready = endpoints["subsets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|subset| {
+            subset["notReadyAddresses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .filter(|address| address["targetRef"]["uid"] == primary["instanceId"])
+        .count();
+    if ready != 1 || not_ready != 0 {
+        return Ok(None);
+    }
+    let pods = routed_kubectl(
+        cluster,
+        deadline,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pods",
+            "-l",
+            "operator.kuberic.io/set-name=kvstore2",
+            "-o",
+            "json",
+        ],
+    )?;
+    let Some(pods) = require_routed_lookup(pods, "Pod")? else {
+        return Ok(None);
+    };
+    let pods: Value = serde_json::from_slice(&pods.stdout)?;
+    Ok(pods["items"]
+        .as_array()
+        .context("routed primary Pod list")?
+        .iter()
+        .find(|pod| pod["metadata"]["uid"] == primary["instanceId"])
+        .and_then(|pod| pod["metadata"]["name"].as_str())
+        .map(str::to_string))
+}
+
 fn assert_routed_service_write(
     cluster: &SwitchoverCluster,
     primary: &Value,
@@ -1113,52 +1351,13 @@ fn assert_routed_service_write(
     deadline: Instant,
 ) -> Result<()> {
     wait_routed_write(deadline, || {
-        let service = routed_kubectl(
-            cluster,
-            deadline,
-            &[
-                "-n",
-                "default",
-                "get",
-                "service",
-                "kvstore2-write",
-                "-o",
-                "json",
-            ],
-        )?;
-        if !service.status.success() {
-            return Ok(service);
-        }
-        let service: Value = serde_json::from_slice(&service.stdout)?;
-        ensure!(
-            routing_instance(&service) == primary["instanceId"].as_str(),
-            "routing lost exact primary: {service}"
-        );
-        let pods = routed_kubectl(
-            cluster,
-            deadline,
-            &[
-                "-n",
-                "default",
-                "get",
-                "pods",
-                "-l",
-                "operator.kuberic.io/set-name=kvstore2",
-                "-o",
-                "json",
-            ],
-        )?;
-        if !pods.status.success() {
-            return Ok(pods);
-        }
-        let pods: Value = serde_json::from_slice(&pods.stdout)?;
-        let pod = pods["items"]
-            .as_array()
-            .context("routed primary Pod list")?
-            .iter()
-            .find(|pod| pod["metadata"]["uid"] == primary["instanceId"])
-            .and_then(|pod| pod["metadata"]["name"].as_str())
-            .context("exact accepted primary Pod incarnation is absent")?;
+        let Some(pod) = routed_service_client_pod(cluster, primary, deadline)? else {
+            return Ok(routed_test_output(
+                7,
+                "000",
+                "curl: (7) routed Service endpoint unavailable",
+            ));
+        };
         routed_kubectl(
             cluster,
             deadline,
@@ -1166,7 +1365,7 @@ fn assert_routed_service_write(
                 "-n",
                 "default",
                 "exec",
-                pod,
+                &pod,
                 "--",
                 "curl",
                 "--silent",
@@ -1185,6 +1384,75 @@ fn assert_routed_service_write(
             ],
         )
     })
+}
+
+fn assert_routed_service_read(
+    cluster: &SwitchoverCluster,
+    primary: &Value,
+    key: &str,
+    expected: &str,
+    deadline: Instant,
+) -> Result<()> {
+    let mut last = "no attempt made".to_string();
+    loop {
+        ensure!(
+            Instant::now() < deadline,
+            "deadline exceeded waiting for routed Service read; last {last}"
+        );
+        let Some(pod) = routed_service_client_pod(cluster, primary, deadline)? else {
+            last = "Service shape or exact endpoint not ready".into();
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        let service = routed_kubectl(
+            cluster,
+            deadline,
+            &[
+                "-n",
+                "default",
+                "exec",
+                &pod,
+                "--",
+                "curl",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "5",
+                "-w",
+                "\n%{http_code}",
+                &format!("http://kvstore2-write/kv/{key}"),
+            ],
+        )?;
+        let stdout = String::from_utf8_lossy(&service.stdout);
+        let stderr = String::from_utf8_lossy(&service.stderr);
+        last = format!(
+            "exit={}, stdout={stdout:?}, stderr={stderr:?}",
+            service.status
+        );
+        if service.status.success() {
+            let (body, status) = stdout
+                .rsplit_once('\n')
+                .with_context(|| format!("routed Service read omitted HTTP status; {last}"))?;
+            match status {
+                "200" => {
+                    ensure!(
+                        body == expected,
+                        "routed Service returned wrong value for {key}: expected {expected:?}, got {body:?}"
+                    );
+                    return Ok(());
+                }
+                "503" => {}
+                _ => bail!("unexpected routed Service read status {status:?}; {last}"),
+            }
+        } else {
+            let status = stdout.rsplit_once('\n').map_or("", |(_, status)| status);
+            classify_routed_write(service.status.code(), status, &stderr)
+                .with_context(|| format!("routed Service read; last {last}"))?;
+        }
+        std::thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
 }
 
 fn check_receipt(
@@ -1743,7 +2011,7 @@ fn run_switchover(test: impl FnOnce(&SwitchoverCluster) -> Result<()>) -> Result
     result
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ScaleResource {
     kind: &'static str,
     object: Value,
@@ -1775,6 +2043,143 @@ impl ScaleResource {
             Ok(Some(serde_json::from_str(&output)?))
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct CleanupDeletionObservation {
+    kind: &'static str,
+    name: String,
+    uid: String,
+    resource_version: u64,
+    observed_at: std::time::SystemTime,
+}
+
+fn validate_cleanup_observations(
+    expected: &[ScaleResource],
+    observed: &[CleanupDeletionObservation],
+    complete: bool,
+) -> Result<()> {
+    let order = ["service", "pod", "pvc"];
+    ensure!(
+        expected.len() == order.len()
+            && expected
+                .iter()
+                .zip(order)
+                .all(|(resource, kind)| resource.kind == kind),
+        "cleanup expectation is not endpoint -> Pod -> PVC: {expected:?}"
+    );
+    ensure!(
+        observed.len() <= expected.len(),
+        "cleanup observed duplicate or extra deletion: {observed:?}"
+    );
+    if complete {
+        ensure!(
+            observed.len() == expected.len(),
+            "cleanup omitted exact deletion observations: {observed:?}"
+        );
+    }
+    for (index, observation) in observed.iter().enumerate() {
+        let frozen = &expected[index];
+        ensure!(
+            observation.kind == frozen.kind
+                && observation.name == frozen.name()
+                && observation.uid == frozen.uid(),
+            "cleanup deletion did not match frozen exact resource at position {index}: \
+             expected kind={} name={} uid={}, observed={observation:?}",
+            frozen.kind,
+            frozen.name(),
+            frozen.uid()
+        );
+        if let Some(previous) = index.checked_sub(1).and_then(|i| observed.get(i)) {
+            ensure!(
+                previous.resource_version < observation.resource_version,
+                "cleanup deletion resourceVersions were not strictly ordered: {observed:?}"
+            );
+            ensure!(
+                previous.observed_at <= observation.observed_at,
+                "cleanup observation timestamps regressed: {observed:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn record_cleanup_deletions(
+    cluster: &SwitchoverCluster,
+    watches: &[(&'static str, &Receiver<Value>)],
+    expected: &[ScaleResource],
+    observed: &mut Vec<CleanupDeletionObservation>,
+) -> Result<()> {
+    let mut batch = Vec::new();
+    for (kind, events) in watches {
+        for event in events.try_iter() {
+            ensure!(event["type"] != "ERROR", "cleanup watch failed: {event}");
+            if event["type"] != "DELETED" {
+                continue;
+            }
+            let object = &event["object"];
+            let Some(frozen) = expected.iter().find(|resource| {
+                resource.kind == *kind
+                    && object["metadata"]["name"].as_str() == Some(resource.name())
+                    && object["metadata"]["uid"].as_str() == Some(resource.uid())
+            }) else {
+                continue;
+            };
+            if observed
+                .iter()
+                .any(|prior| prior.kind == *kind && prior.uid == frozen.uid())
+            {
+                continue;
+            }
+            batch.push(CleanupDeletionObservation {
+                kind,
+                name: frozen.name().to_string(),
+                uid: frozen.uid().to_string(),
+                resource_version: resource_version(object)?,
+                observed_at: std::time::SystemTime::now(),
+            });
+        }
+    }
+    batch.sort_by_key(|observation| observation.resource_version);
+    for mut observation in batch {
+        observation.observed_at = std::time::SystemTime::now();
+        let frozen = expected
+            .iter()
+            .find(|resource| {
+                resource.kind == observation.kind
+                    && resource.name() == observation.name
+                    && resource.uid() == observation.uid
+            })
+            .context("frozen cleanup resource")?;
+        ensure!(
+            frozen
+                .get(cluster)?
+                .is_none_or(|live| live["metadata"]["uid"].as_str() != Some(frozen.uid())),
+            "exact {} {} UID {} remained after its deletion observation",
+            frozen.kind,
+            frozen.name(),
+            frozen.uid()
+        );
+        if observation.kind == "pod" {
+            let endpoint = &expected[0];
+            ensure!(
+                endpoint
+                    .get(cluster)?
+                    .is_none_or(|live| live["metadata"]["uid"].as_str() != Some(endpoint.uid())),
+                "candidate Pod deletion was observed before exact endpoint absence"
+            );
+        } else if observation.kind == "pvc" {
+            let pod = &expected[1];
+            ensure!(
+                pod.get(cluster)?
+                    .is_none_or(|live| live["metadata"]["uid"].as_str() != Some(pod.uid())),
+                "candidate PVC deletion was observed before exact Pod absence"
+            );
+        }
+        observed.push(observation);
+        validate_cleanup_observations(expected, observed, false)?;
+    }
+    Ok(())
 }
 
 fn scale_resources(cluster: &SwitchoverCluster, member: &Value) -> Result<Vec<ScaleResource>> {
@@ -1857,6 +2262,14 @@ fn scale_ready(cluster: &SwitchoverCluster, count: usize, deadline: Instant) -> 
 }
 
 fn reset_scale_set(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
+    reset_scale_set_with_delay(cluster, count, 30)
+}
+
+fn reset_scale_set_with_delay(
+    cluster: &SwitchoverCluster,
+    count: usize,
+    failover_delay_seconds: u64,
+) -> Result<()> {
     cluster.kubectl(&[
         "-n",
         "default",
@@ -1890,8 +2303,13 @@ fn reset_scale_set(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
     }
     let object = json!({
         "apiVersion":"operator.kuberic.io/v1alpha1", "kind":"KubericSet",
-        "metadata":{"name":"kvstore2","namespace":"default"},
-        "spec":{"replicas":count,"image":"localhost/kvstore2:level-triggered-v1","failoverDelaySeconds":30}
+        "metadata":{
+            "name":"kvstore2",
+            "namespace":"default",
+            "annotations":{"testing.kuberic.io/live-copy-gate":"enabled"}
+        },
+        "spec":{"replicas":count,"image":"localhost/kvstore2:level-triggered-v1",
+            "failoverDelaySeconds":failover_delay_seconds}
     });
     let mut child = OwnedChild(
         cluster
@@ -1909,7 +2327,7 @@ fn reset_scale_set(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
         .write_all(object.to_string().as_bytes())?;
     ensure!(
         child.0.wait()?.success(),
-        "create fresh scale-down set failed"
+        "create fresh level-triggered set failed"
     );
     scale_ready(cluster, count, Instant::now() + Duration::from_secs(180))?;
     Ok(())
@@ -2559,10 +2977,7 @@ impl LiveStepper {
                 kuberic_controller::normalize::normalize(raw.clone(), Default::default())?;
             let plan = kuberic_protocol::evaluator::evaluate(
                 &snapshot,
-                &kuberic_protocol::evaluator::EvaluationConfig {
-                    enable_secondary_scale_down: true,
-                    ..Default::default()
-                },
+                &kuberic_controller::production_evaluation_config(30, 5, 30),
             );
             let result =
                 kuberic_controller::executor::execute_plan(&api, &raw, &snapshot, plan.clone())
@@ -2582,6 +2997,34 @@ impl LiveStepper {
                 plan,
                 command: self.agents.last_command.lock().unwrap().take(),
             })
+        })
+    }
+
+    fn observe_snapshot(
+        &self,
+        cluster: &SwitchoverCluster,
+    ) -> Result<kuberic_protocol::observation::ObservationSnapshot> {
+        use kuberic_controller::cluster_api::{ClusterApi, KubeClusterApi};
+        self.runtime.block_on(async {
+            let options = kube::config::KubeConfigOptions {
+                context: Some(cluster.context.clone()),
+                ..Default::default()
+            };
+            let config = kube::Config::from_custom_kubeconfig(
+                kube::config::Kubeconfig::read_from(&cluster.kubeconfig)?,
+                &options,
+            )
+            .await?;
+            let api = KubeClusterApi::new(
+                kube::Client::try_from(config)?,
+                self.agents.clone(),
+                std::env::var("KUBERIC_AGENT_BEARER_TOKEN").context("live agent token")?,
+            )?;
+            let raw = api.observe("default", "kvstore2").await?;
+            Ok(kuberic_controller::normalize::normalize(
+                raw,
+                Default::default(),
+            )?)
         })
     }
 
@@ -3306,6 +3749,3122 @@ fn scale_down_selectors_are_exact_ignored_and_in_all() {
     assert!(recipes.contains("-- --ignored --exact --nocapture"));
 }
 
+struct CollectionWatch {
+    _process: OwnedChild,
+    events: Receiver<Value>,
+}
+
+impl CollectionWatch {
+    fn start(cluster: &SwitchoverCluster, resource: &str) -> Result<Self> {
+        let mut process = OwnedChild(
+            Command::new("kubectl")
+                .args([
+                    "--kubeconfig",
+                    &cluster.kubeconfig,
+                    "--context",
+                    &cluster.context,
+                    "-n",
+                    "default",
+                    "get",
+                    resource,
+                    "-l",
+                    "operator.kuberic.io/set-name=kvstore2",
+                    "--watch",
+                    "--output-watch-events",
+                    "-o",
+                    "json",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()?,
+        );
+        let stdout = process.0.stdout.take().context("collection watch stdout")?;
+        let (send, events) = channel();
+        std::thread::spawn(move || {
+            for event in serde_json::Deserializer::from_reader(stdout).into_iter::<Value>() {
+                let Ok(event) = event else { break };
+                if send.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            _process: process,
+            events,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResourceCreation {
+    name: String,
+    uid: String,
+    resource_version: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ScaleUpCommit {
+    count: usize,
+    target: i64,
+    resource_version: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AcknowledgedValue {
+    key: String,
+    value: String,
+    lsn: i64,
+}
+
+#[derive(Clone, Debug)]
+struct PhaseWriteEvidence {
+    target: i64,
+    phase: &'static str,
+    boundary_lsn: i64,
+    write_lsn: i64,
+    candidate: Value,
+    candidate_process_session: String,
+    build_id: String,
+    reached_candidate: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveScaleUpCopyCheckpoint {
+    operation_id: String,
+    build_id: String,
+    source: Value,
+    source_process_session: String,
+    candidate: Value,
+    candidate_process_session: String,
+    snapshot_boundary_lsn: i64,
+}
+
+fn active_scale_up_copy_checkpoint(
+    status: &Value,
+    source: &Value,
+    candidate: &Value,
+    expected_source_session: &str,
+    expected_candidate_session: &str,
+) -> Result<ActiveScaleUpCopyCheckpoint> {
+    use kuberic_protocol::types::{ProvisioningIntent, ReplicaRole, ResourceUid};
+
+    let provisioning: ProvisioningIntent =
+        serde_json::from_value(status["status"]["provisioning"].clone())
+            .context("active scale-up provisioning")?;
+    let scale_up = provisioning
+        .scale_up()
+        .context("active provisioning is not scale-up")?;
+    let resource_uid = ResourceUid::new(
+        status["metadata"]["uid"]
+            .as_str()
+            .context("active scale-up resource UID")?,
+    );
+    ensure!(
+        provisioning.operation_id == provisioning.expected_operation_id(),
+        "active scale-up provisioning operation is not deterministic"
+    );
+    let build_id = provisioning
+        .scale_up_build_id(&resource_uid)
+        .context("active scale-up build ID")?;
+    let target = provisioning.target_identity(&resource_uid);
+    let primary = scale_up
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| {
+            member.identity.replica_id == scale_up.previous_configuration.primary_id
+                && member.role == ReplicaRole::Primary
+        })
+        .context("active scale-up primary")?
+        .identity
+        .clone();
+    let target_json = serde_json::to_value(&target)?;
+    let primary_json = serde_json::to_value(&primary)?;
+    ensure!(
+        status["status"]["transition"].is_null()
+            && status["status"]["scaleUpAdmissionStarted"].is_null(),
+        "active-copy checkpoint was observed after transition/admission began"
+    );
+    ensure!(
+        status["status"]["topology"]["configurationId"]
+            == scale_up.previous_configuration.configuration_id.as_str(),
+        "active-copy checkpoint no longer has the exact previous accepted configuration"
+    );
+    ensure!(
+        status["status"]["topology"]["members"]
+            .as_array()
+            .is_some_and(|members| members.iter().all(|member| identity(member) != target_json)),
+        "active-copy candidate already has accepted membership credit"
+    );
+    ensure!(
+        identity(source) == primary_json
+            && source["role"] == "Primary"
+            && source["previousConfiguration"].is_null()
+            && source["currentConfiguration"]
+                == scale_up.previous_configuration.configuration_id.as_str(),
+        "active-copy source differs from exact pre-admission authority: {source}"
+    );
+    ensure!(
+        identity(candidate) == target_json
+            && candidate["role"] == "IdleSecondary"
+            && candidate["previousConfiguration"].is_null()
+            && candidate["currentConfiguration"].is_null()
+            && candidate["scaleUpOperation"].is_null()
+            && candidate["readStatus"] == "NotPrimary"
+            && matches!(
+                candidate["writeStatus"].as_str(),
+                Some("NotPrimary" | "ReconfigurationPending")
+            ),
+        "active-copy candidate is not exact, idle, and unadmitted: {candidate}"
+    );
+    let source_session = source["processSession"]
+        .as_str()
+        .filter(|session| !session.is_empty())
+        .context("active-copy source process session")?;
+    let candidate_session = candidate["processSession"]
+        .as_str()
+        .filter(|session| !session.is_empty())
+        .context("active-copy candidate process session")?;
+    ensure!(
+        source_session == expected_source_session
+            && candidate_session == expected_candidate_session,
+        "active-copy diagnostics differ from exact observed process sessions: \
+         source={source_session}/{expected_source_session} \
+         candidate={candidate_session}/{expected_candidate_session}"
+    );
+    let exact_build = |report: &Value| {
+        report["builds"]
+            .as_array()
+            .and_then(|builds| {
+                builds.iter().find(|build| {
+                    build["buildId"].as_str() == Some(build_id.as_str())
+                        && build["targetInstance"].as_str() == Some(target.instance_id.as_str())
+                })
+            })
+            .cloned()
+    };
+    let source_build = exact_build(source);
+    let candidate_build = exact_build(candidate);
+    ensure!(
+        source_build.is_some() || candidate_build.is_some(),
+        "source and candidate both lack the exact active scale-up build"
+    );
+    if source_build.is_none() {
+        ensure!(
+            source["pendingOperation"]
+                .as_str()
+                .is_some_and(|operation| operation == format!("{build_id}:build-replica")),
+            "source lacks both exact build report and exact pending build effect: {source}"
+        );
+    }
+    let boundary = source_build
+        .as_ref()
+        .or(candidate_build.as_ref())
+        .and_then(|build| build["replicationBoundaryLsn"].as_i64())
+        .context("active snapshot boundary")?;
+    ensure!(boundary >= 0, "active snapshot boundary is negative");
+    if let (Some(source_build), Some(candidate_build)) = (&source_build, &candidate_build) {
+        ensure!(
+            source_build["replicationBoundaryLsn"] == candidate_build["replicationBoundaryLsn"],
+            "source/candidate active builds disagree on snapshot boundary: \
+             source={source_build} candidate={candidate_build}"
+        );
+    }
+    ensure!(
+        source_build
+            .iter()
+            .chain(candidate_build.iter())
+            .any(|build| build["completed"] == false),
+        "exact build is already complete rather than actively held"
+    );
+    ensure!(
+        source_build
+            .iter()
+            .chain(candidate_build.iter())
+            .all(|build| build["catchUpBoundaryLsn"].is_null()),
+        "active-copy checkpoint was observed after copy enumeration completed"
+    );
+    Ok(ActiveScaleUpCopyCheckpoint {
+        operation_id: provisioning.operation_id.to_string(),
+        build_id: build_id.to_string(),
+        source: primary_json,
+        source_process_session: source_session.to_string(),
+        candidate: target_json,
+        candidate_process_session: candidate_session.to_string(),
+        snapshot_boundary_lsn: boundary,
+    })
+}
+
+fn active_copy_observed_sessions(
+    cluster: &SwitchoverCluster,
+    status: &Value,
+) -> Result<(String, String)> {
+    use kuberic_protocol::observation::AgentObservation;
+    use kuberic_protocol::types::{ProvisioningIntent, ReplicaRole, ResourceUid};
+
+    let provisioning: ProvisioningIntent =
+        serde_json::from_value(status["status"]["provisioning"].clone())?;
+    let scale_up = provisioning.scale_up().context("scale-up provisioning")?;
+    let resource_uid = ResourceUid::new(
+        status["metadata"]["uid"]
+            .as_str()
+            .context("scale-up resource UID")?,
+    );
+    let target = provisioning.target_identity(&resource_uid);
+    let primary = scale_up
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .context("scale-up primary")?
+        .identity
+        .clone();
+    let snapshot = LiveStepper::new(cluster)?.observe_snapshot(cluster)?;
+    let session = |identity| {
+        snapshot
+            .replicas
+            .values()
+            .find_map(|observation| match &observation.agent {
+                AgentObservation::Report(report) if report.identity == identity => {
+                    Some(report.process_session_id.to_string())
+                }
+                _ => None,
+            })
+            .with_context(|| format!("exact observed process session for {identity:?}"))
+    };
+    Ok((session(primary)?, session(target)?))
+}
+
+fn active_copy_reconstruction_checkpoint(
+    cluster: &SwitchoverCluster,
+    status: &Value,
+) -> Result<ActiveScaleUpCopyCheckpoint> {
+    use kuberic_protocol::observation::AgentObservation;
+    use kuberic_protocol::types::{OperationId, ProvisioningIntent, ReplicaRole, ResourceUid};
+
+    let provisioning: ProvisioningIntent =
+        serde_json::from_value(status["status"]["provisioning"].clone())?;
+    let scale_up = provisioning.scale_up().context("scale-up provisioning")?;
+    let resource_uid = ResourceUid::new(
+        status["metadata"]["uid"]
+            .as_str()
+            .context("scale-up resource UID")?,
+    );
+    let target = provisioning.target_identity(&resource_uid);
+    let build_id = provisioning
+        .scale_up_build_id(&resource_uid)
+        .context("scale-up build ID")?;
+    let primary = scale_up
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .context("scale-up primary")?
+        .identity
+        .clone();
+    ensure!(
+        status["status"]["transition"].is_null()
+            && status["status"]["scaleUpAdmissionStarted"].is_null()
+            && status["status"]["topology"]["configurationId"]
+                == scale_up.previous_configuration.configuration_id.as_str(),
+        "reconstructed active copy crossed transition/admission authority"
+    );
+    let snapshot = LiveStepper::new(cluster)?.observe_snapshot(cluster)?;
+    let report = |identity| {
+        snapshot
+            .replicas
+            .values()
+            .find_map(|observation| match &observation.agent {
+                AgentObservation::Report(report) if report.identity == identity => {
+                    Some(report.as_ref())
+                }
+                _ => None,
+            })
+            .with_context(|| format!("exact reconstructed report for {identity:?}"))
+    };
+    let source = report(primary.clone())?;
+    let candidate = report(target.clone())?;
+    ensure!(
+        source.role == ReplicaRole::Primary
+            && source.previous_configuration.is_none()
+            && source.current_configuration.as_ref() == Some(&scale_up.previous_configuration)
+            && candidate.role == ReplicaRole::IdleSecondary
+            && candidate.previous_configuration.is_none()
+            && candidate.current_configuration.is_none()
+            && candidate.scale_up_intent.is_none(),
+        "reconstructed active copy installed membership authority prematurely"
+    );
+    let source_build = source
+        .builds
+        .iter()
+        .find(|build| build.build_id == build_id && build.target == target);
+    let candidate_build = candidate
+        .builds
+        .iter()
+        .find(|build| build.build_id == build_id && build.target == target);
+    ensure!(
+        source_build.is_some() || candidate_build.is_some(),
+        "reconstructed source/candidate reports omit the exact build"
+    );
+    if source_build.is_none() {
+        ensure!(
+            source.pending_operation_id.as_ref()
+                == Some(&OperationId::new(format!("{build_id}:build-replica"))),
+            "reconstructed source lacks exact pending build authority"
+        );
+    }
+    let boundary = source_build
+        .or(candidate_build)
+        .map(|build| build.replication_boundary_lsn)
+        .context("reconstructed snapshot boundary")?;
+    ensure!(
+        source_build
+            .into_iter()
+            .chain(candidate_build)
+            .all(|build| {
+                build.replication_boundary_lsn == boundary
+                    && !build.completed
+                    && build.catch_up_boundary_lsn.is_none()
+            }),
+        "reconstructed exact build is conflicting or no longer active"
+    );
+    Ok(ActiveScaleUpCopyCheckpoint {
+        operation_id: provisioning.operation_id.to_string(),
+        build_id: build_id.to_string(),
+        source: serde_json::to_value(primary)?,
+        source_process_session: source.process_session_id.to_string(),
+        candidate: serde_json::to_value(target)?,
+        candidate_process_session: candidate.process_session_id.to_string(),
+        snapshot_boundary_lsn: boundary,
+    })
+}
+
+struct LiveCopyGate {
+    cleanup: GateCleanupOwner<LiveCopyGateCleanup>,
+}
+
+trait CopyGateCleanup {
+    fn cleanup(&mut self) -> Result<()>;
+}
+
+struct GateCleanupOwner<C: CopyGateCleanup> {
+    cleanup: C,
+    armed: bool,
+}
+
+impl<C: CopyGateCleanup> GateCleanupOwner<C> {
+    fn release(&mut self) -> Result<()> {
+        if self.armed {
+            self.cleanup.cleanup()?;
+            self.armed = false;
+        }
+        Ok(())
+    }
+}
+
+impl<C: CopyGateCleanup> Drop for GateCleanupOwner<C> {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+fn arm_with_cleanup<C: CopyGateCleanup>(
+    cleanup: C,
+    arm: impl FnOnce() -> Result<()>,
+) -> Result<GateCleanupOwner<C>> {
+    let owner = GateCleanupOwner {
+        cleanup,
+        armed: true,
+    };
+    arm()?;
+    Ok(owner)
+}
+
+#[cfg(test)]
+struct FileCopyGateCleanup {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl CopyGateCleanup for FileCopyGateCleanup {
+    fn cleanup(&mut self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[test]
+fn lost_copy_gate_hold_response_still_runs_preowned_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("copy-gate");
+    let result = arm_with_cleanup(
+        FileCopyGateCleanup { path: path.clone() },
+        || -> Result<()> {
+            std::fs::write(&path, b"armed")?;
+            anyhow::bail!("simulated lost hold response")
+        },
+    );
+    assert!(result.is_err());
+    assert!(!path.exists());
+}
+
+struct LiveCopyGateCleanup {
+    cluster: SwitchoverCluster,
+    source: Value,
+    deadline: Instant,
+}
+
+impl LiveCopyGateCleanup {
+    fn pod(&self) -> Result<String> {
+        self.cluster.pod(&self.source)
+    }
+
+    fn sentinel_absent(&self) -> Result<()> {
+        let pod = self.pod()?;
+        self.cluster
+            .kubectl(&[
+                "-n",
+                "default",
+                "exec",
+                &pod,
+                "--",
+                "test",
+                "!",
+                "-e",
+                "/var/lib/kuberic/.live-test-copy-gate",
+            ])
+            .context("live-test copy gate sentinel remained present")?;
+        Ok(())
+    }
+}
+
+impl CopyGateCleanup for LiveCopyGateCleanup {
+    fn cleanup(&mut self) -> Result<()> {
+        let pod = self.pod()?;
+        let release = (|| {
+            let mut client = DirectClient::connect_port(&self.cluster, &pod, 18080, self.deadline)?;
+            let (code, body) = client.request("PUT", "/live-test/copy-gate/release", "")?;
+            ensure!(
+                code == 200 && body == "released",
+                "copy gate release failed: HTTP {code} {body}"
+            );
+            Ok(())
+        })();
+        if let Err(http_error) = release {
+            self.cluster
+                .kubectl(&[
+                    "-n",
+                    "default",
+                    "exec",
+                    &pod,
+                    "--",
+                    "rm",
+                    "-f",
+                    "/var/lib/kuberic/.live-test-copy-gate",
+                ])
+                .with_context(|| format!("copy gate HTTP release also failed: {http_error:#}"))?;
+        }
+        self.sentinel_absent()
+    }
+}
+
+impl LiveCopyGate {
+    fn hold(cluster: &SwitchoverCluster, source: &Value, deadline: Instant) -> Result<Self> {
+        let pod = cluster.pod(source)?;
+        let cleanup = LiveCopyGateCleanup {
+            cluster: cluster.clone(),
+            source: source.clone(),
+            deadline,
+        };
+        let owner = arm_with_cleanup(cleanup, || {
+            let mut client = DirectClient::connect_port(cluster, &pod, 18080, deadline)?;
+            let (code, body) = client.request("PUT", "/live-test/copy-gate/hold", "")?;
+            ensure!(
+                code == 200 && body == "held",
+                "copy gate hold failed: HTTP {code} {body}"
+            );
+            Ok(())
+        })?;
+        Ok(Self { cleanup: owner })
+    }
+
+    fn release(&mut self) -> Result<()> {
+        self.cleanup.release()
+    }
+}
+
+struct HeldActiveCopy {
+    gate: LiveCopyGate,
+    step: Option<std::thread::JoinHandle<Result<LiveStep>>>,
+}
+
+impl HeldActiveCopy {
+    fn release_and_finish(mut self) -> Result<()> {
+        self.gate.release()?;
+        if let Some(step) = self.step.take() {
+            step.join()
+                .map_err(|_| anyhow::anyhow!("active copy controller step panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HeldActiveCopy {
+    fn drop(&mut self) {
+        let _ = self.gate.release();
+        if let Some(step) = self.step.take() {
+            let _ = step.join();
+        }
+    }
+}
+
+fn begin_exact_active_copy(
+    cluster: &SwitchoverCluster,
+    source: &Value,
+    target: i64,
+    deadline: Instant,
+) -> Result<(ActiveScaleUpCopyCheckpoint, HeldActiveCopy)> {
+    let gate = LiveCopyGate::hold(cluster, source, deadline)?;
+    let mut step = None;
+    let mut build_dispatched = false;
+    loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if let (Ok(source_report), Ok(candidate_report)) = (
+            replica_diagnostics(
+                &cluster.kubeconfig,
+                &cluster.context,
+                source["replicaId"].as_i64().unwrap(),
+            ),
+            replica_diagnostics(&cluster.kubeconfig, &cluster.context, target),
+        ) && let Ok((source_session, candidate_session)) =
+            active_copy_observed_sessions(cluster, &status)
+            && let Ok(checkpoint) = active_scale_up_copy_checkpoint(
+                &status,
+                &source_report,
+                &candidate_report,
+                &source_session,
+                &candidate_session,
+            )
+        {
+            eprintln!(
+                "held exact active scale-up copy: operation={}, build={}, source_session={}, \
+                 candidate_session={}, snapshot_boundary={}",
+                checkpoint.operation_id,
+                checkpoint.build_id,
+                checkpoint.source_process_session,
+                checkpoint.candidate_process_session,
+                checkpoint.snapshot_boundary_lsn
+            );
+            return Ok((checkpoint, HeldActiveCopy { gate, step }));
+        }
+        if step
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            let finished = step
+                .take()
+                .expect("finished active-copy step remains present")
+                .join()
+                .map_err(|_| anyhow::anyhow!("active copy controller step panicked"))?;
+            finished?;
+        }
+        if !build_dispatched
+            && scale_up_progress_condition(&status)
+                .and_then(|condition| condition["reason"].as_str())
+                == Some("ScaleUpCopying")
+            && status["status"]["transition"].is_null()
+        {
+            let owned = cluster.clone();
+            build_dispatched = true;
+            step = Some(std::thread::spawn(move || {
+                manual_live_step(&owned, deadline)
+            }));
+        } else if !build_dispatched {
+            manual_live_step(cluster, deadline)?;
+        }
+        poll(deadline, "exact active scale-up copy checkpoint")?;
+    }
+}
+
+fn candidate_delivery_matches(report: &Value, evidence: &PhaseWriteEvidence) -> bool {
+    if identity(report) != evidence.candidate
+        || report["processSession"].as_str() != Some(&evidence.candidate_process_session)
+    {
+        return false;
+    }
+    let Some(build) = report["builds"].as_array().and_then(|builds| {
+        builds.iter().find(|build| {
+            build["buildId"].as_str() == Some(&evidence.build_id)
+                && build["targetInstance"] == evidence.candidate["instanceId"]
+        })
+    }) else {
+        return false;
+    };
+    report["currentProgress"]
+        .as_i64()
+        .is_some_and(|progress| progress >= evidence.write_lsn)
+        || build["durableLsn"]
+            .as_i64()
+            .is_some_and(|durable| durable >= evidence.write_lsn)
+}
+
+#[derive(Clone, Debug, Default)]
+struct StatusObservationWatermark {
+    resource_version: u64,
+    generation: u64,
+    initialized: bool,
+}
+
+impl StatusObservationWatermark {
+    fn accept(&mut self, object: &Value) -> Result<bool> {
+        let next_resource_version = resource_version(object)?;
+        let next_generation = object["metadata"]["generation"]
+            .as_u64()
+            .context("metadata generation")?;
+        if self.initialized && next_resource_version <= self.resource_version {
+            return Ok(false);
+        }
+        ensure!(
+            !self.initialized || next_generation >= self.generation,
+            "newer resourceVersion {next_resource_version} regressed generation \
+             {} -> {next_generation}",
+            self.generation
+        );
+        self.resource_version = next_resource_version;
+        self.generation = next_generation;
+        self.initialized = true;
+        Ok(true)
+    }
+}
+
+fn resource_version(object: &Value) -> Result<u64> {
+    object["metadata"]["resourceVersion"]
+        .as_str()
+        .context("resourceVersion")?
+        .parse()
+        .context("numeric resourceVersion")
+}
+
+fn replica_label(object: &Value) -> Option<i64> {
+    object["metadata"]["labels"]["operator.kuberic.io/replica-id"]
+        .as_str()?
+        .parse()
+        .ok()
+}
+
+fn scale_up_progress_condition(object: &Value) -> Option<&Value> {
+    object["status"]["conditions"]
+        .as_array()?
+        .iter()
+        .find(|condition| {
+            condition["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("ScaleUp"))
+        })
+}
+
+fn assert_scale_up_condition_context(object: &Value) -> Result<()> {
+    let Some(condition) = scale_up_progress_condition(object) else {
+        return Ok(());
+    };
+    let reason = condition["reason"].as_str().context("scale-up reason")?;
+    let message = condition["message"]
+        .as_str()
+        .context("scale-up condition message")?;
+    for field in [
+        "accepted=",
+        "desired=",
+        "target=",
+        "attempt=",
+        "phase=",
+        "blocking=",
+    ] {
+        ensure!(
+            message.contains(field),
+            "{reason} omitted {field} diagnostic context: {message}"
+        );
+    }
+    Ok(())
+}
+
+fn check_expansion(before: &Value, after: &Value) -> Result<i64> {
+    let old = before["members"]
+        .as_array()
+        .context("old topology members")?;
+    let new = after["members"]
+        .as_array()
+        .context("new topology members")?;
+    ensure!(
+        new.len() == old.len() + 1,
+        "scale-up did not add exactly one member: {} -> {}",
+        old.len(),
+        new.len()
+    );
+    for member in old {
+        ensure!(
+            new.iter().any(|candidate| candidate == member),
+            "scale-up changed retained exact member: {member}"
+        );
+    }
+    let added = new
+        .iter()
+        .find(|member| old.iter().all(|retained| retained != *member))
+        .context("new exact member")?;
+    ensure!(
+        added["role"] == "activeSecondary",
+        "new member was not an ActiveSecondary: {added}"
+    );
+    ensure!(
+        before["primaryId"] == after["primaryId"],
+        "healthy scale-up changed primary"
+    );
+    ensure!(
+        before["epoch"]["dataLossNumber"] == after["epoch"]["dataLossNumber"],
+        "healthy scale-up changed data-loss epoch"
+    );
+    ensure!(
+        after["epoch"]["configurationNumber"].as_i64()
+            == before["epoch"]["configurationNumber"]
+                .as_i64()
+                .map(|number| number + 1),
+        "scale-up did not advance exactly one configuration epoch"
+    );
+    ensure!(
+        after["writeQuorum"].as_u64() == Some((new.len() / 2 + 1) as u64),
+        "expanded topology has the wrong majority write quorum"
+    );
+    let expected = (1..=new.len() as i64)
+        .find(|candidate| {
+            old.iter()
+                .all(|member| member["replicaId"].as_i64() != Some(*candidate))
+        })
+        .context("next cardinality-derived logical ID")?;
+    ensure!(
+        added["replicaId"].as_i64() == Some(expected),
+        "scale-up added the wrong logical ID: expected {expected}, got {added}"
+    );
+    Ok(expected)
+}
+
+fn exact_member(status: &Value, replica_id: i64) -> Result<&Value> {
+    status["status"]["topology"]["members"]
+        .as_array()
+        .context("accepted topology members")?
+        .iter()
+        .find(|member| member["replicaId"].as_i64() == Some(replica_id))
+        .with_context(|| format!("accepted member {replica_id}"))
+}
+
+fn exact_replica_resources(
+    cluster: &SwitchoverCluster,
+    replica_id: i64,
+) -> Result<Vec<ScaleResource>> {
+    let pod_name = pod_for_replica(&cluster.kubeconfig, &cluster.context, replica_id)?;
+    let pod: Value = serde_json::from_str(
+        &cluster.kubectl(&["-n", "default", "get", "pod", &pod_name, "-o", "json"])?,
+    )?;
+    let pvc_name = pod["spec"]["volumes"]
+        .as_array()
+        .context("candidate volumes")?
+        .iter()
+        .find_map(|volume| volume["persistentVolumeClaim"]["claimName"].as_str())
+        .context("candidate PVC name")?;
+    let pvc: Value = serde_json::from_str(
+        &cluster.kubectl(&["-n", "default", "get", "pvc", pvc_name, "-o", "json"])?,
+    )?;
+    let services: Value = serde_json::from_str(
+        &cluster.kubectl(&["-n", "default", "get", "services", "-o", "json"])?,
+    )?;
+    let endpoint = services["items"]
+        .as_array()
+        .context("Service list")?
+        .iter()
+        .find(|service| {
+            service["metadata"]["name"] != "kvstore2-write"
+                && routing_instance(service) == pod["metadata"]["uid"].as_str()
+        })
+        .context("exact candidate peer Service")?
+        .clone();
+    Ok(vec![
+        ScaleResource {
+            kind: "service",
+            object: endpoint,
+        },
+        ScaleResource {
+            kind: "pod",
+            object: pod,
+        },
+        ScaleResource {
+            kind: "pvc",
+            object: pvc,
+        },
+    ])
+}
+
+struct ScaleUpCase<'a> {
+    cluster: &'a SwitchoverCluster,
+    start: Value,
+    accepted: Value,
+    primary: Value,
+    writer: DirectClient,
+    status: KubeWatch,
+    pods: CollectionWatch,
+    pvcs: CollectionWatch,
+    pod_creations: std::collections::BTreeMap<i64, ResourceCreation>,
+    pvc_creations: std::collections::BTreeMap<i64, ResourceCreation>,
+    commits: Vec<ScaleUpCommit>,
+    phase_reasons: std::collections::BTreeSet<String>,
+    phase_writes: std::collections::BTreeMap<(i64, &'static str), PhaseWriteEvidence>,
+    acknowledged: Vec<AcknowledgedValue>,
+    status_watermark: StatusObservationWatermark,
+    started: Instant,
+    deadline: Instant,
+}
+
+impl<'a> ScaleUpCase<'a> {
+    fn new(cluster: &'a SwitchoverCluster, count: usize) -> Result<Self> {
+        let start = scale_ready(cluster, count, Instant::now() + Duration::from_secs(180))?;
+        let primary = start["status"]["topology"]["members"]
+            .as_array()
+            .context("starting members")?
+            .iter()
+            .find(|member| member["role"] == "primary")
+            .context("starting primary")?
+            .clone();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(900);
+        let writer = DirectClient::connect(cluster, &cluster.pod(&primary)?, deadline)?;
+        let status = KubeWatch::start(cluster, "kubericset", "kvstore2")?;
+        let pods = CollectionWatch::start(cluster, "pods")?;
+        let pvcs = CollectionWatch::start(cluster, "persistentvolumeclaims")?;
+        let mut case = Self {
+            cluster,
+            accepted: start["status"]["topology"].clone(),
+            start,
+            primary,
+            writer,
+            status,
+            pods,
+            pvcs,
+            pod_creations: Default::default(),
+            pvc_creations: Default::default(),
+            commits: Vec::new(),
+            phase_reasons: Default::default(),
+            phase_writes: Default::default(),
+            acknowledged: Vec::new(),
+            status_watermark: Default::default(),
+            started,
+            deadline,
+        };
+        let initial = case.status.initial.clone();
+        case.process_status(&initial)?;
+        for suffix in ["seed-a", "seed-b", "seed-c"] {
+            case.write(suffix)?;
+        }
+        Ok(case)
+    }
+
+    fn submit(&self, count: usize) -> Result<()> {
+        self.cluster.kubectl(&[
+            "-n",
+            "default",
+            "patch",
+            "kubericset",
+            "kvstore2",
+            "--type=merge",
+            "-p",
+            &json!({"spec":{"replicas":count}}).to_string(),
+        ])?;
+        Ok(())
+    }
+
+    fn write(&mut self, phase: &str) -> Result<i64> {
+        let key = format!(
+            "scale-up-{}-{phase}-{}",
+            self.start["metadata"]["uid"].as_str().context("set UID")?,
+            self.acknowledged.len()
+        );
+        let value = format!("acknowledged-{key}");
+        let before = self.writer.report()?["committedLsn"]
+            .as_i64()
+            .context("committed LSN before routed write")?;
+        assert_routed_service_write(self.cluster, &self.primary, &key, &value, self.deadline)?;
+        let lsn = loop {
+            let committed = self.writer.report()?["committedLsn"]
+                .as_i64()
+                .context("committed LSN after routed write")?;
+            if committed > before {
+                break committed;
+            }
+            poll(self.deadline, "routed write committed LSN")?;
+        };
+        self.acknowledged
+            .push(AcknowledgedValue { key, value, lsn });
+        Ok(lsn)
+    }
+
+    fn record_resource_events(
+        events: &Receiver<Value>,
+        destination: &mut std::collections::BTreeMap<i64, ResourceCreation>,
+    ) -> Result<()> {
+        for event in events.try_iter() {
+            ensure!(event["type"] != "ERROR", "resource watch failed: {event}");
+            let object = &event["object"];
+            let Some(replica_id) = replica_label(object) else {
+                continue;
+            };
+            if event["type"] == "ADDED" {
+                destination.entry(replica_id).or_insert(ResourceCreation {
+                    name: object["metadata"]["name"]
+                        .as_str()
+                        .context("resource name")?
+                        .to_string(),
+                    uid: object["metadata"]["uid"]
+                        .as_str()
+                        .context("resource UID")?
+                        .to_string(),
+                    resource_version: resource_version(object)?,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn process_status(&mut self, object: &Value) -> Result<()> {
+        if !self.status_watermark.accept(object)? {
+            return Ok(());
+        }
+        ensure!(
+            !object["status"]["conditions"]
+                .as_array()
+                .is_some_and(|conditions| conditions.iter().any(|condition| {
+                    condition["type"] == "Unsafe" && condition["status"] == "true"
+                })),
+            "scale-up entered Unsafe: {}",
+            object["status"]["conditions"]
+        );
+        assert_scale_up_condition_context(object)?;
+        if let Some(condition) = scale_up_progress_condition(object)
+            && let Some(reason) = condition["reason"].as_str()
+        {
+            self.phase_reasons.insert(reason.to_string());
+        }
+        let topology = &object["status"]["topology"];
+        if topology.is_object() && topology != &self.accepted {
+            let target = check_expansion(&self.accepted, topology)?;
+            let count = topology["members"]
+                .as_array()
+                .context("expanded members")?
+                .len();
+            self.commits.push(ScaleUpCommit {
+                count,
+                target,
+                resource_version: resource_version(object)?,
+            });
+            self.accepted = topology.clone();
+            eprintln!(
+                "scale-up accepted target={target}, count={count}, epoch={}, elapsed={:?}",
+                topology["epoch"],
+                self.started.elapsed()
+            );
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self) -> Result<Value> {
+        Self::record_resource_events(&self.pods.events, &mut self.pod_creations)?;
+        Self::record_resource_events(&self.pvcs.events, &mut self.pvc_creations)?;
+        let events = self.status.events.try_iter().collect::<Vec<_>>();
+        for event in events {
+            ensure!(event["type"] != "ERROR", "status watch failed: {event}");
+            self.process_status(&event["object"])?;
+            self.maybe_write_in_live_phase(&event["object"])?;
+        }
+        let current = self.cluster.status()?;
+        self.process_status(&current)?;
+        self.maybe_write_in_live_phase(&current)?;
+        Ok(current)
+    }
+
+    fn record_candidate_delivery(&mut self) -> Result<()> {
+        let pending = self
+            .phase_writes
+            .iter()
+            .filter_map(|(key, evidence)| {
+                (!evidence.reached_candidate).then_some((*key, evidence.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (key, evidence) in pending {
+            let report = replica_diagnostics(
+                &self.cluster.kubeconfig,
+                &self.cluster.context,
+                evidence.target,
+            )?;
+            let reached = candidate_delivery_matches(&report, &evidence);
+            if reached {
+                self.phase_writes
+                    .get_mut(&key)
+                    .expect("pending phase write remains present")
+                    .reached_candidate = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_during_exact_active_copy(&mut self, target: i64) -> Result<()> {
+        let (checkpoint, held) =
+            begin_exact_active_copy(self.cluster, &self.primary, target, self.deadline)?;
+        ensure!(
+            checkpoint.candidate["replicaId"].as_i64() == Some(target),
+            "held copy targeted the wrong candidate: {checkpoint:?}"
+        );
+        let write_lsn = self.write(&format!("copy-target-{target}"))?;
+        ensure!(
+            write_lsn > checkpoint.snapshot_boundary_lsn,
+            "copy-phase acknowledged write LSN {write_lsn} did not exceed \
+             snapshot boundary {}",
+            checkpoint.snapshot_boundary_lsn
+        );
+        self.phase_writes.insert(
+            (target, "copy"),
+            PhaseWriteEvidence {
+                target,
+                phase: "copy",
+                boundary_lsn: checkpoint.snapshot_boundary_lsn,
+                write_lsn,
+                candidate: checkpoint.candidate,
+                candidate_process_session: checkpoint.candidate_process_session,
+                build_id: checkpoint.build_id,
+                reached_candidate: false,
+            },
+        );
+        held.release_and_finish()?;
+        Ok(())
+    }
+
+    fn maybe_write_in_live_phase(&mut self, status: &Value) -> Result<()> {
+        let target = self.accepted["members"]
+            .as_array()
+            .context("accepted members")?
+            .len() as i64
+            + 1;
+        self.record_candidate_delivery()?;
+        if !self.phase_writes.contains_key(&(target, "admission")) {
+            let intent = &status["status"]["transition"]["scaleUp"];
+            if intent.is_object()
+                && status["status"]["scaleUpAdmissionStarted"] == intent["operationId"]
+                && status["status"]["topology"]["configurationId"]
+                    == intent["previousConfiguration"]["configurationId"]
+                && let Ok(intent) =
+                    serde_json::from_value::<kuberic_protocol::types::ScaleUpIntent>(intent.clone())
+                && let Ok(current) =
+                    serde_json::from_value::<kuberic_protocol::types::ConfigurationDescriptor>(
+                        status["status"]["transition"]["currentConfiguration"].clone(),
+                    )
+                && let Ok(snapshot) = LiveStepper::new(self.cluster)
+                    .and_then(|stepper| stepper.observe_snapshot(self.cluster))
+            {
+                use kuberic_protocol::observation::AgentObservation;
+                let reports =
+                    snapshot
+                        .replicas
+                        .values()
+                        .filter_map(|observation| match &observation.agent {
+                            AgentObservation::Report(report) => Some(report.as_ref()),
+                            _ => None,
+                        });
+                let source = reports
+                    .clone()
+                    .find(|report| report.identity == intent.primary);
+                let candidate = reports
+                    .clone()
+                    .find(|report| report.identity == intent.target);
+                let exact_pc_cc = |report: &kuberic_protocol::observation::AgentReport| {
+                    report.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+                        && report.current_configuration.as_ref() == Some(&current)
+                        && report.scale_up_intent.as_deref() == Some(&intent)
+                        && report.pending_operation_id.is_none()
+                };
+                if source.is_some_and(|report| {
+                    exact_pc_cc(report)
+                        && report.identity == intent.primary
+                        && report.role == kuberic_protocol::types::ReplicaRole::Primary
+                }) && candidate.is_some_and(|report| {
+                    exact_pc_cc(report)
+                        && report.identity == intent.target
+                        && report.role == kuberic_protocol::types::ReplicaRole::ActiveSecondary
+                }) {
+                    let write_lsn = self.write(&format!("admission-target-{target}"))?;
+                    let boundary_lsn = intent.catch_up_boundary_lsn;
+                    ensure!(
+                        write_lsn > boundary_lsn,
+                        "admission write LSN {write_lsn} did not exceed catch-up boundary {boundary_lsn}"
+                    );
+                    self.phase_writes.insert(
+                        (target, "admission"),
+                        PhaseWriteEvidence {
+                            target,
+                            phase: "admission",
+                            boundary_lsn,
+                            write_lsn,
+                            candidate: serde_json::to_value(&intent.target)?,
+                            candidate_process_session: candidate
+                                .expect("exact PC/CC candidate")
+                                .process_session_id
+                                .to_string(),
+                            build_id: intent.build_id.to_string(),
+                            reached_candidate: false,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stable_at(&self, status: &Value, count: usize) -> bool {
+        status_ready(status)
+            && status["status"]["transition"].is_null()
+            && status["status"]["provisioning"].is_null()
+            && status["status"]["scaleUpAllocation"].is_null()
+            && status["status"]["scaleUpCleanup"].is_null()
+            && status["status"]["topology"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == count)
+    }
+
+    fn wait_for_count_manually(&mut self, count: usize) -> Result<Value> {
+        loop {
+            let status = self.observe()?;
+            if self.stable_at(&status, count) {
+                self.process_status(&status)?;
+                return Ok(status);
+            }
+            let target = self.accepted["members"]
+                .as_array()
+                .context("accepted members")?
+                .len() as i64
+                + 1;
+            if target <= count as i64 && !self.phase_writes.contains_key(&(target, "copy")) {
+                self.write_during_exact_active_copy(target)?;
+            } else {
+                manual_live_step(self.cluster, self.deadline)?;
+            }
+            poll(
+                self.deadline,
+                &format!("manually stepped stable scale-up to {count}"),
+            )?;
+        }
+    }
+
+    fn assert_resource_order(&self, replica_id: i64) -> Result<()> {
+        let pvc = self
+            .pvc_creations
+            .get(&replica_id)
+            .with_context(|| format!("PVC creation for replica {replica_id}"))?;
+        let pod = self
+            .pod_creations
+            .get(&replica_id)
+            .with_context(|| format!("Pod creation for replica {replica_id}"))?;
+        ensure!(
+            pvc.resource_version < pod.resource_version,
+            "candidate Pod was not observed after its PVC: pvc={pvc:?}, pod={pod:?}"
+        );
+        ensure!(
+            pvc.name == format!("kvstore2-{replica_id}-data")
+                && pod.name == format!("kvstore2-{replica_id}"),
+            "candidate did not use canonical ordinal names: pvc={pvc:?}, pod={pod:?}"
+        );
+        ensure!(
+            pvc.uid != pod.uid,
+            "Pod and PVC unexpectedly shared an identity"
+        );
+        Ok(())
+    }
+
+    fn verify_final(&mut self, status: &Value, count: usize) -> Result<()> {
+        let topology = &status["status"]["topology"];
+        ensure!(
+            status["status"]["effectivePolicy"]["replicaSetSize"].as_u64() == Some(count as u64)
+                && status["status"]["effectivePolicy"]["writeQuorum"].as_u64()
+                    == Some((count / 2 + 1) as u64),
+            "accepted policy did not expand to majority policy: {}",
+            status["status"]["effectivePolicy"]
+        );
+        ensure!(
+            topology_primary_id(status) == self.primary["replicaId"].as_i64(),
+            "healthy scale-up changed the exact primary"
+        );
+        let service: Value = serde_json::from_str(&self.cluster.kubectl(&[
+            "-n",
+            "default",
+            "get",
+            "service",
+            "kvstore2-write",
+            "-o",
+            "json",
+        ])?)?;
+        validate_routed_service(&service, &self.primary)?;
+        let configuration = &topology["configurationId"];
+        let committed = self.writer.report()?["committedLsn"]
+            .as_i64()
+            .context("committed LSN")?;
+        for member in topology["members"].as_array().context("final members")? {
+            let report = self.cluster.report(member)?;
+            ensure!(
+                identity(&report) == identity(member)
+                    && report["currentConfiguration"] == *configuration
+                    && report["previousConfiguration"].is_null()
+                    && report["pendingOperation"].is_null()
+                    && report["currentProgress"]
+                        .as_i64()
+                        .is_some_and(|progress| progress >= committed),
+                "member lacked exact stable acknowledged prefix: {report}"
+            );
+            ensure!(
+                report["role"]
+                    == if member["role"] == "primary" {
+                        "Primary"
+                    } else {
+                        "ActiveSecondary"
+                    },
+                "application role did not match accepted topology: {report}"
+            );
+            let mut exact =
+                DirectClient::connect(self.cluster, &self.cluster.pod(member)?, self.deadline)?;
+            for acknowledged in &self.acknowledged {
+                let (code, value) =
+                    exact.request("GET", &format!("/kv/{}", acknowledged.key), "")?;
+                ensure!(
+                    code == 200 && value == acknowledged.value,
+                    "exact member {} lost acknowledged value {} at LSN {}: HTTP {code} {value}",
+                    member["replicaId"],
+                    acknowledged.key,
+                    acknowledged.lsn
+                );
+            }
+        }
+        for acknowledged in &self.acknowledged {
+            assert_routed_service_read(
+                self.cluster,
+                &self.primary,
+                &acknowledged.key,
+                &acknowledged.value,
+                self.deadline,
+            )?;
+        }
+        for evidence in self.phase_writes.values() {
+            ensure!(
+                evidence.write_lsn > evidence.boundary_lsn && evidence.reached_candidate,
+                "{} write for target {} lacked exact post-boundary candidate delivery: {evidence:?}",
+                evidence.phase,
+                evidence.target
+            );
+        }
+        ensure!(
+            status["status"]["lastScaleUp"].is_object(),
+            "stable scale-up omitted its bounded completion receipt"
+        );
+        assert_scale_up_condition_context(status)?;
+        eprintln!(
+            "scale-up stable count={count}, commits={:?}, writes={}, phases={:?}, elapsed={:?}",
+            self.commits,
+            self.acknowledged.len(),
+            self.phase_reasons,
+            self.started.elapsed()
+        );
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "requires an explicitly owned isolated KinD cluster"]
+fn scale_up() -> Result<()> {
+    run_switchover(|cluster| {
+        reset_scale_set_with_delay(cluster, 1, 3)?;
+        let mut case = ScaleUpCase::new(cluster, 1)?;
+        let pause = ControllerPause::new(cluster)?;
+        case.submit(2)?;
+        let two = case.wait_for_count_manually(2)?;
+        case.assert_resource_order(2)?;
+        case.verify_final(&two, 2)?;
+        case.submit(3)?;
+        let three = case.wait_for_count_manually(3)?;
+        case.assert_resource_order(3)?;
+        case.verify_final(&three, 3)?;
+        ensure!(
+            case.commits
+                .iter()
+                .map(|commit| (commit.count, commit.target))
+                .collect::<Vec<_>>()
+                == vec![(2, 2), (3, 3)],
+            "healthy scale-up skipped or reordered additions: {:?}",
+            case.commits
+        );
+        for target in [2, 3] {
+            ensure!(
+                case.phase_writes.contains_key(&(target, "copy"))
+                    && case.phase_writes.contains_key(&(target, "admission")),
+                "target {target} lacked acknowledged writes during copy and admission: {:?}",
+                case.phase_writes
+            );
+        }
+        drop(pause);
+        wait_controller_ready(cluster, case.deadline)?;
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires an explicitly owned isolated KinD cluster"]
+fn scale_up_multi() -> Result<()> {
+    run_switchover(|cluster| {
+        reset_scale_set_with_delay(cluster, 1, 3)?;
+        let mut case = ScaleUpCase::new(cluster, 1)?;
+        let pause = ControllerPause::new(cluster)?;
+        case.submit(3)?;
+        let stable = case.wait_for_count_manually(3)?;
+        case.assert_resource_order(2)?;
+        case.assert_resource_order(3)?;
+        case.verify_final(&stable, 3)?;
+        ensure!(
+            case.commits
+                .iter()
+                .map(|commit| (commit.count, commit.target))
+                .collect::<Vec<_>>()
+                == vec![(2, 2), (3, 3)],
+            "1->3 did not commit one exact candidate at a time: {:?}",
+            case.commits
+        );
+        let first_commit = case.commits[0].resource_version;
+        let second_pvc = case.pvc_creations.get(&3).context("replica 3 PVC")?;
+        let second_pod = case.pod_creations.get(&3).context("replica 3 Pod")?;
+        ensure!(
+            second_pvc.resource_version > first_commit
+                && second_pod.resource_version > first_commit,
+            "replica 3 resources appeared before replica 2 membership committed: \
+             first_commit={first_commit}, pvc={second_pvc:?}, pod={second_pod:?}"
+        );
+        drop(pause);
+        wait_controller_ready(cluster, case.deadline)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
+    let recipes = include_str!("../../justfile");
+    let workflow = include_str!("../../.github/workflows/level-triggered-CI.yml");
+    for (selector, test) in [
+        ("scale-up", "scale_up"),
+        ("scale-up-multi", "scale_up_multi"),
+        ("scale-up-adversarial", "scale_up_adversarial"),
+    ] {
+        assert!(recipes.contains(&format!(
+            "{selector}) test_name=\"level_triggered_k8s::{test}\""
+        )));
+        assert!(
+            recipes
+                .lines()
+                .any(|line| line.contains("expanded+=(") && line.contains(selector))
+        );
+    }
+    assert!(recipes.contains("expanded+=(scale-up scale-up-multi scale-up-adversarial)"));
+    assert!(recipes.contains("-- --ignored --exact --nocapture"));
+    assert!(workflow.contains("just level-triggered-kind-test scale-up"));
+    assert!(workflow.contains("just level-triggered-kind-test all"));
+    assert!(workflow.contains("test_reconciler_scale_up -- --exact"));
+    assert!(workflow.contains("test_scale_up_replays_writes_buffered_during_copy -- --exact"));
+}
+
+#[test]
+fn scale_up_status_watermark_ignores_delayed_watch_but_rejects_newer_rollback() -> Result<()> {
+    fn topology(count: i64) -> Value {
+        json!({
+            "configurationId":format!("configuration-{count}"),
+            "epoch":{"dataLossNumber":1,"configurationNumber":count},
+            "primaryId":1,
+            "writeQuorum":count / 2 + 1,
+            "members":(1..=count).map(|replica_id| json!({
+                "replicaId":replica_id,
+                "instanceId":format!("pod-{replica_id}"),
+                "agentGeneration":format!("generation-{replica_id}"),
+                "role":if replica_id == 1 {"primary"} else {"activeSecondary"}
+            })).collect::<Vec<_>>()
+        })
+    }
+    fn observation(resource_version: u64, generation: u64, topology: Value) -> Value {
+        json!({
+            "metadata":{
+                "resourceVersion":resource_version.to_string(),
+                "generation":generation
+            },
+            "status":{"topology":topology}
+        })
+    }
+
+    let one = topology(1);
+    let two = topology(2);
+    let mut watermark = StatusObservationWatermark::default();
+    let initial = observation(10, 1, one.clone());
+    assert!(watermark.accept(&initial)?);
+    let newer_get = observation(20, 2, two.clone());
+    assert!(watermark.accept(&newer_get)?);
+    let accepted = two.clone();
+
+    let delayed_watch = observation(15, 1, one.clone());
+    assert!(!watermark.accept(&delayed_watch)?);
+    assert_eq!(accepted, two, "stale watch rolled accepted topology back");
+
+    let truly_newer_rollback = observation(21, 2, one);
+    assert!(watermark.accept(&truly_newer_rollback)?);
+    assert!(
+        check_expansion(&accepted, &truly_newer_rollback["status"]["topology"]).is_err(),
+        "truly newer topology rollback was accepted"
+    );
+    assert_ne!(truly_newer_rollback["status"]["topology"], two);
+
+    let regressed_generation = observation(22, 1, topology(3));
+    assert!(watermark.accept(&regressed_generation).is_err());
+    Ok(())
+}
+
+#[test]
+fn scale_up_cleanup_order_rejects_every_wrong_permutation_and_identity() -> Result<()> {
+    fn resource(kind: &'static str, name: &str, uid: &str) -> ScaleResource {
+        ScaleResource {
+            kind,
+            object: json!({"metadata":{"name":name,"uid":uid}}),
+        }
+    }
+    fn deletion(resource: &ScaleResource, resource_version: u64) -> CleanupDeletionObservation {
+        CleanupDeletionObservation {
+            kind: resource.kind,
+            name: resource.name().to_string(),
+            uid: resource.uid().to_string(),
+            resource_version,
+            observed_at: std::time::UNIX_EPOCH + Duration::from_secs(resource_version),
+        }
+    }
+    let expected = vec![
+        resource("service", "candidate-peer", "service-uid"),
+        resource("pod", "candidate", "pod-uid"),
+        resource("pvc", "candidate-data", "pvc-uid"),
+    ];
+    let correct = vec![
+        deletion(&expected[0], 10),
+        deletion(&expected[1], 11),
+        deletion(&expected[2], 12),
+    ];
+    validate_cleanup_observations(&expected, &correct, true)?;
+    for order in [[0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        let observed = order
+            .iter()
+            .enumerate()
+            .map(|(index, source)| deletion(&expected[*source], 20 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(
+            validate_cleanup_observations(&expected, &observed, true).is_err(),
+            "wrong cleanup order passed: {order:?}"
+        );
+    }
+    for (field, value) in [("name", "other-name"), ("uid", "other-uid")] {
+        let mut invalid = correct.clone();
+        match field {
+            "name" => invalid[1].name = value.into(),
+            "uid" => invalid[1].uid = value.into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_cleanup_observations(&expected, &invalid, true).is_err(),
+            "wrong cleanup {field} passed"
+        );
+    }
+    let mut regressed_rv = correct.clone();
+    regressed_rv[2].resource_version = regressed_rv[1].resource_version;
+    assert!(validate_cleanup_observations(&expected, &regressed_rv, true).is_err());
+    Ok(())
+}
+
+#[test]
+fn scale_up_candidate_delivery_requires_exact_incarnation_session_and_build() {
+    let evidence = PhaseWriteEvidence {
+        target: 4,
+        phase: "copy",
+        boundary_lsn: 10,
+        write_lsn: 12,
+        candidate: json!({
+            "replicaId":4,
+            "instanceId":"candidate-pod-uid",
+            "agentGeneration":"candidate-generation"
+        }),
+        candidate_process_session: "candidate-session".into(),
+        build_id: "scale-up-build".into(),
+        reached_candidate: false,
+    };
+    let report = json!({
+        "replicaId":4,
+        "instanceId":"candidate-pod-uid",
+        "agentGeneration":"candidate-generation",
+        "processSession":"candidate-session",
+        "currentProgress":12,
+        "builds":[{
+            "buildId":"scale-up-build",
+            "targetInstance":"candidate-pod-uid",
+            "durableLsn":12
+        }]
+    });
+    assert!(candidate_delivery_matches(&report, &evidence));
+    for (pointer, replacement) in [
+        ("/instanceId", json!("wrong-pod-uid")),
+        ("/agentGeneration", json!("wrong-generation")),
+        ("/processSession", json!("wrong-session")),
+        ("/builds/0/buildId", json!("wrong-build")),
+        ("/builds/0/targetInstance", json!("other-target")),
+    ] {
+        let mut wrong = report.clone();
+        *wrong.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            !candidate_delivery_matches(&wrong, &evidence),
+            "wrong candidate delivery evidence passed at {pointer}: {wrong}"
+        );
+    }
+}
+
+#[test]
+fn scale_up_active_copy_oracle_requires_exact_unadmitted_inflight_build() {
+    use kuberic_protocol::types::{
+        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
+        OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId,
+        ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpProvisioning,
+    };
+
+    let resource_uid = ResourceUid::new("set-uid");
+    let primary = ReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new("primary-pod"),
+        agent_generation: AgentGeneration::new("primary-generation"),
+    };
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    let previous_policy = EffectivePolicy::fixed(1, 3).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 3).unwrap();
+    let mut provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            previous_policy,
+            current_policy,
+            target_replica_id: ReplicaId::new(2),
+        }),
+        pod_uid: PodUid::new("candidate-pod"),
+        pvc_uid: PvcUid::new("candidate-pvc"),
+        operation_id: OperationId::default(),
+    };
+    provisioning.operation_id = provisioning.expected_operation_id();
+    let target = provisioning.target_identity(&resource_uid);
+    let build_id = provisioning.scale_up_build_id(&resource_uid).unwrap();
+    let status = json!({
+        "metadata":{"uid":resource_uid},
+        "status":{
+            "topology":serde_json::to_value(&previous).unwrap(),
+            "provisioning":serde_json::to_value(&provisioning).unwrap(),
+            "transition":null,
+            "scaleUpAdmissionStarted":null
+        }
+    });
+    let build = json!({
+        "buildId":build_id,
+        "targetInstance":target.instance_id,
+        "replicationBoundaryLsn":7,
+        "durableLsn":7,
+        "completed":false,
+        "catchUpBoundaryLsn":null
+    });
+    let source = json!({
+        "replicaId":primary.replica_id,
+        "instanceId":primary.instance_id,
+        "agentGeneration":primary.agent_generation,
+        "processSession":"source-session",
+        "role":"Primary",
+        "previousConfiguration":null,
+        "currentConfiguration":previous.configuration_id,
+        "scaleUpOperation":null,
+        "readStatus":"Granted",
+        "writeStatus":"Granted",
+        "builds":[build.clone()]
+    });
+    let candidate = json!({
+        "replicaId":target.replica_id,
+        "instanceId":target.instance_id,
+        "agentGeneration":target.agent_generation,
+        "processSession":"candidate-session",
+        "role":"IdleSecondary",
+        "previousConfiguration":null,
+        "currentConfiguration":null,
+        "scaleUpOperation":null,
+        "readStatus":"NotPrimary",
+        "writeStatus":"NotPrimary",
+        "builds":[build]
+    });
+    assert!(
+        active_scale_up_copy_checkpoint(
+            &status,
+            &source,
+            &candidate,
+            "source-session",
+            "candidate-session"
+        )
+        .is_ok()
+    );
+
+    let mut invalid = Vec::new();
+    let mut empty_builds = source.clone();
+    empty_builds["builds"] = json!([]);
+    let mut empty_candidate_builds = candidate.clone();
+    empty_candidate_builds["builds"] = json!([]);
+    invalid.push((
+        "empty builds",
+        status.clone(),
+        empty_builds,
+        empty_candidate_builds,
+    ));
+    let mut wrong_build = source.clone();
+    wrong_build["builds"][0]["buildId"] = json!("wrong-build");
+    let mut wrong_candidate_build = candidate.clone();
+    wrong_candidate_build["builds"][0]["buildId"] = json!("wrong-build");
+    invalid.push((
+        "wrong build",
+        status.clone(),
+        wrong_build,
+        wrong_candidate_build,
+    ));
+    let mut wrong_identity = candidate.clone();
+    wrong_identity["instanceId"] = json!("wrong-candidate");
+    invalid.push((
+        "wrong identity",
+        status.clone(),
+        source.clone(),
+        wrong_identity,
+    ));
+    let mut wrong_session = candidate.clone();
+    wrong_session["processSession"] = json!("wrong-session");
+    invalid.push((
+        "wrong session",
+        status.clone(),
+        source.clone(),
+        wrong_session,
+    ));
+    let mut pc_cc = status.clone();
+    pc_cc["status"]["transition"] = json!({"kind":"scaleUp"});
+    let mut admitted_candidate = candidate.clone();
+    admitted_candidate["role"] = json!("ActiveSecondary");
+    admitted_candidate["previousConfiguration"] = json!(previous.configuration_id.as_str());
+    admitted_candidate["currentConfiguration"] = json!("expanded-configuration");
+    invalid.push(("PC/CC installed", pc_cc, source.clone(), admitted_candidate));
+    let mut post_admission = status.clone();
+    post_admission["status"]["scaleUpAdmissionStarted"] = json!(provisioning.operation_id.as_str());
+    invalid.push((
+        "post admission",
+        post_admission,
+        source.clone(),
+        candidate.clone(),
+    ));
+    let mut completed_source = source.clone();
+    completed_source["builds"][0]["completed"] = json!(true);
+    let mut completed_candidate = candidate.clone();
+    completed_candidate["builds"][0]["completed"] = json!(true);
+    invalid.push(("post copy", status, completed_source, completed_candidate));
+
+    for (case, status, source, candidate) in invalid {
+        assert!(
+            active_scale_up_copy_checkpoint(
+                &status,
+                &source,
+                &candidate,
+                "source-session",
+                "candidate-session"
+            )
+            .is_err(),
+            "{case} evidence passed the active-copy oracle"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn scale_up_retry_classifiers_propagate_unknown_failures() {
+    use kuberic_controller::ControllerError;
+
+    for transient in [
+        anyhow::Error::new(ControllerError::ObservationStale),
+        anyhow::Error::new(ControllerError::TransientObservation(
+            "HTTP 429 Too Many Requests".into(),
+        )),
+        anyhow::Error::new(ControllerError::TransientObservation(
+            "HTTP 503 Service Unavailable".into(),
+        )),
+        anyhow::Error::new(ControllerError::AgentUnavailable("restart".into())),
+        anyhow::Error::new(io::Error::new(io::ErrorKind::ConnectionReset, "reset")),
+    ] {
+        assert!(transient_live_step_error(&transient), "{transient:#}");
+    }
+    for permanent in [
+        anyhow::Error::new(ControllerError::InvalidAgentEvidence("bad protocol".into())),
+        anyhow::Error::new(ControllerError::Effect("rejected".into())),
+        anyhow::Error::new(ControllerError::Observation(
+            "ApiError: Forbidden (ErrorResponse { code: 403 })".into(),
+        )),
+        anyhow::Error::new(ControllerError::Observation("KubericSet has no UID".into())),
+        anyhow::Error::new(ControllerError::Observation(
+            "invalid Kubernetes object".into(),
+        )),
+        anyhow::anyhow!("unknown live-step failure"),
+    ] {
+        assert!(!transient_live_step_error(&permanent), "{permanent:#}");
+    }
+    for (code, transient) in [
+        (403, false),
+        (404, false),
+        (422, false),
+        (429, true),
+        (500, true),
+        (503, true),
+    ] {
+        let error = anyhow::Error::new(kube::Error::Api(Box::new(kube::core::Status {
+            code,
+            message: format!("HTTP {code}"),
+            ..Default::default()
+        })));
+        assert_eq!(
+            transient_live_step_error(&error),
+            transient,
+            "HTTP {code} observation classification"
+        );
+    }
+
+    assert!(
+        require_routed_lookup(routed_test_output(0, "{}", ""), "Service")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        require_routed_lookup(
+            routed_test_output(1, "", "Unable to connect to the server"),
+            "Service"
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        require_routed_lookup(
+            routed_test_output(1, "", "Error from server (Forbidden): denied"),
+            "Service"
+        )
+        .is_err()
+    );
+}
+
+fn scale_up_stage(plan: &kuberic_protocol::plan::Plan) -> Option<String> {
+    use kuberic_protocol::{
+        command::{KubernetesChange, ProtocolCommand},
+        plan::Plan,
+    };
+    match plan {
+        Plan::Execute { command } => match command {
+            ProtocolCommand::InitializeAgentStore(command)
+                if command
+                    .provisioning
+                    .as_ref()
+                    .is_some_and(|provisioning| provisioning.scale_up().is_some()) =>
+            {
+                Some("initialize".into())
+            }
+            ProtocolCommand::EnsureReplicaBuild(_) => Some("build".into()),
+            ProtocolCommand::EnsureConfiguration(command)
+                if command.scale_up_evidence.is_some() =>
+            {
+                Some(format!(
+                    "{}-{}",
+                    if command.current_only {
+                        "current-only"
+                    } else {
+                        "pc-cc"
+                    },
+                    command.local_replica_id
+                ))
+            }
+            _ => None,
+        },
+        Plan::Apply { changes } => changes.iter().find_map(|change| match change {
+            KubernetesChange::EnsureReplicaScaffolding { replica_ids } => Some(format!(
+                "scaffolding-{}",
+                replica_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            KubernetesChange::DeleteScaleDownResource { resource, .. } => {
+                Some(format!("delete-{resource:?}"))
+            }
+            KubernetesChange::PersistStatus { status } => status
+                .conditions
+                .iter()
+                .find(|condition| {
+                    condition
+                        .reason
+                        .strip_prefix("ScaleUp")
+                        .is_some_and(|suffix| !suffix.is_empty())
+                })
+                .map(|condition| format!("status-{}", condition.reason)),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn transient_live_step_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(controller) = cause.downcast_ref::<kuberic_controller::ControllerError>() {
+            return matches!(
+                controller,
+                kuberic_controller::ControllerError::TransientObservation(_)
+                    | kuberic_controller::ControllerError::ObservationStale
+                    | kuberic_controller::ControllerError::AgentUnavailable(_)
+            );
+        }
+        if let Some(kube) = cause.downcast_ref::<kube::Error>() {
+            return match kube {
+                kube::Error::Api(status) => {
+                    matches!(status.code, 409 | 410 | 429 | 500 | 502 | 503 | 504)
+                }
+                kube::Error::HyperError(_)
+                | kube::Error::Service(_)
+                | kube::Error::ReadEvents(_) => true,
+                _ => false,
+            };
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::Interrupted
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::WouldBlock
+            )
+        })
+    })
+}
+
+fn manual_live_step(cluster: &SwitchoverCluster, deadline: Instant) -> Result<LiveStep> {
+    loop {
+        let error = match LiveStepper::new(cluster).and_then(|stepper| stepper.step(cluster)) {
+            Ok(step) => return Ok(step),
+            Err(error) => error,
+        };
+        if !transient_live_step_error(&error) {
+            return Err(error.context("manual live controller step failed permanently"));
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "manual live controller could not take a step; last error: {:#}",
+            error
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn wait_controller_ready(cluster: &SwitchoverCluster, deadline: Instant) -> Result<()> {
+    loop {
+        let deployment: Value = serde_json::from_str(&cluster.kubectl(&[
+            "-n",
+            "kuberic-system",
+            "get",
+            "deployment",
+            "kuberic-controller",
+            "-o",
+            "json",
+        ])?)?;
+        if deployment["status"]["observedGeneration"] == deployment["metadata"]["generation"]
+            && deployment["status"]["updatedReplicas"] == 1
+            && deployment["status"]["availableReplicas"] == 1
+            && deployment["status"]["replicas"] == 1
+        {
+            return Ok(());
+        }
+        poll(deadline, "controller deployment availability")?;
+    }
+}
+
+fn patch_replicas(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
+    cluster.kubectl(&[
+        "-n",
+        "default",
+        "patch",
+        "kubericset",
+        "kvstore2",
+        "--type=merge",
+        "-p",
+        &json!({"spec":{"replicas":count}}).to_string(),
+    ])?;
+    Ok(())
+}
+
+fn wait_process_session_change(
+    cluster: &SwitchoverCluster,
+    replica_id: i64,
+    previous: &Value,
+    deadline: Instant,
+) -> Result<Value> {
+    loop {
+        if let Ok(report) = replica_diagnostics(&cluster.kubeconfig, &cluster.context, replica_id)
+            && report["processSession"] != *previous
+        {
+            return Ok(report);
+        }
+        poll(
+            deadline,
+            &format!("replica {replica_id} process-session restart"),
+        )?;
+    }
+}
+
+fn write_routed(
+    cluster: &SwitchoverCluster,
+    primary: &Value,
+    acknowledged: &mut Vec<(String, String)>,
+    label: &str,
+    deadline: Instant,
+) -> Result<()> {
+    let key = format!("scale-up-adversarial-{label}-{}", acknowledged.len());
+    let value = format!("acknowledged-{key}");
+    assert_routed_service_write(cluster, primary, &key, &value, deadline)?;
+    acknowledged.push((key, value));
+    Ok(())
+}
+
+fn write_routed_after_boundary(
+    cluster: &SwitchoverCluster,
+    primary: &Value,
+    primary_client: &mut DirectClient,
+    acknowledged: &mut Vec<(String, String)>,
+    label: &str,
+    boundary_lsn: i64,
+    deadline: Instant,
+) -> Result<(String, String, i64)> {
+    let key = format!("scale-up-adversarial-{label}-{}", acknowledged.len());
+    let value = format!("acknowledged-{key}");
+    let before = primary_client.report()?["committedLsn"]
+        .as_i64()
+        .context("committed LSN before routed active-copy write")?;
+    assert_routed_service_write(cluster, primary, &key, &value, deadline)?;
+    let write_lsn = loop {
+        let committed = primary_client.report()?["committedLsn"]
+            .as_i64()
+            .context("committed LSN after routed active-copy write")?;
+        if committed > before {
+            break committed;
+        }
+        poll(deadline, "routed active-copy write committed LSN")?;
+    };
+    ensure!(
+        write_lsn > boundary_lsn,
+        "active-copy acknowledged write LSN {write_lsn} did not exceed snapshot boundary {boundary_lsn}"
+    );
+    acknowledged.push((key.clone(), value.clone()));
+    Ok((key, value, write_lsn))
+}
+
+fn verify_acknowledged(
+    cluster: &SwitchoverCluster,
+    status: &Value,
+    acknowledged: &[(String, String)],
+    deadline: Instant,
+) -> Result<()> {
+    let primary = status["status"]["topology"]["members"]
+        .as_array()
+        .context("accepted members")?
+        .iter()
+        .find(|member| member["role"] == "primary")
+        .context("accepted primary")?;
+    let service: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "service",
+        "kvstore2-write",
+        "-o",
+        "json",
+    ])?)?;
+    validate_routed_service(&service, primary)?;
+    for (key, expected) in acknowledged {
+        assert_routed_service_read(cluster, primary, key, expected, deadline)?;
+    }
+    let configuration = &status["status"]["topology"]["configurationId"];
+    for member in status["status"]["topology"]["members"]
+        .as_array()
+        .context("accepted members")?
+    {
+        let report = cluster.report(member)?;
+        ensure!(
+            identity(&report) == identity(member)
+                && report["currentConfiguration"] == *configuration
+                && report["previousConfiguration"].is_null()
+                && report["pendingOperation"].is_null()
+                && report["role"]
+                    == if member["role"] == "primary" {
+                        "Primary"
+                    } else {
+                        "ActiveSecondary"
+                    },
+            "member lacked exact stable authority/role: {report}"
+        );
+        let mut client = DirectClient::connect(cluster, &cluster.pod(member)?, deadline)?;
+        for (key, expected) in acknowledged {
+            let (code, value) = client.request("GET", &format!("/kv/{key}"), "")?;
+            ensure!(
+                code == 200 && value == *expected,
+                "exact member {} lost acknowledged value {key}: HTTP {code} {value}",
+                member["replicaId"]
+            );
+        }
+    }
+    Ok(())
+}
+
+fn create_same_name_endpoint(
+    cluster: &SwitchoverCluster,
+    original: &ScaleResource,
+) -> Result<Value> {
+    let replacement = json!({
+        "apiVersion":"v1",
+        "kind":"Service",
+        "metadata":{
+            "name":original.name(),
+            "namespace":"default",
+            "ownerReferences":original.object["metadata"]["ownerReferences"],
+            "labels":{"kuberic-test":"same-name-resource-fence"}
+        },
+        "spec":{
+            "ports":[{"name":"unrelated","port":12345,"targetPort":12345}],
+            "selector":{"kuberic-test":"same-name-resource-fence"}
+        }
+    });
+    let mut child = OwnedChild(
+        cluster
+            .command()
+            .args(["create", "-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()?,
+    );
+    child
+        .0
+        .stdin
+        .take()
+        .context("replacement Service stdin")?
+        .write_all(replacement.to_string().as_bytes())?;
+    ensure!(
+        child.0.wait()?.success(),
+        "same-name endpoint creation failed"
+    );
+    Ok(serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "service",
+        original.name(),
+        "-o",
+        "json",
+    ])?)?)
+}
+
+fn scale_up_cancellation_failure_and_retry(
+    cluster: &SwitchoverCluster,
+) -> Result<Vec<(String, String)>> {
+    reset_scale_set_with_delay(cluster, 1, 3)?;
+    let start = scale_ready(cluster, 1, Instant::now() + Duration::from_secs(180))?;
+    let primary = exact_member(
+        &start,
+        topology_primary_id(&start).context("singleton primary")?,
+    )?
+    .clone();
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let mut acknowledged = Vec::new();
+    write_routed(
+        cluster,
+        &primary,
+        &mut acknowledged,
+        "before-cancellation",
+        deadline,
+    )?;
+
+    let pause = ControllerPause::new(cluster)?;
+    patch_replicas(cluster, 2)?;
+    let mut stages = Vec::new();
+    loop {
+        let step = manual_live_step(cluster, deadline)?;
+        if let Some(stage) = scale_up_stage(&step.plan) {
+            if stages.last() != Some(&stage) {
+                stages.push(stage);
+            }
+        }
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if status["status"]["transition"]["scaleUp"].is_object()
+            && status["status"]["scaleUpAdmissionStarted"].is_null()
+        {
+            break;
+        }
+        poll(deadline, "pre-PC scale-up cancellation boundary")?;
+    }
+    let old = exact_replica_resources(cluster, 2)?;
+    let old_uids = old
+        .iter()
+        .map(|resource| (resource.kind, resource.uid().to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let endpoint = old
+        .iter()
+        .find(|resource| resource.kind == "service")
+        .context("candidate endpoint")?
+        .clone();
+    let service_cleanup_watch = CollectionWatch::start(cluster, "services")?;
+    let pod_cleanup_watch = CollectionWatch::start(cluster, "pods")?;
+    let pvc_cleanup_watch = CollectionWatch::start(cluster, "persistentvolumeclaims")?;
+    let mut cleanup_observations = Vec::new();
+    patch_replicas(cluster, 1)?;
+    let mut replacement = None;
+    loop {
+        let step = manual_live_step(cluster, deadline)?;
+        if let Some(stage) = scale_up_stage(&step.plan) {
+            if stages.last() != Some(&stage) {
+                stages.push(stage);
+            }
+        }
+        record_cleanup_deletions(
+            cluster,
+            &[
+                ("service", &service_cleanup_watch.events),
+                ("pod", &pod_cleanup_watch.events),
+                ("pvc", &pvc_cleanup_watch.events),
+            ],
+            &old,
+            &mut cleanup_observations,
+        )?;
+        if cleanup_observations
+            .iter()
+            .any(|observation| observation.kind == "service")
+            && replacement.is_none()
+        {
+            let object = create_same_name_endpoint(cluster, &endpoint)?;
+            ensure!(
+                object["metadata"]["uid"].as_str() != Some(endpoint.uid()),
+                "same-name endpoint reused the frozen UID"
+            );
+            replacement = Some(object);
+        }
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if status["status"]["scaleUpAllocation"].is_null()
+            && status["status"]["scaleUpCleanup"].is_null()
+            && status["status"]["provisioning"].is_null()
+            && status["status"]["transition"].is_null()
+            && status["status"]["topology"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == 1)
+        {
+            break;
+        }
+        poll(deadline, "exact pre-PC cancellation cleanup")?;
+    }
+    record_cleanup_deletions(
+        cluster,
+        &[
+            ("service", &service_cleanup_watch.events),
+            ("pod", &pod_cleanup_watch.events),
+            ("pvc", &pvc_cleanup_watch.events),
+        ],
+        &old,
+        &mut cleanup_observations,
+    )?;
+    validate_cleanup_observations(&old, &cleanup_observations, true)?;
+    let replacement = replacement.context("same-name endpoint race was not exercised")?;
+    let live: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "service",
+        endpoint.name(),
+        "-o",
+        "json",
+    ])?)?;
+    ensure!(
+        live["metadata"]["uid"] == replacement["metadata"]["uid"],
+        "cleanup deleted a different-UID same-name endpoint"
+    );
+    cluster.kubectl(&[
+        "-n",
+        "default",
+        "delete",
+        "service",
+        endpoint.name(),
+        "--wait=true",
+        "--timeout=60s",
+    ])?;
+    drop(pause);
+    wait_controller_ready(cluster, deadline)?;
+
+    patch_replicas(cluster, 2)?;
+    let stable = scale_ready(cluster, 2, deadline)?;
+    let fresh = exact_replica_resources(cluster, 2)?;
+    for resource in &fresh {
+        if let Some(old_uid) = old_uids.get(resource.kind) {
+            ensure!(
+                resource.uid() != old_uid,
+                "retry reused frozen {} UID {}",
+                resource.kind,
+                old_uid
+            );
+        }
+    }
+    verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
+
+    // Delete an initialized, unadmitted candidate and require exact cleanup plus
+    // a fresh automatic retry rather than partial-PVC adoption.
+    let pause = ControllerPause::new(cluster)?;
+    patch_replicas(cluster, 3)?;
+    let failed = loop {
+        manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if status["status"]["provisioning"]["purpose"]["scaleUp"].is_object()
+            && status["status"]["transition"].is_null()
+            && let Ok(resources) = exact_replica_resources(cluster, 3)
+        {
+            break resources;
+        }
+        poll(
+            deadline,
+            "unadmitted candidate before injected disappearance",
+        )?;
+    };
+    let failed_uids = failed
+        .iter()
+        .map(|resource| (resource.kind, resource.uid().to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let failed_member = json!({
+        "replicaId":3,
+        "instanceId":failed.iter().find(|resource| resource.kind == "pod").unwrap().uid(),
+        "agentGeneration":"unadmitted"
+    });
+    cluster.delete_exact_pod(&failed_member)?;
+    drop(pause);
+    wait_controller_ready(cluster, deadline)?;
+    let stable = scale_ready(cluster, 3, deadline)?;
+    let retry = exact_replica_resources(cluster, 3)?;
+    for resource in &retry {
+        if let Some(old_uid) = failed_uids.get(resource.kind) {
+            ensure!(
+                resource.uid() != old_uid,
+                "failed-candidate retry reused {} UID {}",
+                resource.kind,
+                old_uid
+            );
+        }
+    }
+    verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
+    eprintln!(
+        "scale-up cancellation/failure cleanup and fresh retry PASS: \
+         stages={stages:?}, exact_cleanup={cleanup_observations:?}"
+    );
+    Ok(acknowledged)
+}
+
+fn scale_up_pre_admission_failover(cluster: &SwitchoverCluster) -> Result<Vec<(String, String)>> {
+    reset_scale_set_with_delay(cluster, 3, 3)?;
+    let start = scale_ready(cluster, 3, Instant::now() + Duration::from_secs(180))?;
+    let old_primary_id = topology_primary_id(&start).context("starting primary")?;
+    let old_primary = exact_member(&start, old_primary_id)?.clone();
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let mut acknowledged = Vec::new();
+    write_routed(
+        cluster,
+        &old_primary,
+        &mut acknowledged,
+        "before-pre-admission-failover",
+        deadline,
+    )?;
+    let pause = ControllerPause::new(cluster)?;
+    patch_replicas(cluster, 4)?;
+    let (checkpoint, held_copy) = begin_exact_active_copy(cluster, &old_primary, 4, deadline)?;
+    let old_candidate = exact_replica_resources(cluster, 4)?;
+    let old_provisioning_id = checkpoint.operation_id.clone();
+    let candidate_before = replica_diagnostics(&cluster.kubeconfig, &cluster.context, 4)?;
+    let source_before = replica_diagnostics(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+    ensure!(
+        source_before["processSession"] == checkpoint.source_process_session
+            && candidate_before["processSession"] == checkpoint.candidate_process_session,
+        "active-copy checkpoint sessions changed before restart injection: \
+         checkpoint={checkpoint:?} source={source_before} candidate={candidate_before}"
+    );
+    let mut old_source = DirectClient::connect(cluster, &cluster.pod(&old_primary)?, deadline)?;
+    let (copy_key, _copy_value, copy_write_lsn) = write_routed_after_boundary(
+        cluster,
+        &old_primary,
+        &mut old_source,
+        &mut acknowledged,
+        "during-held-copy",
+        checkpoint.snapshot_boundary_lsn,
+        deadline,
+    )?;
+    kill_replica_process(&cluster.kubeconfig, &cluster.context, 4)?;
+    let candidate_after =
+        wait_process_session_change(cluster, 4, &candidate_before["processSession"], deadline)?;
+    ensure!(
+        identity(&candidate_after) == identity(&candidate_before),
+        "candidate process restart changed its frozen identity: before={candidate_before} after={candidate_after}"
+    );
+    let after_candidate_restart = loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        let source = replica_diagnostics(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+        if let Ok((source_session, candidate_session)) =
+            active_copy_observed_sessions(cluster, &status)
+            && let Ok(active) = active_scale_up_copy_checkpoint(
+                &status,
+                &source,
+                &candidate_after,
+                &source_session,
+                &candidate_session,
+            )
+        {
+            break active;
+        }
+        poll(
+            deadline,
+            "candidate restart under exact active-copy authority",
+        )?;
+    };
+    ensure!(
+        after_candidate_restart.operation_id == checkpoint.operation_id
+            && after_candidate_restart.build_id == checkpoint.build_id
+            && after_candidate_restart.candidate_process_session
+                != checkpoint.candidate_process_session,
+        "candidate restart did not reconstruct the same exact active build: \
+         before={checkpoint:?} after={after_candidate_restart:?}"
+    );
+    kill_replica_process(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+    drop(old_source);
+    let after_source_restart = loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if let Ok(active) = active_copy_reconstruction_checkpoint(cluster, &status)
+            && active.source_process_session != checkpoint.source_process_session
+        {
+            break active;
+        }
+        poll(deadline, "source restart under exact active-copy authority")?;
+    };
+    ensure!(
+        after_source_restart.operation_id == checkpoint.operation_id
+            && after_source_restart.build_id == checkpoint.build_id
+            && after_source_restart.source_process_session != checkpoint.source_process_session
+            && after_source_restart.candidate_process_session
+                == after_candidate_restart.candidate_process_session,
+        "source restart did not reconstruct the same exact active build: \
+         before={checkpoint:?} after={after_source_restart:?}"
+    );
+    let copy_evidence = PhaseWriteEvidence {
+        target: 4,
+        phase: "copy",
+        boundary_lsn: checkpoint.snapshot_boundary_lsn,
+        write_lsn: copy_write_lsn,
+        candidate: checkpoint.candidate.clone(),
+        candidate_process_session: after_source_restart.candidate_process_session.clone(),
+        build_id: checkpoint.build_id.clone(),
+        reached_candidate: false,
+    };
+    held_copy.release_and_finish()?;
+    loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        ensure!(
+            status["status"]["scaleUpAdmissionStarted"].is_null(),
+            "copy delivery crossed the admission fence before exact candidate durability: {status}"
+        );
+        let candidate = replica_diagnostics(&cluster.kubeconfig, &cluster.context, 4)?;
+        if candidate_delivery_matches(&candidate, &copy_evidence) {
+            ensure!(
+                candidate["currentProgress"]
+                    .as_i64()
+                    .is_some_and(|progress| progress >= copy_write_lsn),
+                "candidate build report claimed delivery without durable application progress: {candidate}"
+            );
+            break;
+        }
+        manual_live_step(cluster, deadline)?;
+        poll(deadline, "held-copy write durable on restarted candidate")?;
+    }
+    loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if status["status"]["transition"]["scaleUp"].is_object()
+            && status["status"]["scaleUpAdmissionStarted"].is_null()
+        {
+            break;
+        }
+        manual_live_step(cluster, deadline)?;
+        poll(deadline, "restarted copy through pre-admission boundary")?;
+    }
+    write_routed(
+        cluster,
+        &old_primary,
+        &mut acknowledged,
+        "after-copy-restarts",
+        deadline,
+    )?;
+    let restarted_source_session = after_source_restart.source_process_session.clone();
+    let restarted_candidate_session = after_source_restart.candidate_process_session.clone();
+    eprintln!(
+        "restarted exact active copy resumed: operation={}, build={}, source_session={} -> {}, \
+         candidate_session={} -> {}, write={copy_key}@{copy_write_lsn}",
+        checkpoint.operation_id,
+        checkpoint.build_id,
+        checkpoint.source_process_session,
+        restarted_source_session,
+        checkpoint.candidate_process_session,
+        restarted_candidate_session
+    );
+    let old_uids = old_candidate
+        .iter()
+        .map(|resource| (resource.kind, resource.uid().to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    cluster.delete_exact_pod(&old_primary)?;
+    let mut failed_process_changed = false;
+    let new_primary = loop {
+        manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        failed_process_changed |=
+            replica_diagnostics(&cluster.kubeconfig, &cluster.context, old_primary_id).is_ok_and(
+                |report| {
+                    report["instanceId"] != old_primary["instanceId"]
+                        || report["processSession"] != restarted_source_session
+                },
+            );
+        ensure!(
+            status["status"]["scaleUpAdmissionStarted"].is_null(),
+            "pre-admission primary failure crossed the PC/CC admission fence: {status}"
+        );
+        if topology_primary_id(&status).is_some_and(|primary| primary != old_primary_id)
+            && status["status"]["topology"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == 3)
+        {
+            break topology_primary_id(&status).unwrap();
+        }
+        poll(deadline, "ordinary failover before scale-up admission")?;
+    };
+    ensure!(
+        failed_process_changed || new_primary != old_primary_id,
+        "accepted-primary fault produced neither a new process session nor a failover primary"
+    );
+    loop {
+        let status = cluster.status()?;
+        let primary = exact_member(&status, new_primary)?.clone();
+        let writable = cluster.report(&primary).is_ok_and(|report| {
+            identity(&report) == identity(&primary)
+                && report["writeStatus"] == "Granted"
+                && report["pendingOperation"].is_null()
+        });
+        let routed = cluster
+            .kubectl(&[
+                "-n",
+                "default",
+                "get",
+                "service",
+                "kvstore2-write",
+                "-o",
+                "json",
+            ])
+            .ok()
+            .and_then(|service| serde_json::from_str::<Value>(&service).ok())
+            .is_some_and(|service| routing_instance(&service) == primary["instanceId"].as_str());
+        if writable && routed {
+            write_routed(
+                cluster,
+                &primary,
+                &mut acknowledged,
+                "after-pre-admission-failover",
+                deadline,
+            )?;
+            break;
+        }
+        manual_live_step(cluster, deadline)?;
+        poll(
+            deadline,
+            "writable failover primary while desired scale-up retry remains active",
+        )?;
+    }
+    drop(pause);
+    wait_controller_ready(cluster, deadline)?;
+    let (fresh_status, fresh, fresh_provisioning_id) = loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        ensure!(
+            status["spec"]["replicas"].as_u64() == Some(4),
+            "pre-admission failover lowered desired replicas: {status}"
+        );
+        let old_exact_absent = old_candidate.iter().all(|resource| {
+            resource.get(cluster).is_ok_and(|live| {
+                live.is_none_or(|live| live["metadata"]["uid"].as_str() != Some(resource.uid()))
+            })
+        });
+        if status["status"]["provisioning"]["purpose"]["scaleUp"].is_object()
+            && status["status"]["topology"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == 3)
+            && topology_primary_id(&status) == Some(new_primary)
+            && old_exact_absent
+            && let Ok(resources) = exact_replica_resources(cluster, 4)
+        {
+            let operation = status["status"]["provisioning"]["operationId"]
+                .as_str()
+                .context("fresh provisioning operation")?
+                .to_string();
+            ensure!(
+                operation != old_provisioning_id,
+                "pre-admission failover reused old provisioning operation {operation}"
+            );
+            break (status, resources, operation);
+        }
+        poll(
+            deadline,
+            "exact old-candidate cleanup and fresh post-failover scale-up retry",
+        )?;
+    };
+    for resource in &fresh {
+        if let Some(old_uid) = old_uids.get(resource.kind) {
+            ensure!(
+                resource.uid() != old_uid,
+                "pre-admission failover retry reused {} UID {}",
+                resource.kind,
+                old_uid
+            );
+        }
+    }
+    ensure!(
+        fresh_status["status"]["scaleUpCleanup"].is_null(),
+        "fresh retry overlapped unresolved old cleanup: {fresh_status}"
+    );
+    let retained_identities = fresh_status["status"]["topology"]["members"]
+        .as_array()
+        .context("post-failover retained members")?
+        .iter()
+        .map(identity)
+        .collect::<Vec<_>>();
+    let stable = scale_ready(cluster, 4, deadline)?;
+    ensure!(
+        topology_primary_id(&stable) == Some(new_primary),
+        "fresh 3->4 admission changed the accepted failover primary"
+    );
+    ensure!(
+        stable["status"]["effectivePolicy"]["replicaSetSize"].as_u64() == Some(4)
+            && stable["status"]["effectivePolicy"]["writeQuorum"].as_u64() == Some(3),
+        "fresh 3->4 admission installed the wrong policy: {}",
+        stable["status"]["effectivePolicy"]
+    );
+    let members = stable["status"]["topology"]["members"]
+        .as_array()
+        .context("stable expanded members")?;
+    ensure!(
+        retained_identities
+            .iter()
+            .filter(|retained| retained["replicaId"].as_i64() != Some(old_primary_id))
+            .all(|retained| members.iter().any(|member| identity(member) == *retained)),
+        "fresh retry changed a surviving retained exact identity: {members:?}"
+    );
+    let replacement = exact_member(&stable, old_primary_id)?;
+    ensure!(
+        identity(replacement) != identity(&old_primary),
+        "deleted accepted-primary incarnation returned without a fresh identity: {replacement}"
+    );
+    let fresh_pod = fresh
+        .iter()
+        .find(|resource| resource.kind == "pod")
+        .context("fresh candidate Pod")?;
+    let admitted = exact_member(&stable, 4)?;
+    ensure!(
+        admitted["instanceId"].as_str() == Some(fresh_pod.uid())
+            && admitted["role"] == "activeSecondary",
+        "fresh retry did not admit its exact candidate as ActiveSecondary: {admitted}"
+    );
+    verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
+    eprintln!(
+        "scale-up pre-admission process restarts/failover/retry PASS: desired=4, primary \
+         {old_primary_id}->{new_primary}, old_operation={old_provisioning_id}, \
+         fresh_operation={fresh_provisioning_id}, source_session={restarted_source_session}, \
+         candidate_session={restarted_candidate_session}"
+    );
+    Ok(acknowledged)
+}
+
+fn scale_up_post_admission_recovery_and_replacement(
+    cluster: &SwitchoverCluster,
+) -> Result<Vec<(String, String)>> {
+    reset_scale_set_with_delay(cluster, 2, 3)?;
+    let start = scale_ready(cluster, 2, Instant::now() + Duration::from_secs(180))?;
+    let old_primary_id = topology_primary_id(&start).context("starting primary")?;
+    let old_primary = exact_member(&start, old_primary_id)?.clone();
+    let retained_secondary = start["status"]["topology"]["members"]
+        .as_array()
+        .context("starting members")?
+        .iter()
+        .find(|member| member["replicaId"].as_i64() != Some(old_primary_id))
+        .context("retained secondary")?
+        .clone();
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let mut acknowledged = Vec::new();
+    write_routed(
+        cluster,
+        &old_primary,
+        &mut acknowledged,
+        "before-post-pc-failover",
+        deadline,
+    )?;
+    let pause = ControllerPause::new(cluster)?;
+    patch_replicas(cluster, 3)?;
+    let (intent, expanded) = loop {
+        manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        let intent_value = &status["status"]["transition"]["scaleUp"];
+        if intent_value.is_object()
+            && status["status"]["scaleUpAdmissionStarted"].is_string()
+            && let Ok(intent) = serde_json::from_value::<kuberic_protocol::types::ScaleUpIntent>(
+                intent_value.clone(),
+            )
+            && let Ok(expanded) =
+                serde_json::from_value::<kuberic_protocol::types::ConfigurationDescriptor>(
+                    status["status"]["transition"]["currentConfiguration"].clone(),
+                )
+            && let Ok(snapshot) =
+                LiveStepper::new(cluster).and_then(|stepper| stepper.observe_snapshot(cluster))
+        {
+            use kuberic_protocol::observation::AgentObservation;
+            let reports = snapshot
+                .replicas
+                .values()
+                .filter_map(|observation| match &observation.agent {
+                    AgentObservation::Report(report) => Some(report.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let exact_pc_cc = |expected: &Value| {
+                reports.iter().copied().any(|report| {
+                    report.identity.replica_id.value() == expected["replicaId"].as_i64().unwrap()
+                        && report.identity.instance_id.as_str()
+                            == expected["instanceId"].as_str().unwrap()
+                        && report.previous_configuration.as_ref()
+                            == Some(&intent.previous_configuration)
+                        && report.current_configuration.as_ref() == Some(&expanded)
+                        && report.scale_up_intent.as_deref() == Some(&intent)
+                        && report.pending_operation_id.is_none()
+                })
+            };
+            let candidate = serde_json::to_value(&intent.target)?;
+            if exact_pc_cc(&old_primary)
+                && exact_pc_cc(&retained_secondary)
+                && exact_pc_cc(&candidate)
+            {
+                ensure!(
+                    intent.previous_policy.replica_set_size == 2
+                        && intent.current_policy.replica_set_size == 3
+                        && intent.current_policy.write_quorum == 2,
+                    "installed PC/CC reports carried the wrong scale-up policy: {intent:?}"
+                );
+                break (intent, expanded);
+            }
+        }
+        poll(
+            deadline,
+            "exact expanded PC/CC authority/policy on source, retained member, and candidate",
+        )?;
+    };
+    write_routed(
+        cluster,
+        &old_primary,
+        &mut acknowledged,
+        "during-pc-cc-admission",
+        deadline,
+    )?;
+    let candidate_before = replica_diagnostics(
+        &cluster.kubeconfig,
+        &cluster.context,
+        intent.target.replica_id.value(),
+    )?;
+    kill_replica_process(
+        &cluster.kubeconfig,
+        &cluster.context,
+        intent.target.replica_id.value(),
+    )?;
+    let candidate_after = wait_process_session_change(
+        cluster,
+        intent.target.replica_id.value(),
+        &candidate_before["processSession"],
+        deadline,
+    )?;
+    ensure!(
+        identity(&candidate_after) == identity(&candidate_before)
+            && candidate_after["previousConfiguration"]
+                == candidate_before["previousConfiguration"]
+            && candidate_after["currentConfiguration"] == candidate_before["currentConfiguration"],
+        "candidate process restart lost exact admitted PC/CC authority: before={candidate_before} after={candidate_after}"
+    );
+    write_routed(
+        cluster,
+        &old_primary,
+        &mut acknowledged,
+        "after-candidate-pc-cc-restart",
+        deadline,
+    )?;
+    let suspension =
+        suspend_replica_process(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+    let (carried, new_primary_id) = loop {
+        manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        let evidence = &status["status"]["transition"]["scaleUpFailover"];
+        if evidence.is_object() {
+            ensure!(
+                status["status"]["transition"]["scaleUp"].is_null()
+                    && evidence["intent"]["operationId"].as_str()
+                        == Some(intent.operation_id.as_str())
+                    && evidence["intent"]["currentConfiguration"]["configurationId"].as_str()
+                        == Some(expanded.configuration_id.as_str()),
+                "failover did not carry and supersede exact outstanding scale-up authority: \
+                 {}",
+                status["status"]["transition"]
+            );
+            let new_primary = status["status"]["transition"]["currentConfiguration"]["members"]
+                .as_array()
+                .context("scale-up failover members")?
+                .iter()
+                .find(|member| member["role"] == "primary")
+                .and_then(|member| member["replicaId"].as_i64())
+                .context("scale-up failover primary")?;
+            ensure!(
+                new_primary != old_primary_id,
+                "post-PC/CC failover retained the failed accepted primary"
+            );
+            break (status, new_primary);
+        }
+        poll(
+            deadline,
+            "carried/superseded post-PC/CC primary failover authority",
+        )?;
+    };
+    ensure!(
+        carried["status"]["topology"]["members"]
+            .as_array()
+            .is_some_and(|members| members.len() == 2),
+        "post-PC/CC fault mutated accepted topology before failover commit"
+    );
+    drop(suspension);
+    drop(pause);
+    wait_controller_ready(cluster, deadline)?;
+    let stable = scale_ready(cluster, 3, deadline)?;
+    ensure!(
+        topology_primary_id(&stable) == Some(new_primary_id),
+        "post-PC/CC failover did not retain its exact elected primary"
+    );
+    let receipt = &stable["status"]["lastScaleUp"];
+    ensure!(
+        receipt["intent"]["operationId"].as_str() == Some(intent.operation_id.as_str())
+            && receipt["failoverEvidence"]["intent"]["operationId"].as_str()
+                == Some(intent.operation_id.as_str())
+            && receipt["acceptedConfiguration"] == stable["status"]["topology"],
+        "stable expanded membership omitted exact carried failover receipt: {receipt}"
+    );
+    let expected_identities = start["status"]["topology"]["members"]
+        .as_array()
+        .context("starting identities")?
+        .iter()
+        .map(identity)
+        .chain(std::iter::once(serde_json::to_value(&intent.target)?))
+        .collect::<Vec<_>>();
+    let stable_members = stable["status"]["topology"]["members"]
+        .as_array()
+        .context("stable expanded members")?;
+    ensure!(
+        stable_members.len() == 3
+            && expected_identities.iter().all(|expected| {
+                stable_members
+                    .iter()
+                    .any(|member| identity(member) == *expected)
+            })
+            && stable_members.iter().all(|member| {
+                member["role"]
+                    == if member["replicaId"].as_i64() == Some(new_primary_id) {
+                        "primary"
+                    } else {
+                        "activeSecondary"
+                    }
+            }),
+        "post-PC/CC recovery changed exact identities or roles: {stable_members:?}"
+    );
+    verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
+    eprintln!(
+        "scale-up post-PC/CC accepted-primary failover PASS: carried operation={}, \
+         primary {old_primary_id}->{new_primary_id}, candidate_session {}->{}, \
+         exact expanded membership stable",
+        intent.operation_id, candidate_before["processSession"], candidate_after["processSession"]
+    );
+
+    // A separate post-completion cut retains the original member-replacement
+    // coverage without conflating it with the post-PC/CC authority recovery.
+    let added_before = exact_member(&stable, 3)?.clone();
+    let old_resources = exact_replica_resources(cluster, 3)?;
+    cluster.delete_exact_pod(&added_before)?;
+    let replaced = loop {
+        let status = scale_ready(cluster, 3, deadline)?;
+        let member = exact_member(&status, 3)?;
+        if member["instanceId"] != added_before["instanceId"] {
+            break status;
+        }
+        poll(
+            deadline,
+            "post-completion replacement of the scaled-up member",
+        )?;
+    };
+    let fresh_resources = exact_replica_resources(cluster, 3)?;
+    for resource in &fresh_resources {
+        if let Some(old) = old_resources.iter().find(|old| old.kind == resource.kind) {
+            ensure!(
+                resource.uid() != old.uid(),
+                "post-completion replacement reused {} UID {}",
+                resource.kind,
+                old.uid()
+            );
+        }
+    }
+    verify_acknowledged(cluster, &replaced, &acknowledged, deadline)?;
+    eprintln!(
+        "scale-up separate post-completion member replacement PASS: primary={new_primary_id}"
+    );
+
+    let replacement_primary =
+        topology_primary_id(&replaced).context("replacement topology primary")?;
+    let failover_started = Instant::now();
+    let failed_primary =
+        suspend_replica_process(&cluster.kubeconfig, &cluster.context, replacement_primary)?;
+    let failed_over = loop {
+        let status = cluster.status()?;
+        if status_ready(&status)
+            && topology_primary_id(&status).is_some_and(|primary| primary != replacement_primary)
+        {
+            break status;
+        }
+        poll(
+            deadline,
+            "Ready after scale-up, accepted replacement, and ordinary primary failover",
+        )?;
+    };
+    let failover_primary =
+        topology_primary_id(&failed_over).context("post-replacement failover primary")?;
+    let routed: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "service",
+        "kvstore2-write",
+        "-o",
+        "json",
+    ])?)?;
+    validate_routed_service(&routed, exact_member(&failed_over, failover_primary)?)?;
+    drop(failed_primary);
+    loop {
+        if replica_diagnostics(&cluster.kubeconfig, &cluster.context, replacement_primary).is_ok() {
+            break;
+        }
+        poll(
+            deadline,
+            "former primary process resumed after readiness proof",
+        )?;
+    }
+    let recovered = scale_ready(cluster, 3, deadline)?;
+    let recovered_primary =
+        topology_primary_id(&recovered).context("recovered post-failover primary")?;
+    let recovered_member = exact_member(&recovered, recovered_primary)?;
+    let routed: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "service",
+        "kvstore2-write",
+        "-o",
+        "json",
+    ])?)?;
+    validate_routed_service(&routed, recovered_member)?;
+    write_routed(
+        cluster,
+        recovered_member,
+        &mut acknowledged,
+        "after-scale-up-replacement-failover",
+        deadline,
+    )?;
+    ensure!(
+        recovered["status"]["lastScaleUp"]["intent"]["operationId"].as_str()
+            == Some(intent.operation_id.as_str()),
+        "historical scale-up receipt was erased after replacement/failover: {}",
+        recovered["status"]
+    );
+    verify_acknowledged(cluster, &recovered, &acknowledged, deadline)?;
+    eprintln!(
+        "scale-up -> accepted replacement -> ordinary failover readiness PASS: primary \
+         {replacement_primary}->{failover_primary}, recovered_primary={recovered_primary}, \
+         ready_ms={}",
+        failover_started.elapsed().as_millis()
+    );
+    Ok(acknowledged)
+}
+
+fn scale_down_then_restore_non_contiguous(cluster: &SwitchoverCluster) -> Result<()> {
+    reset_scale_set_with_delay(cluster, 3, 3)?;
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let stable = scale_ready(cluster, 3, deadline)?;
+    let primary = stable["status"]["topology"]["members"]
+        .as_array()
+        .context("restoration starting members")?
+        .iter()
+        .find(|member| member["role"] == "primary")
+        .context("restoration starting primary")?
+        .clone();
+    let mut acknowledged = Vec::new();
+    write_routed(
+        cluster,
+        &primary,
+        &mut acknowledged,
+        "before-non-contiguous-restoration",
+        deadline,
+    )?;
+    let target = exact_member(&stable, 3)?.clone();
+    if topology_primary_id(&stable) != Some(3) {
+        let request = format!(
+            "scale-up-restoration-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        cluster.kubectl(&[
+            "-n",
+            "default",
+            "patch",
+            "kubericset",
+            "kvstore2",
+            "--type=merge",
+            "-p",
+            &json!({"spec":{"switchover":{"requestId":request,"targetReplicaId":3}}}).to_string(),
+        ])?;
+        loop {
+            let status = cluster.status()?;
+            if status_ready(&status)
+                && topology_primary_id(&status) == Some(3)
+                && status["status"]["lastSwitchover"]["requestId"] == request
+            {
+                break;
+            }
+            poll(
+                deadline,
+                "planned primary placement for non-contiguous restoration",
+            )?;
+        }
+        cluster.kubectl(&[
+            "-n",
+            "default",
+            "patch",
+            "kubericset",
+            "kvstore2",
+            "--type=merge",
+            "-p",
+            r#"{"spec":{"switchover":null}}"#,
+        ])?;
+        scale_ready(cluster, 3, deadline)?;
+    }
+    let old_two = exact_replica_resources(cluster, 2)?;
+    patch_replicas(cluster, 2)?;
+    let reduced = scale_ready(cluster, 2, deadline)?;
+    let ids = reduced["status"]["topology"]["members"]
+        .as_array()
+        .context("reduced members")?
+        .iter()
+        .map(|member| member["replicaId"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    ensure!(
+        ids == vec![1, 3],
+        "scale-down did not create the planned non-contiguous accepted topology: {ids:?}"
+    );
+    ensure!(
+        topology_primary_id(&reduced) == Some(3),
+        "scale-down changed the placed primary"
+    );
+    patch_replicas(cluster, 3)?;
+    let restored = scale_ready(cluster, 3, deadline)?;
+    let restored_two = exact_member(&restored, 2)?;
+    ensure!(
+        restored_two["role"] == "activeSecondary",
+        "restored gap was not admitted as an ActiveSecondary"
+    );
+    let fresh_two = exact_replica_resources(cluster, 2)?;
+    for resource in &fresh_two {
+        let old = old_two
+            .iter()
+            .find(|old| old.kind == resource.kind)
+            .context("old ordinal-2 resource")?;
+        ensure!(
+            resource.uid() != old.uid(),
+            "scale-down->scale-up restoration reused {} UID {}",
+            resource.kind,
+            old.uid()
+        );
+    }
+    ensure!(
+        target["replicaId"] == 3,
+        "restoration setup lost the exact primary target"
+    );
+    verify_acknowledged(cluster, &restored, &acknowledged, deadline)?;
+    eprintln!("scale-down->scale-up non-contiguous restoration PASS: [1,3] -> [1,2,3]");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an explicitly owned isolated KinD cluster"]
+fn scale_up_adversarial() -> Result<()> {
+    run_switchover(|cluster| {
+        scale_up_cancellation_failure_and_retry(cluster)?;
+        scale_up_pre_admission_failover(cluster)?;
+        scale_up_post_admission_recovery_and_replacement(cluster)?;
+        scale_down_then_restore_non_contiguous(cluster)
+    })
+}
+
 #[test]
 #[ignore = "requires an explicitly owned isolated KinD cluster"]
 fn planned_switchover() -> Result<()> {
@@ -3493,6 +7052,38 @@ fn scale_routed_write_requires_exact_http_success() {
     }
     assert!(classify_routed_write(Some(1), "200", "unknown failure").is_err());
     assert!(classify_routed_write(Some(1), "503", "unknown failure").is_err());
+}
+
+#[test]
+fn scale_routed_service_shape_rejects_broken_selector_or_target_port() -> Result<()> {
+    let primary = json!({"instanceId":"pod-uid-primary"});
+    let service = json!({
+        "metadata":{"name":"kvstore2-write"},
+        "spec":{
+            "selector":{"operator.kuberic.io/instance":"pod-uid-primary"},
+            "ports":[{"name":"application","port":80,"targetPort":8080}]
+        }
+    });
+    validate_routed_service(&service, &primary)?;
+    for pointer in [
+        "/spec/selector/operator.kuberic.io~1instance",
+        "/spec/ports/0/targetPort",
+        "/spec/ports/0/port",
+    ] {
+        let mut broken = service.clone();
+        *broken
+            .pointer_mut(pointer)
+            .context("Service test pointer")? = if pointer.ends_with("instance") {
+            json!("wrong-pod")
+        } else {
+            json!(9999)
+        };
+        assert!(
+            validate_routed_service(&broken, &primary).is_err(),
+            "broken routed Service field passed: {pointer}"
+        );
+    }
+    Ok(())
 }
 
 #[test]

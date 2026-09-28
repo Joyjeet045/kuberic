@@ -220,6 +220,7 @@ pub(crate) fn admit_configuration(
         current_configuration: command.current_configuration.clone(),
         switchover_handoff: None,
         secondary_removal: Some(evidence.clone()),
+        scale_up: None,
     };
     authority.validate().map_err(|e| reject(&e.to_string()))?;
     Ok(authority)

@@ -280,6 +280,12 @@ fn authority_replica_ids(status: &AcceptedStatus) -> BTreeSet<ReplicaId> {
                 .flat_map(|transition| &transition.current_configuration.members),
         )
         .map(|member| member.identity.replica_id)
+        .chain(
+            status
+                .scale_up_allocation
+                .iter()
+                .map(|allocation| allocation.target_replica_id),
+        )
         .chain(status.provisioning.iter().map(|intent| intent.replica_id()))
         .chain(
             status
@@ -343,13 +349,17 @@ fn normalize_agent(
     let observation = match raw {
         RawAgentObservation::Absent => AgentObservation::Absent,
         RawAgentObservation::Unavailable { message } => AgentObservation::Unreachable { message },
-        RawAgentObservation::Invalid { message } => AgentObservation::Invalid { message },
+        RawAgentObservation::Invalid { message } => AgentObservation::Invalid {
+            message,
+            uninitialized_report: None,
+        },
         RawAgentObservation::Report(report) => {
             match kuberic_wire::normalize_agent_status_report(*report) {
                 Ok(observation) => observation,
                 Err(error) => {
                     return AgentObservation::Invalid {
                         message: error.to_string(),
+                        uninitialized_report: None,
                     };
                 }
             }
@@ -386,8 +396,13 @@ fn normalize_agent(
         | AgentObservation::Invalid { .. } => None,
     };
     if let Some(message) = mismatch {
+        let uninitialized_report = match observation {
+            AgentObservation::Uninitialized(ref report) => Some(Box::new(report.clone())),
+            _ => None,
+        };
         return AgentObservation::Invalid {
             message: message.to_string(),
+            uninitialized_report,
         };
     }
 
@@ -421,7 +436,10 @@ fn normalize_agent(
         return if switchover_active {
             AgentObservation::Unreachable { message }
         } else {
-            AgentObservation::Invalid { message }
+            AgentObservation::Invalid {
+                message,
+                uninitialized_report: None,
+            }
         };
     }
     observation

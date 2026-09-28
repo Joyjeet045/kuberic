@@ -19,6 +19,7 @@ fn removal_authority(size: i64, current_only: bool) -> AdmittedAuthority {
         current_configuration: intent.current_configuration.clone(),
         switchover_handoff: None,
         secondary_removal: Some(removal_fixture::evidence(&intent)),
+        scale_up: None,
     }
 }
 
@@ -241,6 +242,7 @@ fn exact_peer_eviction_discards_both_windows_and_cannot_reconnect() {
         lsn: 1,
         committed_lsn: 0,
         replication_boundary_lsn: 1,
+        catch_up_boundary_lsn: Some(1),
         final_item: true,
         snapshot_chunk: true,
         data: bytes::Bytes::new(),
@@ -366,6 +368,7 @@ async fn two_incarnations_of_one_replica_receive_distinct_quorum_credit() {
     );
     let authority = AdmittedAuthority {
         secondary_removal: None,
+        scale_up: None,
         local_identity: primary,
         transition_kind: Some(TransitionKind::Replacement),
         previous_configuration: Some(previous),
@@ -408,6 +411,7 @@ async fn stale_authority_ack_cannot_advance_progress_or_commit() {
     );
     let authority = AdmittedAuthority {
         secondary_removal: None,
+        scale_up: None,
         local_identity: primary,
         transition_kind: None,
         previous_configuration: None,
@@ -451,6 +455,7 @@ async fn authority_change_fails_pending_writes_instead_of_rebinding_them() {
     ];
     let initial = AdmittedAuthority {
         secondary_removal: None,
+        scale_up: None,
         local_identity: primary.clone(),
         transition_kind: None,
         previous_configuration: None,
@@ -464,6 +469,7 @@ async fn authority_change_fails_pending_writes_instead_of_rebinding_them() {
     };
     let advanced = AdmittedAuthority {
         secondary_removal: None,
+        scale_up: None,
         local_identity: primary,
         transition_kind: None,
         previous_configuration: None,
@@ -492,6 +498,7 @@ fn authority_change_discards_remote_acknowledgement_credit() {
     let third = identity(3, "third");
     let initial = AdmittedAuthority {
         secondary_removal: None,
+        scale_up: None,
         local_identity: primary.clone(),
         transition_kind: None,
         previous_configuration: None,
@@ -521,6 +528,7 @@ fn authority_change_discards_remote_acknowledgement_credit() {
     );
     let advanced = AdmittedAuthority {
         secondary_removal: None,
+        scale_up: None,
         local_identity: primary,
         transition_kind: Some(TransitionKind::Replacement),
         previous_configuration: Some(previous),
@@ -567,6 +575,7 @@ fn catch_up_requires_recorded_cc_boundary() {
     );
     let authority = AdmittedAuthority {
         secondary_removal: None,
+        scale_up: None,
         local_identity: primary,
         transition_kind: Some(TransitionKind::Replacement),
         previous_configuration: Some(previous),
@@ -615,6 +624,7 @@ fn catch_up_requires_each_derived_must_catch_up_member() {
     );
     let authority = AdmittedAuthority {
         secondary_removal: None,
+        scale_up: None,
         local_identity: new_primary,
         transition_kind: Some(TransitionKind::Failover),
         previous_configuration: Some(previous),

@@ -14,8 +14,11 @@
 > quorum principles, with Kuberic-specific target/minimum coupling, deterministic
 > selection, write closure, sequential cleanup, and Kubernetes resource deletion.
 > `spec.replicas` target=min is Kuberic policy; SF target and minimum are
-> independently configurable. Scale-up remains absent. Availability, provenance,
-> status/API redesign and ownership gaps are explicit
+> independently configurable. Protocol-7 sequential scale-up is also implemented
+> as a separate Service Fabric-inspired replica-add protocol with fresh
+> PVC-before-Pod provisioning, copy/catch-up closure, PC/CC admission, and exact
+> failed-candidate cleanup. Primary removal remains absent. Availability,
+> provenance, status/API redesign and ownership gaps are explicit
 > [deferred follow-ups](v1-retirement-plan.md#deferred-scale-down-follow-ups),
 > not a general SF scaling-equivalence claim.
 

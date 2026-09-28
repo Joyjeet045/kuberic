@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
-use kuberic_protocol::command::{KubernetesChange, ProtocolCommand};
+use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, ScaleDownResource};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{
     AgentObservation, AgentReport, DesiredState, KubernetesReplicaObservation, ObservationSnapshot,
@@ -9,12 +10,1537 @@ use kuberic_protocol::observation::{
 use kuberic_protocol::plan::Plan;
 use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
-    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PlannedSwitchoverOutcome,
-    PlannedSwitchoverRequest, PodUid, ProcessSessionId, ProvisioningIntent, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff,
-    SwitchoverRequestId, TransitionIntent, TransitionKind, derive_transition_id,
+    ConfigurationMember, EffectivePolicy, Epoch, FaultType, OperationId, PlannedSwitchoverOutcome,
+    PlannedSwitchoverRequest, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose,
+    PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpStage,
+    SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind, derive_transition_id,
 };
 use kuberic_protocol::validation::{ValidationError, validate_snapshot, validate_status};
+
+#[allow(dead_code)]
+#[path = "support/scale_up_model.rs"]
+mod scale_up_model;
+
+#[test]
+fn scale_up_model_is_level_triggered_sequential_and_restart_deterministic() {
+    let mut model = scale_up_model::Model::new(1, 3);
+    for _ in 0..160 {
+        let replayed = model.snapshot.clone();
+        let first = model.plan();
+        assert_eq!(first, evaluate(&replayed, &scale_up_model::config()));
+        if model.step() && model.accepted_count() == 3 {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_history, vec![1, 2, 3]);
+    assert_eq!(model.accepted_count(), 3);
+}
+
+#[test]
+fn restart_drops_volatile_build_execution_and_fences_queued_old_reports() {
+    let mut model = scale_up_model::Model::new(1, 2);
+    let build_command = loop {
+        let plan = model.plan();
+        model.step();
+        if model.has_pending_build() {
+            let Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } = plan
+            else {
+                continue;
+            };
+            break command;
+        }
+    };
+    let source_id = build_command.local_replica_id.value();
+    let (source_key, queued_report) = model
+        .snapshot
+        .replicas
+        .iter()
+        .find_map(|(key, observation)| match &observation.agent {
+            AgentObservation::Report(report)
+                if report.identity.replica_id == ReplicaId::new(source_id) =>
+            {
+                Some((key.clone(), report.clone()))
+            }
+            _ => None,
+        })
+        .unwrap();
+    model.restart(source_id);
+    assert!(
+        !model.has_pending_build(),
+        "restart retained process-local build execution"
+    );
+    let AgentObservation::Report(restarted_report) = &model.snapshot.replicas[&source_key].agent
+    else {
+        unreachable!()
+    };
+    assert_ne!(
+        restarted_report.process_session_id,
+        queued_report.process_session_id
+    );
+
+    let mut delayed = model.snapshot.clone();
+    delayed.previous_report_watermarks.insert(
+        source_key.clone(),
+        ReportWatermark {
+            process_session_id: restarted_report.process_session_id.clone(),
+            report_sequence: restarted_report.report_sequence,
+        },
+    );
+    let AgentObservation::Report(delayed_report) =
+        &mut delayed.replicas.get_mut(&source_key).unwrap().agent
+    else {
+        unreachable!()
+    };
+    delayed_report.process_session_id = queued_report.process_session_id.clone();
+    delayed_report.report_sequence = queued_report.report_sequence;
+    let accepted = delayed.status.topology.clone();
+    let plan = evaluate(&delayed, &scale_up_model::config());
+    match plan {
+        Plan::Wait { status, .. } | Plan::Unsafe { status, .. } => {
+            assert_eq!(status.topology, accepted);
+        }
+        Plan::Apply { changes } => assert!(changes.iter().all(|change| {
+            matches!(
+                change,
+                KubernetesChange::PersistStatus { status } if status.topology == accepted
+            )
+        })),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureReplicaBuild(replayed),
+        } => {
+            assert_eq!(
+                replayed, build_command,
+                "stale report may only trigger the exact deterministic durable build replay"
+            );
+            assert_eq!(delayed.status.topology, accepted);
+        }
+        other => panic!("queued old-session report escaped its fence: {other:?}"),
+    }
+
+    model.run(160);
+    assert_eq!(model.accepted_count(), 2);
+}
+
+#[test]
+fn queued_old_build_command_is_fenced_after_candidate_session_changes() {
+    let mut model = scale_up_model::Model::new(1, 2);
+    let queued = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } => break ProtocolCommand::EnsureReplicaBuild(command),
+            _ => {
+                model.step();
+            }
+        }
+    };
+    let ProtocolCommand::EnsureReplicaBuild(old) = &queued else {
+        unreachable!()
+    };
+    let old_target = old.target.clone();
+    let old_session = model
+        .snapshot
+        .replicas
+        .get(&ReplicaObservationKey::new(
+            old_target.replica_id,
+            old_target.instance_id.clone(),
+        ))
+        .and_then(|observation| match &observation.agent {
+            AgentObservation::Report(report) => Some(report.process_session_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    model.snapshot.desired.replicas = 1;
+    model.snapshot.desired.generation += 1;
+    model.run(160);
+    model.snapshot.desired.replicas = 2;
+    model.snapshot.desired.generation += 1;
+    let fresh = loop {
+        model.step();
+        if let Some(report) = model.snapshot.replicas.values().find_map(|observation| {
+            let AgentObservation::Report(report) = &observation.agent else {
+                return None;
+            };
+            (report.identity.replica_id == old_target.replica_id && report.identity != old_target)
+                .then_some(report.clone())
+        }) {
+            break report;
+        }
+    };
+    assert_ne!(fresh.process_session_id, old_session);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model.execute(queued);
+    }))
+    .expect_err("old candidate command survived fresh-incarnation fencing");
+    let panic = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        panic.contains("stale build command target incarnation was fenced"),
+        "queued command failed at the wrong assertion: {panic}"
+    );
+    model.run(160);
+    assert_eq!(model.accepted_count(), 2);
+}
+
+#[derive(Clone, Copy)]
+struct ModelRng(u64);
+
+impl ModelRng {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+
+    fn index(&mut self, upper: usize) -> usize {
+        (self.next() as usize) % upper
+    }
+}
+
+fn model_env_u64(name: &str, default: u64) -> u64 {
+    let Ok(value) = std::env::var(name) else {
+        return default;
+    };
+    let parsed = value
+        .strip_prefix("0x")
+        .map_or_else(|| value.parse(), |hex| u64::from_str_radix(hex, 16));
+    parsed.unwrap_or_else(|error| panic!("invalid {name}={value:?}: {error}"))
+}
+
+fn scale_up_model_writable(model: &scale_up_model::Model) -> bool {
+    model.can_acknowledge_write()
+}
+
+fn assert_stale_report_cannot_advance(model: &scale_up_model::Model) {
+    let mut stale = model.snapshot.clone();
+    let Some((key, report)) = stale.replicas.iter().find_map(|(key, observation)| {
+        let AgentObservation::Report(report) = &observation.agent else {
+            return None;
+        };
+        Some((key.clone(), report.clone()))
+    }) else {
+        return;
+    };
+    stale.previous_report_watermarks.insert(
+        key,
+        ReportWatermark {
+            process_session_id: report.process_session_id.clone(),
+            report_sequence: report.report_sequence + 1,
+        },
+    );
+    let accepted = stale.status.topology.clone();
+    let policy = stale.status.effective_policy.clone();
+    match evaluate(&stale, &scale_up_model::config()) {
+        Plan::Wait { status, .. } | Plan::Unsafe { status, .. } => {
+            assert_eq!(status.topology, accepted);
+            assert_eq!(status.effective_policy, policy);
+        }
+        Plan::Apply { changes } => {
+            assert!(changes.iter().all(|change| {
+                matches!(
+                    change,
+                    KubernetesChange::PersistStatus { status }
+                        if status.topology == accepted
+                            && status.effective_policy == policy
+                )
+            }));
+        }
+        Plan::Execute { command } => {
+            panic!("stale report authorized command {command:?}");
+        }
+        Plan::Stable { .. } => panic!("stale report was classified as stable"),
+    }
+}
+
+#[test]
+fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
+    const RECORDED_SEED: u64 = 0x5ca1_e006_d15c_a11e;
+    const RECORDED_CASES: u64 = 24;
+    let configured_seed = model_env_u64("KUBERIC_MODEL_SEED", RECORDED_SEED);
+    let cases = model_env_u64("KUBERIC_MODEL_CASES", RECORDED_CASES);
+    let explicit_seed = std::env::var_os("KUBERIC_MODEL_SEED").is_some();
+    let run_seeds = if explicit_seed {
+        vec![configured_seed]
+    } else {
+        vec![
+            configured_seed,
+            configured_seed.wrapping_add(0x9e37_79b9_7f4a_7c15),
+            configured_seed.wrapping_add(0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(2)),
+            72,
+        ]
+    };
+    let runs = run_seeds.len();
+    println!(
+        "scale-up-model seed={configured_seed:#018x} cases={cases} runs={runs}; \
+         reproduce with KUBERIC_MODEL_SEED={configured_seed} KUBERIC_MODEL_CASES={cases}"
+    );
+    let mut coverage = BTreeMap::<&'static str, u64>::new();
+    let mut run_fingerprints = BTreeSet::new();
+    let mut run_coverages = Vec::new();
+
+    for (run, seed) in run_seeds.into_iter().enumerate() {
+        let mut rng = ModelRng(seed);
+        let class_offset = rng.index(12);
+        let mut run_coverage = BTreeMap::<&'static str, u64>::new();
+        let mut run_trace = Vec::new();
+        macro_rules! cover {
+            ($label:literal) => {{
+                *coverage.entry($label).or_default() += 1;
+                *run_coverage.entry($label).or_default() += 1;
+            }};
+        }
+        for case in 0..cases {
+            let schedule_class = (usize::try_from(case).unwrap() + class_offset) % 12;
+            // Participant-outage schedules require an accepted ActiveSecondary.
+            // Constrain only that schedule class to an eligible starting topology
+            // instead of crediting coverage for an outage that could not occur.
+            let accepted = if schedule_class == 3 {
+                2 + u32::try_from(rng.index(2)).unwrap()
+            } else {
+                1 + u32::try_from(rng.index(3)).unwrap()
+            };
+            let additions = if schedule_class == 10 || rng.index(2) == 0 {
+                2
+            } else {
+                1
+            };
+            let desired = accepted + additions;
+            let write_period = 3 + u64::try_from(rng.index(5)).unwrap();
+            let write_offset = u64::try_from(rng.index(write_period as usize)).unwrap();
+            let restart_period = 6 + u64::try_from(rng.index(5)).unwrap();
+            let stale_period = 9 + u64::try_from(rng.index(5)).unwrap();
+            let mut model = scale_up_model::Model::new(accepted, desired);
+            let mut cancellation_requested = false;
+            let mut cancellation_completed = false;
+            let mut cancelled_incarnation = None;
+            let mut replay_trace = Vec::new();
+            let mut candidate_failure_injected = false;
+            let mut participant_restore = None;
+            let mut participant_unavailability_injected = false;
+            let mut participant_unavailability_observed = false;
+            let mut cleanup_variant_injected = false;
+            let mut cleanup_conflict_restore = None;
+            let mut delayed_authority = false;
+            let mut late_member_restore = None;
+            let mut late_member_injected = false;
+
+            for step in 0..480_u64 {
+                if let Some((restore_at, key, agent)) = participant_restore.take() {
+                    if step >= restore_at {
+                        model.snapshot.replicas.get_mut(&key).unwrap().agent = agent;
+                    } else {
+                        participant_restore = Some((restore_at, key, agent));
+                    }
+                }
+                if let Some((restore_at, index, observation)) = cleanup_conflict_restore.take() {
+                    if step >= restore_at {
+                        model.snapshot.secondary_scale_down_resources[index] = observation;
+                    } else {
+                        cleanup_conflict_restore = Some((restore_at, index, observation));
+                    }
+                }
+                if let Some((restore_at, key, report)) = late_member_restore.take() {
+                    if step >= restore_at {
+                        model.restore_report_with_replication_catch_up(&key, report);
+                    } else {
+                        late_member_restore = Some((restore_at, key, report));
+                    }
+                }
+                if step % write_period == write_offset && scale_up_model_writable(&model) {
+                    let lsn = model.acknowledge_write(case + run as u64 * cases, step);
+                    assert!(
+                        model.durable_source.contains_key(&lsn),
+                        "acknowledged write was not durably recorded"
+                    );
+                    cover!("write-varied-times");
+                }
+                if step % restart_period == 0 {
+                    let ids = model
+                        .snapshot
+                        .replicas
+                        .values()
+                        .filter_map(|observation| match &observation.agent {
+                            AgentObservation::Report(report) => {
+                                Some(report.identity.replica_id.value())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if !ids.is_empty() {
+                        let id = ids[rng.index(ids.len())];
+                        let previous_session = model.report_mut(id).process_session_id.clone();
+                        model.restart(id);
+                        assert!(!model.has_pending_build());
+                        assert_ne!(model.report_mut(id).process_session_id, previous_session);
+                        cover!("restart-drops-volatile-session");
+                    }
+                }
+                if step % stale_period == 0 {
+                    assert_stale_report_cannot_advance(&model);
+                    cover!("obsolete-session-report");
+                }
+
+                if schedule_class == 1
+                    && !candidate_failure_injected
+                    && model.snapshot.status.provisioning.is_some()
+                    && model.snapshot.status.transition.is_none()
+                    && let Some(report) =
+                        model
+                            .snapshot
+                            .replicas
+                            .values_mut()
+                            .find_map(|observation| match &mut observation.agent {
+                                AgentObservation::Report(report)
+                                    if !model
+                                        .snapshot
+                                        .status
+                                        .topology
+                                        .as_ref()
+                                        .unwrap()
+                                        .configuration
+                                        .members
+                                        .iter()
+                                        .any(|member| member.identity == report.identity) =>
+                                {
+                                    Some(report)
+                                }
+                                _ => None,
+                            })
+                {
+                    report.reported_fault = Some(FaultType::Permanent);
+                    report.report_sequence += 1;
+                    assert_eq!(report.reported_fault, Some(FaultType::Permanent));
+                    candidate_failure_injected = true;
+                    cover!("candidate-failure-retry");
+                }
+                if schedule_class == 3
+                    && !participant_unavailability_injected
+                    && participant_restore.is_none()
+                    && model.snapshot.status.provisioning.is_some()
+                    && let Some((key, observation)) =
+                        model.snapshot.replicas.iter_mut().find(|(_, observation)| {
+                            matches!(
+                                &observation.agent,
+                                AgentObservation::Report(report)
+                                    if report.role == ReplicaRole::ActiveSecondary
+                                        && model
+                                            .snapshot
+                                            .status
+                                            .topology
+                                            .as_ref()
+                                            .unwrap()
+                                            .configuration
+                                            .members
+                                            .iter()
+                                            .any(|member| member.identity == report.identity)
+                            )
+                        })
+                {
+                    let saved = observation.agent.clone();
+                    observation.agent = AgentObservation::Unreachable {
+                        message: "scheduled participant outage".into(),
+                    };
+                    participant_restore = Some((step + 1, key.clone(), saved));
+                    participant_unavailability_injected = true;
+                    assert!(matches!(
+                        observation.agent,
+                        AgentObservation::Unreachable { .. }
+                    ));
+                }
+
+                if matches!(schedule_class, 0 | 4 | 8)
+                    && !cancellation_requested
+                    && model.snapshot.status.transition.is_none()
+                    && model.snapshot.status.provisioning.is_some()
+                {
+                    cancelled_incarnation = model
+                        .snapshot
+                        .status
+                        .provisioning
+                        .as_ref()
+                        .map(|provisioning| provisioning.pod_uid.to_string());
+                    model.snapshot.desired.replicas = model.accepted_count();
+                    model.snapshot.desired.generation += 1;
+                    cancellation_requested = true;
+                    assert_eq!(model.snapshot.desired.replicas, model.accepted_count());
+                    cover!("desired-churn-cancel");
+                } else if cancellation_requested
+                    && !cancellation_completed
+                    && model.snapshot.status.scale_up_cleanup.is_none()
+                    && model.snapshot.status.scale_up_allocation.is_none()
+                    && model.snapshot.status.provisioning.is_none()
+                {
+                    model.snapshot.desired.replicas = desired;
+                    model.snapshot.desired.generation += 1;
+                    cancellation_completed = true;
+                    assert_eq!(model.snapshot.desired.replicas, desired);
+                    cover!("fresh-incarnation-retry");
+                }
+
+                if !cleanup_variant_injected
+                    && model.snapshot.status.scale_up_cleanup.is_some()
+                    && let Some((index, exact)) = model
+                        .snapshot
+                        .secondary_scale_down_resources
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, exact)| {
+                            model
+                                .snapshot
+                                .status
+                                .scale_up_cleanup
+                                .as_ref()
+                                .is_some_and(|cleanup| cleanup.target == exact.target)
+                        })
+                {
+                    match schedule_class {
+                        0 => {
+                            exact.endpoint =
+                                kuberic_protocol::observation::ExactResourceObservation::NotFound;
+                            assert!(matches!(
+                                exact.endpoint,
+                                kuberic_protocol::observation::ExactResourceObservation::NotFound
+                            ));
+                            cover!("cleanup-404");
+                        }
+                        4 => {
+                            exact.endpoint = kuberic_protocol::observation::ExactResourceObservation::ReplacementPresent {
+                                uid: "different-endpoint-uid".into(),
+                                resource_version: "replacement-rv".into(),
+                            };
+                            assert!(matches!(
+                                exact.endpoint,
+                                kuberic_protocol::observation::ExactResourceObservation::ReplacementPresent { .. }
+                            ));
+                            cover!("cleanup-different-uid");
+                        }
+                        8 => {
+                            let saved = exact.clone();
+                            exact.endpoint = kuberic_protocol::observation::ExactResourceObservation::LookupFailed {
+                                message: "scheduled cleanup conflict".into(),
+                            };
+                            cleanup_conflict_restore = Some((step + 1, index, saved));
+                            assert!(matches!(
+                                exact.endpoint,
+                                kuberic_protocol::observation::ExactResourceObservation::LookupFailed { .. }
+                            ));
+                            cover!("cleanup-conflict-retry");
+                        }
+                        _ => {}
+                    }
+                    cleanup_variant_injected = true;
+                }
+
+                if additions == 2
+                    && !late_member_injected
+                    && model.accepted_count() == accepted + 1
+                    && model.snapshot.status.transition.is_none()
+                    && let Some(receipt) = model.snapshot.status.last_scale_up.as_deref()
+                {
+                    let target = receipt.intent.target.clone();
+                    let key =
+                        ReplicaObservationKey::new(target.replica_id, target.instance_id.clone());
+                    if let AgentObservation::Report(report) =
+                        &model.snapshot.replicas.get(&key).unwrap().agent
+                    {
+                        late_member_restore = Some((step + 2, key.clone(), report.clone()));
+                        model.snapshot.replicas.get_mut(&key).unwrap().agent =
+                            AgentObservation::Absent;
+                        late_member_injected = true;
+                        assert_eq!(
+                            model.snapshot.status.last_scale_up.as_deref(),
+                            Some(receipt)
+                        );
+                        cover!("late-retained-member-sequential-addition");
+                    }
+                }
+
+                let replay = model.snapshot.clone();
+                let plan = model.plan();
+                replay_trace.push(format!(
+                    "step={step} accepted={} desired={} plan={plan:?}",
+                    model.accepted_count(),
+                    model.snapshot.desired.replicas
+                ));
+                let observed_provisioning = model.snapshot.status.provisioning.is_some();
+                let observed_cleanup = model.snapshot.status.scale_up_cleanup.is_some();
+                let observed_pc_cc = model
+                    .snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.scale_up.is_some());
+                assert_eq!(
+                    plan,
+                    evaluate(&replay, &scale_up_model::config()),
+                    "seed={seed:#x} case={case} step={step}"
+                );
+                if participant_unavailability_injected
+                    && !participant_unavailability_observed
+                    && replay.replicas.values().any(|observation| {
+                        matches!(observation.agent, AgentObservation::Unreachable { .. })
+                    })
+                {
+                    assert!(
+                        replay
+                            .status
+                            .topology
+                            .as_ref()
+                            .unwrap()
+                            .configuration
+                            .members
+                            .iter()
+                            .any(|member| member.role == ReplicaRole::ActiveSecondary),
+                        "participant outage was not exercised against an eligible accepted topology"
+                    );
+                    participant_unavailability_observed = true;
+                    cover!("participant-unavailability");
+                }
+                let skip_for_delayed_authority = !delayed_authority
+                    && model
+                        .snapshot
+                        .status
+                        .transition
+                        .as_ref()
+                        .is_some_and(|transition| transition.scale_up.is_some())
+                    && model.snapshot.status.scale_up_admission_started.is_some();
+                if skip_for_delayed_authority {
+                    assert_eq!(plan, model.plan());
+                    delayed_authority = true;
+                    cover!("delayed-authority-delivery");
+                    continue;
+                }
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.step())).is_err()
+                {
+                    panic!(
+                        "model replay failed seed={seed:#x} case={case} step={step}; \
+                         full replay trace:\n{}",
+                        replay_trace.join("\n")
+                    );
+                }
+                if observed_provisioning {
+                    cover!("candidate-provisioning");
+                }
+                if observed_cleanup {
+                    cover!("exact-candidate-cleanup");
+                }
+                if observed_pc_cc {
+                    cover!("pc-cc-authority");
+                }
+                if model.accepted_count() == desired
+                    && model.snapshot.status.transition.is_none()
+                    && model.snapshot.status.provisioning.is_none()
+                    && model.snapshot.status.scale_up_cleanup.is_none()
+                    && matches!(model.plan(), Plan::Stable { .. })
+                {
+                    break;
+                }
+                assert!(
+                    step < 479,
+                    "unclassified model state seed={seed:#x} case={case}: {:?}",
+                    model.plan()
+                );
+            }
+
+            assert_eq!(
+                model.accepted_history,
+                (accepted..=desired).collect::<Vec<_>>(),
+                "seed={seed:#x} case={case}"
+            );
+            if let Some(cancelled) = cancelled_incarnation {
+                let accepted_instances = model
+                    .snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration
+                    .members
+                    .iter()
+                    .map(|member| member.identity.instance_id.as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !accepted_instances.contains(&cancelled.as_str()),
+                    "cancelled incarnation {cancelled} was admitted"
+                );
+            }
+            model.assert_acknowledged_write_oracle();
+            model.assert_safety_invariants();
+            if additions == 2 {
+                cover!("sequential-additions-late-receipt");
+            }
+            run_trace.extend(replay_trace);
+        }
+        let mut hasher = DefaultHasher::new();
+        run_trace.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        assert!(
+            run_fingerprints.insert(fingerprint) || runs == 1,
+            "different seeds produced the same replay trace fingerprint {fingerprint:#x}"
+        );
+        println!(
+            "scale-up-model run-seed={seed:#018x} trace={fingerprint:#018x} \
+             event-coverage={run_coverage:?}"
+        );
+        run_coverages.push(run_coverage);
+    }
+    if runs > 1 {
+        assert!(
+            run_coverages.windows(2).any(|pair| pair[0] != pair[1]),
+            "different seeds produced identical behavioral coverage counts: {run_coverages:?}"
+        );
+    }
+    for required in [
+        "write-varied-times",
+        "restart-drops-volatile-session",
+        "obsolete-session-report",
+        "desired-churn-cancel",
+        "fresh-incarnation-retry",
+        "candidate-provisioning",
+        "exact-candidate-cleanup",
+        "pc-cc-authority",
+        "sequential-additions-late-receipt",
+        "candidate-failure-retry",
+        "participant-unavailability",
+        "cleanup-404",
+        "cleanup-different-uid",
+        "cleanup-conflict-retry",
+        "delayed-authority-delivery",
+        "late-retained-member-sequential-addition",
+    ] {
+        assert!(
+            coverage.get(required).copied().unwrap_or_default() > 0,
+            "recorded/default corpus missed event class {required}"
+        );
+    }
+    println!("scale-up-model event-coverage={coverage:?}");
+}
+
+fn fail_model_primary(model: &mut scale_up_model::Model) -> (ReplicaIdentity, Box<AgentReport>) {
+    let primary = model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap()
+        .identity
+        .clone();
+    let observation = model
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            primary.replica_id,
+            primary.instance_id.clone(),
+        ))
+        .unwrap();
+    let AgentObservation::Report(report) = &observation.agent else {
+        panic!("accepted primary report")
+    };
+    let report = report.clone();
+    observation.agent = AgentObservation::Absent;
+    model.snapshot.now_unix_seconds += 20;
+    (primary, report)
+}
+
+fn drive_exact_scale_up_pc_cc(model: &mut scale_up_model::Model) {
+    for step in 0..240 {
+        let installed = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                model.snapshot.status.scale_up_admission_started.as_ref()
+                    == Some(&intent.operation_id)
+                    && intent.current_configuration.members.iter().all(|member| {
+                        model.snapshot.replicas.values().any(|observation| {
+                            matches!(
+                                &observation.agent,
+                                AgentObservation::Report(report)
+                                    if report.identity == member.identity
+                                        && report.previous_configuration.as_ref()
+                                            == Some(&intent.previous_configuration)
+                                        && report.current_configuration.as_ref()
+                                            == Some(&intent.current_configuration)
+                                        && report.retained_operation_id.as_ref()
+                                            == Some(&intent.command_operation_id(
+                                                ScaleUpStage::PreviousCurrent,
+                                                &member.identity,
+                                                &intent.current_configuration,
+                                            ))
+                            )
+                        })
+                    })
+            });
+        if installed {
+            return;
+        }
+        model.step();
+        assert!(step < 239, "exact PC/CC installation was not reached");
+    }
+}
+
+#[test]
+fn acknowledged_write_requires_independent_durable_pc_and_cc_quorums() {
+    let mut missing_previous = scale_up_model::Model::new(2, 3);
+    drive_exact_scale_up_pc_cc(&mut missing_previous);
+    let intent = missing_previous
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .scale_up
+        .as_deref()
+        .unwrap()
+        .clone();
+    let dropped_previous = intent
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.identity != intent.primary)
+        .unwrap()
+        .identity
+        .clone();
+    let error = missing_previous
+        .try_acknowledge_write(1, 1, &BTreeSet::from([dropped_previous]))
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "previous write quorum missing: delivered=1, required=2"
+    );
+
+    let mut missing_current = scale_up_model::Model::new(3, 4);
+    drive_exact_scale_up_pc_cc(&mut missing_current);
+    let intent = missing_current
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .scale_up
+        .as_deref()
+        .unwrap()
+        .clone();
+    let dropped_retained = intent
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.identity != intent.primary)
+        .unwrap()
+        .identity
+        .clone();
+    let error = missing_current
+        .try_acknowledge_write(
+            2,
+            1,
+            &BTreeSet::from([intent.target.clone(), dropped_retained]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "current write quorum missing: delivered=2, required=3"
+    );
+}
+
+#[test]
+fn configuration_requires_contiguous_byte_exact_incarnation_history() {
+    fn candidate_configuration_cut()
+    -> (scale_up_model::Model, ProtocolCommand, ReplicaIdentity, i64) {
+        let mut model = scale_up_model::Model::new(2, 3);
+        loop {
+            match model.plan() {
+                Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(command),
+                } if command
+                    .scale_up_evidence
+                    .as_deref()
+                    .is_some_and(|evidence| {
+                        command.local_replica_id == evidence.intent().target.replica_id
+                    }) =>
+                {
+                    let intent = command.scale_up_evidence.as_deref().unwrap().intent();
+                    let target = intent.target.clone();
+                    let boundary = intent.catch_up_boundary_lsn;
+                    return (
+                        model,
+                        ProtocolCommand::EnsureConfiguration(command),
+                        target,
+                        boundary,
+                    );
+                }
+                _ => {
+                    model.step();
+                }
+            }
+        }
+    }
+
+    let (mut valid, command, target, boundary) = candidate_configuration_cut();
+    let exact_progress = valid
+        .validate_exact_durable_history(&target, boundary)
+        .expect("valid copied history");
+    assert!(exact_progress >= boundary);
+    valid.execute(command);
+    assert_eq!(
+        valid.report_mut(target.replica_id.value()).current_progress,
+        exact_progress
+    );
+
+    let (mut interior_gap, _, target, boundary) = candidate_configuration_cut();
+    let missing = boundary - 1;
+    interior_gap.remove_durable_value(&target, missing);
+    assert_eq!(
+        interior_gap
+            .validate_exact_durable_history(&target, boundary)
+            .unwrap_err(),
+        format!("exact durable history for {target:?} has an interior gap at LSN {missing}")
+    );
+
+    let (mut corruption, _, target, boundary) = candidate_configuration_cut();
+    let corrupt_lsn = boundary - 1;
+    corruption.replace_durable_value(&target, corrupt_lsn, "corrupt-payload");
+    let error = corruption
+        .validate_exact_durable_history(&target, boundary)
+        .unwrap_err();
+    assert!(
+        error.contains(&format!("payload corruption at LSN {corrupt_lsn}"))
+            && error.contains("actual=\"corrupt-payload\""),
+        "wrong payload assertion: {error}"
+    );
+
+    let (mut final_gap, command, target, boundary) = candidate_configuration_cut();
+    final_gap.remove_durable_value(&target, boundary);
+    assert_eq!(
+        final_gap
+            .validate_exact_durable_history(&target, boundary)
+            .unwrap_err(),
+        format!("exact durable history for {target:?} has an interior gap at LSN {boundary}")
+    );
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        final_gap.execute(command);
+    }))
+    .expect_err("authority installation accepted a missing final boundary");
+    let panic = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        panic.contains("configuration requires exact complete durable history")
+            && panic.contains(&format!("interior gap at LSN {boundary}")),
+        "configuration failed at the wrong assertion: {panic}"
+    );
+
+    let mut terminal = scale_up_model::Model::new(3, 3);
+    let lsn = terminal.acknowledge_write(7, 1);
+    let identities = terminal.accepted_identities();
+    terminal.remove_durable_value(&identities[0], lsn);
+    terminal.remove_durable_value(&identities[1], lsn);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            terminal.assert_acknowledged_write_oracle();
+        }))
+        .is_err(),
+        "terminal read masks ignored missing per-incarnation durable bytes"
+    );
+}
+
+#[test]
+fn insufficient_scale_up_failover_witness_masks_block_precisely() {
+    struct Scenario {
+        accepted: u32,
+        desired: u32,
+        missing: &'static str,
+        reason: &'static str,
+        expected_fragment: &'static str,
+    }
+    for scenario in [
+        Scenario {
+            accepted: 3,
+            desired: 4,
+            missing: "previous",
+            reason: "ScaleUpPreviousQuorumEvidencePending",
+            expected_fragment: "missing previous configuration read quorum: observed=1 required=2; current configuration satisfied: observed=2 required=2",
+        },
+        Scenario {
+            accepted: 2,
+            desired: 3,
+            missing: "current",
+            reason: "ScaleUpCurrentQuorumEvidencePending",
+            expected_fragment: "previous configuration satisfied: observed=1 required=1; missing current configuration read quorum: observed=1 required=2",
+        },
+    ] {
+        let mut model = scale_up_model::Model::new(scenario.accepted, scenario.desired);
+        drive_exact_scale_up_pc_cc(&mut model);
+        let intent = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .scale_up
+            .as_deref()
+            .unwrap()
+            .clone();
+        let (failed_primary, _) = fail_model_primary(&mut model);
+        if scenario.missing == "previous" {
+            let unavailable = intent
+                .previous_configuration
+                .members
+                .iter()
+                .filter(|member| member.identity != failed_primary)
+                .nth(1)
+                .unwrap()
+                .identity
+                .clone();
+            model
+                .snapshot
+                .replicas
+                .get_mut(&ReplicaObservationKey::new(
+                    unavailable.replica_id,
+                    unavailable.instance_id.clone(),
+                ))
+                .unwrap()
+                .agent = AgentObservation::Absent;
+        } else {
+            model
+                .snapshot
+                .replicas
+                .get_mut(&ReplicaObservationKey::new(
+                    intent.target.replica_id,
+                    intent.target.instance_id.clone(),
+                ))
+                .unwrap()
+                .agent = AgentObservation::Absent;
+        }
+        let plan = model.plan();
+        let Plan::Wait { reason, status, .. } = plan else {
+            panic!(
+                "{} witness loss was not safely blocked: {plan:?}",
+                scenario.missing
+            );
+        };
+        assert_eq!(reason, kuberic_protocol::plan::WaitReason::ActiveTransition);
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Progressing")
+            .unwrap();
+        assert_eq!(condition.reason, scenario.reason);
+        assert!(
+            condition.message.contains("phase=failover-recovery")
+                && condition.message.contains(scenario.expected_fragment),
+            "{} deficit was misclassified: {}",
+            scenario.missing,
+            condition.message
+        );
+    }
+}
+
+#[test]
+fn insufficient_fresh_fenced_pc_cc_masks_wait_with_classified_diagnostics() {
+    struct Scenario {
+        accepted: u32,
+        desired: u32,
+        unavailable: &'static [i64],
+        reason: &'static str,
+        expected_fragment: &'static str,
+    }
+    for scenario in [
+        Scenario {
+            accepted: 3,
+            desired: 4,
+            unavailable: &[3],
+            reason: "ScaleUpFencedPreviousQuorumPending",
+            expected_fragment: "fresh fenced previous configuration read quorum is insufficient: observed=1 required=2; fresh current configuration quorum is satisfied: observed=2 required=2",
+        },
+        Scenario {
+            accepted: 2,
+            desired: 3,
+            unavailable: &[3],
+            reason: "ScaleUpFencedCurrentQuorumPending",
+            expected_fragment: "fresh fenced previous configuration quorum is satisfied: observed=1 required=1; fresh current configuration read quorum is insufficient: observed=1 required=2",
+        },
+        Scenario {
+            accepted: 4,
+            desired: 5,
+            unavailable: &[3, 4, 5],
+            reason: "ScaleUpFencedDualQuorumPending",
+            expected_fragment: "fresh fenced previous configuration read quorum is insufficient: observed=1 required=2; fresh current configuration read quorum is insufficient: observed=1 required=3",
+        },
+    ] {
+        let mut model = scale_up_model::Model::new(scenario.accepted, scenario.desired);
+        drive_exact_scale_up_pc_cc(&mut model);
+        fail_model_primary(&mut model);
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("primary failure did not persist provisional failover")
+        };
+        for change in changes {
+            model.apply(change);
+        }
+        assert!(
+            model
+                .snapshot
+                .status
+                .transition
+                .as_ref()
+                .is_some_and(|transition| transition.election_lsn.is_none())
+        );
+        for replica_id in scenario.unavailable {
+            let key = model
+                .snapshot
+                .replicas
+                .iter()
+                .find_map(|(key, observation)| match &observation.agent {
+                    AgentObservation::Report(report)
+                        if report.identity.replica_id == ReplicaId::new(*replica_id) =>
+                    {
+                        Some(key.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            model.snapshot.replicas.get_mut(&key).unwrap().agent = AgentObservation::Absent;
+        }
+
+        let blocked = loop {
+            match model.plan() {
+                Plan::Execute { command } => model.execute(command),
+                Plan::Apply { changes } => {
+                    for change in changes {
+                        model.apply(change);
+                    }
+                }
+                Plan::Wait { status, .. }
+                    if status.conditions.iter().any(|condition| {
+                        condition.type_ == "Progressing" && condition.reason == scenario.reason
+                    }) =>
+                {
+                    break status;
+                }
+                Plan::Wait { status, .. } => model.apply_wait(status),
+                other => panic!("fresh fenced mask was misclassified: {other:?}"),
+            }
+        };
+        let condition = blocked
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Progressing")
+            .unwrap();
+        assert_eq!(condition.reason, scenario.reason);
+        assert!(
+            condition.message.contains("phase=failover-election")
+                && condition.message.contains(scenario.expected_fragment),
+            "fresh fenced deficit was misclassified: {}",
+            condition.message
+        );
+    }
+}
+
+#[test]
+fn model_invariant_mutations_reject_epoch_incarnation_and_cleanup_provenance() {
+    let epoch = scale_up_model::Model::new(2, 2);
+    let accepted_epoch = epoch
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .epoch;
+    epoch
+        .validate_accepted_epoch(accepted_epoch)
+        .expect("valid epoch baseline");
+    assert_eq!(
+        epoch
+            .validate_accepted_epoch(Epoch::new(
+                accepted_epoch.data_loss_number,
+                accepted_epoch.configuration_number - 1,
+            ))
+            .unwrap_err(),
+        format!(
+            "accepted-state persistence rolled epoch back from {accepted_epoch:?} to {:?}",
+            Epoch::new(
+                accepted_epoch.data_loss_number,
+                accepted_epoch.configuration_number - 1
+            )
+        )
+    );
+    validate_status(&epoch.snapshot.status).expect("epoch mutation control baseline stays valid");
+
+    let policy = scale_up_model::Model::new(3, 3);
+    policy
+        .validate_accepted_policy(3)
+        .expect("valid policy baseline");
+    assert_eq!(
+        policy.validate_accepted_policy(2).unwrap_err(),
+        "accepted-state persistence rolled policy back from 3 to 2"
+    );
+    validate_status(&policy.snapshot.status).expect("policy mutation control baseline stays valid");
+
+    let mut cleanup = scale_up_model::Model::new(1, 2);
+    let delete = loop {
+        if cleanup.snapshot.status.provisioning.is_some()
+            && cleanup.snapshot.status.transition.is_none()
+        {
+            cleanup.snapshot.desired.replicas = 1;
+            cleanup.snapshot.desired.generation += 1;
+        }
+        match cleanup.plan() {
+            Plan::Apply { changes } => {
+                if let Some(delete) = changes.iter().find(|change| {
+                    matches!(
+                        change,
+                        KubernetesChange::DeleteScaleDownResource {
+                            resource: ScaleDownResource::Pod | ScaleDownResource::Pvc,
+                            ..
+                        }
+                    )
+                }) {
+                    break delete.clone();
+                }
+                for change in changes {
+                    cleanup.apply(change);
+                }
+            }
+            _ => {
+                cleanup.step();
+            }
+        }
+    };
+    cleanup.validate_deletion_change(&delete).unwrap();
+    let KubernetesChange::DeleteScaleDownResource {
+        resource,
+        uid,
+        resource_version,
+        ..
+    } = &delete
+    else {
+        unreachable!()
+    };
+    let target = cleanup
+        .snapshot
+        .status
+        .scale_up_cleanup
+        .as_ref()
+        .unwrap()
+        .target
+        .clone();
+    let name = match &delete {
+        KubernetesChange::DeleteScaleDownResource { name, .. } => name.clone(),
+        _ => unreachable!(),
+    };
+    for mutation in [
+        KubernetesChange::DeleteScaleDownResource {
+            resource: *resource,
+            name: "wrong-name".into(),
+            uid: uid.clone(),
+            resource_version: resource_version.clone(),
+        },
+        KubernetesChange::DeleteScaleDownResource {
+            resource: *resource,
+            name: match &delete {
+                KubernetesChange::DeleteScaleDownResource { name, .. } => name.clone(),
+                _ => unreachable!(),
+            },
+            uid: "wrong-incarnation".into(),
+            resource_version: resource_version.clone(),
+        },
+        KubernetesChange::DeleteScaleDownResource {
+            resource: *resource,
+            name: match &delete {
+                KubernetesChange::DeleteScaleDownResource { name, .. } => name.clone(),
+                _ => unreachable!(),
+            },
+            uid: uid.clone(),
+            resource_version: "wrong-resource-version".into(),
+        },
+    ] {
+        let KubernetesChange::DeleteScaleDownResource {
+            name: actual_name,
+            uid: actual_uid,
+            resource_version: actual_resource_version,
+            ..
+        } = &mutation
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            cleanup.validate_deletion_change(&mutation).unwrap_err(),
+            format!(
+                "deletion identity/version mismatch for {target:?}: expected \
+                 {name}/{uid}@{resource_version}, got \
+                 {actual_name}/{actual_uid}@{actual_resource_version}"
+            )
+        );
+    }
+    cleanup
+        .snapshot
+        .status
+        .scale_up_cleanup
+        .as_mut()
+        .unwrap()
+        .provisioning
+        .operation_id = OperationId::new("wrong-allocation-provenance");
+    let provenance_error = cleanup.validate_deletion_change(&delete).unwrap_err();
+    assert!(
+        provenance_error.starts_with(
+            "deletion allocation provenance mismatch: expected \
+             wrong-allocation-provenance"
+        ),
+        "wrong invariant rejected provenance mutation: {provenance_error}"
+    );
+
+    let mut duplicate = scale_up_model::Model::new(1, 2);
+    while duplicate.snapshot.status.provisioning.is_none() {
+        duplicate.step();
+    }
+    duplicate
+        .validate_exact_candidate_set()
+        .expect("valid exact candidate baseline");
+    let provisioning = duplicate.snapshot.status.provisioning.clone().unwrap();
+    let mut allocation = duplicate
+        .snapshot
+        .status
+        .scale_up_allocation
+        .clone()
+        .unwrap_or_else(|| {
+            let scale_up = provisioning.scale_up().unwrap();
+            let mut allocation = kuberic_protocol::types::ScaleUpAllocation {
+                resource_uid: scale_up.resource_uid.clone(),
+                spec_generation: scale_up.spec_generation,
+                desired_replicas: scale_up.desired_replicas,
+                previous_configuration_id: scale_up.previous_configuration.configuration_id.clone(),
+                accepted_configuration_id: scale_up.previous_configuration.configuration_id.clone(),
+                target_replica_id: scale_up.target_replica_id,
+                operation_id: OperationId::default(),
+                previous_operation_id: None,
+                scaffolding_requested: true,
+                pod_uid: Some(PodUid::new("duplicate-incarnation")),
+                pvc_uid: Some(PvcUid::new("duplicate-pvc")),
+                cancellation_started: false,
+            };
+            allocation.operation_id = allocation.expected_operation_id();
+            allocation
+        });
+    allocation.pod_uid = Some(PodUid::new("duplicate-incarnation"));
+    duplicate.snapshot.status.scale_up_allocation = Some(allocation);
+    let duplicate_error = duplicate.validate_exact_candidate_set().unwrap_err();
+    assert!(
+        duplicate_error.starts_with("more than one exact scale-up candidate identity is active:"),
+        "wrong invariant rejected duplicate exact identities: {duplicate_error}"
+    );
+}
+
+#[test]
+fn generated_scale_up_primary_failure_traces_classify_pre_and_post_admission_recovery() {
+    for fail_after_pc_cc in [false, true] {
+        let mut model = scale_up_model::Model::new(2, 3);
+        for step in 0..160 {
+            if scale_up_model_writable(&model) && step % 4 == 0 {
+                model.acknowledge_write(u64::from(fail_after_pc_cc), step);
+            }
+            let reached_cut = if fail_after_pc_cc {
+                model
+                    .snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .and_then(|transition| transition.scale_up.as_deref())
+                    .is_some_and(|intent| {
+                        model.snapshot.status.scale_up_admission_started.as_ref()
+                            == Some(&intent.operation_id)
+                            && intent.current_configuration.members.iter().all(|member| {
+                                model.snapshot.replicas.values().any(|observation| {
+                                    matches!(
+                                        &observation.agent,
+                                        AgentObservation::Report(report)
+                                            if report.identity == member.identity
+                                                && report.previous_configuration.as_ref()
+                                                    == Some(&intent.previous_configuration)
+                                                && report.current_configuration.as_ref()
+                                                    == Some(&intent.current_configuration)
+                                                && report.retained_operation_id.as_ref()
+                                                    == Some(&intent.command_operation_id(
+                                                        ScaleUpStage::PreviousCurrent,
+                                                        &member.identity,
+                                                        &intent.current_configuration,
+                                                    ))
+                                    )
+                                })
+                            })
+                    })
+            } else {
+                model.snapshot.status.provisioning.is_some()
+                    && model.snapshot.status.transition.is_none()
+            };
+            if reached_cut {
+                break;
+            }
+            model.step();
+            assert!(step < 159, "scale-up failure cut was not reached");
+        }
+        let (failed_primary, mut returning_primary) = fail_model_primary(&mut model);
+        if !fail_after_pc_cc {
+            // Explicit desired churn cancels the unadmitted attempt while
+            // ordinary failover preserves the accepted two-member authority.
+            // Once exact cleanup completes, the original request is restored
+            // and must allocate a fresh incarnation.
+            model.snapshot.desired.replicas = model.accepted_count();
+            model.snapshot.desired.generation += 1;
+        }
+        let failed_attempt = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .map(|intent| intent.operation_id.clone())
+            .or_else(|| {
+                model
+                    .snapshot
+                    .status
+                    .provisioning
+                    .as_ref()
+                    .map(|provisioning| provisioning.operation_id.clone())
+            })
+            .unwrap();
+        let mut observed_cleanup = false;
+        let mut observed_failover = false;
+        let mut primary_returned = false;
+        let mut retry_requested = fail_after_pc_cc;
+        let mut converged = false;
+        for _step in 0..320 {
+            model.snapshot.now_unix_seconds += 1;
+            observed_cleanup |= model.snapshot.status.scale_up_cleanup.is_some();
+            observed_failover |= model
+                .snapshot
+                .status
+                .topology
+                .as_ref()
+                .is_some_and(|topology| {
+                    topology.configuration.primary_id != failed_primary.replica_id
+                })
+                || model
+                    .snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.kind == TransitionKind::Failover);
+            if observed_failover && !primary_returned && !fail_after_pc_cc {
+                returning_primary.process_session_id =
+                    ProcessSessionId::new("failed-primary-restarted");
+                returning_primary.report_sequence = 1;
+                model
+                    .snapshot
+                    .replicas
+                    .get_mut(&ReplicaObservationKey::new(
+                        failed_primary.replica_id,
+                        failed_primary.instance_id.clone(),
+                    ))
+                    .unwrap()
+                    .agent = AgentObservation::Report(returning_primary.clone());
+                primary_returned = true;
+            }
+            if !fail_after_pc_cc
+                && observed_cleanup
+                && !retry_requested
+                && model.snapshot.status.transition.is_none()
+                && model.snapshot.status.scale_up_cleanup.is_none()
+                && model.snapshot.status.provisioning.is_none()
+            {
+                model.snapshot.desired.replicas = 3;
+                model.snapshot.desired.generation += 1;
+                retry_requested = true;
+            }
+            if fail_after_pc_cc
+                && !primary_returned
+                && model.accepted_count() == 3
+                && model.snapshot.status.transition.is_none()
+            {
+                returning_primary.process_session_id =
+                    ProcessSessionId::new("failed-primary-late-return");
+                returning_primary.report_sequence = 1;
+                model
+                    .snapshot
+                    .replicas
+                    .get_mut(&ReplicaObservationKey::new(
+                        failed_primary.replica_id,
+                        failed_primary.instance_id.clone(),
+                    ))
+                    .unwrap()
+                    .agent = AgentObservation::Report(returning_primary.clone());
+                primary_returned = true;
+            }
+            model.step();
+            if model.accepted_count() == 3
+                && model.snapshot.status.transition.is_none()
+                && model.snapshot.status.scale_up_cleanup.is_none()
+                && matches!(model.plan(), Plan::Stable { .. })
+            {
+                converged = true;
+                break;
+            }
+        }
+        assert!(observed_failover);
+        assert!(
+            converged,
+            "{} recoverable primary-failure trace did not converge: {:?}",
+            if fail_after_pc_cc {
+                "post-PC/CC"
+            } else {
+                "pre-PC/CC"
+            },
+            (
+                model.plan(),
+                model
+                    .snapshot
+                    .replicas
+                    .values()
+                    .filter_map(|observation| match &observation.agent {
+                        AgentObservation::Report(report) => Some((
+                            report.identity.clone(),
+                            report.role,
+                            report.epoch,
+                            report.previous_configuration.clone(),
+                            report.current_configuration.clone(),
+                            report.deactivation_epoch,
+                            report.deactivated_lsn,
+                            report.write_status,
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            )
+        );
+        if fail_after_pc_cc {
+            let receipt = model.snapshot.status.last_scale_up.as_ref().unwrap();
+            assert_eq!(receipt.intent.operation_id, failed_attempt);
+            assert!(!observed_cleanup);
+        } else {
+            assert!(observed_cleanup);
+            let receipt = model.snapshot.status.last_scale_up.as_ref().unwrap();
+            assert_ne!(receipt.intent.operation_id, failed_attempt);
+        }
+        model.assert_acknowledged_write_oracle();
+        model.assert_safety_invariants();
+    }
+}
 
 fn identity(replica_id: i64, incarnation: u64) -> ReplicaIdentity {
     ReplicaIdentity {
@@ -78,6 +1604,8 @@ fn transition_status(
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(&resource_uid, kind, &current.configuration_id),
             kind,
             spec_generation: 1,
@@ -149,7 +1677,7 @@ fn generated_transition_traces_preserve_authority_invariants() {
                 .identity
                 .clone();
             conflicting.provisioning = Some(ProvisioningIntent {
-                replaces: replaced,
+                purpose: ProvisioningPurpose::replacement(replaced),
                 pod_uid: PodUid::new("conflicting-pod"),
                 pvc_uid: PvcUid::new("conflicting-pvc"),
                 operation_id: OperationId::new("conflicting-provisioning"),

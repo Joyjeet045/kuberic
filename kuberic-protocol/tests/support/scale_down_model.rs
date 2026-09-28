@@ -134,9 +134,12 @@ impl Model {
                     pod: ExactResourceObservation::FrozenUidPresent {
                         resource_version: "pod-rv".into(),
                     },
+                    pod_allocation_operation_id: None,
+                    pod_matches_allocation_metadata: false,
                     pvc: ExactResourceObservation::FrozenUidPresent {
                         resource_version: "pvc-rv".into(),
                     },
+                    pvc_allocation_operation_id: None,
                     endpoint: ExactResourceObservation::FrozenUidPresent {
                         resource_version: "service-rv".into(),
                     },
@@ -283,6 +286,51 @@ impl Model {
                                 }
                             }
                         }
+                        KubernetesChange::EnsureReplacementScaffolding {
+                            replica_id,
+                            replacing,
+                        } => {
+                            assert_eq!(replica_id, replacing.replica_id);
+                            assert_eq!(
+                                self.snapshot
+                                    .status
+                                    .pending_replacement_cleanup
+                                    .as_ref()
+                                    .map(|cleanup| &cleanup.target),
+                                Some(&replacing)
+                            );
+                            let pod_uid = PodUid::new(format!("replacement-pod-{replica_id}"));
+                            let pvc_uid = PvcUid::new(format!("replacement-pvc-{replica_id}"));
+                            let instance_id = ReplicaInstanceId::new(pod_uid.as_str());
+                            let key = ReplicaObservationKey::new(replica_id, instance_id.clone());
+                            self.snapshot.replicas.entry(key).or_insert_with(|| {
+                                ReplicaObservation {
+                                    kubernetes: Some(KubernetesReplicaObservation {
+                                        replica_id,
+                                        pod_name: instance_id.to_string(),
+                                        pod_uid: Some(pod_uid.clone()),
+                                        pvc_name: format!("replacement-data-{replica_id}"),
+                                        pvc_uid: Some(pvc_uid.clone()),
+                                        image: Some(self.snapshot.desired.image.clone()),
+                                        pod_ready: true,
+                                        peer_endpoint_ready: true,
+                                    }),
+                                    agent: AgentObservation::Uninitialized(
+                                        UninitializedAgentObservation {
+                                            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                                            resource_uid: self.snapshot.resource_uid.clone(),
+                                            replica_id,
+                                            pod_uid,
+                                            pvc_uid,
+                                            process_session_id: ProcessSessionId::new(format!(
+                                                "replacement-session-{replica_id}"
+                                            )),
+                                            report_sequence: 1,
+                                        },
+                                    ),
+                                }
+                            });
+                        }
                         KubernetesChange::DeleteScaleDownResource {
                             resource,
                             name,
@@ -293,14 +341,21 @@ impl Model {
                                 self.snapshot.status.transition.is_none(),
                                 "never delete before commit"
                             );
-                            let cleanup = self
+                            let target = self
                                 .snapshot
                                 .status
                                 .secondary_scale_down_cleanup
                                 .as_ref()
-                                .unwrap();
-                            let intent = &cleanup.evidence.preparation.intent;
-                            let id = intent.target.replica_id.value();
+                                .map(|cleanup| &cleanup.evidence.preparation.intent.target)
+                                .or_else(|| {
+                                    self.snapshot
+                                        .status
+                                        .last_replacement
+                                        .as_ref()
+                                        .map(|cleanup| &cleanup.target)
+                                })
+                                .expect("committed cleanup target");
+                            let id = target.replica_id.value();
                             let exact = self.exact(id);
                             let (identity, observed) = match resource {
                                 ScaleDownResource::Endpoint => {
@@ -350,6 +405,85 @@ impl Model {
                 let effect = id.and_then(|id| self.applied_effects.remove(&id));
                 self.commands.push(command.clone());
                 match command {
+                    ProtocolCommand::InitializeAgentStore(c) => {
+                        let key = ReplicaObservationKey::new(
+                            c.local_replica_id,
+                            c.expected_instance_id.clone(),
+                        );
+                        let observation = self.snapshot.replicas.get_mut(&key).unwrap();
+                        let AgentObservation::Uninitialized(uninitialized) = &observation.agent
+                        else {
+                            panic!("replacement target must be uninitialized")
+                        };
+                        assert_eq!(uninitialized.pod_uid, c.expected_pod_uid);
+                        assert_eq!(uninitialized.pvc_uid, c.expected_pvc_uid);
+                        observation.agent = AgentObservation::Report(Box::new(AgentReport {
+                            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                            resource_uid: c.resource_uid,
+                            identity: ReplicaIdentity {
+                                replica_id: c.local_replica_id,
+                                instance_id: c.expected_instance_id,
+                                agent_generation: c.assigned_agent_generation,
+                            },
+                            process_session_id: ProcessSessionId::new(format!(
+                                "replacement-initialized-{}",
+                                c.local_replica_id
+                            )),
+                            report_sequence: 2,
+                            role: ReplicaRole::None,
+                            read_status: AccessStatus::NotPrimary,
+                            write_status: AccessStatus::NotPrimary,
+                            healthy: true,
+                            ..AgentReport::default()
+                        }));
+                    }
+                    ProtocolCommand::EnsureReplicaBuild(c) => {
+                        let source_key = self.key(c.local_replica_id.value());
+                        if c.retire {
+                            if let AgentObservation::Report(source) =
+                                &mut self.snapshot.replicas.get_mut(&source_key).unwrap().agent
+                            {
+                                source
+                                    .builds
+                                    .retain(|build| build.build_id != c.operation_id);
+                            }
+                            return;
+                        }
+                        let source_progress = match &self.snapshot.replicas[&source_key].agent {
+                            AgentObservation::Report(report) => report.current_progress,
+                            _ => panic!("replacement source report"),
+                        };
+                        let build = AgentBuildReport {
+                            build_id: c.operation_id,
+                            target: c.target.clone(),
+                            last_sequence: 1,
+                            replication_boundary_lsn: source_progress,
+                            durable_lsn: source_progress,
+                            completed: true,
+                            catch_up_boundary_lsn: None,
+                        };
+                        let AgentObservation::Report(source) =
+                            &mut self.snapshot.replicas.get_mut(&source_key).unwrap().agent
+                        else {
+                            panic!("replacement source report")
+                        };
+                        source.builds = vec![build.clone()];
+                        source.report_sequence += 1;
+                        let target_key = ReplicaObservationKey::new(
+                            c.target.replica_id,
+                            c.target.instance_id.clone(),
+                        );
+                        let AgentObservation::Report(target) =
+                            &mut self.snapshot.replicas.get_mut(&target_key).unwrap().agent
+                        else {
+                            panic!("replacement target report")
+                        };
+                        target.role = ReplicaRole::IdleSecondary;
+                        target.current_progress = source_progress;
+                        target.committed_lsn = source_progress;
+                        target.builds = vec![build];
+                        target.report_sequence += 1;
+                    }
                     ProtocolCommand::PrepareSecondaryRemoval(c) => {
                         assert!(self.snapshot.routing.write_target.is_none());
                         assert_eq!(
@@ -390,7 +524,7 @@ impl Model {
                                 c.primary_write_status,
                                 AccessStatus::ReconfigurationPending
                             );
-                        } else {
+                        } else if c.transition_kind != TransitionKind::Replacement {
                             assert!(
                                 self.snapshot.status.transition.is_none(),
                                 "grant only accepted authority"
@@ -405,10 +539,19 @@ impl Model {
                                 c.current_configuration
                             );
                         }
-                        let r = self.report(c.local_replica_id.value());
+                        let key = ReplicaObservationKey::new(
+                            c.local_replica_id,
+                            c.expected_instance_id.clone(),
+                        );
+                        let AgentObservation::Report(r) =
+                            &mut self.snapshot.replicas.get_mut(&key).unwrap().agent
+                        else {
+                            panic!("configuration target report")
+                        };
                         r.report_sequence += 1;
                         r.epoch = c.current_epoch;
                         r.previous_configuration = c.previous_configuration;
+                        r.read_status = AccessStatus::Granted;
                         r.role = c
                             .current_configuration
                             .members
@@ -425,7 +568,14 @@ impl Model {
                         }
                         r.current_configuration = Some(c.current_configuration);
                         r.pending_operation_id = None;
+                        r.pending_configuration = None;
                         r.retained_operation_id = Some(c.operation_id);
+                        r.catch_up_complete = true;
+                        r.builds
+                            .retain(|build| !c.retire_build_ids.contains(&build.build_id));
+                        if c.transition_kind == TransitionKind::Replacement {
+                            r.scale_up_intent = None;
+                        }
                         r.write_status = if r.role == ReplicaRole::Primary {
                             c.primary_write_status
                         } else {
@@ -475,6 +625,7 @@ impl Model {
                         r.prepared_secondary_removal = None;
                         r.accepted_secondary_removal = Some(c.committed);
                         r.pending_operation_id = None;
+                        r.pending_configuration = None;
                     }
                     ProtocolCommand::RetireReplica(c) => {
                         assert!(self.snapshot.status.transition.is_none());
@@ -492,6 +643,7 @@ impl Model {
                         r.verified_replication_lsn = None;
                         r.previous_configuration = None;
                         r.pending_operation_id = None;
+                        r.pending_configuration = None;
                         r.retained_operation_id = Some(c.operation_id);
                         r.prepared_secondary_removal = None;
                         r.secondary_removal_evidence = None;

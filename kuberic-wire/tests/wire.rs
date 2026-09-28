@@ -1,12 +1,15 @@
+use kuberic_protocol::command::EnsureConfiguration;
 use kuberic_protocol::types::{
-    AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, InitializationId,
-    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, derive_agent_generation,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
+    Epoch, InitializationId, OperationId, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
+    ReplicaRole, TransitionKind, derive_agent_generation,
 };
 use kuberic_wire::convert::WireError;
 use kuberic_wire::{
-    ensure_supported_version, normalize_agent_status_report, normalize_execute_request, proto,
-    validate_agent_status_report, validate_copy_ack, validate_copy_item, validate_execute_request,
-    validate_replication_ack, validate_replication_item,
+    configuration_command_to_proto, ensure_supported_version, normalize_agent_status_report,
+    normalize_execute_request, proto, validate_agent_status_report, validate_copy_ack,
+    validate_copy_item, validate_execute_request, validate_replication_ack,
+    validate_replication_item,
 };
 use prost::Message;
 
@@ -28,6 +31,7 @@ fn removal_ensure(
         effective_policy: Some(command.effective_policy.into()),
         previous_policy: command.previous_policy.map(Into::into),
         secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
+        scale_up_evidence: command.scale_up_evidence.map(|evidence| (*evidence).into()),
         local_replica_id: command.local_replica_id.value(),
         expected_instance_id: command.expected_instance_id.to_string(),
         expected_agent_generation: command.expected_agent_generation.to_string(),
@@ -168,7 +172,7 @@ fn accepted_removal_commit_rejects_mutated_certificates_and_envelopes() {
 fn secondary_removal_rejects_missing_unknown_and_mismatched_wire_authority() {
     use kuberic_wire::proto::execute_command_request::Command;
     let intent = scale_down_fixture::intent(&[1, 2], 1);
-    for mutation in 0..17 {
+    for mutation in 0..18 {
         let mut command = removal_ensure(&intent, false);
         match mutation {
             0 => command.previous_policy = None,
@@ -210,6 +214,7 @@ fn secondary_removal_rejects_missing_unknown_and_mismatched_wire_authority() {
                     .unwrap()
                     .desired_replicas = 0
             }
+            16 => command.scale_up_evidence = Some(proto::ScaleUpConfigurationEvidence::default()),
             _ => {
                 command
                     .secondary_removal_evidence
@@ -240,7 +245,7 @@ fn secondary_removal_rejects_missing_unknown_and_mismatched_wire_authority() {
         match mutation {
             0 => request.protocol_version = 5,
             1 => request.protocol_version = 0,
-            2 => request.protocol_version = 7,
+            2 => request.protocol_version = 9,
             3 => request.expected_process_session_id.clear(),
             4 => request.target = None,
             5 => request.resource_uid = "other-resource".into(),
@@ -475,6 +480,94 @@ fn configuration() -> ConfigurationDescriptor {
         ],
         2,
     )
+}
+
+#[test]
+fn pending_configuration_report_round_trips_exact_durable_command() {
+    use kuberic_protocol::observation::AgentObservation;
+
+    let policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let identity = ReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new("pod-uid-1"),
+        agent_generation: AgentGeneration::new("generation-1"),
+    };
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        identity.replica_id,
+        vec![ConfigurationMember {
+            identity: identity.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        policy.write_quorum,
+    );
+    let command = EnsureConfiguration {
+        operation_id: OperationId::new("pending-bootstrap-authority"),
+        previous_configuration: None,
+        current_configuration: current.clone(),
+        previous_epoch: None,
+        current_epoch: current.epoch,
+        effective_policy: policy,
+        previous_policy: None,
+        secondary_removal_evidence: None,
+        scale_up_evidence: None,
+        local_replica_id: identity.replica_id,
+        expected_instance_id: identity.instance_id.clone(),
+        expected_agent_generation: identity.agent_generation.clone(),
+        transition_kind: TransitionKind::Bootstrap,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
+        current_only: false,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    let wire = proto::AgentStatusReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-uid".into(),
+        identity: Some(identity.into()),
+        process_session_id: "process-session".into(),
+        report_sequence: 1,
+        role: proto::ReplicaRole::Primary as i32,
+        read_status: proto::AccessStatus::ReconfigurationPending as i32,
+        write_status: proto::AccessStatus::ReconfigurationPending as i32,
+        epoch: Some(current.epoch.into()),
+        current_configuration: Some(current.into()),
+        current_progress: 12,
+        verified_replication_lsn: Some(12),
+        committed_lsn: 12,
+        storage_state: proto::AgentStorageState::Initialized as i32,
+        healthy: true,
+        pending_operation_id: command.operation_id.to_string(),
+        pending_configuration: Some(configuration_command_to_proto(command.clone())),
+        ..Default::default()
+    };
+    let AgentObservation::Report(normalized) = normalize_agent_status_report(wire.clone()).unwrap()
+    else {
+        panic!("initialized pending report")
+    };
+    assert_eq!(normalized.pending_configuration.as_deref(), Some(&command));
+
+    let uninitialized_with_pending_authority = proto::AgentStatusReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-uid".into(),
+        process_session_id: "uninitialized-session".into(),
+        report_sequence: 1,
+        storage_state: proto::AgentStorageState::Uninitialized as i32,
+        replica_id: 1,
+        pod_uid: "uninitialized-pod".into(),
+        pvc_uid: "uninitialized-pvc".into(),
+        pending_configuration: wire.pending_configuration.clone(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        normalize_agent_status_report(uninitialized_with_pending_authority),
+        Err(WireError::InvalidAuthority(_))
+    ));
+
+    let mut mismatched = wire;
+    mismatched.pending_operation_id = "different-operation".into();
+    assert!(normalize_agent_status_report(mismatched).is_err());
 }
 
 #[test]
@@ -791,6 +884,7 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
                 proto::EnsureConfigurationCommand {
                     previous_policy: None,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     operation_id: "install-1".to_string(),
                     previous_configuration: Some(previous.clone().into()),
                     current_configuration: Some(current.clone().into()),
@@ -1045,13 +1139,26 @@ fn copy_contract_requires_exact_target_and_final_boundary_ack() {
         sequence: 3,
         durable_lsn: 2,
         replication_boundary_lsn: 2,
+        catch_up_boundary_lsn: Some(2),
         final_item: true,
         snapshot_chunk: false,
         ..Default::default()
     };
     assert!(validate_copy_ack(&final_ack).is_ok());
+    let mut missing_catch_up_boundary = final_ack.clone();
+    missing_catch_up_boundary.catch_up_boundary_lsn = None;
+    assert!(matches!(
+        validate_copy_ack(&missing_catch_up_boundary),
+        Err(WireError::InvalidAuthority(_))
+    ));
 
     let mut missing_target = item;
+    let mut premature_boundary = missing_target.clone();
+    premature_boundary.catch_up_boundary_lsn = Some(2);
+    assert!(matches!(
+        validate_copy_item(&premature_boundary),
+        Err(WireError::InvalidAuthority(_))
+    ));
     missing_target.receiver = None;
     assert!(matches!(
         validate_copy_item(&missing_target),
@@ -1237,6 +1344,7 @@ fn ensure_request_rejects_previous_configuration_outside_frozen_policy() {
                 proto::EnsureConfigurationCommand {
                     previous_policy: None,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     operation_id: "operation".to_string(),
                     previous_configuration: Some(previous.clone().into()),
                     current_configuration: Some(current.clone().into()),
@@ -1296,6 +1404,7 @@ fn ensure_request_rejects_regressing_pc_cc_relationship() {
                 proto::EnsureConfigurationCommand {
                     previous_policy: None,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     operation_id: "operation".to_string(),
                     previous_configuration: Some(previous.clone().into()),
                     current_configuration: Some(current.clone().into()),

@@ -10,7 +10,7 @@ fn enabled() -> EvaluationConfig {
     }
 }
 
-fn fixture(count: u32, desired: u32) -> RawObservation {
+pub(super) fn fixture(count: u32, desired: u32) -> RawObservation {
     let mut raw = raw(desired);
     raw.set.spec.failover_delay_seconds = 10;
     raw.set.metadata.generation = Some(2);
@@ -159,7 +159,7 @@ fn fixture(count: u32, desired: u32) -> RawObservation {
     raw
 }
 
-async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
+pub(super) async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
     let mut raw = api.observation().await;
     let target = match command {
         ProtocolCommand::PrepareSecondaryRemoval(c) => c.intent.primary.clone(),
@@ -1221,6 +1221,8 @@ fn replacement_at_commit() -> (RawObservation, ReplicaIdentity, ReplicaIdentity)
         switchover: None,
         secondary_scale_down: None,
         secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
     });
     let mut pod = raw.pods[1].clone();
     pod.metadata.name = Some("db-replacement".into());

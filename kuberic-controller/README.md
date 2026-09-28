@@ -55,9 +55,16 @@ serialize subsequent operations until exact cleanup completes; label loss,
 finalizers, and ambiguous replies cannot overwrite the obligation or authorize
 deletion of same-name replacement UIDs.
 
-Protocol 6 and agent store schema 2 require a fresh coordinated deployment.
-Scale-up, primary/explicit-target removal, and active-removal cancellation are
-unsupported. There is no maximum write-interruption guarantee.
+Protocol 8 and agent store schema 3 require a fresh coordinated deployment.
+The production controller configuration enables sequential scale-up: it
+persists one allocation, creates/freeze the annotated canonical PVC before the
+bound Pod, builds from the exact accepted primary through a post-enumeration
+catch-up boundary, and admits one fresh ordinal through independent PC/CC
+policies. Cancellation before admission and exact endpoint→Pod→PVC cleanup use
+frozen provenance; after admission, accepted authority rolls forward. Classic
+v1 remains unchanged. Primary/explicit-target removal, independent target and
+minimum counts, a validated maximum replica-count budget, and active-removal
+cancellation are unsupported. There is no maximum write-interruption guarantee.
 Frozen-primary loss during removal or cleanup can cause indefinite outage;
 there is no overlapping failover even after membership commit.
 See the [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
@@ -71,3 +78,6 @@ See the [level-triggered operator guide](../docs/features/kuberic/level-triggere
 for the CRD, deployment, supported operations, diagnostics, and limitations.
 The guide includes the [request example and retry contract](../docs/features/kuberic/level-triggered-operator.md#planned-switchover).
 See also [secondary scale-down usage and conditions](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down).
+See [sequential scale-up usage and diagnostics](../docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
+for fresh-incarnation restoration, write-availability boundaries, failover,
+cleanup, and limitations.

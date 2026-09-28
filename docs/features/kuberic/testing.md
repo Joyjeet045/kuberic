@@ -15,6 +15,14 @@ successful-write and session-fencing tests, controller exact-resource race tests
 and explicitly owned KinD scenarios. Secondary scale-down covers healthy 3→2,
 2→1 and singleton restart, sequential 5→2, unavailable-target evidence, retirement,
 and exact Pod/PVC/endpoint cleanup without deleting replacement UIDs.
+Scale-up controller races cover durable scaffolding authorization, lost PVC
+create replies, operation-specific PVC creation provenance, same-name
+collisions before UID freeze, and replacement without adoption or deletion.
+Protocol/model, agent crash-boundary, runtime, and controller suites cover
+sequential one-member admission, post-enumeration catch-up closure, independent
+PC/CC policies, cancellation, pre/post-admission failover, exact cleanup,
+committed-degraded convergence, and fresh restoration. These prove the tested
+traces, not a maximum cardinality, arbitrary-failure guarantee, or outage SLO.
 
 The scale-down routed-write assertion verifies the exact primary Service selector
 and requires HTTP 200 through `kvstore2-write` before recording an acknowledged
@@ -32,15 +40,27 @@ scripts/check_level_triggered_documentation.sh
 # After the owned-cluster installation:
 just level-triggered-kind-test scale-down
 just level-triggered-kind-test scale-down-adversarial
+just level-triggered-kind-test scale-up
+just level-triggered-kind-test scale-up-multi
+just level-triggered-kind-test scale-up-adversarial
+# Equivalent shorthand for the three scale-up selectors:
+just level-triggered-kind-test scale-up-full
 just level-triggered-kind-test all
 ```
 
 Run `all` from fresh bootstrap, not after standalone failover. The
 [Level-Triggered CI workflow](../../../.github/workflows/level-triggered-CI.yml)
-runs serial targeted tests and PR smoke including healthy scale-down; scheduled
-or full manual CI repeats all seven live scenarios on two fresh clusters.
+runs serial targeted tests, classic v1 scale-up regressions, and PR smoke
+including healthy scale-down and healthy sequential scale-up. Scheduled or full
+manual CI repeats the ten-scenario live matrix on two fresh clusters.
 The [operator guide](level-triggered-operator.md#tests-and-diagnostics) documents
 ownership checks, diagnostics, final measured timings, and availability limits.
+
+The live copy gate used to hold scale-up at an observable boundary is test-only,
+disabled by default, absent from the checked-in sample and Service, and exposed
+only on direct Pod diagnostic port 18080 when the owned-cluster install recipe
+injects `testing.kuberic.io/live-copy-gate: enabled`. It is not a CRD field,
+application route, production switch, or supported user API.
 
 ---
 

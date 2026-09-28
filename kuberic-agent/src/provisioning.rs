@@ -22,6 +22,7 @@ pub struct ObservedStorageIdentity {
 pub enum InitializationAuthority<'a> {
     Bootstrap(&'a TransitionIntent),
     Replacement(&'a ProvisioningIntent),
+    ScaleUp(&'a ProvisioningIntent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +95,8 @@ pub fn authorize_initialization(
             }
         }
         InitializationAuthority::Replacement(provisioning) => {
-            if provisioning.replica_id() != command.local_replica_id
+            if provisioning.replacement().is_none()
+                || provisioning.replica_id() != command.local_replica_id
                 || provisioning.instance_id() != command.expected_instance_id
                 || provisioning.pod_uid != command.expected_pod_uid
                 || provisioning.pvc_uid != command.expected_pvc_uid
@@ -105,6 +107,41 @@ pub fn authorize_initialization(
             {
                 return Err(AgentError::InitializationNotAuthorized(
                     "command does not match persisted replacement provisioning".into(),
+                ));
+            }
+        }
+        InitializationAuthority::ScaleUp(provisioning) => {
+            kuberic_protocol::validation::validate_scale_up_provisioning(provisioning)
+                .map_err(|error| AgentError::InitializationNotAuthorized(error.to_string()))?;
+            let scale_up = provisioning.scale_up().ok_or_else(|| {
+                AgentError::InitializationNotAuthorized(
+                    "missing persisted scale-up provisioning authority".into(),
+                )
+            })?;
+            let primary = scale_up
+                .previous_configuration
+                .members
+                .iter()
+                .find(|member| {
+                    member.identity.replica_id == scale_up.previous_configuration.primary_id
+                })
+                .expect("validated previous configuration has one primary");
+            if command.provisioning.as_ref() != Some(provisioning)
+                || scale_up.resource_uid != command.resource_uid
+                || provisioning.replica_id() != command.local_replica_id
+                || provisioning.instance_id() != command.expected_instance_id
+                || provisioning.pod_uid != command.expected_pod_uid
+                || provisioning.pvc_uid != command.expected_pvc_uid
+                || provisioning.initialization_id(&command.resource_uid)
+                    != command.initialization_id
+                || provisioning.assigned_agent_generation(&command.resource_uid)
+                    != command.assigned_agent_generation
+                || command.bootstrap_configuration != scale_up.previous_configuration
+                || command.effective_policy != scale_up.current_policy
+                || primary.role != kuberic_protocol::types::ReplicaRole::Primary
+            {
+                return Err(AgentError::InitializationNotAuthorized(
+                    "command does not match exact persisted scale-up provisioning authority".into(),
                 ));
             }
         }

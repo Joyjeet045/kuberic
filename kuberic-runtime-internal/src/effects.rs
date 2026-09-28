@@ -100,6 +100,8 @@ pub struct BuildPostcondition {
     pub last_sequence: u64,
     pub durable_lsn: i64,
     pub completed: bool,
+    #[serde(default)]
+    pub catch_up_boundary_lsn: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -128,17 +128,17 @@
                       },
                       "readQuorum": {
                         "format": "uint32",
-                        "minimum": 0.0,
+                        "minimum": 1.0,
                         "type": "integer"
                       },
                       "replicaSetSize": {
                         "format": "uint32",
-                        "minimum": 0.0,
+                        "minimum": 1.0,
                         "type": "integer"
                       },
                       "writeQuorum": {
                         "format": "uint32",
-                        "minimum": 0.0,
+                        "minimum": 1.0,
                         "type": "integer"
                       }
                     },
@@ -321,6 +321,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -339,10 +340,86 @@
                     ],
                     "type": "object"
                   },
-                  "lastSecondaryRemoval": {
-                    "description": "Last completed removal's immutable convergence proof, never deletion authority.\nOne receipt is retained; a later removal supersedes it only after lagging members settle.",
+                  "lastScaleUp": {
+                    "description": "One bounded completed-addition proof retained for late local convergence.",
                     "nullable": true,
                     "properties": {
+                      "acceptedConfiguration": {
+                        "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                        "properties": {
+                          "configurationId": {
+                            "type": "string"
+                          },
+                          "epoch": {
+                            "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                            "properties": {
+                              "configurationNumber": {
+                                "format": "int64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              },
+                              "dataLossNumber": {
+                                "format": "int64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationNumber",
+                              "dataLossNumber"
+                            ],
+                            "type": "object"
+                          },
+                          "members": {
+                            "items": {
+                              "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                              "properties": {
+                                "agentGeneration": {
+                                  "type": "string"
+                                },
+                                "instanceId": {
+                                  "type": "string"
+                                },
+                                "replicaId": {
+                                  "format": "int64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "role": {
+                                  "description": "Runtime role of one exact replica incarnation.",
+                                  "enum": [
+                                    "primary",
+                                    "activeSecondary",
+                                    "idleSecondary",
+                                    "none"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "agentGeneration",
+                                "instanceId",
+                                "replicaId",
+                                "role"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "writeQuorum": {
+                            "format": "uint32",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "configurationId",
+                          "epoch",
+                          "members",
+                          "writeQuorum"
+                        ],
+                        "type": "object"
+                      },
                       "currentOnlyWriteQuorum": {
                         "items": {
                           "properties": {
@@ -354,10 +431,12 @@
                               "properties": {
                                 "configurationNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 },
                                 "dataLossNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 }
                               },
@@ -378,6 +457,768 @@
                                 },
                                 "replicaId": {
                                   "format": "int64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "agentGeneration",
+                                "instanceId",
+                                "replicaId"
+                              ],
+                              "type": "object"
+                            },
+                            "pendingOperationId": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "previousConfigurationId": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "processSessionId": {
+                              "type": "string"
+                            },
+                            "reportSequence": {
+                              "format": "uint64",
+                              "minimum": 1.0,
+                              "type": "integer"
+                            },
+                            "resourceUid": {
+                              "type": "string"
+                            },
+                            "retainedOperationId": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "role": {
+                              "description": "Runtime role of one exact replica incarnation.",
+                              "enum": [
+                                "primary",
+                                "activeSecondary",
+                                "idleSecondary",
+                                "none"
+                              ],
+                              "type": "string"
+                            },
+                            "verifiedReplicationLsn": {
+                              "format": "int64",
+                              "minimum": 0.0,
+                              "type": "integer"
+                            },
+                            "writeStatus": {
+                              "description": "Current write-access decision exposed by the replica runtime.",
+                              "enum": [
+                                "granted",
+                                "reconfigurationPending",
+                                "notPrimary",
+                                "noWriteQuorum"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "currentConfigurationId",
+                            "epoch",
+                            "identity",
+                            "processSessionId",
+                            "reportSequence",
+                            "resourceUid",
+                            "role",
+                            "verifiedReplicationLsn",
+                            "writeStatus"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "failoverEvidence": {
+                        "nullable": true,
+                        "properties": {
+                          "currentReadQuorum": {
+                            "items": {
+                              "properties": {
+                                "currentConfigurationId": {
+                                  "type": "string"
+                                },
+                                "epoch": {
+                                  "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                  "properties": {
+                                    "configurationNumber": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "dataLossNumber": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "configurationNumber",
+                                    "dataLossNumber"
+                                  ],
+                                  "type": "object"
+                                },
+                                "identity": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId"
+                                  ],
+                                  "type": "object"
+                                },
+                                "pendingOperationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "previousConfigurationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "processSessionId": {
+                                  "type": "string"
+                                },
+                                "reportSequence": {
+                                  "format": "uint64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "resourceUid": {
+                                  "type": "string"
+                                },
+                                "retainedOperationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "role": {
+                                  "description": "Runtime role of one exact replica incarnation.",
+                                  "enum": [
+                                    "primary",
+                                    "activeSecondary",
+                                    "idleSecondary",
+                                    "none"
+                                  ],
+                                  "type": "string"
+                                },
+                                "verifiedReplicationLsn": {
+                                  "format": "int64",
+                                  "minimum": 0.0,
+                                  "type": "integer"
+                                },
+                                "writeStatus": {
+                                  "description": "Current write-access decision exposed by the replica runtime.",
+                                  "enum": [
+                                    "granted",
+                                    "reconfigurationPending",
+                                    "notPrimary",
+                                    "noWriteQuorum"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "currentConfigurationId",
+                                "epoch",
+                                "identity",
+                                "processSessionId",
+                                "reportSequence",
+                                "resourceUid",
+                                "role",
+                                "verifiedReplicationLsn",
+                                "writeStatus"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "finalElection": {
+                            "properties": {
+                              "currentReadQuorum": {
+                                "items": {
+                                  "format": "int64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "type": "array"
+                              },
+                              "previousReadQuorum": {
+                                "items": {
+                                  "format": "int64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "type": "array"
+                              },
+                              "selectedPrimaryReplicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "witnesses": {
+                                "items": {
+                                  "properties": {
+                                    "committedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "currentProgress": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivatedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "fenceOperationId": {
+                                      "type": "string"
+                                    },
+                                    "processSessionId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "reportSequence": {
+                                      "format": "uint64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "committedLsn",
+                                    "currentProgress",
+                                    "deactivatedLsn",
+                                    "fenceOperationId",
+                                    "processSessionId",
+                                    "replicaId",
+                                    "reportSequence"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "currentReadQuorum",
+                              "previousReadQuorum",
+                              "selectedPrimaryReplicaId",
+                              "witnesses"
+                            ],
+                            "type": "object"
+                          },
+                          "previousReadQuorum": {
+                            "items": {
+                              "properties": {
+                                "currentConfigurationId": {
+                                  "type": "string"
+                                },
+                                "epoch": {
+                                  "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                  "properties": {
+                                    "configurationNumber": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "dataLossNumber": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "configurationNumber",
+                                    "dataLossNumber"
+                                  ],
+                                  "type": "object"
+                                },
+                                "identity": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId"
+                                  ],
+                                  "type": "object"
+                                },
+                                "pendingOperationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "previousConfigurationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "processSessionId": {
+                                  "type": "string"
+                                },
+                                "reportSequence": {
+                                  "format": "uint64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "resourceUid": {
+                                  "type": "string"
+                                },
+                                "retainedOperationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "role": {
+                                  "description": "Runtime role of one exact replica incarnation.",
+                                  "enum": [
+                                    "primary",
+                                    "activeSecondary",
+                                    "idleSecondary",
+                                    "none"
+                                  ],
+                                  "type": "string"
+                                },
+                                "verifiedReplicationLsn": {
+                                  "format": "int64",
+                                  "minimum": 0.0,
+                                  "type": "integer"
+                                },
+                                "writeStatus": {
+                                  "description": "Current write-access decision exposed by the replica runtime.",
+                                  "enum": [
+                                    "granted",
+                                    "reconfigurationPending",
+                                    "notPrimary",
+                                    "noWriteQuorum"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "currentConfigurationId",
+                                "epoch",
+                                "identity",
+                                "processSessionId",
+                                "reportSequence",
+                                "resourceUid",
+                                "role",
+                                "verifiedReplicationLsn",
+                                "writeStatus"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "provisionalPrimaryReplicaId": {
+                            "format": "int64",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "currentReadQuorum",
+                          "finalElection",
+                          "previousReadQuorum",
+                          "provisionalPrimaryReplicaId"
+                        ],
+                        "type": "object"
+                      },
+                      "failoverSafeLsn": {
+                        "format": "int64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "intent": {
+                        "description": "Immutable authority for one exact membership increase.",
+                        "properties": {
+                          "buildId": {
+                            "type": "string"
+                          },
+                          "catchUpBoundaryLsn": {
+                            "format": "int64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "currentConfiguration": {
+                            "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                            "properties": {
+                              "configurationId": {
+                                "type": "string"
+                              },
+                              "epoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "members": {
+                                "items": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationId",
+                              "epoch",
+                              "members",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
+                          "currentPolicy": {
+                            "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                            "properties": {
+                              "failoverDelaySeconds": {
+                                "format": "uint64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              },
+                              "readQuorum": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "replicaSetSize": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "failoverDelaySeconds",
+                              "readQuorum",
+                              "replicaSetSize",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
+                          "desiredReplicas": {
+                            "format": "uint32",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          },
+                          "operationId": {
+                            "type": "string"
+                          },
+                          "previousConfiguration": {
+                            "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                            "properties": {
+                              "configurationId": {
+                                "type": "string"
+                              },
+                              "epoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "members": {
+                                "items": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationId",
+                              "epoch",
+                              "members",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
+                          "previousPolicy": {
+                            "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                            "properties": {
+                              "failoverDelaySeconds": {
+                                "format": "uint64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              },
+                              "readQuorum": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "replicaSetSize": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "failoverDelaySeconds",
+                              "readQuorum",
+                              "replicaSetSize",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
+                          "primary": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          },
+                          "resourceUid": {
+                            "type": "string"
+                          },
+                          "snapshotBoundaryLsn": {
+                            "format": "int64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "specGeneration": {
+                            "format": "uint64",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          },
+                          "target": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "buildId",
+                          "catchUpBoundaryLsn",
+                          "currentConfiguration",
+                          "currentPolicy",
+                          "desiredReplicas",
+                          "operationId",
+                          "previousConfiguration",
+                          "previousPolicy",
+                          "primary",
+                          "resourceUid",
+                          "snapshotBoundaryLsn",
+                          "specGeneration",
+                          "target"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "acceptedConfiguration",
+                      "currentOnlyWriteQuorum",
+                      "intent"
+                    ],
+                    "type": "object"
+                  },
+                  "lastSecondaryRemoval": {
+                    "description": "Last completed removal's immutable convergence proof, never deletion authority.\nOne receipt is retained; a later removal supersedes it only after lagging members settle.",
+                    "nullable": true,
+                    "properties": {
+                      "currentOnlyWriteQuorum": {
+                        "items": {
+                          "properties": {
+                            "currentConfigurationId": {
+                              "type": "string"
+                            },
+                            "epoch": {
+                              "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                              "properties": {
+                                "configurationNumber": {
+                                  "format": "int64",
+                                  "minimum": 0.0,
+                                  "type": "integer"
+                                },
+                                "dataLossNumber": {
+                                  "format": "int64",
+                                  "minimum": 0.0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "configurationNumber",
+                                "dataLossNumber"
+                              ],
+                              "type": "object"
+                            },
+                            "identity": {
+                              "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                              "properties": {
+                                "agentGeneration": {
+                                  "type": "string"
+                                },
+                                "instanceId": {
+                                  "type": "string"
+                                },
+                                "replicaId": {
+                                  "format": "int64",
+                                  "minimum": 1.0,
                                   "type": "integer"
                                 }
                               },
@@ -627,10 +1468,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -652,6 +1495,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -699,17 +1543,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -740,10 +1584,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -765,6 +1611,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -812,17 +1659,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -845,6 +1692,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -874,6 +1722,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -932,10 +1781,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -956,6 +1807,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -1042,10 +1894,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -1066,6 +1920,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -1169,6 +2024,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -1194,6 +2050,7 @@
                       },
                       "requestedTargetReplicaId": {
                         "format": "int64",
+                        "minimum": 1.0,
                         "type": "integer"
                       },
                       "resultingPrimary": {
@@ -1208,6 +2065,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -1400,6 +2258,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -1432,6 +2291,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -1463,36 +2323,226 @@
                       "podUid": {
                         "type": "string"
                       },
-                      "pvcUid": {
-                        "type": "string"
-                      },
-                      "replaces": {
-                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                      "purpose": {
                         "properties": {
-                          "agentGeneration": {
+                          "kind": {
+                            "enum": [
+                              "replacement",
+                              "scaleUp"
+                            ],
                             "type": "string"
                           },
-                          "instanceId": {
-                            "type": "string"
+                          "replaces": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "nullable": true,
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
                           },
-                          "replicaId": {
-                            "format": "int64",
-                            "type": "integer"
+                          "scaleUp": {
+                            "nullable": true,
+                            "properties": {
+                              "currentPolicy": {
+                                "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                                "properties": {
+                                  "failoverDelaySeconds": {
+                                    "format": "uint64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "readQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "replicaSetSize": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "writeQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "failoverDelaySeconds",
+                                  "readQuorum",
+                                  "replicaSetSize",
+                                  "writeQuorum"
+                                ],
+                                "type": "object"
+                              },
+                              "desiredReplicas": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "previousConfiguration": {
+                                "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                "properties": {
+                                  "configurationId": {
+                                    "type": "string"
+                                  },
+                                  "epoch": {
+                                    "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                    "properties": {
+                                      "configurationNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      },
+                                      "dataLossNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "configurationNumber",
+                                      "dataLossNumber"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "members": {
+                                    "items": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        },
+                                        "role": {
+                                          "description": "Runtime role of one exact replica incarnation.",
+                                          "enum": [
+                                            "primary",
+                                            "activeSecondary",
+                                            "idleSecondary",
+                                            "none"
+                                          ],
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId",
+                                        "role"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "writeQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationId",
+                                  "epoch",
+                                  "members",
+                                  "writeQuorum"
+                                ],
+                                "type": "object"
+                              },
+                              "previousPolicy": {
+                                "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                                "properties": {
+                                  "failoverDelaySeconds": {
+                                    "format": "uint64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "readQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "replicaSetSize": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "writeQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "failoverDelaySeconds",
+                                  "readQuorum",
+                                  "replicaSetSize",
+                                  "writeQuorum"
+                                ],
+                                "type": "object"
+                              },
+                              "resourceUid": {
+                                "type": "string"
+                              },
+                              "specGeneration": {
+                                "format": "uint64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "targetReplicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "currentPolicy",
+                              "desiredReplicas",
+                              "previousConfiguration",
+                              "previousPolicy",
+                              "resourceUid",
+                              "specGeneration",
+                              "targetReplicaId"
+                            ],
+                            "type": "object"
                           }
                         },
                         "required": [
-                          "agentGeneration",
-                          "instanceId",
-                          "replicaId"
+                          "kind"
                         ],
                         "type": "object"
+                      },
+                      "pvcUid": {
+                        "type": "string"
                       }
                     },
                     "required": [
                       "operationId",
                       "podUid",
-                      "pvcUid",
-                      "replaces"
+                      "purpose",
+                      "pvcUid"
                     ],
                     "type": "object"
                   },
@@ -1505,6 +2555,489 @@
                     },
                     "required": [
                       "configurationId"
+                    ],
+                    "type": "object"
+                  },
+                  "scaleUpAdmissionStarted": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "scaleUpAllocation": {
+                    "description": "Durable scale-up allocation recorded before any candidate resource is created.",
+                    "nullable": true,
+                    "properties": {
+                      "acceptedConfigurationId": {
+                        "type": "string"
+                      },
+                      "cancellationStarted": {
+                        "default": false,
+                        "type": "boolean"
+                      },
+                      "desiredReplicas": {
+                        "format": "uint32",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "operationId": {
+                        "type": "string"
+                      },
+                      "podUid": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "previousConfigurationId": {
+                        "type": "string"
+                      },
+                      "previousOperationId": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "pvcUid": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "resourceUid": {
+                        "type": "string"
+                      },
+                      "scaffoldingRequested": {
+                        "default": false,
+                        "type": "boolean"
+                      },
+                      "specGeneration": {
+                        "format": "uint64",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "targetReplicaId": {
+                        "format": "int64",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "acceptedConfigurationId",
+                      "desiredReplicas",
+                      "operationId",
+                      "previousConfigurationId",
+                      "resourceUid",
+                      "specGeneration",
+                      "targetReplicaId"
+                    ],
+                    "type": "object"
+                  },
+                  "scaleUpCleanup": {
+                    "nullable": true,
+                    "properties": {
+                      "provisioning": {
+                        "description": "Compact intent for one fresh replica that has not entered PC or CC.",
+                        "properties": {
+                          "operationId": {
+                            "type": "string"
+                          },
+                          "podUid": {
+                            "type": "string"
+                          },
+                          "purpose": {
+                            "properties": {
+                              "kind": {
+                                "enum": [
+                                  "replacement",
+                                  "scaleUp"
+                                ],
+                                "type": "string"
+                              },
+                              "replaces": {
+                                "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                "nullable": true,
+                                "properties": {
+                                  "agentGeneration": {
+                                    "type": "string"
+                                  },
+                                  "instanceId": {
+                                    "type": "string"
+                                  },
+                                  "replicaId": {
+                                    "format": "int64",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "agentGeneration",
+                                  "instanceId",
+                                  "replicaId"
+                                ],
+                                "type": "object"
+                              },
+                              "scaleUp": {
+                                "nullable": true,
+                                "properties": {
+                                  "currentPolicy": {
+                                    "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                                    "properties": {
+                                      "failoverDelaySeconds": {
+                                        "format": "uint64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      },
+                                      "readQuorum": {
+                                        "format": "uint32",
+                                        "minimum": 1.0,
+                                        "type": "integer"
+                                      },
+                                      "replicaSetSize": {
+                                        "format": "uint32",
+                                        "minimum": 1.0,
+                                        "type": "integer"
+                                      },
+                                      "writeQuorum": {
+                                        "format": "uint32",
+                                        "minimum": 1.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "failoverDelaySeconds",
+                                      "readQuorum",
+                                      "replicaSetSize",
+                                      "writeQuorum"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "desiredReplicas": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "previousConfiguration": {
+                                    "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                    "properties": {
+                                      "configurationId": {
+                                        "type": "string"
+                                      },
+                                      "epoch": {
+                                        "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                        "properties": {
+                                          "configurationNumber": {
+                                            "format": "int64",
+                                            "minimum": 0.0,
+                                            "type": "integer"
+                                          },
+                                          "dataLossNumber": {
+                                            "format": "int64",
+                                            "minimum": 0.0,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "configurationNumber",
+                                          "dataLossNumber"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "members": {
+                                        "items": {
+                                          "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                          "properties": {
+                                            "agentGeneration": {
+                                              "type": "string"
+                                            },
+                                            "instanceId": {
+                                              "type": "string"
+                                            },
+                                            "replicaId": {
+                                              "format": "int64",
+                                              "minimum": 1.0,
+                                              "type": "integer"
+                                            },
+                                            "role": {
+                                              "description": "Runtime role of one exact replica incarnation.",
+                                              "enum": [
+                                                "primary",
+                                                "activeSecondary",
+                                                "idleSecondary",
+                                                "none"
+                                              ],
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "agentGeneration",
+                                            "instanceId",
+                                            "replicaId",
+                                            "role"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "type": "array"
+                                      },
+                                      "writeQuorum": {
+                                        "format": "uint32",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "configurationId",
+                                      "epoch",
+                                      "members",
+                                      "writeQuorum"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "previousPolicy": {
+                                    "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                                    "properties": {
+                                      "failoverDelaySeconds": {
+                                        "format": "uint64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      },
+                                      "readQuorum": {
+                                        "format": "uint32",
+                                        "minimum": 1.0,
+                                        "type": "integer"
+                                      },
+                                      "replicaSetSize": {
+                                        "format": "uint32",
+                                        "minimum": 1.0,
+                                        "type": "integer"
+                                      },
+                                      "writeQuorum": {
+                                        "format": "uint32",
+                                        "minimum": 1.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "failoverDelaySeconds",
+                                      "readQuorum",
+                                      "replicaSetSize",
+                                      "writeQuorum"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "resourceUid": {
+                                    "type": "string"
+                                  },
+                                  "specGeneration": {
+                                    "format": "uint64",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "targetReplicaId": {
+                                    "format": "int64",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "currentPolicy",
+                                  "desiredReplicas",
+                                  "previousConfiguration",
+                                  "previousPolicy",
+                                  "resourceUid",
+                                  "specGeneration",
+                                  "targetReplicaId"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "kind"
+                            ],
+                            "type": "object"
+                          },
+                          "pvcUid": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "operationId",
+                          "podUid",
+                          "purpose",
+                          "pvcUid"
+                        ],
+                        "type": "object"
+                      },
+                      "resources": {
+                        "properties": {
+                          "endpoint": {
+                            "description": "Absence may only be frozen from a successful exact-name lookup.",
+                            "oneOf": [
+                              {
+                                "required": [
+                                  "present"
+                                ]
+                              },
+                              {
+                                "required": [
+                                  "absent"
+                                ]
+                              }
+                            ],
+                            "properties": {
+                              "absent": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ],
+                                "type": "object"
+                              },
+                              "present": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "uid": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name",
+                                  "uid"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "pod": {
+                            "description": "Absence may only be frozen from a successful exact-name lookup.",
+                            "oneOf": [
+                              {
+                                "required": [
+                                  "present"
+                                ]
+                              },
+                              {
+                                "required": [
+                                  "absent"
+                                ]
+                              }
+                            ],
+                            "properties": {
+                              "absent": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ],
+                                "type": "object"
+                              },
+                              "present": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "uid": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name",
+                                  "uid"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "pvc": {
+                            "description": "Absence may only be frozen from a successful exact-name lookup.",
+                            "oneOf": [
+                              {
+                                "required": [
+                                  "present"
+                                ]
+                              },
+                              {
+                                "required": [
+                                  "absent"
+                                ]
+                              }
+                            ],
+                            "properties": {
+                              "absent": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ],
+                                "type": "object"
+                              },
+                              "present": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "uid": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name",
+                                  "uid"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "endpoint",
+                          "pod",
+                          "pvc"
+                        ],
+                        "type": "object"
+                      },
+                      "target": {
+                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                        "properties": {
+                          "agentGeneration": {
+                            "type": "string"
+                          },
+                          "instanceId": {
+                            "type": "string"
+                          },
+                          "replicaId": {
+                            "format": "int64",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "agentGeneration",
+                          "instanceId",
+                          "replicaId"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "provisioning",
+                      "resources",
+                      "target"
                     ],
                     "type": "object"
                   },
@@ -1523,10 +3056,12 @@
                               "properties": {
                                 "configurationNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 },
                                 "dataLossNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 }
                               },
@@ -1547,6 +3082,7 @@
                                 },
                                 "replicaId": {
                                   "format": "int64",
+                                  "minimum": 1.0,
                                   "type": "integer"
                                 }
                               },
@@ -1796,10 +3332,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -1821,6 +3359,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -1868,17 +3407,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -1909,10 +3448,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -1934,6 +3475,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -1981,17 +3523,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -2014,6 +3556,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -2043,6 +3586,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -2101,10 +3645,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -2125,6 +3671,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -2211,10 +3758,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -2235,6 +3784,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -2327,10 +3877,12 @@
                             "properties": {
                               "configurationNumber": {
                                 "format": "int64",
+                                "minimum": 0.0,
                                 "type": "integer"
                               },
                               "dataLossNumber": {
                                 "format": "int64",
+                                "minimum": 0.0,
                                 "type": "integer"
                               }
                             },
@@ -2505,10 +4057,12 @@
                                     "properties": {
                                       "configurationNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       },
                                       "dataLossNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       }
                                     },
@@ -2530,6 +4084,7 @@
                                         },
                                         "replicaId": {
                                           "format": "int64",
+                                          "minimum": 1.0,
                                           "type": "integer"
                                         },
                                         "role": {
@@ -2577,17 +4132,17 @@
                                   },
                                   "readQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "replicaSetSize": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "writeQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -2618,10 +4173,12 @@
                                     "properties": {
                                       "configurationNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       },
                                       "dataLossNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       }
                                     },
@@ -2643,6 +4200,7 @@
                                         },
                                         "replicaId": {
                                           "format": "int64",
+                                          "minimum": 1.0,
                                           "type": "integer"
                                         },
                                         "role": {
@@ -2690,17 +4248,17 @@
                                   },
                                   "readQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "replicaSetSize": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "writeQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -2723,6 +4281,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -2752,6 +4311,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -2856,10 +4416,12 @@
                         "properties": {
                           "configurationNumber": {
                             "format": "int64",
+                            "minimum": 0.0,
                             "type": "integer"
                           },
                           "dataLossNumber": {
                             "format": "int64",
+                            "minimum": 0.0,
                             "type": "integer"
                           }
                         },
@@ -2881,6 +4443,7 @@
                             },
                             "replicaId": {
                               "format": "int64",
+                              "minimum": 1.0,
                               "type": "integer"
                             },
                             "role": {
@@ -2937,10 +4500,12 @@
                             "properties": {
                               "configurationNumber": {
                                 "format": "int64",
+                                "minimum": 0.0,
                                 "type": "integer"
                               },
                               "dataLossNumber": {
                                 "format": "int64",
+                                "minimum": 0.0,
                                 "type": "integer"
                               }
                             },
@@ -2962,6 +4527,7 @@
                                 },
                                 "replicaId": {
                                   "format": "int64",
+                                  "minimum": 1.0,
                                   "type": "integer"
                                 },
                                 "role": {
@@ -3009,17 +4575,17 @@
                           },
                           "readQuorum": {
                             "format": "uint32",
-                            "minimum": 0.0,
+                            "minimum": 1.0,
                             "type": "integer"
                           },
                           "replicaSetSize": {
                             "format": "uint32",
-                            "minimum": 0.0,
+                            "minimum": 1.0,
                             "type": "integer"
                           },
                           "writeQuorum": {
                             "format": "uint32",
-                            "minimum": 0.0,
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -3043,7 +4609,8 @@
                           "replacement",
                           "failover",
                           "plannedSwitchover",
-                          "secondaryScaleDown"
+                          "secondaryScaleDown",
+                          "scaleUp"
                         ],
                         "type": "string"
                       },
@@ -3068,6 +4635,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -3082,6 +4650,1020 @@
                         "required": [
                           "operationId",
                           "target"
+                        ],
+                        "type": "object"
+                      },
+                      "scaleUp": {
+                        "description": "Immutable authority for one exact membership increase.",
+                        "nullable": true,
+                        "properties": {
+                          "buildId": {
+                            "type": "string"
+                          },
+                          "catchUpBoundaryLsn": {
+                            "format": "int64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "currentConfiguration": {
+                            "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                            "properties": {
+                              "configurationId": {
+                                "type": "string"
+                              },
+                              "epoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "members": {
+                                "items": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationId",
+                              "epoch",
+                              "members",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
+                          "currentPolicy": {
+                            "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                            "properties": {
+                              "failoverDelaySeconds": {
+                                "format": "uint64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              },
+                              "readQuorum": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "replicaSetSize": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "failoverDelaySeconds",
+                              "readQuorum",
+                              "replicaSetSize",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
+                          "desiredReplicas": {
+                            "format": "uint32",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          },
+                          "operationId": {
+                            "type": "string"
+                          },
+                          "previousConfiguration": {
+                            "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                            "properties": {
+                              "configurationId": {
+                                "type": "string"
+                              },
+                              "epoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "members": {
+                                "items": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationId",
+                              "epoch",
+                              "members",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
+                          "previousPolicy": {
+                            "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                            "properties": {
+                              "failoverDelaySeconds": {
+                                "format": "uint64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              },
+                              "readQuorum": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "replicaSetSize": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "failoverDelaySeconds",
+                              "readQuorum",
+                              "replicaSetSize",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
+                          "primary": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          },
+                          "resourceUid": {
+                            "type": "string"
+                          },
+                          "snapshotBoundaryLsn": {
+                            "format": "int64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "specGeneration": {
+                            "format": "uint64",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          },
+                          "target": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "buildId",
+                          "catchUpBoundaryLsn",
+                          "currentConfiguration",
+                          "currentPolicy",
+                          "desiredReplicas",
+                          "operationId",
+                          "previousConfiguration",
+                          "previousPolicy",
+                          "primary",
+                          "resourceUid",
+                          "snapshotBoundaryLsn",
+                          "specGeneration",
+                          "target"
+                        ],
+                        "type": "object"
+                      },
+                      "scaleUpFailover": {
+                        "nullable": true,
+                        "properties": {
+                          "currentReadQuorum": {
+                            "items": {
+                              "properties": {
+                                "currentConfigurationId": {
+                                  "type": "string"
+                                },
+                                "epoch": {
+                                  "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                  "properties": {
+                                    "configurationNumber": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "dataLossNumber": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "configurationNumber",
+                                    "dataLossNumber"
+                                  ],
+                                  "type": "object"
+                                },
+                                "identity": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId"
+                                  ],
+                                  "type": "object"
+                                },
+                                "pendingOperationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "previousConfigurationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "processSessionId": {
+                                  "type": "string"
+                                },
+                                "reportSequence": {
+                                  "format": "uint64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "resourceUid": {
+                                  "type": "string"
+                                },
+                                "retainedOperationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "role": {
+                                  "description": "Runtime role of one exact replica incarnation.",
+                                  "enum": [
+                                    "primary",
+                                    "activeSecondary",
+                                    "idleSecondary",
+                                    "none"
+                                  ],
+                                  "type": "string"
+                                },
+                                "verifiedReplicationLsn": {
+                                  "format": "int64",
+                                  "minimum": 0.0,
+                                  "type": "integer"
+                                },
+                                "writeStatus": {
+                                  "description": "Current write-access decision exposed by the replica runtime.",
+                                  "enum": [
+                                    "granted",
+                                    "reconfigurationPending",
+                                    "notPrimary",
+                                    "noWriteQuorum"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "currentConfigurationId",
+                                "epoch",
+                                "identity",
+                                "processSessionId",
+                                "reportSequence",
+                                "resourceUid",
+                                "role",
+                                "verifiedReplicationLsn",
+                                "writeStatus"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "finalElection": {
+                            "nullable": true,
+                            "properties": {
+                              "currentReadQuorum": {
+                                "items": {
+                                  "format": "int64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "type": "array"
+                              },
+                              "previousReadQuorum": {
+                                "items": {
+                                  "format": "int64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "type": "array"
+                              },
+                              "selectedPrimaryReplicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "witnesses": {
+                                "items": {
+                                  "properties": {
+                                    "committedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "currentProgress": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivatedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "fenceOperationId": {
+                                      "type": "string"
+                                    },
+                                    "processSessionId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "reportSequence": {
+                                      "format": "uint64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "committedLsn",
+                                    "currentProgress",
+                                    "deactivatedLsn",
+                                    "fenceOperationId",
+                                    "processSessionId",
+                                    "replicaId",
+                                    "reportSequence"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "currentReadQuorum",
+                              "previousReadQuorum",
+                              "selectedPrimaryReplicaId",
+                              "witnesses"
+                            ],
+                            "type": "object"
+                          },
+                          "intent": {
+                            "description": "Immutable authority for one exact membership increase.",
+                            "properties": {
+                              "buildId": {
+                                "type": "string"
+                              },
+                              "catchUpBoundaryLsn": {
+                                "format": "int64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              },
+                              "currentConfiguration": {
+                                "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                "properties": {
+                                  "configurationId": {
+                                    "type": "string"
+                                  },
+                                  "epoch": {
+                                    "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                    "properties": {
+                                      "configurationNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      },
+                                      "dataLossNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "configurationNumber",
+                                      "dataLossNumber"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "members": {
+                                    "items": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        },
+                                        "role": {
+                                          "description": "Runtime role of one exact replica incarnation.",
+                                          "enum": [
+                                            "primary",
+                                            "activeSecondary",
+                                            "idleSecondary",
+                                            "none"
+                                          ],
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId",
+                                        "role"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "writeQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationId",
+                                  "epoch",
+                                  "members",
+                                  "writeQuorum"
+                                ],
+                                "type": "object"
+                              },
+                              "currentPolicy": {
+                                "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                                "properties": {
+                                  "failoverDelaySeconds": {
+                                    "format": "uint64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "readQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "replicaSetSize": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "writeQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "failoverDelaySeconds",
+                                  "readQuorum",
+                                  "replicaSetSize",
+                                  "writeQuorum"
+                                ],
+                                "type": "object"
+                              },
+                              "desiredReplicas": {
+                                "format": "uint32",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "operationId": {
+                                "type": "string"
+                              },
+                              "previousConfiguration": {
+                                "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                "properties": {
+                                  "configurationId": {
+                                    "type": "string"
+                                  },
+                                  "epoch": {
+                                    "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                    "properties": {
+                                      "configurationNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      },
+                                      "dataLossNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "configurationNumber",
+                                      "dataLossNumber"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "members": {
+                                    "items": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        },
+                                        "role": {
+                                          "description": "Runtime role of one exact replica incarnation.",
+                                          "enum": [
+                                            "primary",
+                                            "activeSecondary",
+                                            "idleSecondary",
+                                            "none"
+                                          ],
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId",
+                                        "role"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "writeQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationId",
+                                  "epoch",
+                                  "members",
+                                  "writeQuorum"
+                                ],
+                                "type": "object"
+                              },
+                              "previousPolicy": {
+                                "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                                "properties": {
+                                  "failoverDelaySeconds": {
+                                    "format": "uint64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "readQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "replicaSetSize": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  },
+                                  "writeQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "failoverDelaySeconds",
+                                  "readQuorum",
+                                  "replicaSetSize",
+                                  "writeQuorum"
+                                ],
+                                "type": "object"
+                              },
+                              "primary": {
+                                "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                "properties": {
+                                  "agentGeneration": {
+                                    "type": "string"
+                                  },
+                                  "instanceId": {
+                                    "type": "string"
+                                  },
+                                  "replicaId": {
+                                    "format": "int64",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "agentGeneration",
+                                  "instanceId",
+                                  "replicaId"
+                                ],
+                                "type": "object"
+                              },
+                              "resourceUid": {
+                                "type": "string"
+                              },
+                              "snapshotBoundaryLsn": {
+                                "format": "int64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              },
+                              "specGeneration": {
+                                "format": "uint64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "target": {
+                                "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                "properties": {
+                                  "agentGeneration": {
+                                    "type": "string"
+                                  },
+                                  "instanceId": {
+                                    "type": "string"
+                                  },
+                                  "replicaId": {
+                                    "format": "int64",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "agentGeneration",
+                                  "instanceId",
+                                  "replicaId"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "buildId",
+                              "catchUpBoundaryLsn",
+                              "currentConfiguration",
+                              "currentPolicy",
+                              "desiredReplicas",
+                              "operationId",
+                              "previousConfiguration",
+                              "previousPolicy",
+                              "primary",
+                              "resourceUid",
+                              "snapshotBoundaryLsn",
+                              "specGeneration",
+                              "target"
+                            ],
+                            "type": "object"
+                          },
+                          "previousReadQuorum": {
+                            "items": {
+                              "properties": {
+                                "currentConfigurationId": {
+                                  "type": "string"
+                                },
+                                "epoch": {
+                                  "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                  "properties": {
+                                    "configurationNumber": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "dataLossNumber": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "configurationNumber",
+                                    "dataLossNumber"
+                                  ],
+                                  "type": "object"
+                                },
+                                "identity": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId"
+                                  ],
+                                  "type": "object"
+                                },
+                                "pendingOperationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "previousConfigurationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "processSessionId": {
+                                  "type": "string"
+                                },
+                                "reportSequence": {
+                                  "format": "uint64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "resourceUid": {
+                                  "type": "string"
+                                },
+                                "retainedOperationId": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "role": {
+                                  "description": "Runtime role of one exact replica incarnation.",
+                                  "enum": [
+                                    "primary",
+                                    "activeSecondary",
+                                    "idleSecondary",
+                                    "none"
+                                  ],
+                                  "type": "string"
+                                },
+                                "verifiedReplicationLsn": {
+                                  "format": "int64",
+                                  "minimum": 0.0,
+                                  "type": "integer"
+                                },
+                                "writeStatus": {
+                                  "description": "Current write-access decision exposed by the replica runtime.",
+                                  "enum": [
+                                    "granted",
+                                    "reconfigurationPending",
+                                    "notPrimary",
+                                    "noWriteQuorum"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "currentConfigurationId",
+                                "epoch",
+                                "identity",
+                                "processSessionId",
+                                "reportSequence",
+                                "resourceUid",
+                                "role",
+                                "verifiedReplicationLsn",
+                                "writeStatus"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "provisionalConfiguration": {
+                            "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                            "properties": {
+                              "configurationId": {
+                                "type": "string"
+                              },
+                              "epoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "members": {
+                                "items": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationId",
+                              "epoch",
+                              "members",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "currentReadQuorum",
+                          "intent",
+                          "previousReadQuorum",
+                          "provisionalConfiguration"
                         ],
                         "type": "object"
                       },
@@ -3261,10 +5843,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -3286,6 +5870,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -3333,17 +5918,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -3374,10 +5959,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -3399,6 +5986,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -3446,17 +6034,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -3479,6 +6067,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -3508,6 +6097,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -3566,10 +6156,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -3590,6 +6182,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -3676,10 +6269,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -3700,6 +6295,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -3947,10 +6543,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -3972,6 +6570,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -4019,17 +6618,17 @@
                               },
                               "readQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "replicaSetSize": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "writeQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4060,10 +6659,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4085,6 +6686,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -4132,17 +6734,17 @@
                               },
                               "readQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "replicaSetSize": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "writeQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4165,6 +6767,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4194,6 +6797,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4257,6 +6861,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4275,10 +6880,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4299,6 +6906,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4341,10 +6949,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4366,6 +6976,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -4423,6 +7034,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4444,6 +7056,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },

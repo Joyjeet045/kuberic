@@ -12,7 +12,7 @@ use kuberic_runtime::{Result, RuntimeError};
 use tokio::sync::RwLock;
 
 use crate::persistence::KvPersistence;
-use crate::state::KvStateProvider;
+use crate::state::{CopyGate, KvStateProvider};
 
 pub struct KvService {
     provider: Arc<KvStateProvider>,
@@ -23,9 +23,13 @@ pub struct KvService {
 }
 
 impl KvService {
-    pub fn new(persistence: Arc<KvPersistence>, replication_address: String) -> Self {
+    pub fn new(
+        persistence: Arc<KvPersistence>,
+        replication_address: String,
+        copy_gate: CopyGate,
+    ) -> Self {
         Self {
-            provider: Arc::new(KvStateProvider::new(persistence)),
+            provider: Arc::new(KvStateProvider::new(persistence, copy_gate)),
             replication_address,
             state_replicator: RwLock::new(None),
             partition: RwLock::new(None),

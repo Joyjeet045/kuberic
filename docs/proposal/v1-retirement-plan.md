@@ -1,8 +1,8 @@
 # Kuberic v1 Retirement Plan
 
 > **Status:** In progress — Workstream 1 implemented and validated; Workstream 2
-> partially complete (secondary scale-down implemented and validated). Scale-up,
-> primary-removal behavior, and broader retirement remain outstanding.
+> has implemented and validated sequential scale-up and secondary scale-down.
+> Primary-removal behavior and broader retirement remain outstanding.
 >
 > **Goal:** Make the level-triggered stack the default Kuberic implementation,
 > deprecate the classic v1 stack, and eventually remove it.
@@ -26,8 +26,8 @@ available or destructive recovery path.
 The work should proceed in this order:
 
 1. Add planned switchover to v2 — implemented and validated.
-2. Add scale-up and scale-down to v2 — secondary scale-down complete; scale-up
-   and primary-removal behavior remain.
+2. Add scale-up and scale-down to v2 — sequential scale-up and secondary
+   scale-down complete; primary-removal behavior remains.
 3. Add a v2 SQLite application.
 4. Move the PostgreSQL application to v2.
 5. Publish and make v2 deployment assets the default.
@@ -82,6 +82,9 @@ The level-triggered stack already supports:
   newer-epoch compensation, and terminal write-closed Unsafe outcomes;
 - deterministic secondary-only scale-down to a target/minimum as low as one,
   sequential reductions, and exact post-commit Pod/PVC/endpoint cleanup;
+- sequential one-at-a-time scale-up with fresh ordinal restoration,
+  PVC-before-Pod allocation provenance, copy plus catch-up closure, PC/CC
+  admission, exact pre-admission cleanup, and failover recovery;
 - retained-history repair and full-copy fallback;
 - explicit quorum-loss write blocking and non-destructive recovery;
 - restart recovery for the controller, replica agent, runtime, and
@@ -89,14 +92,15 @@ The level-triggered stack already supports:
 - bounded level-triggered reconciliation and stale-command fencing;
 - the `kvstore2` conformance application;
 - isolated KinD bootstrap, replacement, failover, quorum-loss, healthy
-  switchover, secondary scale-down, and adversarial restart/target-loss scenarios.
+  switchover, secondary scale-down, sequential scale-up, and adversarial
+  restart/target-loss scenarios.
 
 The principal retirement gaps are:
 
 | Area | Classic v1 | Level-triggered v2 | Retirement disposition |
 |---|---|---|---|
 | Planned switchover | Supported | Explicit named-target request supported and validated | Workstream 1 complete |
-| Scale up/down | Supported | Secondary-only scale-down implemented/validated; no scale-up or primary removal | Workstream 2 partially complete |
+| Scale up/down | Supported | Sequential scale-up and secondary-only scale-down implemented/validated; no primary removal | Workstream 2 partially complete |
 | KVStore | Supported | `kvstore2` supported | Make v2 the default |
 | SQLite | Supported | Not ported | Add a v2 application |
 | PostgreSQL | Depends on `kuberic-core` and `kuberic-operator` | Not ported | Move to v2 before deprecation |
@@ -118,7 +122,7 @@ describes the as-built request and operational contract.
   acceptance freezes exact source/target identities, membership, and policy.
   An active request cannot be cancelled or retargeted. Identical active or
   latest-receipted requests are idempotent; status retains only the latest receipt.
-- Exact protocol 6 retains the process-session dispatch fences introduced in
+- Exact protocol 7 retains the process-session dispatch fences introduced in
   version 4 and the generation-bound preparation/retirement added in version 5.
   Preparations bind the accepted spec generation with durable
   retirement high-water marks. Durable preparation closes source writes and records a handoff
@@ -153,10 +157,64 @@ unsupported or deferred.
 
 ## Workstream 2: Scale Up and Scale Down
 
-**Partially complete.** The
+**Scale-up and secondary scale-down are implemented and validated; the
+workstream remains partially complete because primary removal is not
+implemented.** The
+[scale-up guide](../features/kuberic/level-triggered-operator.md#sequential-scale-up)
+and
 [secondary-scale-down guide](../features/kuberic/level-triggered-operator.md#secondary-scale-down)
-describes the implemented and validated subset. It extends existing PC/CC
-authority rather than adding an independent membership protocol.
+describe the as-built contracts. Both use typed PC/CC authority, but they are
+separate membership-increase and membership-decrease protocols rather than
+replacement or one generic scaling state machine.
+
+Sequential scale-up is enabled in the production v2 controller configuration;
+classic `kuberic.io/v1` remains unchanged. Its as-built behavior is:
+
+- Increasing `spec.replicas` from accepted size `N` adds exactly one missing
+  positive ordinal through `N+1`, fully settles it, and only then begins another
+  addition. Scaling down and back up restores the missing ordinal with fresh
+  PVC, Pod/incarnation, generation, session, endpoint, build, and operation
+  identities.
+- Allocation authority is persisted before resource creation. The controller
+  creates and freezes the annotated canonical PVC, revalidates it, and creates
+  the bound Pod afterward. Same-name resources without exact operation
+  provenance are neither adopted nor deleted.
+- The exact accepted primary supplies immutable snapshot enumeration and
+  continued replication. A distinct post-enumeration catch-up boundary is
+  frozen, and the candidate must durably apply the full snapshot plus every
+  contiguous operation through that boundary before admission.
+- The candidate remains outside accepted membership and supplies no quorum
+  credit before typed scale-up PC/CC authority. PC retains the previous policy;
+  expanded CC uses its independently validated majority policy. Healthy
+  same-primary writes may continue only while both configurations remain
+  writable and authorized.
+- Expanded current-only authority is irreversible. Candidate-local acceptance,
+  `ActiveSecondary` role, expanded write quorum including the primary, write
+  grant, routing, and late-member receipt convergence remain separate. Status
+  reports committed-degraded rather than rolling back an accepted member.
+- Desired reduction before PC/CC cancels and exactly cleans the unadmitted
+  candidate. After admission starts, scale-up completes before newer desired
+  state is evaluated. Pre-admission primary failure uses ordinary failover,
+  exact cleanup, and a fresh retry; post-PC/CC failure carries independent
+  previous/expanded recovery evidence.
+- Failed or cancelled unadmitted work is cleaned endpoint→Pod→PVC using frozen
+  UID/resource-version provenance and authoritative absence. Different-UID
+  resources survive, and partial PVCs are not resumed.
+
+Protocol 8 and agent schema 3 are exact coordinated-deployment boundaries.
+Protocol 7 and earlier, plus schema 2, are rejected with no migration,
+mixed-version mode, or rolling-upgrade contract. The generated CRD is currently 344,907 bytes under a
+strict-below-350,000-byte regression guard; the largest current representative
+18-member serialized scale-up status sample is carried failover at 26,353
+bytes. These are growth guards, not a supported maximum replica-count budget.
+
+Validation includes pure protocol/model traces, runtime and durable agent crash
+boundaries, controller allocation/cleanup races, healthy and multi-count KinD
+scale-up, writes held during live copy, cancellation/fresh retry,
+pre-admission failover, post-PC/CC carried failover, accepted replacement and
+ordinary failover composition, and scale-down→scale-up fresh restoration.
+These results cover the tested scenarios; they are not outage, latency,
+maximum-scale, or arbitrary-failure guarantees.
 
 This is SF-inspired secondary scale-down using PC/CC quorum principles, with
 Kuberic-specific target/minimum coupling, deterministic selection, write closure,
@@ -186,9 +244,10 @@ sequential cleanup, and Kubernetes resource deletion.
   prevents this, scale-down waits/fails closed rather than treating list omission
   as absence. Unavailable-target support requires frozen or reconstructable exact
   cleanup identity.
-- Schema-2 retirement-started/tombstone recovery prevents application Open
-  after retirement begins. Protocol 6/store schema 2 require fresh deployment,
-  without migration or mixed-version support.
+- Schema-3 retirement-started/tombstone recovery prevents application Open
+  after retirement begins and additionally persists scale-up build/admission
+  authority. Protocol 8/store schema 3 require fresh deployment, without
+  migration or mixed-version support.
 - Active removal cannot be cancelled or retargeted. Cleanup serializes later
   removals and other authority work. Primary loss or missing evidence waits
   fail-closed, including indefinite outage if the frozen primary is lost during
@@ -204,24 +263,18 @@ in 18m16s/16m29s; the final post-fix matrix passed in 927.942s command wall time
 (959.565s full lifecycle), plus separate failover in 18.71s. The guide records
 per-scenario results. These measurements are not outage guarantees.
 
-**Outstanding scale-up** must:
-
-- provision a fresh exact Pod/PVC incarnation;
-- build it from copy plus replication-gap closure;
-- add it through an intersecting PC/CC transition;
-- update quorum policy only as part of accepted membership authority;
-- recover safely from target loss and abandoned build attempts.
-
 **Outstanding primary-removal behavior** must:
 
 - define selection and durable authority for removing a primary;
 - move primary authority first through an approved safe transition;
 - compose that movement with removal, recovery, and exact cleanup.
 
-The secondary-only feature does not implement those behaviors, explicit
-user-selected removal, or full scaling parity. It does not establish v1
-retirement readiness; application ports, distribution, deprecation, and the
-separately approved removal gates still apply.
+The implemented scaling subset does not provide primary removal, explicit
+user-selected removal, independent target/minimum policy, placement balancing,
+concurrent additions, a validated maximum replica count, or full scaling
+parity. It does not establish v1 retirement readiness; application ports,
+distribution, deprecation, and the separately approved removal gates still
+apply.
 
 Only one authority-changing membership command may be issued from one
 observation. Reconciliation must remain level-triggered and restart-safe.
@@ -231,7 +284,7 @@ observation. Reconciliation must remain level-triggered and restart-safe.
 These are explicitly **deferred**, not merge requirements or claims of existing
 SF parity. P1 is the first follow-up tier (availability/status boundaries), P2
 is maintainability or policy expansion, and P3 needs a new recovery protocol.
-Scale-up is separately prioritized by retirement Workstream 2.
+Scale-up completion does not promote these follow-ups into the current scope.
 
 | Priority | Follow-up | Why deferred / change class |
 |---|---|---|
@@ -242,7 +295,7 @@ Scale-up is separately prioritized by retirement Workstream 2.
 | P1 design / P3 implementation | Frozen-primary recovery during removal/cleanup; possible overlapping cleanup and failover | Current serialization can cause indefinite outage. Safe continuation needs a new cross-epoch recovery and cleanup-ownership protocol; do not loosen frozen evidence or silently enable overlap. |
 | P3 | Multi-member removal in one reconfiguration | Current reductions are sequential and require cleanup plus receipt/local-acceptance prerequisites between steps. Batch removal changes quorum, identity, evidence and cleanup semantics, not just the loop. |
 | P3 | Move RA-style distributed phase scheduling from evaluator to a durable primary-agent coordinator | Explicitly defer: per-member ordering, witness freezing, PC/CC progression and restart replay require a durable cross-replica coordination protocol. Keep desired-count/target policy in the evaluator/controller, not the agent/runtime; keep local journals out of CR status and Kubernetes cleanup authority out of the replicator. |
-| Separate Workstream 2 | Scale-up | Remains absent. Requires placement, fresh build/copy, catch-up, ready-state admission, accepted-policy changes, and failed-build recovery as a separate protocol; replacement is not scaling parity. |
+| P2 | Scale-up operational budget and performance characterization | Existing linear serialized-status guards and bounded live scenarios do not define a supported maximum replica count, completion SLO, throughput target, or outage bound. Establish those only with explicit Kubernetes object-size, controller, copy, quorum, and application measurements. |
 
 Compaction must preserve typed structural schemas, exact contextual evidence and
 late-member recovery. Do **not** use opaque schemas, hash-only receipts, or TTL

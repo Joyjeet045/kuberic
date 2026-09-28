@@ -19,7 +19,7 @@ use kuberic_protocol::command::{
 };
 use kuberic_protocol::observation::ReplicaObservationKey;
 use kuberic_protocol::types::{
-    AcceptedStatus, EffectivePolicy, PodUid, ProvisioningIntent, PvcUid, ReplicaId,
+    AcceptedStatus, EffectivePolicy, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
     derive_agent_generation, derive_initialization_id, derive_replacement_resource_name,
     derive_replica_endpoint_name,
@@ -30,7 +30,7 @@ use tonic::Code;
 
 use crate::crd::{
     CONTROL_ADDRESS_ANNOTATION, CONTROLLER_NAME, INSTANCE_LABEL, KubericSet, KubericSetStatus,
-    REPLICA_ID_LABEL, SET_UID_LABEL,
+    REPLICA_ID_LABEL, SCALE_UP_ALLOCATION_ANNOTATION, SET_UID_LABEL,
 };
 use crate::observation::{
     ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
@@ -39,6 +39,8 @@ use crate::{ControllerError, Result};
 
 const CONTROL_PORT: i32 = 50051;
 const REPLICATION_PORT: i32 = 50052;
+const LIVE_TEST_COPY_GATE_ANNOTATION: &str = "testing.kuberic.io/live-copy-gate";
+const LIVE_TEST_COPY_GATE_ADDRESS: &str = "0.0.0.0:18080";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectRecord {
@@ -326,10 +328,7 @@ where
     }
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation> {
         let sets: Api<KubericSet> = Api::namespaced(self.client.clone(), namespace);
-        let set = sets
-            .get(name)
-            .await
-            .map_err(|error| ControllerError::Observation(error.to_string()))?;
+        let set = sets.get(name).await.map_err(map_kube_observation_error)?;
         let uid = set
             .uid()
             .ok_or_else(|| ControllerError::Observation("KubericSet has no UID".to_string()))?;
@@ -432,6 +431,8 @@ where
         ensure_peer_service(self.client.clone(), observation, &namespace, &uid, &owner).await?;
         let image = effective_replica_image(observation)?;
         for replica_id in replica_ids {
+            let allocation_operation_id =
+                scale_up_allocation_operation_id(&observation.set, *replica_id);
             let configured_identity = observation
                 .set
                 .status
@@ -500,17 +501,50 @@ where
                 create_exact(
                     &pvcs,
                     &pvc_name,
-                    &replica_pvc(&observation.set, *replica_id, &uid, &owner),
+                    &replica_pvc(
+                        &observation.set,
+                        *replica_id,
+                        &uid,
+                        &owner,
+                        allocation_operation_id,
+                    ),
                 )
                 .await?;
                 continue;
             };
             let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
+            if let Some(operation_id) = allocation_operation_id
+                && (!pvc_matches_allocation(pvc, operation_id)
+                    || observation
+                        .set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                        .and_then(|allocation| allocation.pvc_uid.as_ref())
+                        .is_some_and(|frozen| frozen.as_str() != pvc_uid))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
             if !observation
                 .pods
                 .iter()
                 .any(|pod| pod.name_any() == pod_name)
             {
+                let pvc = authoritative_pvc_for_pod_create(
+                    &pvcs,
+                    pvc,
+                    &observation.set,
+                    *replica_id,
+                    allocation_operation_id,
+                    observation
+                        .set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                        .and_then(|allocation| allocation.pvc_uid.as_ref()),
+                )
+                .await?;
+                let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
                 create_exact(
                     &pods,
                     &pod_name,
@@ -522,6 +556,7 @@ where
                         &pvc_name,
                         &pvc_uid,
                         &image,
+                        allocation_operation_id,
                     ),
                 )
                 .await?;
@@ -532,6 +567,22 @@ where
                 .iter()
                 .find(|pod| pod.name_any() == pod_name)
                 .expect("observed existing replica Pod");
+            if let Some(operation_id) = allocation_operation_id
+                && (!pod_matches_allocation(pod, operation_id)
+                    || !crate::exact_resources::pod_matches_scale_up_allocation_metadata(
+                        &observation.set,
+                        pod,
+                        *replica_id,
+                        observation
+                            .set
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                            .and_then(|allocation| allocation.pvc_uid.as_ref()),
+                    ))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
             ensure_exact_peer_endpoint(
                 self.client.clone(),
                 observation,
@@ -600,6 +651,7 @@ where
                     &pvc_name,
                     &pvc_uid,
                     &image,
+                    None,
                 ),
             )
             .await?;
@@ -690,7 +742,11 @@ where
         pod_name: &str,
         pod_uid: &PodUid,
     ) -> Result<()> {
-        if crate::exact_resources::protected(observation, Some(pod_name), Some(pod_uid.as_str())) {
+        if crate::exact_resources::protected_from_exact_pod_fence(
+            observation,
+            Some(pod_name),
+            Some(pod_uid.as_str()),
+        ) {
             return Err(ControllerError::ObservationStale);
         }
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
@@ -1033,14 +1089,22 @@ fn replica_pvc(
     replica_id: ReplicaId,
     uid: &str,
     owner: &OwnerReference,
+    allocation_operation_id: Option<&OperationId>,
 ) -> PersistentVolumeClaim {
-    replica_pvc_named(
+    let mut pvc = replica_pvc_named(
         set,
         replica_id,
         uid,
         owner,
         &format!("{}-data", replica_name(set, replica_id)),
-    )
+    );
+    if let Some(operation_id) = allocation_operation_id {
+        pvc.metadata.annotations = Some(BTreeMap::from([(
+            SCALE_UP_ALLOCATION_ANNOTATION.to_string(),
+            operation_id.to_string(),
+        )]));
+    }
+    pvc
 }
 
 fn replica_pvc_named(
@@ -1072,6 +1136,87 @@ fn replica_pvc_named(
     }
 }
 
+fn scale_up_allocation_operation_id(
+    set: &KubericSet,
+    replica_id: ReplicaId,
+) -> Option<&OperationId> {
+    set.status
+        .as_ref()?
+        .authority
+        .scale_up_allocation
+        .as_ref()
+        .filter(|allocation| {
+            allocation.target_replica_id == replica_id
+                && allocation.scaffolding_requested
+                && !allocation.cancellation_started
+        })
+        .map(|allocation| &allocation.operation_id)
+}
+
+fn pvc_matches_allocation(pvc: &PersistentVolumeClaim, operation_id: &OperationId) -> bool {
+    pvc.annotations()
+        .get(SCALE_UP_ALLOCATION_ANNOTATION)
+        .map(String::as_str)
+        == Some(operation_id.as_str())
+}
+
+fn pod_matches_allocation(pod: &Pod, operation_id: &OperationId) -> bool {
+    pod.annotations()
+        .get(SCALE_UP_ALLOCATION_ANNOTATION)
+        .map(String::as_str)
+        == Some(operation_id.as_str())
+}
+
+async fn authoritative_pvc_for_pod_create(
+    pvcs: &Api<PersistentVolumeClaim>,
+    observed: &PersistentVolumeClaim,
+    set: &KubericSet,
+    replica_id: ReplicaId,
+    allocation_operation_id: Option<&OperationId>,
+    frozen_pvc_uid: Option<&PvcUid>,
+) -> Result<PersistentVolumeClaim> {
+    let expected_name = format!("{}-{}-data", set.name_any(), replica_id.value());
+    let set_uid = set.uid().ok_or(ControllerError::ObservationStale)?;
+    let owner = owner_reference(set)?;
+    let live = pvcs.get(&expected_name).await.map_err(|error| {
+        tracing::warn!(
+            %error,
+            pvc = %expected_name,
+            "authoritative PVC revalidation failed before Pod creation"
+        );
+        ControllerError::ObservationStale
+    })?;
+    let live_uid = live.uid().ok_or(ControllerError::ObservationStale)?;
+    let expected_uid = observed.uid().ok_or(ControllerError::ObservationStale)?;
+    let live_resource_version = live
+        .resource_version()
+        .ok_or(ControllerError::ObservationStale)?;
+    let expected_resource_version = observed
+        .resource_version()
+        .ok_or(ControllerError::ObservationStale)?;
+    let expected_replica_id = replica_id.to_string();
+    let owned = live
+        .owner_references()
+        .iter()
+        .any(|candidate| candidate == &owner);
+    let provenance_matches = allocation_operation_id
+        .is_none_or(|operation_id| pvc_matches_allocation(&live, operation_id));
+    if live.name_any() != expected_name
+        || live_uid != expected_uid
+        || live_resource_version != expected_resource_version
+        || frozen_pvc_uid.is_some_and(|frozen| frozen.as_str() != live_uid)
+        || live.labels().get(SET_UID_LABEL).map(String::as_str) != Some(set_uid.as_str())
+        || live.labels().get(REPLICA_ID_LABEL).map(String::as_str)
+            != Some(expected_replica_id.as_str())
+        || !owned
+        || !provenance_matches
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    Ok(live)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn replica_pod(
     set: &KubericSet,
     replica_id: ReplicaId,
@@ -1080,6 +1225,7 @@ fn replica_pod(
     pvc_name: &str,
     pvc_uid: &str,
     image: &str,
+    allocation_operation_id: Option<&OperationId>,
 ) -> Pod {
     replica_pod_named(
         set,
@@ -1090,6 +1236,7 @@ fn replica_pod(
         pvc_name,
         pvc_uid,
         image,
+        allocation_operation_id,
     )
 }
 
@@ -1103,13 +1250,104 @@ fn replica_pod_named(
     pvc_name: &str,
     pvc_uid: &str,
     image: &str,
+    allocation_operation_id: Option<&OperationId>,
 ) -> Pod {
     let labels = base_labels(set, Some(replica_id), uid);
+    let annotations = allocation_operation_id.map(|operation_id| {
+        BTreeMap::from([(
+            SCALE_UP_ALLOCATION_ANNOTATION.to_string(),
+            operation_id.to_string(),
+        )])
+    });
     let credential_name = agent_credential_name(set);
+    let mut env = vec![
+        EnvVar {
+            name: "KUBERIC_RESOURCE_UID".to_string(),
+            value: Some(uid.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_REPLICA_ID".to_string(),
+            value: Some(replica_id.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_PVC_UID".to_string(),
+            value: Some(pvc_uid.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_SET_NAME".to_string(),
+            value: Some(set.name_any()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_NAMESPACE".to_string(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    api_version: Some("v1".to_string()),
+                    field_path: "metadata.namespace".to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_POD_UID".to_string(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    api_version: Some("v1".to_string()),
+                    field_path: "metadata.uid".to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_POD_IP".to_string(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    api_version: Some("v1".to_string()),
+                    field_path: "status.podIP".to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_AGENT_BEARER_TOKEN".to_string(),
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    key: "bearer-token".to_string(),
+                    name: credential_name,
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_DATA_ROOT".to_string(),
+            value: Some("/var/lib/kuberic".to_string()),
+            ..Default::default()
+        },
+    ];
+    if set
+        .annotations()
+        .get(LIVE_TEST_COPY_GATE_ANNOTATION)
+        .is_some_and(|value| value == "enabled")
+    {
+        env.push(EnvVar {
+            name: "KUBERIC_LIVE_TEST_COPY_GATE_ADDRESS".to_string(),
+            value: Some(LIVE_TEST_COPY_GATE_ADDRESS.to_string()),
+            ..Default::default()
+        });
+    }
     Pod {
         metadata: kube::core::ObjectMeta {
             name: Some(pod_name.to_string()),
             labels: Some(labels),
+            annotations,
             owner_references: Some(vec![owner.clone()]),
             ..Default::default()
         },
@@ -1143,78 +1381,7 @@ fn replica_pod_named(
                         ..Default::default()
                     },
                 ]),
-                env: Some(vec![
-                    EnvVar {
-                        name: "KUBERIC_RESOURCE_UID".to_string(),
-                        value: Some(uid.to_string()),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_REPLICA_ID".to_string(),
-                        value: Some(replica_id.to_string()),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_PVC_UID".to_string(),
-                        value: Some(pvc_uid.to_string()),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_SET_NAME".to_string(),
-                        value: Some(set.name_any()),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_NAMESPACE".to_string(),
-                        value_from: Some(EnvVarSource {
-                            field_ref: Some(ObjectFieldSelector {
-                                api_version: Some("v1".to_string()),
-                                field_path: "metadata.namespace".to_string(),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_POD_UID".to_string(),
-                        value_from: Some(EnvVarSource {
-                            field_ref: Some(ObjectFieldSelector {
-                                api_version: Some("v1".to_string()),
-                                field_path: "metadata.uid".to_string(),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_POD_IP".to_string(),
-                        value_from: Some(EnvVarSource {
-                            field_ref: Some(ObjectFieldSelector {
-                                api_version: Some("v1".to_string()),
-                                field_path: "status.podIP".to_string(),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_AGENT_BEARER_TOKEN".to_string(),
-                        value_from: Some(EnvVarSource {
-                            secret_key_ref: Some(SecretKeySelector {
-                                key: "bearer-token".to_string(),
-                                name: credential_name,
-                                optional: Some(false),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_DATA_ROOT".to_string(),
-                        value: Some("/var/lib/kuberic".to_string()),
-                        ..Default::default()
-                    },
-                ]),
+                env: Some(env),
                 volume_mounts: Some(vec![VolumeMount {
                     mount_path: "/var/lib/kuberic".to_string(),
                     name: "data".to_string(),
@@ -1657,6 +1824,19 @@ fn map_kube_effect_error(error: kube::Error) -> ControllerError {
     }
 }
 
+fn map_kube_observation_error(error: kube::Error) -> ControllerError {
+    let transient = match &error {
+        kube::Error::Api(response) => response.code == 429 || response.code >= 500,
+        kube::Error::HyperError(_) | kube::Error::Service(_) | kube::Error::ReadEvents(_) => true,
+        _ => false,
+    };
+    if transient {
+        ControllerError::TransientObservation(error.to_string())
+    } else {
+        ControllerError::Observation(error.to_string())
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn exact_pod_precondition_failures_require_reobservation() {
@@ -1671,6 +1851,41 @@ fn exact_pod_precondition_failures_require_reobservation() {
             map_kube_effect_error(error),
             ControllerError::ObservationStale
         ));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn observation_http_errors_preserve_permanent_and_transient_classification() {
+    for code in [400, 401, 403, 404, 422] {
+        let error = kube::Error::Api(Box::new(kube::core::Status {
+            message: "permanent observation failure".into(),
+            reason: "Permanent".into(),
+            code,
+            ..Default::default()
+        }));
+        assert!(
+            matches!(
+                map_kube_observation_error(error),
+                ControllerError::Observation(_)
+            ),
+            "HTTP {code} must fail immediately"
+        );
+    }
+    for code in [429, 500, 502, 503, 504] {
+        let error = kube::Error::Api(Box::new(kube::core::Status {
+            message: "transient observation failure".into(),
+            reason: "Transient".into(),
+            code,
+            ..Default::default()
+        }));
+        assert!(
+            matches!(
+                map_kube_observation_error(error),
+                ControllerError::TransientObservation(_)
+            ),
+            "HTTP {code} must remain retryable"
+        );
     }
 }
 
@@ -1799,6 +2014,7 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
     proto::EnsureConfigurationCommand {
         previous_policy: command.previous_policy.map(Into::into),
         secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
+        scale_up_evidence: command.scale_up_evidence.map(|evidence| (*evidence).into()),
         operation_id: command.operation_id.to_string(),
         previous_configuration: command.previous_configuration.map(Into::into),
         current_configuration: Some(command.current_configuration.into()),
@@ -1867,12 +2083,29 @@ fn ensure_build_command(command: EnsureReplicaBuild) -> proto::EnsureReplicaBuil
         source_session_id: command
             .source_session_id
             .map_or_else(String::new, |session| session.to_string()),
+        retire: command.retire,
     }
 }
 
 fn provisioning(provisioning: ProvisioningIntent) -> proto::ProvisioningIntent {
+    use proto::provisioning_intent::Purpose;
     proto::ProvisioningIntent {
-        replaces: Some(provisioning.replaces.into()),
+        purpose: Some(match provisioning.purpose.kind {
+            kuberic_protocol::types::ProvisioningKind::Replacement => Purpose::Replaces(
+                provisioning
+                    .purpose
+                    .replaces
+                    .expect("validated replacement provisioning")
+                    .into(),
+            ),
+            kuberic_protocol::types::ProvisioningKind::ScaleUp => Purpose::ScaleUp(
+                provisioning
+                    .purpose
+                    .scale_up
+                    .expect("validated scale-up provisioning")
+                    .into(),
+            ),
+        }),
         pod_uid: provisioning.pod_uid.to_string(),
         pvc_uid: provisioning.pvc_uid.to_string(),
         operation_id: provisioning.operation_id.to_string(),
@@ -1895,6 +2128,7 @@ fn transition_kind(kind: TransitionKind) -> proto::TransitionKind {
         TransitionKind::Failover => proto::TransitionKind::Failover,
         TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
         TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
+        TransitionKind::ScaleUp => proto::TransitionKind::ScaleUp,
     }
 }
 
@@ -1912,8 +2146,10 @@ struct InMemoryState {
     max_active_observations: usize,
     observation_delay: Duration,
     unavailable_next_execute: bool,
+    lost_next_create_reply: bool,
     lost_next_delete_reply: bool,
     exact_lookup_failures: BTreeMap<String, String>,
+    next_resource_uid: u64,
 }
 
 impl InMemoryClusterApi {
@@ -1928,8 +2164,10 @@ impl InMemoryClusterApi {
                 max_active_observations: 0,
                 observation_delay: Duration::ZERO,
                 unavailable_next_execute: false,
+                lost_next_create_reply: false,
                 lost_next_delete_reply: false,
                 exact_lookup_failures: BTreeMap::new(),
+                next_resource_uid: 1,
             })),
         }
     }
@@ -1948,6 +2186,10 @@ impl InMemoryClusterApi {
 
     pub async fn unavailable_next_execute(&self) {
         self.state.lock().await.unavailable_next_execute = true;
+    }
+
+    pub async fn lose_next_create_reply(&self) {
+        self.state.lock().await.lost_next_create_reply = true;
     }
 
     pub async fn lose_next_delete_reply(&self) {
@@ -2073,12 +2315,204 @@ impl ClusterApi for InMemoryClusterApi {
 
     async fn ensure_replica_scaffolding(
         &self,
-        _observation: &RawObservation,
+        observation: &RawObservation,
         replica_ids: &[ReplicaId],
     ) -> Result<()> {
-        self.state
-            .lock()
-            .await
+        let uid = observation
+            .set
+            .uid()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let owner = owner_reference(&observation.set)?;
+        let image = effective_replica_image(observation)?;
+        let mut state = self.state.lock().await;
+        if state.observation.set.resource_version() != observation.set.resource_version() {
+            return Err(ControllerError::ObservationStale);
+        }
+        for replica_id in replica_ids {
+            let allocation_operation_id =
+                scale_up_allocation_operation_id(&observation.set, *replica_id);
+            let pod_name = replica_name(&observation.set, *replica_id);
+            let pvc_name = format!("{pod_name}-data");
+            let Some(pvc) = state
+                .observation
+                .pvcs
+                .iter()
+                .find(|pvc| pvc.name_any() == pvc_name)
+                .cloned()
+            else {
+                let resource_number = state.next_resource_uid;
+                state.next_resource_uid += 1;
+                let mut pvc = replica_pvc(
+                    &observation.set,
+                    *replica_id,
+                    &uid,
+                    &owner,
+                    allocation_operation_id,
+                );
+                pvc.metadata.namespace = observation.set.namespace();
+                pvc.metadata.uid = Some(format!(
+                    "in-memory-pvc-{}-{resource_number}",
+                    replica_id.value()
+                ));
+                pvc.metadata.resource_version = Some(resource_number.to_string());
+                state.observation.pvcs.push(pvc);
+                state
+                    .effects
+                    .push(EffectRecord::EnsureScaffolding(replica_ids.to_vec()));
+                if state.lost_next_create_reply {
+                    state.lost_next_create_reply = false;
+                    return Err(ControllerError::ObservationStale);
+                }
+                return Ok(());
+            };
+            let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
+            if let Some(operation_id) = allocation_operation_id
+                && (!pvc_matches_allocation(&pvc, operation_id)
+                    || observation
+                        .set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                        .and_then(|allocation| allocation.pvc_uid.as_ref())
+                        .is_some_and(|frozen| frozen.as_str() != pvc_uid))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
+            let Some(pod) = state
+                .observation
+                .pods
+                .iter()
+                .find(|pod| pod.name_any() == pod_name)
+                .cloned()
+            else {
+                let resource_number = state.next_resource_uid;
+                state.next_resource_uid += 1;
+                let mut pod = replica_pod(
+                    &observation.set,
+                    *replica_id,
+                    &uid,
+                    &owner,
+                    &pvc_name,
+                    &pvc_uid,
+                    &image,
+                    allocation_operation_id,
+                );
+                pod.metadata.namespace = observation.set.namespace();
+                pod.metadata.uid = Some(format!(
+                    "in-memory-pod-{}-{resource_number}",
+                    replica_id.value()
+                ));
+                pod.metadata.resource_version = Some(resource_number.to_string());
+                pod.metadata.annotations.get_or_insert_default().insert(
+                    CONTROL_ADDRESS_ANNOTATION.to_string(),
+                    "http://127.0.0.1:50051".to_string(),
+                );
+                pod.status = Some(k8s_openapi::api::core::v1::PodStatus {
+                    pod_ip: Some("127.0.0.1".to_string()),
+                    conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                        type_: "Ready".to_string(),
+                        status: "True".to_string(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                });
+                state.observation.pods.push(pod);
+                state
+                    .effects
+                    .push(EffectRecord::EnsureScaffolding(replica_ids.to_vec()));
+                if state.lost_next_create_reply {
+                    state.lost_next_create_reply = false;
+                    return Err(ControllerError::ObservationStale);
+                }
+                return Ok(());
+            };
+            let pod_uid = pod.uid().ok_or(ControllerError::ObservationStale)?;
+            if let Some(operation_id) = allocation_operation_id
+                && (!pod_matches_allocation(&pod, operation_id)
+                    || !crate::exact_resources::pod_matches_scale_up_allocation_metadata(
+                        &observation.set,
+                        &pod,
+                        *replica_id,
+                        observation
+                            .set
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                            .and_then(|allocation| allocation.pvc_uid.as_ref()),
+                    ))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
+            if pod.labels().get(INSTANCE_LABEL).map(String::as_str) != Some(pod_uid.as_str()) {
+                state
+                    .observation
+                    .pods
+                    .iter_mut()
+                    .find(|candidate| candidate.name_any() == pod_name)
+                    .expect("observed Pod remains present")
+                    .metadata
+                    .labels
+                    .get_or_insert_default()
+                    .insert(INSTANCE_LABEL.to_string(), pod_uid.clone());
+                state
+                    .effects
+                    .push(EffectRecord::EnsureScaffolding(replica_ids.to_vec()));
+                return Ok(());
+            }
+            let initialization_id = derive_initialization_id(
+                &ResourceUid::new(&uid),
+                *replica_id,
+                &PodUid::new(&pod_uid),
+                &PvcUid::new(&pvc_uid),
+            );
+            let target = ReplicaIdentity {
+                replica_id: *replica_id,
+                instance_id: ReplicaInstanceId::new(&pod_uid),
+                agent_generation: derive_agent_generation(&initialization_id),
+            };
+            let endpoint_name = derive_replica_endpoint_name(&ResourceUid::new(&uid), &target);
+            if !state
+                .observation
+                .services
+                .iter()
+                .any(|service| service.name_any() == endpoint_name)
+            {
+                let resource_number = state.next_resource_uid;
+                state.next_resource_uid += 1;
+                state.observation.services.push(Service {
+                    metadata: kube::core::ObjectMeta {
+                        name: Some(endpoint_name),
+                        namespace: observation.set.namespace(),
+                        uid: Some(format!(
+                            "in-memory-endpoint-{}-{resource_number}",
+                            replica_id.value()
+                        )),
+                        resource_version: Some(resource_number.to_string()),
+                        labels: Some(base_labels(&observation.set, Some(*replica_id), &uid)),
+                        owner_references: Some(vec![owner.clone()]),
+                        ..Default::default()
+                    },
+                    spec: Some(ServiceSpec {
+                        selector: Some(BTreeMap::from([(INSTANCE_LABEL.to_string(), pod_uid)])),
+                        ports: Some(vec![
+                            ServicePort {
+                                name: Some("control".to_string()),
+                                port: CONTROL_PORT,
+                                ..Default::default()
+                            },
+                            ServicePort {
+                                name: Some("replication".to_string()),
+                                port: REPLICATION_PORT,
+                                ..Default::default()
+                            },
+                        ]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            }
+        }
+        state
             .effects
             .push(EffectRecord::EnsureScaffolding(replica_ids.to_vec()));
         Ok(())
@@ -2150,13 +2584,162 @@ impl ClusterApi for InMemoryClusterApi {
 
     async fn ensure_replacement_scaffolding(
         &self,
-        _observation: &RawObservation,
-        _replica_id: ReplicaId,
+        observation: &RawObservation,
+        replica_id: ReplicaId,
         replacing: &ReplicaIdentity,
     ) -> Result<()> {
-        self.state
-            .lock()
-            .await
+        let uid = observation
+            .set
+            .uid()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let owner = owner_reference(&observation.set)?;
+        let image = effective_replica_image(observation)?;
+        let base = derive_replacement_resource_name(&ResourceUid::new(&uid), replacing);
+        let pod_name = format!("{}-{base}", observation.set.name_any());
+        let pvc_name = format!("{pod_name}-data");
+        let mut state = self.state.lock().await;
+        if state.observation.set.resource_version() != observation.set.resource_version() {
+            return Err(ControllerError::ObservationStale);
+        }
+        if !state
+            .observation
+            .pvcs
+            .iter()
+            .any(|pvc| pvc.name_any() == pvc_name)
+        {
+            let resource_number = state.next_resource_uid;
+            state.next_resource_uid += 1;
+            let mut pvc = replica_pvc_named(&observation.set, replica_id, &uid, &owner, &pvc_name);
+            pvc.metadata.namespace = observation.set.namespace();
+            pvc.metadata.uid = Some(format!(
+                "in-memory-replacement-pvc-{}-{resource_number}",
+                replica_id.value()
+            ));
+            pvc.metadata.resource_version = Some(resource_number.to_string());
+            state.observation.pvcs.push(pvc);
+            state
+                .effects
+                .push(EffectRecord::EnsureReplacement(replacing.clone()));
+            return Ok(());
+        }
+        let pvc = state
+            .observation
+            .pvcs
+            .iter()
+            .find(|pvc| pvc.name_any() == pvc_name)
+            .cloned()
+            .expect("replacement PVC remains present");
+        let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
+        if !state
+            .observation
+            .pods
+            .iter()
+            .any(|pod| pod.name_any() == pod_name)
+        {
+            let resource_number = state.next_resource_uid;
+            state.next_resource_uid += 1;
+            let mut pod = replica_pod_named(
+                &observation.set,
+                replica_id,
+                &uid,
+                &owner,
+                &pod_name,
+                &pvc_name,
+                &pvc_uid,
+                &image,
+                None,
+            );
+            let pod_uid = format!(
+                "in-memory-replacement-pod-{}-{resource_number}",
+                replica_id.value()
+            );
+            pod.metadata.namespace = observation.set.namespace();
+            pod.metadata.uid = Some(pod_uid.clone());
+            pod.metadata.resource_version = Some(resource_number.to_string());
+            pod.metadata
+                .labels
+                .get_or_insert_default()
+                .insert(INSTANCE_LABEL.to_string(), pod_uid);
+            pod.metadata.annotations.get_or_insert_default().insert(
+                CONTROL_ADDRESS_ANNOTATION.to_string(),
+                "http://127.0.0.1:50051".to_string(),
+            );
+            pod.status = Some(k8s_openapi::api::core::v1::PodStatus {
+                pod_ip: Some("127.0.0.1".to_string()),
+                conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                    type_: "Ready".to_string(),
+                    status: "True".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            state.observation.pods.push(pod);
+            state
+                .effects
+                .push(EffectRecord::EnsureReplacement(replacing.clone()));
+            return Ok(());
+        }
+        let pod = state
+            .observation
+            .pods
+            .iter()
+            .find(|pod| pod.name_any() == pod_name)
+            .cloned()
+            .expect("replacement Pod remains present");
+        let pod_uid = pod.uid().ok_or(ControllerError::ObservationStale)?;
+        let initialization_id = derive_initialization_id(
+            &ResourceUid::new(&uid),
+            replica_id,
+            &PodUid::new(&pod_uid),
+            &PvcUid::new(&pvc_uid),
+        );
+        let target = ReplicaIdentity {
+            replica_id,
+            instance_id: ReplicaInstanceId::new(&pod_uid),
+            agent_generation: derive_agent_generation(&initialization_id),
+        };
+        let endpoint_name = derive_replica_endpoint_name(&ResourceUid::new(&uid), &target);
+        if !state
+            .observation
+            .services
+            .iter()
+            .any(|service| service.name_any() == endpoint_name)
+        {
+            let resource_number = state.next_resource_uid;
+            state.next_resource_uid += 1;
+            state.observation.services.push(Service {
+                metadata: kube::core::ObjectMeta {
+                    name: Some(endpoint_name),
+                    namespace: observation.set.namespace(),
+                    uid: Some(format!(
+                        "in-memory-replacement-endpoint-{}-{resource_number}",
+                        replica_id.value()
+                    )),
+                    resource_version: Some(resource_number.to_string()),
+                    labels: Some(base_labels(&observation.set, Some(replica_id), &uid)),
+                    owner_references: Some(vec![owner]),
+                    ..Default::default()
+                },
+                spec: Some(ServiceSpec {
+                    selector: Some(BTreeMap::from([(INSTANCE_LABEL.to_string(), pod_uid)])),
+                    ports: Some(vec![
+                        ServicePort {
+                            name: Some("control".to_string()),
+                            port: CONTROL_PORT,
+                            ..Default::default()
+                        },
+                        ServicePort {
+                            name: Some("replication".to_string()),
+                            port: REPLICATION_PORT,
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        state
             .effects
             .push(EffectRecord::EnsureReplacement(replacing.clone()));
         Ok(())
@@ -2220,7 +2803,11 @@ impl ClusterApi for InMemoryClusterApi {
         pod_name: &str,
         pod_uid: &PodUid,
     ) -> Result<()> {
-        if crate::exact_resources::protected(observation, Some(pod_name), Some(pod_uid.as_str())) {
+        if crate::exact_resources::protected_from_exact_pod_fence(
+            observation,
+            Some(pod_name),
+            Some(pod_uid.as_str()),
+        ) {
             return Err(ControllerError::ObservationStale);
         }
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
@@ -2521,6 +3108,7 @@ fn scale_down_delete_params(
         &snapshot,
         &kuberic_protocol::evaluator::EvaluationConfig {
             enable_secondary_scale_down: true,
+            allow_scale_up: true,
             ..Default::default()
         },
     );
@@ -2568,6 +3156,9 @@ fn exact_pod_delete_params(
     pod_name: &str,
     pod_uid: &PodUid,
 ) -> Result<DeleteParams> {
+    // Pod-only safety fencing is distinct from generic candidate cleanup. The
+    // executor already selected this effect from the immutable plan; fence the
+    // exact observed incarnation while retaining its PVC and receipt evidence.
     let pod = observation
         .pods
         .iter()
@@ -2653,6 +3244,35 @@ mod tests {
             instance_id: ReplicaInstanceId::new(format!("pod-{replica_id}")),
             agent_generation: AgentGeneration::new(format!("generation-{replica_id}")),
         }
+    }
+
+    fn replica_environment(set: &KubericSet) -> Vec<EnvVar> {
+        let owner = OwnerReference {
+            api_version: "operator.kuberic.io/v1alpha1".to_string(),
+            kind: "KubericSet".to_string(),
+            name: set.name_any(),
+            uid: "set-uid".to_string(),
+            block_owner_deletion: None,
+            controller: Some(true),
+        };
+        replica_pod(
+            set,
+            ReplicaId::new(1),
+            "set-uid",
+            &owner,
+            "kvstore2-1-data",
+            "pvc-uid",
+            "kvstore2:test",
+            None,
+        )
+        .spec
+        .unwrap()
+        .containers
+        .into_iter()
+        .find(|container| container.name == "application")
+        .unwrap()
+        .env
+        .unwrap()
     }
 
     async fn http_response(
@@ -2977,6 +3597,7 @@ mod tests {
                 ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
                     previous_policy: None,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     operation_id: OperationId::new("configuration-1"),
                     previous_configuration: None,
                     current_configuration: configuration.clone(),
@@ -3005,6 +3626,7 @@ mod tests {
                     target,
                     authority: None,
                     source_session_id: None,
+                    retire: false,
                 })),
                 source,
             ),
@@ -3019,5 +3641,48 @@ mod tests {
             .unwrap();
             assert_eq!(request.expected_process_session_id, "session-current");
         }
+    }
+
+    #[test]
+    fn default_replica_pod_does_not_enable_live_test_copy_gate() {
+        let set = KubericSet::new(
+            "kvstore2",
+            KubericSetSpec {
+                replicas: 3,
+                image: "kvstore2:test".to_string(),
+                failover_delay_seconds: 10,
+                switchover: None,
+            },
+        );
+        assert!(
+            replica_environment(&set)
+                .iter()
+                .all(|variable| variable.name != "KUBERIC_LIVE_TEST_COPY_GATE_ADDRESS")
+        );
+    }
+
+    #[test]
+    fn owned_live_test_annotation_enables_fixed_diagnostic_address() {
+        let mut set = KubericSet::new(
+            "kvstore2",
+            KubericSetSpec {
+                replicas: 3,
+                image: "kvstore2:test".to_string(),
+                failover_delay_seconds: 10,
+                switchover: None,
+            },
+        );
+        set.metadata.annotations = Some(BTreeMap::from([(
+            LIVE_TEST_COPY_GATE_ANNOTATION.to_string(),
+            "enabled".to_string(),
+        )]));
+        let environment = replica_environment(&set);
+        assert_eq!(
+            environment
+                .iter()
+                .find(|variable| variable.name == "KUBERIC_LIVE_TEST_COPY_GATE_ADDRESS")
+                .and_then(|variable| variable.value.as_deref()),
+            Some(LIVE_TEST_COPY_GATE_ADDRESS)
+        );
     }
 }

@@ -364,6 +364,8 @@ where
         } else {
             admit_configuration(&command, &durable)?
         };
+        let preserve_same_primary_scale_up =
+            preserves_same_primary_scale_up_access(&durable, &authority, &command);
         match self.store.begin_configuration(&command).await? {
             BeginConfiguration::Completed(result) => return Ok(result),
             BeginConfiguration::Execute(_)
@@ -397,8 +399,11 @@ where
                         RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
                     )
                     .await?;
-                    let next = if record.command.transition_kind
+                    let next = if preserve_same_primary_scale_up {
+                        CoordinatorStage::Activate
+                    } else if record.command.transition_kind
                         == kuberic_protocol::types::TransitionKind::Failover
+                        && record.command.failover_safe_lsn.is_some()
                     {
                         CoordinatorStage::FailoverPrefix
                     } else {
@@ -449,7 +454,9 @@ where
                         == kuberic_protocol::types::TransitionKind::Failover
                     {
                         if authority.local_role() == ReplicaRole::Primary
-                            && record.command.primary_write_status == AccessStatus::Granted
+                            && (record.command.primary_write_status == AccessStatus::Granted
+                                || (record.command.failover_safe_lsn.is_some()
+                                    && authority.scale_up.is_some()))
                         {
                             CoordinatorStage::Catchup
                         } else {
@@ -608,9 +615,34 @@ where
     }
 
     pub async fn ensure_build(&self, command: EnsureReplicaBuild) -> Result<()> {
+        let state = self.store.load_state().await?;
+        admit_build(&command, &state)?;
+        if command.retire {
+            if state.retired_builds.contains(&command.operation_id) {
+                return Ok(());
+            }
+            self.store.abandon_build(&command).await?;
+            self.runtime.cancel_build(&command.operation_id).await?;
+            let _command = self.command_lock.lock().await;
+            self.runtime
+                .settle_abandoned_build(&command.operation_id)
+                .await?;
+            let state = self.store.load_state().await?;
+            if state.retired_builds.contains(&command.operation_id) {
+                return Ok(());
+            }
+            self.execute_standalone(
+                &command.operation_id,
+                "retire-abandoned-build",
+                RuntimeEffectAction::RetireBuild(command.operation_id.clone()),
+            )
+            .await?;
+            return Ok(());
+        }
         let _command = self.command_lock.lock().await;
         let state = self.store.load_state().await?;
         admit_build(&command, &state)?;
+        let command = self.store.journal_build(&command).await?;
         if let Some(authority) = command.authority.clone() {
             if state.current_configuration.as_ref().is_some_and(|current| {
                 current.epoch > authority.current_configuration.epoch
@@ -734,6 +766,139 @@ where
     }
 }
 
+fn preserves_same_primary_scale_up_access(
+    state: &crate::state::AgentState,
+    authority: &kuberic_runtime_internal::authority::AdmittedAuthority,
+    command: &EnsureConfiguration,
+) -> bool {
+    matches!(
+        authority.scale_up.as_deref(),
+        Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
+    ) && state.role == ReplicaRole::Primary
+        && state.read_status == AccessStatus::Granted
+        && state.write_status == AccessStatus::Granted
+        && authority.local_role() == ReplicaRole::Primary
+        && authority.primary_identity() == &state.identity.local_identity
+        && command.primary_write_status == AccessStatus::Granted
+}
+
 fn stage_operation_id(command: &OperationId, stage: &str) -> OperationId {
     OperationId::new(format!("{}:{stage}", command.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+    use kuberic_protocol::types::{
+        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
+        InitializationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
+        ResourceUid, ScaleUpConfigurationEvidence, ScaleUpIntent, TransitionKind,
+    };
+
+    fn replica(id: i64) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+            agent_generation: AgentGeneration::new(format!("generation-{id}")),
+        }
+    }
+
+    #[test]
+    fn scale_up_same_primary_path_requires_durable_granted_access() {
+        let primary = replica(1);
+        let target = replica(2);
+        let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+        let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+        let previous = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            primary.replica_id,
+            vec![ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            previous_policy.write_quorum,
+        );
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            primary.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: primary.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            current_policy.write_quorum,
+        );
+        let mut intent = ScaleUpIntent {
+            operation_id: OperationId::default(),
+            resource_uid: ResourceUid::new("set"),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            current_configuration: current.clone(),
+            previous_policy: previous_policy.clone(),
+            current_policy: current_policy.clone(),
+            primary: primary.clone(),
+            target,
+            build_id: OperationId::new("build"),
+            snapshot_boundary_lsn: 0,
+            catch_up_boundary_lsn: 0,
+        };
+        intent.operation_id = intent.expected_operation_id();
+        let evidence = ScaleUpConfigurationEvidence::Admission { intent };
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("set"),
+            pod_uid: PodUid::new("pod-1"),
+            pvc_uid: PvcUid::new("pvc-1"),
+            initialization_id: InitializationId::new("init-1"),
+            local_identity: primary.clone(),
+            effective_policy: previous_policy.clone(),
+        });
+        state.role = ReplicaRole::Primary;
+        state.read_status = AccessStatus::Granted;
+        state.write_status = AccessStatus::Granted;
+        let authority = kuberic_runtime_internal::authority::AdmittedAuthority {
+            local_identity: primary.clone(),
+            transition_kind: Some(TransitionKind::ScaleUp),
+            previous_configuration: Some(previous.clone()),
+            current_configuration: current.clone(),
+            switchover_handoff: None,
+            secondary_removal: None,
+            scale_up: Some(Box::new(evidence.clone())),
+        };
+        let command = EnsureConfiguration {
+            operation_id: OperationId::new("command"),
+            previous_configuration: Some(previous.clone()),
+            current_configuration: current.clone(),
+            previous_epoch: Some(previous.epoch),
+            current_epoch: current.epoch,
+            effective_policy: current_policy,
+            previous_policy: Some(previous_policy),
+            secondary_removal_evidence: None,
+            scale_up_evidence: Some(Box::new(evidence)),
+            local_replica_id: primary.replica_id,
+            expected_instance_id: primary.instance_id,
+            expected_agent_generation: primary.agent_generation,
+            transition_kind: TransitionKind::ScaleUp,
+            failover_safe_lsn: None,
+            primary_write_status: AccessStatus::Granted,
+            current_only: false,
+            retire_build_ids: Vec::new(),
+            switchover_handoff: None,
+            retire_switchover_preparation_ids: Vec::new(),
+        };
+        assert!(preserves_same_primary_scale_up_access(
+            &state, &authority, &command
+        ));
+        state.write_status = AccessStatus::NoWriteQuorum;
+        assert!(!preserves_same_primary_scale_up_access(
+            &state, &authority, &command
+        ));
+    }
 }
