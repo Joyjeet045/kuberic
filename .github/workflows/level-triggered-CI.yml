@@ -54,6 +54,8 @@ jobs:
           -p kuberic-agent
           -p kuberic-controller
           -p kvstore2
+          -p sqlite-replicated
+          -p sqlite-commit-barrier
           -p kuberic-level-tests
           --all-targets --all-features -- -D warnings
       - name: Test level-triggered packages
@@ -66,6 +68,9 @@ jobs:
           -p kuberic-agent
           -p kuberic-controller
           -p kvstore2
+          --features kuberic-agent/testing
+      - name: Test SQLite unit and in-process suites
+        run: cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
       - name: Run classic v1 scale-up regressions
         run: |
           cargo test -p kvstore --test reconciler test_reconciler_scale_up -- --exact
@@ -78,7 +83,8 @@ jobs:
         run: |
           scripts/check_level_triggered_scope.sh origin/main
           scripts/check_level_triggered_dependencies.sh
-          scripts/check_level_triggered_documentation.sh
+          scripts/check_level_triggered_guards_test.sh
+          scripts/check_level_triggered_documentation.sh docs/features/sqlite/design.md
 
   bootstrap-kind:
     name: PR live smoke

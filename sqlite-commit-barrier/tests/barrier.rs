@@ -119,6 +119,39 @@ fn an_accepted_transaction_is_visible_and_survives_reopen() {
 }
 
 #[test]
+fn a_large_transaction_publishes_once_and_flushes_in_bounded_parent_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.sqlite");
+    let barrier = RecordingBarrier::accepting();
+    register("barrier-large", barrier.clone()).unwrap();
+    {
+        let mut connection = open(&path, "barrier-large");
+        connection
+            .execute_batch("CREATE TABLE t(v BLOB); PRAGMA wal_autocheckpoint=0")
+            .unwrap();
+        let before = barrier.published.load(Ordering::SeqCst);
+        let transaction = connection.transaction().unwrap();
+        for _ in 0..100 {
+            transaction
+                .execute("INSERT INTO t VALUES(zeroblob(4096))", [])
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        assert_eq!(barrier.published.load(Ordering::SeqCst), before + 1);
+        assert!(barrier.last.lock().unwrap().len() > 128 * 1024);
+        assert_eq!(row_count(&connection), 100);
+    }
+    let reopened = open(&path, "barrier-large");
+    assert_eq!(row_count(&reopened), 100);
+    assert_eq!(
+        reopened
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+}
+
+#[test]
 fn a_rejected_transaction_is_not_recoverable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("reject.sqlite");

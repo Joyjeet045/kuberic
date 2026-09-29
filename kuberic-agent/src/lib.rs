@@ -16,6 +16,8 @@ pub mod session;
 pub mod sqlite_store;
 pub mod state;
 pub mod store;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod transport;
 
 pub use error::{AgentError, Result};

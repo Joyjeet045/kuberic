@@ -21,10 +21,11 @@ trap 'rm -f -- "$changed"' EXIT
 } | sort -zu > "$changed"
 
 violations=()
+# examples/sqlite is the in-place v2 application; the remaining classic paths stay protected.
 while IFS= read -r -d '' path; do
     case "$path" in
         kuberic-core/* | kuberic-operator/* | examples/kvstore/* | \
-            examples/sqlite/* | examples/postgres/* | kuberic-tests/*)
+            examples/postgres/* | kuberic-tests/*)
             violations+=("$path")
             ;;
     esac

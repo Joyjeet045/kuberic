@@ -20,13 +20,13 @@ kuberic-core/          Core replication framework (replicator, driver, runtime)
 kuberic-operator/      K8s operator (reconciler, CRD, pod management)
 kuberic-dex/           Durable execution and deterministic replay kernel
 examples/kvstore/      Replicated key-value store (HashMap + WAL)
-examples/sqlite/       Replicated SQLite database (WAL frame shipping)
 
 kuberic-protocol/      Independent level-triggered domain model and evaluator
 kuberic-runtime/       Independent application and replication runtime
 kuberic-agent/         Durable replica-local authority and process hosting
 kuberic-controller/    operator.kuberic.io/v1alpha1 controller
 examples/kvstore2/     Level-triggered conformance application
+examples/sqlite/       Existing SQLite example migrated in place to v2
 ```
 
 See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/), and
@@ -34,7 +34,9 @@ See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/), and
 [level-triggered operator guide](docs/features/kuberic/level-triggered-operator.md)
 documents the independent experimental stack.
 
-The framework provides `PodRuntime` and `WalReplicator` — your service implements lifecycle event handlers and a gRPC API. See the [kvstore](examples/kvstore/) and [sqlite](examples/sqlite/) examples.
+Classic [kvstore](examples/kvstore/) uses `PodRuntime` and `WalReplicator`.
+The v2 [SQLite example](docs/features/sqlite/design.md) uses public
+`StatefulServiceReplica`/`StateProvider` interfaces and agent-owned `ReplicaHost`.
 
 ## Quick Start
 
@@ -45,6 +47,8 @@ cargo clippy --all-targets
 
 # Test (no K8s required)
 cargo test -p kuberic-core -p kvstore -p sqlite-replicated
+# V2 SQLite unit/in-process validation (no cluster or child-process tests)
+cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
 
 # Run kvstore in demo mode (single node, no operator)
 cargo run -p kvstore -- --demo
@@ -58,7 +62,14 @@ Replicated `HashMap<String, String>` with gRPC Put/Get/Delete API. Demonstrates 
 
 ### SQLite
 
-Replicated SQLite database with gRPC Execute/Query/ExecuteBatch API. Ships WAL frames (page-level) after each commit — no determinism requirements. Secondaries persist frames to a durable log and apply on promotion. 9 integration tests covering replication, failover, and switchover.
+The existing `sqlite-replicated` package is migrated in place to v2, with no
+classic runtime/operator dependencies or second SQLite application. Its gRPC
+Execute/Query/ExecuteBatch API uses quorum-before-publication WAL-frame replication,
+committed snapshots plus retained catch-up, and durable restart/reconciliation/
+rebuild fencing. Unit and in-process tests cover replacement, failover, planned
+switchover, sequential scale-up and secondary scale-down. Fresh v2 storage is
+required: there is no v1 data import. SQLite image publication and deployment
+assets remain future work; see the [design and local validation guide](docs/features/sqlite/design.md).
 
 ## Kubernetes Deployment
 
@@ -88,10 +99,13 @@ Reconfiguration may interrupt writes and connections with no duration guarantee.
 V2 images remain local/CI-only;
 the production v2 controller configuration enables
 [sequential scale-up](docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
-one fresh incarnation at a time. Classic v1 remains unchanged. Primary removal,
-an independent minimum replica count, a validated maximum replica count, and
-the SQLite/PostgreSQL ports remain future work. Protocol 8 / agent schema 3
-require a fresh coordinated v2 deployment.
+one fresh incarnation at a time. Classic v1 remains unchanged. Automatic
+direct-primary removal is deferred; use planned switchover followed by
+secondary scale-down. An independent minimum replica count, a validated
+maximum replica count, and the PostgreSQL port remain future work. SQLite is
+ported in place and validated without Kubernetes; its distribution remains
+separate from the existing KVStore2 live deployment.
+Protocol 8 / agent schema 4 require a fresh coordinated v2 deployment.
 
 ## Continuous Delivery
 
@@ -117,7 +131,7 @@ such as `v0.1.0` also publishes the exact version tag.
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md) — independent stack deployment, authority, supported operations, and diagnostics
 - [Secondary scale-down](docs/features/kuberic/level-triggered-operator.md#secondary-scale-down) — lower desired membership, singleton risks, and exact permanent cleanup
 - [Sequential scale-up](docs/features/kuberic/level-triggered-operator.md#sequential-scale-up) — add or restore one fresh ordinal at a time through copy, catch-up, and PC/CC admission
-- [V1 retirement plan](docs/proposal/v1-retirement-plan.md) — completed switchover and scaling subsets, plus remaining primary-removal and retirement gates
+- [V1 retirement plan](docs/proposal/v1-retirement-plan.md) — completed switchover and scaling workstreams, deferred direct-primary removal, and remaining application/distribution/deprecation gates
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
 
 ## License

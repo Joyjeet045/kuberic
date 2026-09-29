@@ -61,6 +61,14 @@ new_git_repo "$untracked"
 printf 'new\n' > "$untracked/kuberic-core/untracked file.rs"
 expect_scope_failure "$untracked" HEAD
 
+# SQLite is the same package, now migrated in place rather than protected v1.
+sqlite_scope="$temporary/sqlite-scope"
+new_git_repo "$sqlite_scope"
+mkdir -p "$sqlite_scope/examples/sqlite/src"
+printf 'pub fn sqlite() {}\n' > "$sqlite_scope/examples/sqlite/src/lib.rs"
+(cd "$sqlite_scope" && scripts/check_level_triggered_scope.sh HEAD)
+(cd "$sqlite_scope" && git add examples/sqlite/src/lib.rs && scripts/check_level_triggered_scope.sh HEAD)
+
 new_cargo_repo() {
     local directory=$1
     mkdir -p "$directory/scripts" "$directory/kuberic-protocol/src" \
@@ -147,5 +155,55 @@ printf 'pub fn protocol() {}\n' > "$symlink_import/kuberic-protocol/src/lib.rs"
 ln -s ../../kuberic-core/src/types.rs \
     "$symlink_import/kuberic-protocol/src/protected.rs"
 expect_dependency_failure "$symlink_import"
+
+new_sqlite_repo() {
+    local directory=$1
+    new_cargo_repo "$directory"
+    mkdir -p "$directory/examples"
+    mv "$directory/kuberic-protocol" "$directory/examples/sqlite"
+    sed -i 's/"kuberic-protocol"/"examples\/sqlite"/' "$directory/Cargo.toml"
+    sed -i 's/name = "kuberic-protocol"/name = "sqlite-replicated"/' \
+        "$directory/examples/sqlite/Cargo.toml"
+    printf 'pub fn sqlite() {}\n' > "$directory/examples/sqlite/src/lib.rs"
+}
+
+sqlite_dependency="$temporary/sqlite-dependency"
+new_sqlite_repo "$sqlite_dependency"
+(cd "$sqlite_dependency" && scripts/check_level_triggered_dependencies.sh)
+cat >> "$sqlite_dependency/Cargo.toml" <<'EOF'
+exclude = ["kuberic-core"]
+EOF
+cat > "$sqlite_dependency/kuberic-core/Cargo.toml" <<'EOF'
+[package]
+name = "kuberic-core"
+version = "0.1.0"
+edition = "2024"
+EOF
+printf 'pub fn classic() {}\n' > "$sqlite_dependency/kuberic-core/src/lib.rs"
+cat >> "$sqlite_dependency/examples/sqlite/Cargo.toml" <<'EOF'
+[dependencies]
+kuberic-core = { path = "../../kuberic-core" }
+EOF
+expect_dependency_failure "$sqlite_dependency"
+
+# Reject both classic runtime and operator dependencies on the migrated package.
+mv "$sqlite_dependency/kuberic-core" "$sqlite_dependency/kuberic-operator"
+sed -i 's/kuberic-core/kuberic-operator/g' \
+    "$sqlite_dependency/Cargo.toml" \
+    "$sqlite_dependency/examples/sqlite/Cargo.toml" \
+    "$sqlite_dependency/kuberic-operator/Cargo.toml"
+expect_dependency_failure "$sqlite_dependency"
+
+sqlite_source="$temporary/sqlite-source"
+new_sqlite_repo "$sqlite_source"
+cat > "$sqlite_source/examples/sqlite/src/lib.rs" <<'EOF'
+include!("../../../kuberic-core/src/types.rs");
+EOF
+expect_dependency_failure "$sqlite_source"
+
+sqlite_symlink="$temporary/sqlite-symlink"
+new_sqlite_repo "$sqlite_symlink"
+ln -s ../../../kuberic-core/src/types.rs "$sqlite_symlink/examples/sqlite/src/classic.rs"
+expect_dependency_failure "$sqlite_symlink"
 
 echo "Level-triggered guard regression tests passed."

@@ -1716,19 +1716,19 @@ mod tests {
     }
 
     #[test]
-    fn scale_up_schema_three_rejects_schema_two_without_migration() {
+    fn frozen_copy_schema_four_rejects_schema_three_without_migration() {
         let directory = tempfile::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let expected = identity();
         drop(SqliteStore::create_authorized(&path, AgentState::new(expected.clone())).unwrap());
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
         drop(connection);
         assert!(matches!(
             SqliteStore::open_existing(&path, Some(&expected)),
             Err(AgentError::SchemaMismatch {
-                expected: 3,
-                observed: 2
+                expected: 4,
+                observed: 3
             })
         ));
     }

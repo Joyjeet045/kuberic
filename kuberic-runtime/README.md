@@ -118,7 +118,7 @@ After process termination, a started record is finalized without Open: terminati
 already closed the prior host. The pending agent effect then completes its exact
 durable receipt normally. Failed finalization keeps reconstruction closed.
 Preparation, acceptance, and retirement postconditions are unpublished managed
-contracts, not additions to the SF-shaped application traits. Agent schema-3
+contracts, not additions to the SF-shaped application traits. Agent schema-4
 storage persists preparation, accepted-current-only, and retirement evidence.
 Recovery revalidates accepted evidence before restoring previously granted
 access; preparation and current-only coordination by themselves stay closed.
@@ -139,7 +139,7 @@ authority into the runtime. It freezes a separate post-enumeration catch-up
 boundary, admits the candidate through independently validated previous and
 expanded policies, and may preserve same-primary writes only while both
 configurations remain writable. Candidate readiness/copy completion alone never
-grants membership or quorum credit. Protocol 8/schema 3 require a fresh
+grants membership or quorum credit. Protocol 8/schema 4 require a fresh
 coordinated v2 deployment; classic v1 remains unchanged.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 include separating replication proof from Kubernetes cleanup obligations; neither
@@ -173,6 +173,12 @@ metadata, data, and a one-shot acknowledgement:
   before returning an applied peer ACK. Close/Abort and runtime drop terminate
   outstanding deliveries.
 
+`get_copy_state(up_to_lsn, ...)` retains its single-LSN signature. The agent
+freezes that snapshot boundary at durable committed progress; application-applied
+operations above it travel as retained catch-up with their original watermarks.
+The immutable boundary survives source restart. Copy final markers require both
+progress values to equal it, including duplicate completion replay.
+
 Inbound replication exposes two acknowledgements. `PendingReplication::received`
 is available after ordered receiver admission and may advance transport resend
 state without granting quorum credit. `PendingReplication::applied()` completes
@@ -197,7 +203,11 @@ full-copy fallback signaling. The runtime has no dependency on
 
 Role changes drive the replicator before the service callback. Primary
 promotion additionally invokes replicator/state-provider `UpdateEpoch`
-between those callbacks. The completed role is published only after every
+between those callbacks, then settles application commitment through the durable
+authority-fenced verified prefix before invoking the Primary application callback.
+Primary-local unresolved reservations still require exact quorum recovery;
+arbitrary applied suffixes are not committed merely by changing role.
+The completed role is published only after every
 required stage succeeds; an in-process `RoleTransition` exposes partial
 completion after failure. Close fences writes,
 closes the replicator, then closes the service, with abort cleanup on callback

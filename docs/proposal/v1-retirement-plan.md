@@ -1,8 +1,9 @@
 # Kuberic v1 Retirement Plan
 
-> **Status:** In progress — Workstream 1 implemented and validated; Workstream 2
-> has implemented and validated sequential scale-up and secondary scale-down.
-> Primary-removal behavior and broader retirement remain outstanding.
+> **Status:** In progress — Workstreams 1, 2 and 3 are implemented and validated.
+> SQLite is migrated in place to v2 with unit/in-process validation.
+> Direct primary-removal composition is deferred; the PostgreSQL port,
+> distribution, deprecation, and broader retirement remain outstanding.
 >
 > **Goal:** Make the level-triggered stack the default Kuberic implementation,
 > deprecate the classic v1 stack, and eventually remove it.
@@ -27,8 +28,10 @@ The work should proceed in this order:
 
 1. Add planned switchover to v2 — implemented and validated.
 2. Add scale-up and scale-down to v2 — sequential scale-up and secondary
-   scale-down complete; primary-removal behavior remains.
-3. Add a v2 SQLite application.
+   scale-down complete. Direct primary removal is deferred; move authority with
+   planned switchover before reducing membership.
+3. Migrate the existing SQLite application in place to v2 — implemented and
+   validated with unit/in-process tests; distribution remains separate.
 4. Move the PostgreSQL application to v2.
 5. Publish and make v2 deployment assets the default.
 6. Deprecate and freeze v1.
@@ -100,9 +103,9 @@ The principal retirement gaps are:
 | Area | Classic v1 | Level-triggered v2 | Retirement disposition |
 |---|---|---|---|
 | Planned switchover | Supported | Explicit named-target request supported and validated | Workstream 1 complete |
-| Scale up/down | Supported | Sequential scale-up and secondary-only scale-down implemented/validated; no primary removal | Workstream 2 partially complete |
+| Scale up/down | Supported | Sequential scale-up and secondary-only scale-down implemented/validated; planned switchover composes with removal | Workstream 2 complete; direct primary removal deferred |
 | KVStore | Supported | `kvstore2` supported | Make v2 the default |
-| SQLite | Supported | Not ported | Add a v2 application |
+| SQLite | Existing deployed v1 data has no import path | Existing `sqlite-replicated` package migrated in place; unit/in-process scenarios validated | Workstream 3 complete; distribution remains separate |
 | PostgreSQL | Depends on `kuberic-core` and `kuberic-operator` | Not ported | Move to v2 before deprecation |
 | Destructive data-loss recovery | Supported | Fails closed | Keep v2 behavior |
 | API and status compatibility | Existing v1 contract | Independent contract | No compatibility required |
@@ -148,8 +151,8 @@ healthy 4.2/4.3 s and adversarial 44.5/48.8 s; the strict retained-session
 rejection adversarial rerun took 45.2 s. All owned clusters and kubeconfigs were
 cleaned. These are scenario timings, not outage guarantees.
 
-This completes only Workstream 1, not v1 retirement. Workstream 2 is partially
-complete as described below, followed by SQLite, PostgreSQL, distribution,
+This completes only Workstream 1, not v1 retirement. Workstream 2 is complete
+as described below, followed by SQLite, PostgreSQL, distribution,
 deprecation, and separately approved removal. Automatic target selection,
 cancellation/retargeting, node maintenance,
 rolling upgrades, destructive recovery, and data migration/import remain
@@ -157,9 +160,9 @@ unsupported or deferred.
 
 ## Workstream 2: Scale Up and Scale Down
 
-**Scale-up and secondary scale-down are implemented and validated; the
-workstream remains partially complete because primary removal is not
-implemented.** The
+**Scale-up and secondary scale-down are implemented and validated; this
+completes Workstream 2. Direct primary removal is deferred because classic v1
+also removes only stable secondaries.** The
 [scale-up guide](../features/kuberic/level-triggered-operator.md#sequential-scale-up)
 and
 [secondary-scale-down guide](../features/kuberic/level-triggered-operator.md#secondary-scale-down)
@@ -201,8 +204,8 @@ classic `kuberic.io/v1` remains unchanged. Its as-built behavior is:
   UID/resource-version provenance and authoritative absence. Different-UID
   resources survive, and partial PVCs are not resumed.
 
-Protocol 8 and agent schema 3 are exact coordinated-deployment boundaries.
-Protocol 7 and earlier, plus schema 2, are rejected with no migration,
+Protocol 8 and agent schema 4 are exact coordinated-deployment boundaries.
+Protocol 7 and earlier, plus schemas 2 and 3, are rejected with no migration,
 mixed-version mode, or rolling-upgrade contract. The generated CRD is currently 344,907 bytes under a
 strict-below-350,000-byte regression guard; the largest current representative
 18-member serialized scale-up status sample is carried failover at 26,353
@@ -246,7 +249,7 @@ sequential cleanup, and Kubernetes resource deletion.
   cleanup identity.
 - Schema-3 retirement-started/tombstone recovery prevents application Open
   after retirement begins and additionally persists scale-up build/admission
-  authority. Protocol 8/store schema 3 require fresh deployment, without
+  authority. Protocol 8/store schema 4 require fresh deployment, without
   migration or mixed-version support.
 - Active removal cannot be cancelled or retargeted. Cleanup serializes later
   removals and other authority work. Primary loss or missing evidence waits
@@ -263,18 +266,28 @@ in 18m16s/16m29s; the final post-fix matrix passed in 927.942s command wall time
 (959.565s full lifecycle), plus separate failover in 18.71s. The guide records
 per-scenario results. These measurements are not outage guarantees.
 
-**Outstanding primary-removal behavior** must:
+Direct removal of the current primary is not a v1-parity requirement. Classic
+v1 rejects a primary as a remove target and selects a stable secondary during
+scale-down. Both stacks support the same operational composition when the
+physical replica currently hosting primary authority must be removed:
 
-- define selection and durable authority for removing a primary;
-- move primary authority first through an approved safe transition;
-- compose that movement with removal, recovery, and exact cleanup.
+1. complete a planned switchover to a retained secondary;
+2. wait for stable current-only authority;
+3. lower the desired count when the former primary is eligible under the
+   deterministic highest-ID secondary selection policy.
 
-The implemented scaling subset does not provide primary removal, explicit
-user-selected removal, independent target/minimum policy, placement balancing,
-concurrent additions, a validated maximum replica count, or full scaling
-parity. It does not establish v1 retirement readiness; application ports,
-distribution, deprecation, and the separately approved removal gates still
-apply.
+This is not a user-selected removal request: moving authority alone does not
+change which logical secondary the scaling policy chooses.
+
+An automatic or atomic primary-removal request that composes these operations
+is explicitly deferred. It is not a deprecation or retirement gate.
+
+The implemented scaling subset does not provide direct primary removal,
+explicit user-selected removal, independent target/minimum policy, placement
+balancing, concurrent additions, a validated maximum replica count, or full
+scaling policy parity. It does not establish v1 retirement readiness;
+application ports, distribution, deprecation, and the separately approved
+removal gates still apply.
 
 Only one authority-changing membership command may be issued from one
 observation. Reconciliation must remain level-triggered and restart-safe.
@@ -292,6 +305,7 @@ Scale-up completion does not promote these follow-ups into the current scope.
 | P1 | CRD/status compaction and boundary redesign | Context-bound preparation/retirement records should reference their enclosing frozen intent; split replication proof (`RemovalAuthority` / `CommittedRemovalProof`) from Kubernetes `CleanupObligation` and request metadata. Add serialized status-size tests and an operational replica-count budget. This is compatibility/API-breaking status and potentially wire/store redesign, requiring coordinated validation/recovery changes, not a formatting refactor. |
 | P2 | Shared candidate-selection helper, neutral exact-cleanup helpers, and static command-binding predicates | Mechanical refactors reduce duplicated policy/identity checks without changing selection or evidence. Keep layer-specific installed-authority and live-session checks; defer to isolate the admission fix from unrelated code movement. |
 | P2 | Independent target/minimum policy and PLB/placement-aware selection | SF target and minimum are independently configurable. New API, placement inputs, and availability policy are needed; highest-ID selection and target=min remain the deliberately narrow Kuberic contract. |
+| P2 design / P3 implementation | Automatic direct-primary removal composition | The supported user outcome is planned switchover followed by secondary scale-down, matching classic v1. A single request that selects a replacement primary and composes movement, removal, recovery, and cleanup is a new orchestration protocol, not a retirement requirement. |
 | P1 design / P3 implementation | Frozen-primary recovery during removal/cleanup; possible overlapping cleanup and failover | Current serialization can cause indefinite outage. Safe continuation needs a new cross-epoch recovery and cleanup-ownership protocol; do not loosen frozen evidence or silently enable overlap. |
 | P3 | Multi-member removal in one reconfiguration | Current reductions are sequential and require cleanup plus receipt/local-acceptance prerequisites between steps. Batch removal changes quorum, identity, evidence and cleanup semantics, not just the loop. |
 | P3 | Move RA-style distributed phase scheduling from evaluator to a durable primary-agent coordinator | Explicitly defer: per-member ordering, witness freezing, PC/CC progression and restart replay require a durable cross-replica coordination protocol. Keep desired-count/target policy in the evaluator/controller, not the agent/runtime; keep local journals out of CR status and Kubernetes cleanup authority out of the replicator. |
@@ -307,24 +321,33 @@ contract; mechanical helper extraction does not.
 
 ## Workstream 3: SQLite on V2
 
-The v2 SQLite application should validate that the SF-shaped runtime supports
-an application with durable WAL-frame replication rather than only the
-deterministic KVStore operation model.
+**Implemented and validated in place.** `examples/sqlite` remains the single
+`sqlite-replicated` application package, now using public v2 service/provider
+interfaces and `ReplicaHost`, with no classic runtime/operator/Kubernetes
+dependencies. The classic demo and dependency-based test choreography are removed.
 
-The application must:
+SQLite uses quorum-before-publication WAL-frame replication, durable independent
+applied/committed progress, an immutable committed snapshot boundary, and retained
+catch-up with original operation watermarks. The SF single-LSN copy callback is
+unchanged. Restart resolves exact agent reservations and rematerializes committed
+SQL state before requests; reconciliation and acknowledged-loss/rebuild fences
+remain distinct, including stale WAL/SHM removal. Promotion settles only the
+authority-certified prefix; `on_data_loss` reports state unchanged.
 
-- use the public v2 application interfaces without access to managed
-  authority internals;
-- durably accept replicated WAL frames before acknowledging them;
-- support full copy and incremental replication;
-- reconstruct acknowledged state after process restart;
-- participate in bootstrap, replacement, failover, switchover, and scaling;
-- start write-closed and obey runtime access changes;
-- use new storage and metadata directories with no v1 import path.
+Unit and in-process tests cover bootstrap, replacement, failover, planned
+switchover, sequential scale-up, secondary-only scale-down, quorum restoration,
+copy restart/replay, and controlled write/authority races. Exact-set/LSN oracles
+reject extra rows and stale writes, including while the old application remains
+alive during handoff. All restart fixtures reopen durable agent and application
+state with fresh sessions. No SQLite KinD, Kubernetes, container, or subprocess
+test is part of this migration.
 
-The existing v1 SQLite application is behavioral reference material only. The
-new application must not depend on `kuberic-core`, classic wire types, or v1
-operator state.
+Fresh v2 application storage and protocol 8 / schema 4 agent metadata are
+required. This does not import deployed v1 SQLite data, create a second
+application, or establish rolling-upgrade support. Image publication, SQLite
+deployment assets, and live-cluster validation remain separate distribution work.
+See the [SQLite design](../features/sqlite/design.md) and
+[local test selections](../features/kuberic/testing.md#sqlite-v2-unit-and-in-process-validation).
 
 ## Workstream 4: PostgreSQL on V2
 
@@ -400,7 +423,8 @@ Final removal must be a separately reviewed change. It may delete:
 
 - `kuberic-core`;
 - `kuberic-operator`;
-- classic KVStore, SQLite, and PostgreSQL examples;
+- remaining classic KVStore and PostgreSQL examples (the in-place v2 SQLite
+  package is not a classic deletion candidate);
 - classic CRDs, manifests, image publication, and integration tests;
 - compatibility documentation and CI paths that only exercise v1.
 
@@ -488,6 +512,7 @@ The following do not block this retirement plan:
 - in-place v1-to-v2 resource conversion;
 - application data migration;
 - mixed-version negotiation;
+- automatic or atomic direct-primary removal composition;
 - broader stateful successful-write generation across delayed effects and
   concurrent retained-client connections;
 - changes to the SQL Server application, which does not depend on v1.

@@ -1,120 +1,152 @@
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use kuberic_core::pod::PodRuntime;
-use kuberic_core::types::{CancellationToken, ReplicaInstanceId};
-use tokio::sync::Mutex;
-use tracing::info;
-
-use sqlite_replicated::state::{SharedState, SqliteState};
+use kuberic_agent::process::{ApplicationStorageState, ReplicaHost, ReplicaProcessConfig};
+use kuberic_agent::transport::KubernetesDnsResolver;
+use kuberic_protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
+use sqlite_replicated::{SqlitePersistence, proto, server::SqliteServer, service::SqliteService};
 
 #[derive(Parser)]
-#[command(
-    name = "sqlite-replicated",
-    about = "Replicated SQLite database example"
-)]
-struct Args {
-    /// Replica ID for this instance.
-    #[arg(long, env = "KUBERIC_REPLICA_ID", default_value = "1")]
+#[command(name = "sqlite-replicated", about = "V2 replicated SQLite")]
+struct Config {
+    #[arg(long, env = "KUBERIC_RESOURCE_UID")]
+    resource_uid: String,
+    #[arg(long, env = "KUBERIC_REPLICA_ID")]
     replica_id: i64,
-
-    /// Incarnation ID for this concrete runtime process.
-    #[arg(long, env = "KUBERIC_REPLICA_INSTANCE_ID")]
-    replica_instance_id: Option<String>,
-
-    /// Bind address for the gRPC control server (operator → pod).
-    #[arg(long, env = "KUBERIC_CONTROL_BIND", default_value = "127.0.0.1:0")]
-    control_bind: String,
-
-    /// Bind address for the gRPC data server (primary → secondary replication).
-    #[arg(long, env = "KUBERIC_DATA_BIND", default_value = "127.0.0.1:0")]
-    data_bind: String,
-
-    /// Bind address for the client-facing SQL gRPC server.
-    #[arg(long, env = "KUBERIC_CLIENT_BIND", default_value = "127.0.0.1:0")]
-    client_bind: String,
-
-    /// Data directory for persistent state.
-    #[arg(long, default_value = "/var/lib/sqlite-replicated/data")]
-    data_dir: PathBuf,
-
-    /// Run in demo mode: simulates operator + client for quick testing.
-    #[arg(long)]
-    demo: bool,
+    #[arg(long, env = "KUBERIC_POD_UID")]
+    pod_uid: String,
+    #[arg(long, env = "KUBERIC_PVC_UID")]
+    pvc_uid: String,
+    #[arg(long, env = "KUBERIC_POD_IP")]
+    pod_ip: IpAddr,
+    #[arg(long, env = "KUBERIC_NAMESPACE")]
+    namespace: String,
+    #[arg(long, env = "KUBERIC_AGENT_BEARER_TOKEN")]
+    bearer_token: String,
+    #[arg(long, env = "KUBERIC_DATA_ROOT", default_value = "/var/lib/kuberic")]
+    data_root: PathBuf,
+    #[arg(long, env = "KUBERIC_CONTROL_ADDRESS", default_value = "0.0.0.0:50051")]
+    control_address: SocketAddr,
+    #[arg(
+        long,
+        env = "KUBERIC_REPLICATION_ADDRESS",
+        default_value = "0.0.0.0:50052"
+    )]
+    replication_address: SocketAddr,
+    #[arg(
+        long,
+        env = "KUBERIC_APPLICATION_ADDRESS",
+        default_value = "0.0.0.0:8080"
+    )]
+    application_address: SocketAddr,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
-
-    info!("=== SQLite: Replicated SQLite Database ===");
-
-    let mut runtime = PodRuntime::builder(args.replica_id);
-    if let Some(instance_id) = args.replica_instance_id {
-        runtime = runtime.instance_id(ReplicaInstanceId::new(instance_id));
+    let config = Config::parse();
+    if config.replica_id <= 0 {
+        return Err("KUBERIC_REPLICA_ID must be positive".into());
     }
-    let bundle = runtime
-        .reply_timeout(Duration::from_secs(10))
-        .control_bind(args.control_bind)
-        .data_bind(args.data_bind)
-        .build()
-        .await?;
-
-    let control_address = bundle.control_address.clone();
-    let shutdown = bundle.runtime.shutdown_token();
-    let state: SharedState = Arc::new(Mutex::new(SqliteState::open(args.data_dir).await?));
-
-    info!(
-        control = %control_address,
-        client_bind = %args.client_bind,
-        "ready (data address will be logged after Open)"
-    );
-
-    let runtime_handle = tokio::spawn(bundle.runtime.serve());
-    let service_handle = tokio::spawn(sqlite_replicated::service::run_service(
-        bundle.lifecycle_rx,
-        state.clone(),
-        args.client_bind.clone(),
-    ));
-
-    if args.demo {
-        info!("Demo mode: simulating operator + client");
-        sqlite_replicated::demo::simulate_operator(control_address.clone(), args.replica_id).await;
-        sqlite_replicated::demo::run_demo_client(args.client_bind).await;
-        sqlite_replicated::demo::demo_close(control_address, args.replica_id).await;
+    let application_root = config.data_root.join("application");
+    let storage = if SqlitePersistence::is_fresh_empty(&application_root)? {
+        ApplicationStorageState::FreshEmpty
     } else {
-        info!("Waiting for operator commands on {}", control_address);
-        info!("Press Ctrl+C to shut down");
-        wait_for_signal(shutdown).await;
+        ApplicationStorageState::Established
+    };
+    let application = Arc::new(SqliteService::deferred(
+        application_root,
+        format!(
+            "http://{}",
+            SocketAddr::new(config.pod_ip, config.replication_address.port())
+        ),
+    )?);
+    let mut replica = ReplicaHost::new(
+        ReplicaProcessConfig {
+            resource_uid: ResourceUid::new(&config.resource_uid),
+            replica_id: ReplicaId::new(config.replica_id),
+            pod_uid: PodUid::new(&config.pod_uid),
+            pvc_uid: PvcUid::new(&config.pvc_uid),
+            data_root: config.data_root,
+            control_address: config.control_address,
+            replication_address: config.replication_address,
+            bearer_token: config.bearer_token,
+            rpc_deadline: Duration::from_secs(5),
+            transport_window_capacity: 256,
+        },
+        application.clone(),
+        storage,
+        Arc::new(KubernetesDnsResolver::new(
+            ResourceUid::new(&config.resource_uid),
+            config.namespace,
+        )),
+    )
+    .start()
+    .await?;
+    let listener = tokio::net::TcpListener::bind(config.application_address).await?;
+    let mut shutdown = replica.shutdown_signal();
+    let mut client = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(proto::sqlite_store_server::SqliteStoreServer::new(
+                SqliteServer::new(application),
+            ))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async move {
+                    while !*shutdown.borrow() {
+                        if shutdown.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                },
+            )
+            .await
+    });
+    tokio::select! {
+        result = replica.wait() => result?,
+        result = &mut client => result??,
+        result = shutdown_signal() => result?,
     }
-
-    let _ = service_handle.await;
-    let _ = runtime_handle.await;
-
-    info!("=== Shutdown ===");
+    replica.shutdown();
     Ok(())
 }
 
-#[cfg(unix)]
-async fn wait_for_signal(shutdown: CancellationToken) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-    tokio::select! {
-        _ = sigterm.recv() => info!("received SIGTERM"),
-        _ = sigint.recv() => info!("received SIGINT"),
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {}
+        }
+        Ok(())
     }
-    info!("initiating graceful shutdown");
-    shutdown.cancel();
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
-#[cfg(not(unix))]
-async fn wait_for_signal(shutdown: CancellationToken) {
-    let _ = tokio::signal::ctrl_c().await;
-    info!("received Ctrl-C");
-    info!("initiating graceful shutdown");
-    shutdown.cancel();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn startup_uses_replica_host_and_has_no_demo_surface() {
+        assert!(
+            !Config::command()
+                .get_arguments()
+                .any(|argument| argument.get_id() == "demo")
+        );
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(source.contains("ReplicaHost::new("));
+        assert!(source.contains("SqlitePersistence::is_fresh_empty"));
+        assert!(source.contains("SqliteService::deferred("));
+        assert!(!source.contains("SqlitePersistence::open("));
+    }
+    use clap::CommandFactory;
 }

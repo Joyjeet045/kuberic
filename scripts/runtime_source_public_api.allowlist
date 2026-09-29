@@ -255,6 +255,7 @@ public-path hidden trait crate::replicator::ManagedReplicator::async fn receive_
 public-path hidden trait crate::replicator::ManagedReplicator::async fn recover_pending_writes (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicator::async fn repair_peer (& self , identity : ReplicaIdentity , progress : Lsn) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicator::async fn restore_authority (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicator::async fn settle_primary_prefix (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicator::async fn snapshot (& self) -> RuntimeSnapshot
 public-path hidden trait crate::replicator::ManagedReplicator::fn abort (& self)
 public-path hidden trait crate::replicator::PartitionAccessView: Send + Sync

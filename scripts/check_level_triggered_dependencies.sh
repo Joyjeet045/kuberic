@@ -24,13 +24,14 @@ new_packages = {
     "kuberic-agent",
     "kuberic-controller",
     "kvstore2",
+    "sqlite-replicated",  # Migrated in place; never allow classic dependencies back in.
+    "sqlite-commit-barrier",
     "kuberic-level-tests",
 }
 protected_packages = {
     "kuberic-core",
     "kuberic-operator",
     "kvstore",
-    "sqlite-replicated",
     "postgres-replicated",
     "kuberic-tests",
 }
@@ -49,7 +50,6 @@ protected_roots = [
     (workspace_root / "kuberic-core").resolve(),
     (workspace_root / "kuberic-operator").resolve(),
     (workspace_root / "examples" / "kvstore").resolve(),
-    (workspace_root / "examples" / "sqlite").resolve(),
     (workspace_root / "examples" / "postgres").resolve(),
     (workspace_root / "kuberic-tests").resolve(),
 ]
@@ -57,7 +57,6 @@ protected_tokens = {
     "kuberic-core",
     "kuberic-operator",
     "examples/kvstore",
-    "examples/sqlite",
     "examples/postgres",
     "kuberic-tests",
 }

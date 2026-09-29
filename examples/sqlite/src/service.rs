@@ -1,497 +1,370 @@
-//! Lifecycle + StateProvider event loop for the SQLite service.
-//!
-//! Same two-channel pattern as kvstore: LifecycleEvent + StateProviderEvent.
+//! Public v2 lifecycle/provider adapter. Authority stays in ReplicaHost.
+use std::path::PathBuf;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use kuberic_core::events::{LifecycleEvent, StateProviderEvent};
-use kuberic_core::handles::StateReplicatorHandle;
-use kuberic_core::replicator::WalReplicator;
-use kuberic_core::types::{CancellationToken, Operation, OperationStream, Role};
-use tokio::sync::mpsc;
-use tracing::{info, warn};
+use futures::{StreamExt, stream};
+use kuberic_protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
+use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
+use kuberic_runtime::engine::DurableState;
+use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
+use kuberic_runtime::replicator::{
+    DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
+    StatefulServicePartition,
+};
+use kuberic_runtime::{Result, RuntimeError, StateProvider, StatefulServiceReplica};
 
-use crate::frames::WalFrameSet;
-use crate::server::run_client_server;
-use crate::state::SharedState;
+use crate::barrier::ReplicationBarrier;
+use crate::connection::SqliteConnection;
+use crate::state::{RecoveryState, SqlitePersistence, persistence_error};
 
-#[derive(Debug, Clone, Default)]
-pub enum DataLossBehavior {
-    #[default]
-    NoStateChange,
-    StateChanged,
-    Fail(String),
-    Delay {
-        duration: std::time::Duration,
-        state_changed: bool,
-    },
+pub struct SqliteProvider {
+    persistence: Arc<SqlitePersistence>,
 }
 
-/// Handle a single state provider event.
-async fn handle_state_provider_event(
-    event: StateProviderEvent,
-    state: &SharedState,
-    data_loss_behavior: &DataLossBehavior,
-) {
-    match event {
-        StateProviderEvent::UpdateEpoch {
-            previous_epoch_last_lsn,
-            reply,
-            ..
-        } => {
-            let current_lsn = state.lock().await.last_applied_lsn;
-            if previous_epoch_last_lsn > 0 && previous_epoch_last_lsn < current_lsn {
-                info!(
-                    previous_epoch_last_lsn,
-                    current_lsn, "epoch updated — rolling back"
-                );
-                if let Err(e) = state
-                    .lock()
-                    .await
-                    .rollback_to(previous_epoch_last_lsn)
-                    .await
-                {
-                    warn!(error = %e, "rollback failed");
-                }
-            } else {
-                info!(previous_epoch_last_lsn, current_lsn, "epoch updated");
-            }
-            let _ = reply.send(Ok(()));
-        }
-        StateProviderEvent::GetLastCommittedLsn { reply } => {
-            let lsn = state.lock().await.committed_lsn;
-            info!(lsn, "reporting last committed LSN");
-            let _ = reply.send(Ok(lsn));
-        }
-        StateProviderEvent::GetCopyContext { reply } => {
-            let lsn = state.lock().await.committed_lsn;
-            let (tx, stream) = OperationStream::channel(1);
-            let data = Bytes::from(lsn.to_string());
-            let _ = tx.send(Operation::new(0, data, None)).await;
-            drop(tx);
-            info!(lsn, "sent copy context");
-            let _ = reply.send(Ok(stream));
-        }
-        StateProviderEvent::GetCopyState {
-            up_to_lsn,
-            mut copy_context,
-            reply,
-        } => {
-            if crate::barrier::barrier().is_fenced() {
-                warn!("refusing to build copy state on a replica awaiting rebuild");
-                let _ = reply.send(Err(kuberic_core::KubericError::Internal(Box::new(
-                    std::io::Error::other(
-                        "replica lost a replicated transaction locally and must be rebuilt",
-                    ),
-                ))));
-                return;
-            }
-            let peer_lsn = if let Some(op) = copy_context.get_operation().await {
-                String::from_utf8_lossy(&op.data)
-                    .parse::<i64>()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-
-            info!(peer_lsn, up_to_lsn, "producing copy state (DB snapshot)");
-
-            let st = state.clone();
-            let snapshot = match tokio::task::spawn_blocking(move || {
-                let state = st.blocking_lock();
-                state.snapshot_db()
-            })
-            .await
-            {
-                Ok(Ok(data)) => data,
-                Ok(Err(e)) => {
-                    warn!(error = %e, "failed to snapshot DB");
-                    let _ = reply.send(Err(kuberic_core::KubericError::Internal(Box::new(e))));
-                    return;
-                }
-                Err(e) => {
-                    warn!(error = %e, "snapshot task panicked");
-                    let _ = reply.send(Err(kuberic_core::KubericError::Internal(Box::new(
-                        std::io::Error::other(format!("snapshot task panicked: {e}")),
-                    ))));
-                    return;
-                }
-            };
-
-            let current_lsn = state.lock().await.last_applied_lsn;
-            let (tx, stream) = OperationStream::channel(64);
-            let _ = reply.send(Ok(stream));
-
-            // Send snapshot in background (doesn't need state)
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(Operation::new(current_lsn, Bytes::from(snapshot), None))
-                    .await;
-                drop(tx);
-                info!("copy state produced");
-            });
-        }
-        StateProviderEvent::OnDataLoss { reply } => {
-            let result = match data_loss_behavior {
-                DataLossBehavior::NoStateChange => Ok(false),
-                DataLossBehavior::StateChanged => Ok(true),
-                DataLossBehavior::Fail(message) => {
-                    Err(kuberic_core::KubericError::Internal(message.clone().into()))
-                }
-                DataLossBehavior::Delay {
-                    duration,
-                    state_changed,
-                } => {
-                    tokio::time::sleep(*duration).await;
-                    Ok(*state_changed)
-                }
-            };
-            match &result {
-                Ok(state_changed) => {
-                    info!(state_changed, "data loss callback completed");
-                }
-                Err(_) => {
-                    warn!("data loss callback failed");
-                }
-            }
-            let _ = reply.send(result);
-        }
-    }
-}
-
-/// Drain a copy or replication stream for the secondary.
-async fn drain_stream(
-    state: SharedState,
-    mut stream: OperationStream,
-    token: CancellationToken,
-    label: &'static str,
-) -> std::io::Result<()> {
-    loop {
-        tokio::select! {
-            biased;
-            _ = token.cancelled() => {
-                info!(label, "stream drain cancelled");
-                return Err(std::io::Error::other("stream drain cancelled"));
-            }
-            item = stream.get_operation() => {
-                let Some(op) = item else { break };
-                let lsn = op.lsn;
-
-                if label == "copy" {
-                    // Copy stream: full DB snapshot
-                    let mut st = state.lock().await;
-                    if let Err(e) = st.restore_from_snapshot(&op.data).await {
-                        warn!(error = %e, "failed to restore snapshot");
-                        return Err(e);
-                    }
-                    st.last_applied_lsn = lsn;
-                    st.committed_lsn = lsn;
-                    info!(lsn, "restored DB from copy stream");
-                    op.acknowledge();
-                } else {
-                    // Replication stream: WalFrameSet
-                    match serde_json::from_slice::<WalFrameSet>(&op.data) {
-                        Ok(frame_set) => {
-                            if !frame_set.verify_checksum() {
-                                warn!(lsn, "checksum mismatch, not acknowledging");
-                                continue;
-                            }
-                            let mut st = state.lock().await;
-                            if let Err(e) = st.persist_frame(lsn, &frame_set).await {
-                                warn!(lsn, error = %e, "frame persist failed, not acknowledging");
-                                continue;
-                            }
-                            op.acknowledge();
-                        }
-                        Err(e) => {
-                            warn!(lsn, error = %e, "failed to deserialize WalFrameSet");
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if label == "copy" {
-        let lsn = stream
-            .copy_lsn()
-            .ok_or_else(|| std::io::Error::other("incomplete copy stream"))?;
-        let mut state = state.lock().await;
-        if state.last_applied_lsn != lsn {
-            return Err(std::io::Error::other(
-                "copy boundary does not match installed snapshot",
+#[async_trait]
+impl StateProvider for SqliteProvider {
+    async fn update_epoch(&self, _epoch: Epoch, previous_epoch_last_lsn: i64) -> Result<()> {
+        // Agent authority fences epochs; immutable application history must not
+        // discard an unresolved reservation or an acknowledged prefix here.
+        if previous_epoch_last_lsn < 0 {
+            return Err(RuntimeError::Application(
+                "negative previous epoch boundary".into(),
             ));
         }
-        crate::framelog::FrameLog::save_meta(
-            &state.data_dir,
-            &crate::framelog::FrameLogMeta { committed_lsn: lsn },
-        )
-        .await?;
-        state.committed_lsn = lsn;
-        stream
-            .acknowledge_completion()
-            .map_err(std::io::Error::other)?;
+        Ok(())
     }
-    info!(label, "stream drained");
-    Ok(())
+    async fn last_committed_lsn(&self) -> Result<i64> {
+        Ok(self.persistence.durable_progress().await?.committed_lsn)
+    }
+    async fn get_copy_context(&self) -> Result<OperationDataStream> {
+        Ok(Box::pin(stream::empty()))
+    }
+    async fn get_copy_state(
+        &self,
+        up_to_lsn: i64,
+        mut context: OperationDataStream,
+    ) -> Result<OperationDataStream> {
+        if context.next().await.is_some() {
+            return Err(RuntimeError::Application(
+                "SQLite does not use copy context".into(),
+            ));
+        }
+        let data = self
+            .persistence
+            .snapshot(up_to_lsn)
+            .map_err(persistence_error)?;
+        Ok(Box::pin(stream::iter([Ok(Bytes::from(data))])))
+    }
+    async fn on_data_loss(&self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
-/// Main service event loop.
-pub async fn run_service(
-    lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
-    state: SharedState,
-    client_bind: String,
-) {
-    run_service_with_data_loss(
-        lifecycle_rx,
-        state,
-        client_bind,
-        DataLossBehavior::default(),
-    )
-    .await;
+pub struct SqliteService {
+    pub(crate) sql: Arc<Mutex<SqliteConnection>>,
+    pub(crate) request_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) active: Arc<AtomicBool>,
+    pub(crate) vfs_name: String,
+    persistence: Arc<SqlitePersistence>,
+    barrier: Arc<ReplicationBarrier>,
+    provider: Arc<SqliteProvider>,
+    partition: Mutex<Option<StatefulServicePartition>>,
+    replicator: Mutex<Option<Arc<dyn StateReplicator>>>,
+    streams: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    replication_address: String,
 }
 
-pub async fn run_service_with_data_loss(
-    mut lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
-    state: SharedState,
-    client_bind: String,
-    data_loss_behavior: DataLossBehavior,
-) {
-    let mut partition = None;
-    let mut replicator: Option<StateReplicatorHandle> = None;
-    let mut state_provider_rx: Option<mpsc::UnboundedReceiver<StateProviderEvent>> = None;
-    let mut copy_stream: Option<OperationStream> = None;
-    let mut replication_stream: Option<OperationStream> = None;
-    let mut token: Option<CancellationToken> = None;
-    let mut bg_handles: Vec<tokio::task::JoinHandle<std::io::Result<()>>> = Vec::new();
-    let mut copy_failure: Option<String> = None;
-    let mut bg_token: Option<CancellationToken> = None;
-    let mut client_server_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let mut client_server_shutdown: Option<CancellationToken> = None;
-    let mut last_role = Role::Unknown;
+impl SqliteService {
+    pub fn new(
+        persistence: Arc<SqlitePersistence>,
+        replication_address: String,
+    ) -> std::io::Result<Self> {
+        let committed_lsn = persistence.progress()?.committed_lsn;
+        Self::with_persistence(persistence, replication_address, committed_lsn)
+    }
 
-    info!("sqlite service started, waiting for events");
+    /// Construct without touching application files. ReplicaHost must authorize
+    /// agent storage before invoking Open, which opens application persistence.
+    pub fn deferred(root: PathBuf, replication_address: String) -> std::io::Result<Self> {
+        Self::with_persistence(
+            Arc::new(SqlitePersistence::deferred(root)?),
+            replication_address,
+            0,
+        )
+    }
 
-    loop {
-        tokio::select! {
-            biased;
+    fn with_persistence(
+        persistence: Arc<SqlitePersistence>,
+        replication_address: String,
+        committed_lsn: i64,
+    ) -> std::io::Result<Self> {
+        let (barrier, vfs_name) =
+            ReplicationBarrier::register_with_lsn(persistence.clone(), committed_lsn)?;
+        Ok(Self {
+            sql: Arc::new(Mutex::new(SqliteConnection::default())),
+            request_gate: Arc::new(tokio::sync::Mutex::new(())),
+            active: Arc::new(AtomicBool::new(false)),
+            vfs_name,
+            provider: Arc::new(SqliteProvider {
+                persistence: persistence.clone(),
+            }),
+            persistence,
+            barrier,
+            partition: Mutex::new(None),
+            replicator: Mutex::new(None),
+            streams: Mutex::new(Vec::new()),
+            replication_address,
+        })
+    }
+    pub fn persistence(&self) -> &Arc<SqlitePersistence> {
+        &self.persistence
+    }
+    pub fn barrier(&self) -> &Arc<ReplicationBarrier> {
+        &self.barrier
+    }
+    pub fn provider(&self) -> &Arc<SqliteProvider> {
+        &self.provider
+    }
+    pub fn vfs_name(&self) -> &str {
+        &self.vfs_name
+    }
 
-            Some(event) = lifecycle_rx.recv() => match event {
-                LifecycleEvent::Open { ctx, reply } => {
-                    info!("service opened — creating replicator");
-                    let data_dir = state.lock().await.data_dir.clone();
-                    crate::barrier::barrier().arm(data_dir, ctx.fault_tx.clone());
-                    let (sp_tx, sp_rx) = mpsc::unbounded_channel();
-                    match WalReplicator::create(
-                        ctx.replica_id,
-                        &ctx.data_bind,
-                        ctx.fault_tx.clone(),
-                        sp_tx,
-                    ).await {
-                        Ok((handle, handles)) => {
-                            partition = Some(handles.partition);
-                            replicator = Some(handles.replicator);
-                            copy_stream = handles.copy_stream;
-                            replication_stream = handles.replication_stream;
-                            state_provider_rx = Some(sp_rx);
-                            token = Some(ctx.token);
-                            let _ = reply.send(Ok(handle));
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to create replicator");
-                            let _ = reply.send(Err(e));
-                        }
-                    }
+    #[cfg(any(test, feature = "testing"))]
+    pub fn primary_application_active_for_test(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+    pub fn partition(&self) -> Result<StatefulServicePartition> {
+        self.partition
+            .lock()
+            .expect("partition")
+            .clone()
+            .ok_or(RuntimeError::NotOpen)
+    }
+
+    pub(crate) async fn access(&self, write: bool) -> Result<(StatefulServicePartition, bool)> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(RuntimeError::NotPrimary);
+        }
+        let partition = self.partition()?;
+        let status = if write {
+            partition.get_write_status().await?
+        } else {
+            partition.get_read_status().await?
+        };
+        if status != AccessStatus::Granted {
+            return Err(if write {
+                RuntimeError::WriteClosed(status)
+            } else {
+                RuntimeError::ReadClosed(status)
+            });
+        }
+        // A write grant follows the runtime's exact local-journal recovery. Reads
+        // alone must not clear a reservation-only reconciliation marker.
+        let recovered = partition.get_write_status().await? == AccessStatus::Granted;
+        Ok((partition, recovered))
+    }
+
+    /// Grant-time journal recovery can advance commitment after the Primary
+    /// callback. Under the request/connection locks, refresh that materialization
+    /// before the first SQL request can observe it or issue a different write.
+    pub(crate) fn prepare_sql(
+        &self,
+        sql: &mut SqliteConnection,
+        recovered: bool,
+    ) -> std::io::Result<()> {
+        if !self.active.load(Ordering::SeqCst) || self.barrier.is_fenced() {
+            return Err(std::io::Error::other(
+                "SQL is fenced for this service instance",
+            ));
+        }
+        let recovery = self.persistence.recovery_state()?;
+        if matches!(
+            recovery,
+            RecoveryState::RebuildRequired(_) | RecoveryState::Rebuilding { .. }
+        ) {
+            return Err(std::io::Error::other(
+                "acknowledged history requires rebuild",
+            ));
+        }
+        let committed = self.persistence.progress()?.committed_lsn;
+        if !sql.is_open() || sql.visible_lsn != committed || recovery != RecoveryState::Healthy {
+            sql.close();
+            if recovery != RecoveryState::Healthy {
+                if !recovered {
+                    return Err(std::io::Error::other(
+                        "agent journal reconciliation is incomplete",
+                    ));
                 }
-                LifecycleEvent::ChangeRole { new_role, reply } => {
-                    info!(?new_role, "role changed");
-                    if new_role == last_role {
-                        let _ = reply.send(Ok(String::new()));
-                        continue;
-                    }
-                    if matches!(new_role, Role::ActiveSecondary | Role::Primary)
-                        && let Some(error) = &copy_failure
-                    {
-                        let _ = reply.send(Err(kuberic_core::KubericError::Internal(error.clone().into())));
-                        continue;
-                    }
+                self.persistence.complete_reconciliation()?;
+            }
+            let path = self.persistence.materialize_committed()?;
+            self.barrier.reset_receipt(committed);
+            sql.open(&path, &self.vfs_name, committed)
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+}
 
-                    if matches!(new_role, Role::ActiveSecondary | Role::Primary)
-                        && last_role == Role::IdleSecondary
-                    {
-                        // Let copy drain finish
-                        for h in bg_handles.drain(..) {
-                            match h.await {
-                                Ok(Ok(())) => {}
-                                Ok(Err(error)) => copy_failure = Some(error.to_string()),
-                                Err(error) => copy_failure = Some(error.to_string()),
-                            }
-                        }
-                        if let Some(error) = &copy_failure {
-                            let _ = reply.send(Err(kuberic_core::KubericError::Internal(error.clone().into())));
-                            continue;
-                        }
-                    } else {
-                        if let Some(t) = bg_token.take() {
-                            t.cancel();
-                        }
-                        for h in bg_handles.drain(..) {
-                            let _ = h.await;
-                        }
-                    }
+#[async_trait]
+impl StatefulServiceReplica for SqliteService {
+    async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        self.persistence.initialize().map_err(persistence_error)?;
+        self.barrier.reset_receipt(
+            self.persistence
+                .progress()
+                .map_err(persistence_error)?
+                .committed_lsn,
+        );
+        *self.partition.lock().expect("partition") = Some(context.partition.clone());
+        let interfaces = context
+            .partition
+            .with_factory(Arc::new(DefaultReplicatorFactory::new(
+                self.persistence.clone(),
+            )))
+            .create_replicator(
+                self.provider.clone(),
+                Some(ReplicatorSettings {
+                    replication_address: self.replication_address.clone(),
+                }),
+            )
+            .await?;
+        let replicator = interfaces.state_replicator();
+        for stream in [
+            replicator.get_copy_stream().await?,
+            replicator.get_replication_stream().await?,
+        ] {
+            let task = tokio::spawn(consume_stream(self.persistence.clone(), stream));
+            self.streams.lock().expect("streams").push(task);
+        }
+        *self.replicator.lock().expect("replicator") = Some(replicator);
+        if matches!(
+            self.persistence
+                .recovery_state()
+                .map_err(persistence_error)?,
+            RecoveryState::RebuildRequired(_) | RecoveryState::Rebuilding { .. }
+        ) {
+            self.partition()?.report_fault(FaultType::Permanent).await?;
+        }
+        Ok(interfaces.replicator())
+    }
 
-                    let t = CancellationToken::new();
-                    bg_token = Some(t.clone());
+    async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        self.active.store(false, Ordering::SeqCst);
+        self.barrier.uninstall();
+        let state = self.sql.clone();
+        tokio::task::spawn_blocking(move || state.lock().expect("SQL connection").close())
+            .await
+            .map_err(|e| RuntimeError::Application(e.to_string()))?;
+        if role == ReplicaRole::Primary {
+            if self.barrier.is_fenced() {
+                return Err(RuntimeError::Application(
+                    "reopen the fenced service before promotion".into(),
+                ));
+            }
+            let replicator = self
+                .replicator
+                .lock()
+                .expect("replicator")
+                .clone()
+                .ok_or(RuntimeError::NotOpen)?;
+            self.barrier.install(replicator, self.partition()?);
+            let state = self.sql.clone();
+            let persistence = self.persistence.clone();
+            let vfs = self.vfs_name.clone();
+            let barrier = self.barrier.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                let mut state = state.lock().expect("SQL connection");
+                let path = persistence.materialize_committed()?;
+                let committed = persistence.progress()?.committed_lsn;
+                barrier.reset_receipt(committed);
+                state
+                    .open(&path, &vfs, committed)
+                    .map_err(std::io::Error::other)
+            })
+            .await
+            .map_err(|e| RuntimeError::Application(e.to_string()))?;
+            if let Err(error) = opened {
+                self.barrier.uninstall();
+                return Err(persistence_error(error));
+            }
+            self.active.store(true, Ordering::SeqCst);
+        }
+        Ok(RoleChange {
+            service_address: None,
+        })
+    }
 
-                    match new_role {
-                        Role::IdleSecondary => {
-                            // Open frame log for secondary
-                            {
-                                let mut st = state.lock().await;
-                                if let Err(e) = st.open_frame_log().await {
-                                    warn!(error = %e, "failed to open frame log");
-                                }
-                            }
-                            if let Some(cs) = copy_stream.take() {
-                                let st = state.clone();
-                                bg_handles.push(tokio::spawn(
-                                    drain_stream(st, cs, t.clone(), "copy"),
-                                ));
-                            }
-                        }
-                        Role::ActiveSecondary => {
-                            if let Some(rs) = replication_stream.take() {
-                                let st = state.clone();
-                                bg_handles.push(tokio::spawn(
-                                    drain_stream(st, rs, t.clone(), "replication"),
-                                ));
-                            }
-                        }
-                        Role::Primary => {
-                            // Apply unapplied frames, then open SQLite as primary
-                            {
-                                let mut st = state.lock().await;
-                                let lsn = st.last_applied_lsn;
-                                if let Err(e) = st.apply_committed_frames(lsn).await {
-                                    warn!(error = %e, "applying frames before promotion failed");
-                                }
-                            }
-                            // Commits block on the barrier, so it must accept
-                            // replication before SQLite can write anything.
-                            let ready = if crate::barrier::barrier().is_fenced() {
-                                tracing::error!(
-                                    "refusing to promote a replica that must be rebuilt"
-                                );
-                                false
-                            } else {
-                                match (replicator.as_ref(), token.as_ref()) {
-                                    (Some(r), Some(t)) => {
-                                        crate::barrier::barrier().install(r.clone(), t.clone());
-                                        true
-                                    }
-                                    _ => {
-                                        tracing::error!(
-                                            "promotion without a replicator — refusing to serve"
-                                        );
-                                        false
-                                    }
-                                }
-                            };
-                            // open_as_primary is blocking (rusqlite) — use spawn_blocking
-                            let st = state.clone();
-                            let opened = if ready {
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = st.blocking_lock();
-                                    st.open_as_primary()
-                                })
-                                .await
-                                .unwrap_or_else(|e| Err(std::io::Error::other(e)))
-                            } else {
-                                Err(std::io::Error::other("no replicator"))
-                            };
-                            if let Err(e) = opened {
-                                tracing::error!(
-                                    error = %e,
-                                    "failed to open as primary — not starting the client server"
-                                );
-                                crate::barrier::barrier().uninstall();
-                                state.lock().await.close();
-                            } else if client_server_handle.is_none() {
-                                let srv_state = state.clone();
-                                let p = partition.as_ref().unwrap().clone();
-                                let shutdown = CancellationToken::new();
-                                let shutdown_cp = shutdown.clone();
-                                let bind = client_bind.clone();
+    async fn close(&self) -> Result<()> {
+        self.abort();
+        let state = self.sql.clone();
+        tokio::task::spawn_blocking(move || state.lock().expect("SQL connection").close())
+            .await
+            .map_err(|e| RuntimeError::Application(e.to_string()))?;
+        Ok(())
+    }
 
-                                client_server_shutdown = Some(shutdown);
-                                client_server_handle = Some(tokio::spawn(async move {
-                                    run_client_server(
-                                        bind, srv_state, p, shutdown_cp,
-                                    ).await;
-                                }));
-                            }
-                        }
-                        Role::None => {
-                            crate::barrier::barrier().uninstall();
-                            // Permanent removal — stop client server immediately
-                            if let Some(shutdown) = client_server_shutdown.take() {
-                                shutdown.cancel();
-                            }
-                            if let Some(h) = client_server_handle.take() {
-                                let _ = h.await;
-                            }
-                        }
-                        Role::Unknown => {}
-                    }
-
-                    last_role = new_role;
-                    let _ = reply.send(Ok(String::new()));
-                }
-                LifecycleEvent::Close { reply } => {
-                    info!("service closing");
-                    if let Some(token) = bg_token.take() {
-                        token.cancel();
-                    }
-                    for h in bg_handles.drain(..) {
-                        let _ = h.await;
-                    }
-                    if let Some(shutdown) = client_server_shutdown.take() {
-                        shutdown.cancel();
-                    }
-                    if let Some(h) = client_server_handle.take() {
-                        let _ = h.await;
-                    }
-                    let data_dir = state.lock().await.data_dir.clone();
-                    state.lock().await.close();
-                    if last_role == Role::None {
-                        // Permanent removal — delete data directory
-                        info!(?data_dir, "deleting data directory (decommissioned)");
-                        let _ = tokio::fs::remove_dir_all(&data_dir).await;
-                    }
-                    let _ = reply.send(Ok(()));
-                    break;
-                }
-                LifecycleEvent::Abort => {
-                    if let Some(token) = bg_token.take() {
-                        token.cancel();
-                    }
-                    if let Some(shutdown) = client_server_shutdown.take() {
-                        shutdown.cancel();
-                    }
-                    state.lock().await.close();
-                    break;
-                }
-            },
-
-            Some(event) = async {
-                match state_provider_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                handle_state_provider_event(event, &state, &data_loss_behavior).await;
-            },
-
-            else => break,
+    fn abort(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        self.barrier.uninstall();
+        self.partition.lock().expect("partition").take();
+        self.replicator.lock().expect("replicator").take();
+        for task in self.streams.lock().expect("streams").drain(..) {
+            task.abort();
+        }
+        if let Ok(mut state) = self.sql.try_lock() {
+            state.close();
         }
     }
-    info!("sqlite service exited");
+}
+
+async fn consume_stream(persistence: Arc<SqlitePersistence>, mut stream: OperationStream) {
+    while let Ok(Some(operation)) = stream.get_operation().await {
+        let result = match &operation.metadata {
+            OperationMetadata::Replication { lsn, committed_lsn } => {
+                persistence
+                    .apply(kuberic_runtime::application::Operation {
+                        lsn: *lsn,
+                        committed_lsn: *committed_lsn,
+                        data: operation.data.clone(),
+                    })
+                    .await
+            }
+            OperationMetadata::Copy { build_id, sequence } => match persistence
+                .apply_copy_chunk(
+                    build_id,
+                    *sequence,
+                    kuberic_runtime::application::CopyChunk {
+                        data: operation.data.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(()) => persistence.durable_progress().await,
+                Err(error) => Err(error),
+            },
+            OperationMetadata::CopyComplete {
+                build_id,
+                up_to_lsn,
+                committed_lsn,
+            } => {
+                persistence
+                    .finish_copy(build_id, *up_to_lsn, *committed_lsn)
+                    .await
+            }
+        };
+        match result {
+            Ok(progress) => {
+                let _ = operation.acknowledge(progress);
+            }
+            Err(error) => {
+                let _ = operation.reject(error);
+            }
+        }
+    }
 }

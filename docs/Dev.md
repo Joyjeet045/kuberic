@@ -18,7 +18,7 @@ Helm charts.
 
 For the independent `operator.kuberic.io/v1alpha1` stack, follow the
 [level-triggered deployment and testing guide](features/kuberic/level-triggered-operator.md#local-deployment).
-Use fresh protocol-8/schema-3 storage and an owned cluster. The live
+Use fresh protocol-8/schema-4 storage and an owned cluster. The live
 `just level-triggered-kind-test scale-down` and `scale-down-adversarial`
 selectors exercise secondary removal; `scale-up`, `scale-up-multi`, and
 `scale-up-adversarial` exercise sequential membership increase and recovery.

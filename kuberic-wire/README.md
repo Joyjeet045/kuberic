@@ -79,8 +79,11 @@ replica peers are rejected. Authentication, DNS resolution, retry policy, and
 session registration are agent-owned transport concerns around these schemas.
 Protocol 6 is rejected; the protobuf package remains `kuberic.level.v1` and
 existing field/enum numbers are unchanged. Use a fresh coordinated v2 deployment,
-not mixed-version operation. Agent storage uses schema 3 and rejects schema 2;
+not mixed-version operation. Agent storage uses schema 4 and rejects schemas 2 and 3;
 there is no metadata conversion or data migration.
+Copy final markers must use the immutable committed snapshot boundary for both
+LSN and committed watermark; applied suffixes retain their own operation
+watermarks during catch-up. The wire message shape needs no paired-boundary field.
 Version 4 switchover-bearing persistent records lack the generation proof
 (including retired certificates). No in-place migration of those records is
 provided; incompatible persisted authority fails closed rather than inventing

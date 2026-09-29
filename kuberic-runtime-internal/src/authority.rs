@@ -36,6 +36,7 @@ pub fn validate_build_envelope(authority: &BuildAuthority, envelope: &CopyItem) 
         ));
     }
     if (envelope.final_item != envelope.catch_up_boundary_lsn.is_some())
+        || (envelope.final_item && envelope.committed_lsn != authority.replication_boundary_lsn)
         || envelope
             .catch_up_boundary_lsn
             .is_some_and(|boundary| boundary < authority.replication_boundary_lsn)

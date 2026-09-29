@@ -1,20 +1,93 @@
-//! Client-facing SQL gRPC server (primary only).
-
+//! SQL RPCs use asynchronous v2 access checks and one serialized connection.
 use std::sync::Arc;
 
-use kuberic_core::handles::PartitionHandle;
-use kuberic_core::types::{AccessStatus, CancellationToken};
-use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
 
+use crate::barrier::CommitFailure;
+use crate::connection::Statement;
 use crate::proto;
-use crate::state::SharedState;
+use crate::service::SqliteService;
 
+#[derive(Clone)]
 pub struct SqliteServer {
-    pub state: SharedState,
-    pub partition: Arc<PartitionHandle>,
-    write_gate: Arc<Semaphore>,
+    application: Arc<SqliteService>,
+}
+
+impl SqliteServer {
+    pub fn new(application: Arc<SqliteService>) -> Self {
+        Self { application }
+    }
+
+    async fn write(&self, statements: Vec<Statement>) -> Result<(Vec<usize>, i64, i64), Status> {
+        self.application.access(true).await.map_err(unavailable)?;
+        let permit = self.application.request_gate.clone().lock_owned().await;
+        let (_, recovered) = self.application.access(true).await.map_err(unavailable)?;
+        let application = self.application.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            // A cancelled RPC must not release serialization while SQLite is still
+            // waiting at the barrier or recording successful publication.
+            let _permit = permit;
+            let mut sql = application.sql.lock().expect("SQL connection");
+            application
+                .prepare_sql(&mut sql, recovered)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            let progress = application
+                .persistence()
+                .progress()
+                .map_err(|e| Status::internal(e.to_string()))?;
+            if progress.applied_lsn != progress.committed_lsn {
+                return Err(Status::failed_precondition(
+                    "an applied suffix must be settled by authority before new SQL writes",
+                ));
+            }
+            let before = progress.committed_lsn;
+            application.barrier().reset_receipt(before);
+            let executed = sql.execute(&statements);
+            let lsn = application.barrier().last_lsn();
+            match executed {
+                Ok((rows, rowid)) => {
+                    if application.barrier().is_fenced() {
+                        return Err(unknown("local publication was interrupted"));
+                    }
+                    if let Err(error) = application.persistence().confirm_publication(lsn) {
+                        application.barrier().fence_unknown(&error.to_string());
+                        return Err(unknown(&error.to_string()));
+                    }
+                    sql.visible_lsn = lsn;
+                    Ok((rows, rowid, lsn))
+                }
+                Err(error) => match application.barrier().failure() {
+                    Some(CommitFailure::Unknown(reason)) => Err(unknown(&reason)),
+                    Some(CommitFailure::Definitive(reason)) => Err(Status::unavailable(format!(
+                        "transaction rejected before dispatch: {reason}"
+                    ))),
+                    None if lsn > before => {
+                        application.barrier().fence_unknown(&error.to_string());
+                        Err(unknown(&error.to_string()))
+                    }
+                    None => Err(Status::invalid_argument(format!("SQL rejected: {error}"))),
+                },
+            }
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.application.barrier().fence_unknown(&error.to_string());
+                Err(unknown(&error.to_string()))
+            }
+        }
+    }
+}
+
+fn unavailable(error: kuberic_runtime::RuntimeError) -> Status {
+    Status::unavailable(error.to_string())
+}
+
+fn unknown(reason: &str) -> Status {
+    Status::unknown(format!(
+        "outcome unknown after replication dispatch: {reason}; reopen/reconcile and verify the transaction before retrying"
+    ))
 }
 
 #[tonic::async_trait]
@@ -23,36 +96,30 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
         &self,
         request: Request<proto::ExecuteRequest>,
     ) -> Result<Response<proto::ExecuteResponse>, Status> {
-        self.check_write_access()?;
-
-        let _write = self.write_gate.acquire().await.expect("write gate");
-        self.check_write_access()?;
-
-        let req = request.into_inner();
-        let params = convert_params(&req.params);
-        let sql = req.sql;
-
-        // Execute SQL on blocking thread (rusqlite is synchronous)
-        let state = self.state.clone();
-        let executed = tokio::task::spawn_blocking(move || {
-            let state = state.blocking_lock();
-            state.execute_sql(&sql, &params)
-        })
-        .await;
-
-        let (rows_affected, last_insert_rowid) = match executed {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => return Err(Status::internal(format!("SQL error: {e}"))),
-            Err(e) => return Err(unknown_outcome(format!("execution task failed: {e}"))),
-        };
-
-        // The commit blocked on durable quorum inside the barrier VFS.
-        let lsn = self.confirm_committed().await?;
-
-        debug!(lsn, rows_affected, "execute complete");
+        let request = request.into_inner();
+        let (rows, rowid, lsn) = self
+            .write(vec![(request.sql, convert_params(&request.params))])
+            .await?;
         Ok(Response::new(proto::ExecuteResponse {
-            rows_affected: rows_affected as i64,
-            last_insert_rowid,
+            rows_affected: rows[0] as i64,
+            last_insert_rowid: rowid,
+            lsn,
+        }))
+    }
+
+    async fn execute_batch(
+        &self,
+        request: Request<proto::ExecuteBatchRequest>,
+    ) -> Result<Response<proto::ExecuteBatchResponse>, Status> {
+        let statements = request
+            .into_inner()
+            .statements
+            .into_iter()
+            .map(|sql| (sql, Vec::new()))
+            .collect();
+        let (rows, _, lsn) = self.write(statements).await?;
+        Ok(Response::new(proto::ExecuteBatchResponse {
+            rows_affected: rows.into_iter().map(|n| n as i64).collect(),
             lsn,
         }))
     }
@@ -61,179 +128,43 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
         &self,
         request: Request<proto::QueryRequest>,
     ) -> Result<Response<proto::QueryResponse>, Status> {
-        self.check_read_access()?;
-
-        let req = request.into_inner();
-        let params = convert_params(&req.params);
-        let sql = req.sql;
-
-        let state = self.state.clone();
-        let (columns, rows) = tokio::task::spawn_blocking(move || {
-            let state = state.blocking_lock();
-            state.query_sql(&sql, &params)
+        self.application.access(false).await.map_err(unavailable)?;
+        let permit = self.application.request_gate.clone().lock_owned().await;
+        let (_, recovered) = self.application.access(false).await.map_err(unavailable)?;
+        let request = request.into_inner();
+        let application = self.application.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut sql = application.sql.lock().expect("SQL connection");
+            application
+                .prepare_sql(&mut sql, recovered)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            let (columns, rows) = sql
+                .query(&request.sql, &convert_params(&request.params))
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            Ok(Response::new(proto::QueryResponse {
+                columns,
+                rows: rows
+                    .into_iter()
+                    .map(|values| proto::Row {
+                        values: values.into_iter().map(proto_value).collect(),
+                    })
+                    .collect(),
+            }))
         })
         .await
-        .map_err(|e| Status::internal(format!("task join error: {e}")))?
-        .map_err(|e| Status::internal(format!("SQL error: {e}")))?;
-
-        let proto_rows: Vec<proto::Row> = rows
-            .into_iter()
-            .map(|row| proto::Row {
-                values: row.into_iter().map(json_to_proto_value).collect(),
-            })
-            .collect();
-
-        Ok(Response::new(proto::QueryResponse {
-            columns,
-            rows: proto_rows,
-        }))
+        .map_err(|e| Status::internal(e.to_string()))?
     }
-
-    async fn execute_batch(
-        &self,
-        request: Request<proto::ExecuteBatchRequest>,
-    ) -> Result<Response<proto::ExecuteBatchResponse>, Status> {
-        self.check_write_access()?;
-
-        let _write = self.write_gate.acquire().await.expect("write gate");
-        self.check_write_access()?;
-
-        let req = request.into_inner();
-        let statements = req.statements;
-
-        let state = self.state.clone();
-        let executed = tokio::task::spawn_blocking(move || {
-            let mut state = state.blocking_lock();
-            state.execute_batch_sql(&statements)
-        })
-        .await;
-
-        let rows_affected = match executed {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => return Err(Status::internal(format!("SQL error: {e}"))),
-            Err(e) => return Err(unknown_outcome(format!("execution task failed: {e}"))),
-        };
-
-        // The commit blocked on durable quorum inside the barrier VFS.
-        let lsn = self.confirm_committed().await?;
-
-        debug!(
-            lsn,
-            statements_count = rows_affected.len(),
-            "batch complete"
-        );
-        Ok(Response::new(proto::ExecuteBatchResponse {
-            rows_affected: rows_affected.into_iter().map(|r| r as i64).collect(),
-            lsn,
-        }))
-    }
-}
-
-impl SqliteServer {
-    pub fn new(state: SharedState, partition: Arc<PartitionHandle>) -> Self {
-        Self {
-            state,
-            partition,
-            write_gate: Arc::new(Semaphore::new(1)),
-        }
-    }
-
-    pub fn check_write_access(&self) -> Result<(), Status> {
-        rebuild_fence()?;
-        match self.partition.write_status() {
-            AccessStatus::Granted => Ok(()),
-            AccessStatus::NotPrimary => {
-                Err(Status::unavailable("not primary — redirect to primary"))
-            }
-            AccessStatus::ReconfigurationPending => {
-                Err(Status::unavailable("reconfiguration in progress"))
-            }
-            AccessStatus::NoWriteQuorum => Err(Status::unavailable("no write quorum available")),
-        }
-    }
-
-    pub fn check_read_access(&self) -> Result<(), Status> {
-        rebuild_fence()?;
-        match self.partition.read_status() {
-            AccessStatus::Granted | AccessStatus::NoWriteQuorum => Ok(()),
-            AccessStatus::NotPrimary => {
-                Err(Status::unavailable("not primary — redirect to primary"))
-            }
-            AccessStatus::ReconfigurationPending => {
-                Err(Status::unavailable("reconfiguration in progress"))
-            }
-        }
-    }
-
-    /// The commit itself waits for durable quorum inside the barrier VFS, so a
-    /// returned statement has already been replicated. The LSN is whatever the
-    /// barrier recorded for that commit.
-    async fn confirm_committed(&self) -> Result<i64, Status> {
-        let lsn = crate::barrier::barrier().last_lsn();
-        self.state
-            .lock()
-            .await
-            .mark_confirmed(lsn)
-            .await
-            .map_err(|e| unknown_outcome(format!("confirmation record failed: {e}")))?;
-        Ok(lsn)
-    }
-}
-
-/// The transaction may have committed and reached quorum, so this is not a rollback.
-fn unknown_outcome(detail: String) -> Status {
-    Status::unknown(format!(
-        "outcome unknown: the transaction may have reached durable quorum and committed, but the request could not be completed ({detail}); retry only if the statement is idempotent"
-    ))
-}
-
-fn rebuild_fence() -> Result<(), Status> {
-    if crate::barrier::barrier().is_fenced() {
-        return Err(Status::failed_precondition(
-            "replica lost a replicated transaction locally and must be rebuilt",
-        ));
-    }
-    Ok(())
-}
-
-/// Start the client-facing SQL gRPC server.
-pub async fn run_client_server(
-    bind: String,
-    state: SharedState,
-    partition: Arc<PartitionHandle>,
-    shutdown: CancellationToken,
-) {
-    let listener = match tokio::net::TcpListener::bind(&bind).await {
-        Ok(l) => l,
-        Err(e) => {
-            warn!(error = %e, "failed to bind client server");
-            return;
-        }
-    };
-    let addr = listener.local_addr().unwrap();
-    info!(%addr, "client SQL gRPC server started");
-
-    let server = SqliteServer::new(state, partition);
-
-    let _ = tonic::transport::Server::builder()
-        .add_service(proto::sqlite_store_server::SqliteStoreServer::new(server))
-        .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(listener),
-            shutdown.cancelled(),
-        )
-        .await;
-
-    info!("client SQL gRPC server stopped");
 }
 
 fn convert_params(params: &[proto::Value]) -> Vec<rusqlite::types::Value> {
     params
         .iter()
-        .map(|v| {
-            if v.is_null {
+        .map(|value| {
+            if value.is_null {
                 return rusqlite::types::Value::Null;
             }
-            match &v.kind {
+            match &value.kind {
                 Some(proto::value::Kind::IntegerValue(i)) => rusqlite::types::Value::Integer(*i),
                 Some(proto::value::Kind::RealValue(f)) => rusqlite::types::Value::Real(*f),
                 Some(proto::value::Kind::TextValue(s)) => rusqlite::types::Value::Text(s.clone()),
@@ -244,37 +175,16 @@ fn convert_params(params: &[proto::Value]) -> Vec<rusqlite::types::Value> {
         .collect()
 }
 
-fn json_to_proto_value(val: serde_json::Value) -> proto::Value {
-    match val {
-        serde_json::Value::Null => proto::Value {
-            kind: None,
-            is_null: true,
-        },
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                proto::Value {
-                    kind: Some(proto::value::Kind::IntegerValue(i)),
-                    is_null: false,
-                }
-            } else if let Some(f) = n.as_f64() {
-                proto::Value {
-                    kind: Some(proto::value::Kind::RealValue(f)),
-                    is_null: false,
-                }
-            } else {
-                proto::Value {
-                    kind: None,
-                    is_null: true,
-                }
-            }
-        }
-        serde_json::Value::String(s) => proto::Value {
-            kind: Some(proto::value::Kind::TextValue(s)),
-            is_null: false,
-        },
-        _ => proto::Value {
-            kind: Some(proto::value::Kind::TextValue(val.to_string())),
-            is_null: false,
-        },
+fn proto_value(value: rusqlite::types::Value) -> proto::Value {
+    let kind = match value {
+        rusqlite::types::Value::Null => None,
+        rusqlite::types::Value::Integer(i) => Some(proto::value::Kind::IntegerValue(i)),
+        rusqlite::types::Value::Real(f) => Some(proto::value::Kind::RealValue(f)),
+        rusqlite::types::Value::Text(s) => Some(proto::value::Kind::TextValue(s)),
+        rusqlite::types::Value::Blob(b) => Some(proto::value::Kind::BlobValue(b)),
+    };
+    proto::Value {
+        is_null: kind.is_none(),
+        kind,
     }
 }

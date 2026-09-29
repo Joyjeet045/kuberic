@@ -206,7 +206,7 @@ published only after that proof; it never starts ordinary failover or replacemen
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
 plus [sequential scale-up](../docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
 and [secondary scale-down](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
-for usage, target/minimum risks, recovery, and the protocol 8 / schema 3
+for usage, target/minimum risks, recovery, and the protocol 8 / schema 4
 fresh-deployment contract.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 separate status/API redesign, mechanical helper refactors, and new recovery protocols.

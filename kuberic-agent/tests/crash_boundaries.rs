@@ -837,6 +837,7 @@ struct CrashState {
     path: PathBuf,
     state: Mutex<CrashPersistedState>,
     opens: AtomicUsize,
+    primary_activations: AtomicUsize,
     consume_replication: bool,
 }
 
@@ -906,6 +907,7 @@ impl CrashState {
             path,
             state: Mutex::new(state),
             opens: AtomicUsize::new(0),
+            primary_activations: AtomicUsize::new(0),
             consume_replication: false,
         }
     }
@@ -963,6 +965,9 @@ impl StatefulServiceReplica for CrashState {
     }
 
     async fn change_role(&self, role: ReplicaRole) -> RuntimeResult<RoleChange> {
+        if role == ReplicaRole::Primary {
+            self.primary_activations.fetch_add(1, Ordering::SeqCst);
+        }
         let mut state = self.state.lock().unwrap();
         let mut candidate = state.clone();
         candidate.last_role = Some(role);
@@ -4886,7 +4891,20 @@ async fn execute_scale_up_candidate_configuration_cut(path: &Path, cut: &str, te
     };
     let progress = candidate_application.durable_progress().await.unwrap();
     assert_eq!(progress.applied_lsn, expected_lsn, "{cut}");
-    assert_eq!(progress.committed_lsn, 1, "{cut}");
+    // Current-only recovery sends operation 3 after source operation 2 committed.
+    // Its ordinary replication watermark advances the candidate from 2/1 to 3/2.
+    let expected_committed_lsn = if current_only && !terminate { 2 } else { 1 };
+    assert_eq!(progress.committed_lsn, expected_committed_lsn, "{cut}");
+    assert_eq!(
+        durable_application_history(&scale_up_candidate_root(path).join("application.json")),
+        expected_scale_up_application_history(expected_lsn, expected_committed_lsn),
+        "{cut}: exact candidate history after configuration recovery"
+    );
+    assert_eq!(
+        durable_application_history(&crash_application_path(path)),
+        expected_scale_up_application_history(expected_lsn, expected_lsn),
+        "{cut}: exact source history after configuration recovery"
+    );
     if !terminate {
         let source_authority = source_store.load().await.unwrap().unwrap();
         let candidate_authority = candidate_store.load().await.unwrap().unwrap();
@@ -7472,15 +7490,25 @@ fn real_handoff_configuration_boundaries_survive_process_termination() {
                 };
                 let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
                 let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-                let server =
+                let mut server =
                     tokio::spawn(service.serve(address(), address(), ready_tx, shutdown_rx));
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    ready_rx.wait_for(|ready| *ready),
-                )
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    tokio::select! {
+                        ready = ready_rx.wait_for(|ready| *ready) => {
+                            if let Err(error) = ready {
+                                panic!(
+                                    "{scenario}/{boundary}: readiness closed ({error}); server result: {:?}",
+                                    (&mut server).await
+                                );
+                            }
+                        }
+                        result = &mut server => {
+                            panic!("{scenario}/{boundary}: server stopped before readiness: {result:?}");
+                        }
+                    }
+                })
                 .await
-                .unwrap()
-                .unwrap();
+                .unwrap_or_else(|_| panic!("{scenario}/{boundary}: server readiness timed out"));
                 let direct_client = pod.data_plane();
                 assert!(
                     direct_client
@@ -7518,6 +7546,25 @@ fn real_handoff_configuration_boundaries_survive_process_termination() {
                 let recovered = store.load_state().await.unwrap();
                 assert_eq!(recovered.highest_epoch, command.current_epoch);
                 assert!(recovered.pending_effect.is_none() && recovered.reconfiguration.is_none());
+                if scenario == "demotion" {
+                    assert_eq!(
+                        application.primary_activations.load(Ordering::SeqCst),
+                        0,
+                        "{scenario}/{boundary}: recovery reactivated the old primary"
+                    );
+                    assert_eq!(
+                        application.state.lock().unwrap().last_role,
+                        Some(ReplicaRole::ActiveSecondary),
+                        "{scenario}/{boundary}: demotion application callback did not complete"
+                    );
+                } else if command.current_configuration.primary_id
+                    == state.identity.local_identity.replica_id
+                {
+                    assert!(
+                        application.primary_activations.load(Ordering::SeqCst) > 0,
+                        "{scenario}/{boundary}: authorized primary callback was skipped"
+                    );
+                }
                 assert_ne!(pod.snapshot().await.write_status, AccessStatus::Granted);
                 assert!(
                     application

@@ -1145,6 +1145,19 @@ fn copy_contract_requires_exact_target_and_final_boundary_ack() {
         ..Default::default()
     };
     assert!(validate_copy_ack(&final_ack).is_ok());
+    let mut final_item = item.clone();
+    final_item.sequence = 3;
+    final_item.snapshot_chunk = false;
+    final_item.final_item = true;
+    final_item.lsn = 2;
+    final_item.committed_lsn = 2;
+    final_item.catch_up_boundary_lsn = Some(2);
+    final_item.data.clear();
+    assert!(validate_copy_item(&final_item).is_ok());
+    for conflicting in [-1, 0, 1, 3] {
+        final_item.committed_lsn = conflicting;
+        assert!(validate_copy_item(&final_item).is_err());
+    }
     let mut missing_catch_up_boundary = final_ack.clone();
     missing_catch_up_boundary.catch_up_boundary_lsn = None;
     assert!(matches!(

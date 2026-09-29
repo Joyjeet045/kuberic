@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Replica agent and durable hosting boundary for the level-triggered Kuberic stack"
 
+[features]
+testing = []
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true

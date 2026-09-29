@@ -46,14 +46,24 @@ impl ParentFile {
         }
     }
 
-    unsafe fn write(&self, offset: u64, data: &[u8]) -> c_int {
+    unsafe fn write(&self, mut offset: u64, data: &[u8]) -> c_int {
         unsafe {
-            (self.methods().xWrite.expect("xWrite"))(
-                self.0,
-                data.as_ptr() as *const c_void,
-                data.len() as c_int,
-                offset as i64,
-            )
+            // SQLite's unix VFS assumes bounded requests (its seekAndWriteFd
+            // masks lengths to 17 bits). A staged transaction can be much larger
+            // than a SQLite page, so flush it in page-sized parent writes.
+            for chunk in data.chunks(64 * 1024) {
+                let rc = (self.methods().xWrite.expect("xWrite"))(
+                    self.0,
+                    chunk.as_ptr() as *const c_void,
+                    chunk.len() as c_int,
+                    offset as i64,
+                );
+                if rc != ffi::SQLITE_OK {
+                    return rc;
+                }
+                offset += chunk.len() as u64;
+            }
+            ffi::SQLITE_OK
         }
     }
 

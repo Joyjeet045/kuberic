@@ -173,7 +173,7 @@ assert f"**{crd_headroom:,} bytes**" in guide_text
 status_size_run = subprocess.run(
     [
         "cargo", "test", "-p", "kuberic-protocol",
-        "representative_scale_up_status_variants", "--", "--nocapture",
+        "--lib", "representative_scale_up_status_variants", "--", "--nocapture",
     ],
     check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
 )
@@ -203,10 +203,10 @@ assert "PVC object deletion" in sample and "PVC object deletion" in guide_text
 protocol = (root / "kuberic-protocol/src/lib.rs").read_text()
 store = (root / "kuberic-agent/src/state.rs").read_text()
 assert re.search(r"pub const PROTOCOL_VERSION: u32 = 8;", protocol)
-assert re.search(r"pub const SCHEMA_VERSION: u32 = 3;", store)
-assert "Protocol version 8" in guide_text and "schema 3" in guide_text
+assert re.search(r"pub const SCHEMA_VERSION: u32 = 4;", store)
+assert "Protocol version 8" in guide_text and "schema 4" in guide_text
 assert "Protocol version 8" in (root / "kuberic-wire/README.md").read_text()
-assert "Protocol 8" in sample and "schema 3" in sample
+assert "Protocol 8" in sample and "schema 4" in sample
 current_requirement_documents = [
     root / "docs/Dev.md",
     root / "docs/features/kuberic/level-triggered-operator.md",
@@ -218,17 +218,20 @@ for document in current_requirement_documents:
     normalized = " ".join(text.split()).lower()
     assert "protocol 8" in normalized or "protocol-8" in normalized, \
         f"{document.relative_to(root)}: current deployment requirement must name protocol 8"
-    assert "schema 3" in normalized or "schema-3" in normalized, \
-        f"{document.relative_to(root)}: current deployment requirement must name schema 3"
+    assert "schema 4" in normalized or "schema-4" in normalized, \
+        f"{document.relative_to(root)}: current deployment requirement must name schema 4"
     for stale in (
         "fresh protocol-7/schema-3",
         "fresh coordinated protocol-7/schema-3",
         "fresh deployment for protocol 7 / schema 3",
         "the protocol 7 / schema 3 fresh-deployment contract",
         "requests protocol-7 sequential scale-up",
+        "protocol-8/schema-3",
+        "protocol 8 / schema 3",
+        "protocol 8/schema 3",
     ):
         assert stale not in normalized, \
-            f"{document.relative_to(root)}: stale current protocol-7 requirement: {stale}"
+            f"{document.relative_to(root)}: stale current protocol/schema requirement: {stale}"
 diagnostics = (root / "kuberic-agent/src/process.rs").read_text()
 assert "pub retired: bool" in diagnostics
 assert "state.retired_authority.is_some() || snapshot.retired_authority.is_some()" in diagnostics
@@ -236,6 +239,23 @@ assert "`retired: true`" in guide_text and "Older diagnostic responses can omit"
 
 recipes = (root / "justfile").read_text()
 workflow = (root / ".github/workflows/level-triggered-CI.yml").read_text()
+targeted, live_jobs = workflow.split("\n  bootstrap-kind:", 1)
+sqlite_unit_command = (
+    "cargo test -p sqlite-commit-barrier -p sqlite-replicated "
+    "--all-features -- --test-threads=1"
+)
+assert sqlite_unit_command in targeted
+lint_command = targeted.split("- name: Lint level-triggered packages", 1)[1].split("- name:", 1)[0]
+for package in ("sqlite-replicated", "sqlite-commit-barrier"):
+    assert f"-p {package}" in lint_command
+    assert package not in live_jobs, "SQLite must not enter the KinD/live jobs"
+assert "--features kuberic-agent/testing" in targeted
+assert "scripts/check_level_triggered_guards_test.sh" in targeted
+assert "scripts/check_level_triggered_documentation.sh docs/features/sqlite/design.md" in targeted
+assert "sqlite" not in "\n".join(
+    line.lower() for line in recipes.splitlines()
+    if "level-triggered-kind-test" in line or 'test_name="level_triggered_k8s::' in line
+), "No SQLite live selector is introduced by this migration"
 live_tests = (root / "kuberic-level-tests/src/level_triggered_k8s.rs").read_text()
 matrix = re.search(r"expanded\+=\(([^)]+)\)", recipes).group(1).split()
 for selector, test in (
@@ -271,6 +291,7 @@ documents = [
     root / "docs/Dev.md",
     root / "docs/features/kuberic/testing.md",
     root / "docs/features/kuberic/level-triggered-operator.md",
+    root / "docs/features/sqlite/design.md",
     root / "docs/proposal/level-triggered-operator-design.md",
     root / "docs/proposal/v1-retirement-plan.md",
     root / "examples/kvstore2/README.md",
@@ -320,7 +341,7 @@ for document in summary_documents:
                   "write closure", "sequential cleanup", "kubernetes resource deletion",
                   "independently configurable"):
         assert claim in text, f"{document.relative_to(root)}: missing narrowed claim: {claim}"
-    for claim in ("sequential scale-up", "protocol 8", "schema 3"):
+    for claim in ("sequential scale-up", "protocol 8", "schema 4"):
         assert claim in text, f"{document.relative_to(root)}: missing scale-up claim: {claim}"
 
 scale_up_text = prose(guide_text.split("## Sequential Scale-Up\n", 1)[1]
@@ -364,7 +385,9 @@ for claim in ("sequential scale-up and secondary scale-down",
               "production v2 controller configuration",
               "classic kuberic.io/v1 remains unchanged",
               "pvc-before-pod", "post-enumeration catch-up boundary",
-              "protocol 8 and agent schema 3", "primary-removal behavior"):
+              "protocol 8 and agent schema 4",
+              "direct primary removal is deferred",
+              "completes workstream 2"):
     assert claim in retirement_text, f"Retirement plan missing scale-up status: {claim}"
 assert "outstanding scale-up" not in retirement_text
 assert "scale-up | remains absent" not in retirement_text
@@ -383,6 +406,45 @@ for claim in ("priority", "why deferred", "durable per-member kubernetes resourc
               "maximum replica count", "completion slo", "throughput target",
               "do not use opaque schemas, hash-only receipts, or ttl evidence deletion"):
     assert claim in followups, f"Deferred follow-ups missing contract: {claim}"
+
+metadata = json.loads(subprocess.run(
+    ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+    check=True, stdout=subprocess.PIPE, text=True,
+).stdout)
+packages = {package["name"]: package for package in metadata["packages"]}
+sqlite = packages["sqlite-replicated"]
+assert pathlib.Path(sqlite["manifest_path"]).resolve() == root / "examples/sqlite/Cargo.toml"
+assert {name for name in packages if "sqlite" in name} == {"sqlite-replicated", "sqlite-commit-barrier"}
+assert not {"kuberic-core", "kuberic-operator", "kube", "k8s-openapi"} & {
+    dependency["name"] for dependency in sqlite["dependencies"]
+}
+assert "kuberic-agent/testing" in sqlite["features"]["testing"]
+assert "testing" in packages["kuberic-agent"]["features"]
+assert not packages["kuberic-agent"]["features"].get("default", [])
+assert not (root / "examples/sqlite/src/demo.rs").exists()
+main = (root / "examples/sqlite/src/main.rs").read_text().split("#[cfg(test)]", 1)[0]
+assert "ReplicaHost::new(" in main and "SqlitePersistence::is_fresh_empty" in main
+assert "demo" not in main
+assert "CopyBoundary" not in (root / "kuberic-runtime/src/application.rs").read_text()
+
+sqlite_design = root / "docs/features/sqlite/design.md"
+sqlite_text = prose(sqlite_design.read_text())
+for claim in (
+    "migrated in place", "committed snapshot boundary", "retained catch-up",
+    "quorum before publication", "reconciliation required", "rebuild required",
+    "db.sqlite-wal", "db.sqlite-shm", "state unchanged", "unknown",
+    "fresh v2 storage", "no v1 data", "no second sqlite application",
+    "unit and in-process", "source/runtime migration",
+    "no client idempotency key", "distribution work",
+):
+    assert claim in sqlite_text, f"SQLite design missing contract: {claim}"
+for obsolete in ("running on kuberic-core", "after each commit", "process-global barrier",
+                 "same two-channel pattern", "rollback is trivial"):
+    assert obsolete not in sqlite_text, f"SQLite design retains classic claim: {obsolete}"
+assert "sqlite-v2-unit-and-in-process-validation" in heading_anchors(root / "docs/features/kuberic/testing.md")
+assert "workstream 3 complete" in retirement_text
+assert "not ported" not in next(line.lower() for line in retirement.read_text().splitlines()
+                               if line.startswith("| SQLite |"))
 
 for document in documents:
     if not document.is_file():
@@ -418,4 +480,4 @@ PY
 
 scripts/check_runtime_public_api.sh
 
-echo "Level-triggered links, examples, scale-down/scale-up contracts, live selector boundaries, protocol/schema versions, CRD/status size guards, and runtime API boundaries are current."
+echo "Level-triggered links, examples, scaling/SQLite contracts, unit-only SQLite CI, live selector boundaries, protocol/schema versions, CRD/status size guards, and runtime API boundaries are current."

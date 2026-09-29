@@ -838,6 +838,15 @@ fn startup_transition(
         .iter()
         .find(|member| member.identity == state.identity.local_identity)
         .map(|member| member.role)?;
+    // A planned demotion may already have replaced primary authority. Restore
+    // only the fenced target replicator; the certified handoff needs no further
+    // old-primary catch-up and the journal must finish the application transition.
+    if record.command.transition_kind == kuberic_protocol::types::TransitionKind::PlannedSwitchover
+        && state.role == kuberic_protocol::types::ReplicaRole::Primary
+        && target_role != kuberic_protocol::types::ReplicaRole::Primary
+    {
+        return Some((target_role, false, false));
+    }
     if let Some(retained) = state.retained_result.as_ref() {
         match &retained.effect.action {
             kuberic_runtime_internal::effects::RuntimeEffectAction::ChangeReplicatorRole(role)

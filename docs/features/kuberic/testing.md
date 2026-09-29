@@ -9,8 +9,9 @@ what each layer validates, and known gaps.
 
 ## Independent Level-Triggered Stack
 
-The classic test layers below remain unchanged. The independent v2 stack adds
-pure protocol/model tests, durable SQLite subprocess crash tests, runtime
+The classic test layers below remain unchanged except that the existing SQLite
+application suite is now v2. The independent v2 stack adds pure protocol/model
+tests, agent-metadata SQLite subprocess crash tests (not the SQLite application suite), runtime
 successful-write and session-fencing tests, controller exact-resource race tests,
 and explicitly owned KinD scenarios. Secondary scale-down covers healthy 3→2,
 2→1 and singleton restart, sequential 5→2, unavailable-target evidence, retirement,
@@ -61,6 +62,55 @@ disabled by default, absent from the checked-in sample and Service, and exposed
 only on direct Pod diagnostic port 18080 when the owned-cluster install recipe
 injects `testing.kuberic.io/live-copy-gate: enabled`. It is not a CRD field,
 application route, production switch, or supported user API.
+
+### SQLite V2 Unit and In-Process Validation
+
+The existing `sqlite-replicated` package is migrated in place to v2, not a
+parallel application. Its tests use actual SQLite WAL frames, public
+`StatefulServiceReplica`/`StateProvider`, agent-owned `ReplicaHost`/`PodRuntime`,
+and the feature-gated shared `InProcessTransport`. Disk-backed restart helpers
+reopen both application storage and agent `SqliteStore` with fresh sessions;
+they do not carry in-memory journals into a new process instance.
+
+```bash
+cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
+cargo test -p kuberic-runtime -p kuberic-runtime-internal -p kuberic-wire
+cargo test -p kuberic-agent --features testing --lib --test runtime --test service --test coordinator --test store --test transport -- --test-threads=1 --skip evaluator_scale_up_command_uses_reopened_sqlite_copy_and_preserves_live_write
+cargo test -p kuberic-protocol --lib --test protocol --test model -- --skip terminal_switchover_receipts_survive_process_exit_and_do_not_allocate_again
+cargo test -p kuberic-controller --lib --test controller
+cargo clippy -p kuberic-agent -p sqlite-replicated --all-targets --all-features -- -D warnings
+scripts/check_level_triggered_documentation.sh docs/features/sqlite/design.md
+```
+
+These selections exclude the agent `crash_boundaries` executable and the two
+named child-process tests. The protocol child helper stays ignored. No KinD,
+Kubernetes API, container, or test-launched external process is required.
+Some host tests bind in-process loopback listeners. The isolated relative-root
+target changes only its own process cwd, not parallel library tests.
+
+Coverage includes quorum-before-publication, exact committed snapshots plus
+retained applied catch-up, shrinking/large WAL transactions, reservation-only
+and post-apply failures, committed-but-unpublished reconciliation, acknowledged
+loss/rebuild fences, and copy-completion replay after install/restart/catch-up.
+Reconfiguration scenarios cover bootstrap, replacement, repeated failover,
+planned switchover, sequential scale-up, secondary-only scale-down and quorum
+restoration. A promoted replica must read its last acknowledged transaction
+before any new SQL write, even with an initially stale committed watermark.
+
+Stale-writer probes use unique IDs, require definitive authority/access rejection,
+and verify no new reservations, history, progress, files, or rows. Complete
+expected SQL sets and retained per-LSN prefixes explicitly include resolved
+unknown-outcome transactions. Deterministic handoff checkpoints keep the old
+application alive but fenced while the new primary accepts writes; delayed
+responses for previously committed writes are tracked separately. Local
+crash/fence tests remain separate from group scenarios. Test hooks are disabled
+in production-default builds.
+
+Targeted v2 CI runs these SQLite suites and the standalone barrier; SQLite is
+not added to KinD/live jobs or selectors. These are bounded unit/in-process
+scenarios, not a production outage, performance, or live-controller guarantee.
+See the [SQLite design](../sqlite/design.md) and
+[agent testing surface](../../../kuberic-agent/README.md#in-process-application-tests-opt-in).
 
 ---
 
@@ -464,8 +514,10 @@ Schema tests assert that superseded per-step add phases/actions and
 compatibility sentinels are absent.
 
 **Adapter data-plane coverage** ✅
-`examples/sqlite/tests/correlated_replication.rs` covers multi-page WAL
-shipping, schema changes, switchover, and failover through correlated actions.
+The existing SQLite suite has migrated to public v2 runtime effects and shared
+in-process transport, not classic correlated actions. See
+[SQLite v2 validation](#sqlite-v2-unit-and-in-process-validation) for its
+multi-page/schema, durability, copy, and reconfiguration coverage.
 
 **Pattern 9: Durable removal boundary and fencing** ✅
 `test_durable_remove_coarse_activation` proves production dispatches one

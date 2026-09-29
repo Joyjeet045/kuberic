@@ -417,6 +417,10 @@ impl ReplicationLog {
         self.finalize_commit_inner(committed_lsn)
     }
 
+    pub(crate) fn restore_committed_prefix(&mut self, committed_lsn: Lsn) {
+        self.quorum.restore_committed_lsn(committed_lsn);
+    }
+
     pub(crate) fn restore_committed_write(&mut self, operation: &Operation) -> Result<()> {
         self.restore_committed_write_inner(operation)
     }

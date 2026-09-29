@@ -85,6 +85,7 @@ pub trait ManagedReplicator: Send + Sync {
     ) -> Result<()>;
     async fn complete_open(&self, replication_address: String) -> Result<()>;
     async fn fence_writes(&self) -> Result<()>;
+    async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
     async fn restore_authority(&self) -> Result<()>;
     async fn recover_pending_writes(&self) -> Result<()>;

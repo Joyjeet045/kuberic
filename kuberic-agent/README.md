@@ -48,6 +48,10 @@ full-copy build before current-only completion.
 
 Serving starts fail-closed listeners before reconstructing live hosting from
 durable authority, role, access, pending effects, and retained stage evidence.
+An interrupted planned primary demotion restores only the fenced target
+replicator role until the journal completes the application transition. It must
+not reactivate the old Primary after handoff authority has replaced it; genuine
+Primary activation still settles the authority-verified prefix before its callback.
 Session replacement holds a delivery lease through runtime mutation. Shutdown
 revokes readiness and aborts the owned runtime and workers.
 
@@ -60,6 +64,31 @@ The controller remains responsible for selecting configurations,
 re-observing command postconditions, routing fences, and distributing
 deployment authentication material. Concrete outbound peer dialing is wired
 through the agent's `OutboundDispatcher` contract.
+
+## In-process application tests (opt-in)
+
+The `testing` Cargo feature exposes `testing::InProcessTransport`; it is absent
+from default production builds. Register each opened `PodRuntime` with its exact
+process session. Registration derives the full replica identity from the runtime,
+not just its numeric replica ID. A fresh registration after restart replaces old
+polling/delivery futures and rejects reuse of retired sessions; it does not
+reconstruct or transfer application data, authority, or write journals.
+
+`pump()` performs a bounded nonblocking poll in identity/delivery order.
+`next().await` waits on real queue/ACK wakers rather than sleeping or busy-polling.
+Reports distinguish received ACKs from application-applied ACKs, include pending
+delivery counts, and report idle only when nothing is ready and no delivery is
+outstanding. Transport idle does not imply cluster convergence or write quorum.
+One transport must be the sole outbound consumer of its registered runtimes.
+
+For prepared copy streams or deliberate delayed delivery, call `bind(message)`
+at emission time, retain that session-bound public wire message, then `enqueue`
+it. Copy ACKs return through the source runtime only after durable receiver
+acceptance. Missing exact endpoints, changed sessions, rejected operations, and
+dropped stream operations produce explicit errors/rejection events, never fake
+applied progress. `Build`, `Remove`, and `Evict` outputs are surfaced to the
+caller without interpreting them or granting authority. Tests remain responsible
+for agent-side admission, storage directories, process lifetime, and recovery.
 
 ## Storage and recovery contract
 
@@ -75,12 +104,16 @@ integrity, exact storage identity, and the exact schema version. The current
 migration hook is idempotent only for that version; it is not an older-schema
 upgrade path.
 
-Schema **3** intentionally rejects schema 2 and unknown versions without
+Schema **4** intentionally rejects schemas 2 and 3 and unknown versions without
 migration. Initialization identity (including its original policy) remains
 immutable. Admitted PC/CC policies are separate durable authority; reduced or
 expanded policy does not rewrite initialization replay or Pod/PVC validation.
-Schema 3 adds exact scale-up initialization, build-boundary, PC/CC/current-only
-admission, carried-failover, and bounded completion evidence.
+Schema 3 introduced exact scale-up initialization, build-boundary,
+PC/CC/current-only admission, carried-failover, and bounded completion evidence.
+Schema 4 retains that evidence and establishes committed snapshot boundaries:
+the exact applied suffix is delivered separately through retained catch-up.
+Source restart reuses immutable build authority; final-marker commitment must
+equal that boundary. This is a fresh-storage contract, not an old-schema upgrade.
 
 The controller enables SF-inspired secondary scale-down using PC/CC quorum
 principles, with Kuberic-specific target/minimum coupling, deterministic
@@ -140,7 +173,7 @@ means a retirement tombstone exists. The JSON field is additive; older diagnosti
 responses may omit it. Diagnostics do not expose managed certificates.
 Controller admission and exact Kubernetes cleanup are enabled; these local
 contracts never select the target or authorize arbitrary Pod/PVC deletion.
-Use a fresh coordinated protocol-8/schema-3 deployment, not a rolling upgrade.
+Use a fresh coordinated protocol-8/schema-4 deployment, not a rolling upgrade.
 Exact original PVC provenance must be reconstructable before admission; if Pod
 and PVC already disappeared without that provenance, scale-down waits/fails
 closed rather than treating list omission as absence. Unavailable-target support
@@ -149,7 +182,7 @@ has no retention or import path, not a physical storage erasure guarantee.
 Frozen-primary loss during removal/cleanup can cause indefinite outage. Sequential
 cleanup must finish, and every retained member needs its original completed
 current-only witness or fresh completed local acceptance before superseding the
-bounded receipt. Sequential scale-up uses durable schema-3 build and admission
+bounded receipt. Sequential scale-up uses durable schema-4 build and admission
 authority, preserves healthy same-primary writes only while both PC/CC quorums
 remain authorized, and retries failed unadmitted candidates only after exact
 endpoint→Pod→PVC cleanup. Carried failover first installs a write-closed
@@ -162,7 +195,7 @@ configuration, policy, final epoch, and safe prefix. The completion receipt keep
 that proof with a provisional-primary reference instead of duplicating the full
 intent/configuration, so a returning provisional member can advance through
 final PC/CC and current-only without accepting unrelated stale authority. Protocol
-8/schema 3 require a fresh coordinated deployment; classic v1 remains unchanged.
+8/schema 4 require a fresh coordinated deployment; classic v1 remains unchanged.
 These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in
 [scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).

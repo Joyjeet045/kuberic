@@ -1408,7 +1408,7 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
             .is_some_and(|boundary| boundary < item.replication_boundary_lsn)
         || if item.final_item {
             item.lsn != item.replication_boundary_lsn
-                || item.committed_lsn > item.replication_boundary_lsn
+                || item.committed_lsn != item.replication_boundary_lsn
                 || item.snapshot_chunk
                 || !item.data.is_empty()
         } else if item.snapshot_chunk {

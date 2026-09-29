@@ -268,7 +268,7 @@ impl PodRuntime {
             source: self.host.identity.clone(),
             target,
             current_configuration,
-            replication_boundary_lsn: snapshot.current_progress,
+            replication_boundary_lsn: snapshot.committed_lsn,
         };
         authority.validate()?;
         self.host
@@ -667,11 +667,14 @@ impl PartitionAccessView for HostAccessView {
 
     async fn report_fault(&self, fault: FaultType) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        let _effect = host.effect_lock.lock().await;
+        // Applications may report a fault from Open/change_role while the host
+        // already owns effect_lock. Reports change diagnostics, not authority;
+        // the state lock serializes them without re-entering a lifecycle effect.
+        let mut state = host.state.write().await;
         if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
-        host.state.write().await.reported_fault = Some(fault);
+        state.reported_fault = Some(fault);
         Ok(())
     }
 }
@@ -867,6 +870,23 @@ impl RuntimeHost {
                     expected,
                     observed: effect.sequence,
                 });
+            }
+            if state.fallback_snapshot.role_transition.is_some()
+                && matches!(
+                    effect.action,
+                    RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+                        | RuntimeEffectAction::SetReadStatus(AccessStatus::Granted)
+                        | RuntimeEffectAction::SetAccessStatus {
+                            read: AccessStatus::Granted,
+                            ..
+                        }
+                        | RuntimeEffectAction::SetAccessStatus {
+                            write: AccessStatus::Granted,
+                            ..
+                        }
+                )
+            {
+                return Err(RuntimeError::ReconfigurationPending);
             }
         }
         if !matches!(
@@ -1223,6 +1243,11 @@ impl RuntimeHost {
             return Err(RuntimeError::ReconfigurationPending);
         }
         if !transition.application_completed {
+            if role == ReplicaRole::Primary
+                && let Some(managed) = self.registered.get().and_then(|r| r.managed.as_ref())
+            {
+                managed.settle_primary_prefix().await?;
+            }
             let _ = self.application.change_role(role).await?;
         }
         let mut state = self.state.write().await;

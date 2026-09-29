@@ -488,8 +488,8 @@ scheduling are [deferred](../../proposal/v1-retirement-plan.md#deferred-scale-do
 Scale-up is sequential and restores the first missing positive logical ordinal
 outside accepted authority before allocating a new highest ordinal.
 
-Protocol 8 and agent store schema 3 require a **fresh coordinated deployment**;
-protocol 7 and earlier are rejected, as is schema 2, with no migration or
+Protocol 8 and agent store schema 4 require a **fresh coordinated deployment**;
+protocol 7 and earlier are rejected, as are schemas 2 and 3, with no migration or
 mixed-version mode.
 Schema 3 persists scale-up build and admission authority in addition to the
 schema-2 initialization provenance and admitted policies.
@@ -694,10 +694,12 @@ semantics. Filesystems that cannot provide those semantics, including
 unsupported network-filesystem arrangements, are not valid production
 storage.
 
-The current schema is **3** and accepts only its exact version. The migration hook records
+The current schema is **4** and accepts only its exact version. The migration hook records
 an idempotent current-version migration; it does not upgrade older schemas.
-Schema 2 is rejected without conversion. Use a fresh deployment for protocol 8 /
-schema 3; no rolling upgrade or existing-data migration is provided.
+Schemas 2 and 3 are rejected without conversion. Schema 4 uses committed
+snapshot boundaries for replica builds; the applied suffix follows as retained
+catch-up. Use a fresh deployment for protocol 8 / schema 4; no rolling upgrade
+or existing-data migration is provided.
 
 Crash injection is test-only. `KUBERIC_CRASH_WRITER_PATH` and
 `KUBERIC_CRASH_BOUNDARY` are consumed only by the
@@ -705,6 +707,20 @@ Crash injection is test-only. `KUBERIC_CRASH_WRITER_PATH` and
 fault-injection switch.
 
 ## Local Deployment
+
+The following deployment recipes exercise KVStore2. The existing
+[`sqlite-replicated` example](../sqlite/design.md) is migrated in place to v2
+and uses the same public service/provider and `ReplicaHost` boundary, but this
+migration validates SQLite only with unit and in-process tests. It does not add
+SQLite images, deployment manifests, or live selectors.
+
+SQLite freezes its snapshot at durable committed progress and sends the applied
+suffix through ordinary retained catch-up. Quorum completion precedes local WAL
+publication. Reopen resolves exact agent reservations and rematerializes committed
+SQL state, removing stale WAL/SHM companions; acknowledged-history loss remains
+rebuild-fenced. Primary activation settles only an authority-verified prefix.
+The SQL API has no request-level deduplication: an unknown outcome requires
+verification before retry. See the [SQLite storage and failure contract](../sqlite/design.md#durable-storage-and-recovery).
 
 Prerequisites:
 
@@ -965,6 +981,11 @@ The level-triggered crates have no source dependency on classic v1 crates.
 `scripts/check_level_triggered_scope.sh` rejects changes under protected v1
 paths, and `scripts/check_level_triggered_dependencies.sh` rejects manifest,
 source-link, and include-based dependencies on them.
+The existing `examples/sqlite` path and `sqlite-replicated` package are now v2,
+not protected classic source. SQLite and its standalone commit barrier are
+checked packages; regressions reject reintroduced classic dependencies and
+source includes. This reclassification does not authorize edits to other
+protected v1 paths.
 
 The runtime API guard has two reviewed inventories:
 
@@ -986,8 +1007,13 @@ scripts/check_level_triggered_documentation.sh
 ```
 
 Classic v1 remains the documented path for existing `kuberic.io/v1` resources
-and the SQLite/PostgreSQL examples. V2 supports explicit planned switchover,
+and the classic KVStore/PostgreSQL examples. SQLite is migrated in place to v2;
+existing deployed SQLite data has no import path. V2 supports explicit planned switchover,
 secondary-only scale-down, and sequential scale-up; no v1 conversion, data import, or
 classic-path removal is implied. The [retirement plan](../../proposal/v1-retirement-plan.md)
-keeps primary removal, application ports, distribution, deprecation, and source
-removal as separate workstreams.
+keeps direct primary removal deferred and treats the remaining PostgreSQL port,
+distribution, deprecation, and source removal as separate workstreams. To
+remove the physical replica currently hosting primary authority, complete a
+planned switchover first and then reduce membership after it becomes an eligible
+secondary under the deterministic removal policy. There is no user-selected
+removal target or automatic/atomic primary-removal request.
