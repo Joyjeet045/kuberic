@@ -891,6 +891,16 @@ supplies its `StatefulServiceReplica`, its application-storage classification,
 and endpoint configuration; it no longer constructs agent or transport
 internals.
 
+Applications that create external storage can opt into
+`ReplicaHost::with_application_storage_paths`. Authorized agent initialization
+atomically persists the named, resolved paths and first-open permission. The
+host verifies that binding before opening the application; unbound established
+stores cannot acquire it on restart. Pending first opens receive `OpenMode::New`
+until reconstruction succeeds, then completion is durably recorded before
+readiness accepts commands. Subsequent opens receive `Existing`, regardless of
+directory emptiness. Applications must treat `New` as permission for safe initial
+creation/retry, not permission to erase unrecognized nonempty storage.
+
 Phase 7 implements same-cardinality replacement. Definitive loss of a
 non-primary Pod with surviving exact storage creates one deterministic
 out-of-authority replacement Pod/PVC pair. The controller persists the exact

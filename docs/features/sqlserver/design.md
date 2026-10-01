@@ -103,19 +103,20 @@ each is assigned to a later stage rather than half-built now:
 
 ## Why the PostgreSQL Adapter Is Not a Drop-in Template
 
-The PostgreSQL example establishes the useful control-plane/data-plane
-boundary, but its current executable and safety behavior are incomplete:
+The retired classic PostgreSQL adapter had a placeholder binary, in-memory
+access flags and last-known scalar progress. Those limitations do not describe
+the [implemented PostgreSQL v2 contract](../postgres/design.md): its executable
+uses the v2 host, completed access fences drain the owned PostgreSQL process,
+and recovery validates fresh, exact-session native lineage and replay evidence.
+Workstream 4 is validated with host-local subprocesses; images, deployment and
+distribution remain Workstream 5, without PostgreSQL KinD coverage.
 
-- its binary is still a placeholder;
-- direct PostgreSQL clients bypass Kuberic's in-memory write-status flag;
-- epoch updates do not establish a database-native fence;
-- monitor failures retain last-known progress without freshness evidence; and
-- its LSN can be represented as a 64-bit scalar, while SQL Server AG DMV
-  positions are `numeric(25,0)` and have field-specific meanings.
-
-SQL Server must therefore use native identity, progress, lease, and role
-evidence instead of being forced through the current PostgreSQL adapter or the
-generic scalar election path.
+That control-plane/data-plane boundary is useful, but PostgreSQL's WAL,
+timeline and process-fencing mechanisms are not SQL Server AG protocols.
+PostgreSQL LSNs fit a 64-bit scalar; SQL Server DMV positions are
+`numeric(25,0)` with field-specific meanings. SQL Server still needs its own
+native identity, progress, lease and role evidence, rather than copying
+PostgreSQL recovery or relying on generic scalar election ordering.
 
 ## Native HA Boundary
 

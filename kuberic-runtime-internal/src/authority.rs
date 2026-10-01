@@ -556,7 +556,32 @@ pub trait LocalWriteJournal: Send + Sync {
 pub trait BuildAuthorityStore: Send + Sync {
     async fn load_build(&self, build_id: &OperationId) -> Result<Option<BuildAuthority>>;
 
+    async fn load_builds(&self) -> Result<Vec<BuildAuthority>> {
+        Ok(Vec::new())
+    }
+
     async fn admit_build(&self, authority: &BuildAuthority) -> Result<()>;
+
+    async fn select_build(&self, _authority: &BuildAuthority) -> Result<BuildSelection> {
+        Err(ContractError::AuthorityMismatch(
+            "durable build selection is unavailable".into(),
+        ))
+    }
+
+    async fn load_build_selection(
+        &self,
+        _target: &ReplicaIdentity,
+    ) -> Result<Option<BuildSelection>> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Agent-owned selection of one immutable build for a logical target slot.
+/// Superseded selections cannot be restored by delayed receipts or restarts.
+pub struct BuildSelection {
+    pub authority: BuildAuthority,
+    pub generation: u64,
 }
 
 #[async_trait]
@@ -567,6 +592,16 @@ pub trait BuildProgressStore: Send + Sync {
     ) -> Result<Option<DurableBuildProgress>>;
 
     async fn record_build_progress(&self, progress: &DurableBuildProgress) -> Result<()>;
+
+    async fn record_selected_build_progress(
+        &self,
+        _selection: &BuildSelection,
+        _progress: &DurableBuildProgress,
+    ) -> Result<()> {
+        Err(ContractError::AuthorityMismatch(
+            "durable build selection is unavailable".into(),
+        ))
+    }
 }
 
 pub trait AuthorityStore:

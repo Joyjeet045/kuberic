@@ -32,6 +32,8 @@ pub trait AgentStore: Send + Sync {
 
     async fn load_state(&self) -> Result<AgentState>;
 
+    async fn complete_application_initialization(&self) -> Result<()>;
+
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect>;
 
     async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> Result<()>;

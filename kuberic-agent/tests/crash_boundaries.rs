@@ -541,6 +541,9 @@ impl AgentStore for ScaleUpProductionCutStore {
             .record_partition_reports(load_metrics, reported_fault)
             .await
     }
+    async fn complete_application_initialization(&self) -> Result<()> {
+        self.inner.complete_application_initialization().await
+    }
 }
 
 #[async_trait]
@@ -950,13 +953,18 @@ impl StatefulServiceReplica for CrashState {
             .partition
             .with_factory(Arc::new(DefaultReplicatorFactory::new(self.clone())));
         let interfaces = partition
-            .create_replicator(self.clone(), Some(ReplicatorSettings::default()))
+            .create_replicator(Some(self.clone()), Some(ReplicatorSettings::default()))
             .await?;
-        let copy = interfaces.state_replicator().get_copy_stream().await?;
+        let copy = interfaces
+            .state_replicator()
+            .expect("default state replicator")
+            .get_copy_stream()
+            .await?;
         tokio::spawn(consume_crash_stream(Arc::downgrade(&self), copy));
         if self.consume_replication {
             let stream = interfaces
                 .state_replicator()
+                .expect("default state replicator")
                 .get_replication_stream()
                 .await?;
             tokio::spawn(consume_crash_stream(Arc::downgrade(&self), stream));
@@ -5183,6 +5191,7 @@ fn switchover_authority() -> AdmittedAuthority {
 
 fn snapshot(write_status: AccessStatus) -> RuntimeSnapshot {
     RuntimeSnapshot {
+        live_builds_only: false,
         prepared_secondary_removal: None,
         retired_authority: None,
         accepted_secondary_removal: None,

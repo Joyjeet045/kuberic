@@ -27,11 +27,12 @@ use crate::report::AgentReporter;
 use crate::runtime_adapter::RuntimeEffectExecutor;
 use crate::session::ProcessSession;
 use crate::sqlite_store::SqliteStore;
-use crate::state::{AgentState, CoordinatorStage};
+use crate::state::{AgentState, ApplicationStorageBinding, CoordinatorStage};
 use crate::store::AgentStore;
 use crate::{AgentError, Result};
 
 const AUTHORIZATION_HEADER: &str = "authorization";
+pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct InitializationService {
     observed: ObservedStorageIdentity,
@@ -41,6 +42,7 @@ pub struct InitializationService {
     session: Arc<ProcessSession>,
     initialized: watch::Sender<bool>,
     fresh_application_state: bool,
+    application_storage_paths: Option<BTreeMap<String, PathBuf>>,
 }
 
 impl InitializationService {
@@ -66,7 +68,16 @@ impl InitializationService {
             session: Arc::new(ProcessSession::new()),
             initialized,
             fresh_application_state,
+            application_storage_paths: None,
         })
+    }
+
+    pub(crate) fn with_application_storage_paths(
+        mut self,
+        paths: Option<BTreeMap<String, PathBuf>>,
+    ) -> Self {
+        self.application_storage_paths = paths;
+        self
     }
 
     pub async fn serve(
@@ -209,6 +220,13 @@ impl InitializationService {
         let identity = crate::command::admit_initialization(&command, &self.observed, authority)
             .map_err(status_from_agent)?;
         let mut state = AgentState::new(identity.clone());
+        state.application_storage =
+            self.application_storage_paths
+                .clone()
+                .map(|paths| ApplicationStorageBinding {
+                    paths,
+                    initializing: true,
+                });
         state.scale_up_initialization = command
             .provisioning
             .clone()
@@ -239,6 +257,7 @@ impl Clone for InitializationService {
             session: self.session.clone(),
             initialized: self.initialized.clone(),
             fresh_application_state: self.fresh_application_state,
+            application_storage_paths: self.application_storage_paths.clone(),
         }
     }
 }
@@ -478,15 +497,23 @@ where
         let startup = self.reconstruct_runtime();
         tokio::pin!(startup);
         let startup_result = tokio::select! {
+            biased;
             result = &mut startup => result,
             _ = wait_for_shutdown(&mut shutdown) => {
                 Err(AgentError::Runtime(kuberic_runtime::RuntimeError::OperationCancelled))
             }
         };
         if let Err(error) = startup_result {
-            self.runtime.abort();
             control.abort();
             replication.abort();
+            let _ = tokio::join!(&mut control, &mut replication);
+            let persisted = self.persist_partition_fault().await;
+            self.runtime.abort();
+            if let Err(persisted) = persisted {
+                return Err(AgentError::CommandRejected(format!(
+                    "{persisted}; startup: {error}"
+                )));
+            }
             return Err(error);
         }
 
@@ -501,26 +528,55 @@ where
         let result = tokio::select! {
             result = &mut control => {
                 replication.abort();
+                let _ = (&mut replication).await;
                 flatten_server_result(result)
             }
             result = &mut replication => {
                 control.abort();
+                let _ = (&mut control).await;
                 flatten_server_result(result)
             }
             _ = wait_for_shutdown(&mut shutdown) => {
-                let results = tokio::join!(&mut control, &mut replication);
-                flatten_server_result(results.0).and_then(|_| flatten_server_result(results.1))
+                self.ready_state.store(false, Ordering::Release);
+                ready.send_replace(false);
+                // A retained HTTP/2 stream must not delay the durable shutdown
+                // acknowledgement. Interrupted command intents are replayable.
+                control.abort();
+                replication.abort();
+                let _ = tokio::join!(&mut control, &mut replication);
+                Ok(())
             }
         };
         self.ready_state.store(false, Ordering::Release);
         ready.send_replace(false);
         recovery_task.abort();
+        let _ = recovery_task.await;
+        let persisted = self.persist_partition_fault().await;
         self.runtime.abort();
+        persisted?;
         result
+    }
+
+    async fn persist_partition_fault(&self) -> Result<()> {
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            let partition = self.runtime.partition_report().await;
+            if partition.reported_fault.is_some() {
+                self.store
+                    .record_partition_reports(partition.load_metrics, partition.reported_fault)
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| AgentError::CommandRejected("partition fault persistence timed out".into()))?
     }
 
     pub async fn reconstruct_runtime(&self) -> Result<()> {
         let state = self.store.load_state().await?;
+        self.runtime.bind_replica_session(
+            state.identity.resource_uid.clone(),
+            self.sessions.local_session().clone(),
+        )?;
         let transition = startup_transition(&state);
         let removal_pending =
             state.pending_effect.as_ref().is_some_and(|p| {
@@ -533,7 +589,15 @@ where
             });
         self.runtime
             .reconstruct(
-                OpenMode::Existing,
+                if state
+                    .application_storage
+                    .as_ref()
+                    .is_some_and(|b| b.initializing)
+                {
+                    OpenMode::New
+                } else {
+                    OpenMode::Existing
+                },
                 state.role,
                 if removal_pending {
                     kuberic_protocol::types::AccessStatus::ReconfigurationPending
@@ -550,6 +614,14 @@ where
                 transition,
             )
             .await?;
+        // Consume creation permission before readiness permits any authority/access commands.
+        if state
+            .application_storage
+            .as_ref()
+            .is_some_and(|b| b.initializing)
+        {
+            self.store.complete_application_initialization().await?;
+        }
         if let Some(committed) = state.accepted_secondary_removal
             && self
                 .runtime
@@ -788,6 +860,13 @@ where
                     self.sessions
                         .register_peer(authority.source.clone(), source_session_id.clone())
                         .await;
+                    self.runtime
+                        .register_custom_peer_session(
+                            authority.source.clone(),
+                            source_session_id.clone(),
+                        )
+                        .await
+                        .map_err(status_from_runtime)?;
                 }
                 self.coordinator
                     .ensure_build(*command)
@@ -830,6 +909,15 @@ fn startup_write_status(
 fn startup_transition(
     state: &AgentState,
 ) -> Option<(kuberic_protocol::types::ReplicaRole, bool, bool)> {
+    if let Some(pending) = &state.pending_effect {
+        match pending.effect.action {
+            kuberic_runtime_internal::effects::RuntimeEffectAction::ChangeRole(role)
+            | kuberic_runtime_internal::effects::RuntimeEffectAction::ChangeReplicatorRole(role) => {
+                return Some((role, false, false));
+            }
+            _ => {}
+        }
+    }
     let record = state.reconfiguration.as_ref()?;
     let target_role = record
         .command

@@ -136,6 +136,9 @@ impl AgentStore for CrashStore {
     ) -> Result<()> {
         self.inner.record_partition_reports(metrics, fault).await
     }
+    async fn complete_application_initialization(&self) -> Result<()> {
+        self.inner.complete_application_initialization().await
+    }
 }
 
 struct CrashRuntime {

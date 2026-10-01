@@ -12,9 +12,10 @@ use kuberic_runtime_internal::authority::{DurableBuildProgress, RetiredAuthority
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
-// Fresh schema-4 builds use committed snapshot boundaries, not applied boundaries.
-pub const SCHEMA_VERSION: u32 = 4;
+// Fresh schema-5 stores bind application paths and initialization permission.
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,8 +109,17 @@ pub struct PreparationRetirement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ApplicationStorageBinding {
+    pub paths: BTreeMap<String, PathBuf>,
+    pub initializing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentState {
     pub identity: StorageIdentity,
+    #[serde(default)]
+    pub application_storage: Option<ApplicationStorageBinding>,
     #[serde(default)]
     pub scale_up_initialization: Option<ProvisioningIntent>,
     pub admitted_policy: Option<EffectivePolicy>,
@@ -165,6 +175,7 @@ impl AgentState {
     pub fn new(identity: StorageIdentity) -> Self {
         Self {
             identity,
+            application_storage: None,
             scale_up_initialization: None,
             admitted_policy: None,
             previous_policy: None,

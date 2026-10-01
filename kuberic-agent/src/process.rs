@@ -1,18 +1,21 @@
 //! Reusable replica-process hosting for stateful applications.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kuberic_protocol::types::{PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid};
+use kuberic_protocol::types::{
+    FaultType, PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid,
+};
 use kuberic_runtime::StatefulServiceReplica;
 use serde::Serialize;
 use tokio::sync::{Mutex, watch};
 
 use crate::hosting::PodRuntime;
 use crate::provisioning::{ObservedStorageIdentity, validate_established_identity};
-use crate::service::{AgentService, InitializationService};
+use crate::service::{AgentService, InitializationService, SHUTDOWN_TIMEOUT};
 use crate::sqlite_store::SqliteStore;
 use crate::store::AgentStore;
 use crate::transport::{
@@ -192,6 +195,7 @@ pub struct ReplicaHost<A, R> {
     config: ReplicaProcessConfig,
     application: Arc<A>,
     application_storage: ApplicationStorageState,
+    application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     resolver: Arc<R>,
 }
 
@@ -210,11 +214,38 @@ where
             config,
             application,
             application_storage,
+            application_storage_paths: None,
             resolver,
         }
     }
 
+    /// Bind application paths at authorized initialization. Only an unfinished
+    /// first open receives `OpenMode::New`; missing bindings on existing stores reject.
+    pub fn with_application_storage_paths(mut self, paths: BTreeMap<String, PathBuf>) -> Self {
+        self.application_storage_paths = Some(paths);
+        self
+    }
+
     pub async fn start(self) -> Result<RunningReplica> {
+        let (_shutdown, receiver) = watch::channel(false);
+        self.start_with_shutdown(receiver)
+            .await?
+            .ok_or(AgentError::Runtime(
+                kuberic_runtime::RuntimeError::OperationCancelled,
+            ))
+    }
+
+    /// Cooperatively cancel startup and await its acknowledgement and task cleanup.
+    /// `None` means cancellation completed before readiness. A readiness race may
+    /// return a replica instead; the caller must shut it down and await `wait`.
+    /// Keep this future alive until completion, including after requesting shutdown.
+    pub async fn start_with_shutdown(
+        self,
+        mut startup_shutdown: watch::Receiver<bool>,
+    ) -> Result<Option<RunningReplica>> {
+        if *startup_shutdown.borrow() {
+            return Ok(None);
+        }
         if self.config.replica_id.value() <= 0 {
             return Err(AgentError::CommandRejected(
                 "replica ID must be positive".into(),
@@ -231,6 +262,15 @@ where
             pvc_uid: self.config.pvc_uid.clone(),
             instance_id: ReplicaInstanceId::new(self.config.pod_uid.as_str()),
         };
+        let paths = self
+            .application_storage_paths
+            .map(|paths| {
+                paths
+                    .into_iter()
+                    .map(|(name, path)| resolve_storage_path(&path).map(|path| (name, path)))
+                    .collect::<std::io::Result<BTreeMap<_, _>>>()
+            })
+            .transpose()?;
         let database_path = SqliteStore::metadata_database_path(&self.config.data_root);
         if !database_path.is_file() {
             serve_initialization(
@@ -238,13 +278,32 @@ where
                 observed.clone(),
                 database_path.clone(),
                 self.application_storage == ApplicationStorageState::FreshEmpty,
+                paths.clone(),
+                startup_shutdown.clone(),
             )
             .await?;
+        }
+        if *startup_shutdown.borrow() || startup_shutdown.has_changed().is_err() {
+            return Ok(None);
         }
 
         let store = Arc::new(SqliteStore::open_existing(&database_path, None)?);
         let identity = store.identity().await?;
         validate_established_identity(&identity, &observed, self.config.replica_id)?;
+        let state = store.load_state().await?;
+        if state
+            .application_storage
+            .as_ref()
+            .map(|binding| &binding.paths)
+            != paths.as_ref()
+        {
+            store
+                .record_partition_reports(state.load_metrics, Some(FaultType::Permanent))
+                .await?;
+            return Err(AgentError::InitializationNotAuthorized(
+                "application storage paths differ from the authorized agent binding".into(),
+            ));
+        }
         let runtime = Arc::new(PodRuntime::new(
             identity.local_identity.clone(),
             self.application,
@@ -293,63 +352,109 @@ where
             sessions,
             shutdown_rx,
         ));
-        tokio::select! {
+        let mut agent_finished = false;
+        let mut outbound_finished = false;
+        let mut peer_finished = false;
+        let startup_result = tokio::select! {
+            biased;
             result = &mut agent_task => {
-                result
-                    .map_err(|error| AgentError::CommandRejected(error.to_string()))??;
-                return Err(AgentError::CommandRejected(
-                    "agent service stopped before becoming ready".into(),
-                ));
+                agent_finished = true;
+                match result {
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(AgentError::CommandRejected(error.to_string())),
+                    Ok(Ok(())) => Err(AgentError::CommandRejected(
+                        "agent service stopped before becoming ready".into(),
+                    )),
+                }
             }
             result = &mut outbound_task => {
-                result
-                    .map_err(|error| AgentError::CommandRejected(error.to_string()))??;
-                return Err(AgentError::CommandRejected(
-                    "outbound progress stopped before agent readiness".into(),
-                ));
+                outbound_finished = true;
+                match result {
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(AgentError::CommandRejected(error.to_string())),
+                    Ok(Ok(())) => Err(AgentError::CommandRejected(
+                        "outbound progress stopped before agent readiness".into(),
+                    )),
+                }
             }
             result = &mut peer_task => {
-                result
-                    .map_err(|error| AgentError::CommandRejected(error.to_string()))??;
-                return Err(AgentError::CommandRejected(
-                    "peer discovery stopped before agent readiness".into(),
-                ));
+                peer_finished = true;
+                match result {
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(AgentError::CommandRejected(error.to_string())),
+                    Ok(Ok(())) => Err(AgentError::CommandRejected(
+                        "peer discovery stopped before agent readiness".into(),
+                    )),
+                }
             }
-            result = ready_rx.wait_for(|ready| *ready) => {
-                result.map_err(|_| {
-                    AgentError::CommandRejected("agent readiness channel closed".into())
-                })?;
+            result = async { ready_rx.wait_for(|ready| *ready).await.map(|_| ()) } => {
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(_) => {
+                        agent_finished = true;
+                        match (&mut agent_task).await {
+                            Ok(Err(error)) => Err(error),
+                            Err(error) => Err(AgentError::CommandRejected(error.to_string())),
+                            Ok(Ok(())) => Err(AgentError::CommandRejected(
+                                "agent readiness channel closed".into(),
+                            )),
+                        }
+                    }
+                }
             }
+            _ = async { let _ = startup_shutdown.wait_for(|stopped| *stopped).await; } => Ok(false),
+        };
+        if !matches!(startup_result, Ok(true)) {
+            shutdown.send_replace(true);
+            let outbound = abort_progress(&mut outbound_task, outbound_finished).await;
+            let peer = abort_progress(&mut peer_task, peer_finished).await;
+            let cleanup = if agent_finished {
+                Ok(())
+            } else {
+                finish_agent(&mut agent_task).await
+            };
+            runtime.abort();
+            let cleanup = match cleanup {
+                Err(AgentError::Runtime(kuberic_runtime::RuntimeError::OperationCancelled))
+                    if matches!(startup_result, Ok(false)) =>
+                {
+                    Ok(())
+                }
+                result => result,
+            };
+            let result = with_shutdown_error(startup_result.map(|_| ()), cleanup, "agent shutdown");
+            let result = with_shutdown_error(result, outbound, "outbound shutdown");
+            with_shutdown_error(result, peer, "peer discovery shutdown")?;
+            return Ok(None);
         }
         let supervisor_shutdown = shutdown.clone();
+        let supervisor_runtime = runtime.clone();
         let completion = tokio::spawn(async move {
-            let mut tasks = tokio::task::JoinSet::new();
-            tasks.spawn(async move {
-                agent_task
-                    .await
-                    .map_err(|error| AgentError::CommandRejected(error.to_string()))?
-            });
-            tasks.spawn(async move {
-                outbound_task
-                    .await
-                    .map_err(|error| AgentError::CommandRejected(error.to_string()))?
-            });
-            tasks.spawn(async move {
-                peer_task
-                    .await
-                    .map_err(|error| AgentError::CommandRejected(error.to_string()))?
-            });
-            let first = tasks
-                .join_next()
-                .await
-                .ok_or_else(|| AgentError::CommandRejected("replica host has no tasks".into()))?
-                .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+            let (first, finished) = tokio::select! {
+                result = &mut agent_task => (result, 0),
+                result = &mut outbound_task => (result, 1),
+                result = &mut peer_task => (result, 2),
+            };
             supervisor_shutdown.send_replace(true);
-            tasks.abort_all();
-            first
+            let outbound = abort_progress(&mut outbound_task, finished == 1).await;
+            let peer = abort_progress(&mut peer_task, finished == 2).await;
+            // Joining the agent is the persistence acknowledgement. Aborting its
+            // wrapper task can otherwise discard an accepted fault during shutdown.
+            let cleanup = if finished == 0 {
+                Ok(())
+            } else {
+                finish_agent(&mut agent_task).await
+            };
+            supervisor_runtime.abort();
+            let first = first
+                .map_err(|error| AgentError::CommandRejected(error.to_string()))
+                .and_then(|result| result);
+            let result = with_shutdown_error(cleanup, first, "replica task");
+            let result = with_shutdown_error(result, outbound, "outbound shutdown");
+            with_shutdown_error(result, peer, "peer discovery shutdown")
         });
 
-        Ok(RunningReplica {
+        Ok(Some(RunningReplica {
             handle: ReplicaHandle {
                 runtime,
                 store,
@@ -357,7 +462,45 @@ where
             },
             shutdown,
             completion,
-        })
+        }))
+    }
+}
+
+async fn abort_progress(
+    task: &mut tokio::task::JoinHandle<Result<()>>,
+    finished: bool,
+) -> Result<()> {
+    if finished {
+        return Ok(());
+    }
+    task.abort();
+    match task.await {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(AgentError::CommandRejected(error.to_string())),
+    }
+}
+
+fn with_shutdown_error(primary: Result<()>, cleanup: Result<()>, context: &str) -> Result<()> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(AgentError::CommandRejected(format!(
+            "{primary}; {context}: {cleanup}"
+        ))),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn finish_agent(task: &mut tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    match tokio::time::timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(1), &mut *task).await {
+        Ok(result) => result.map_err(|error| AgentError::CommandRejected(error.to_string()))?,
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(AgentError::CommandRejected(
+                "agent shutdown acknowledgement timed out".into(),
+            ))
+        }
     }
 }
 
@@ -366,6 +509,8 @@ async fn serve_initialization(
     observed: ObservedStorageIdentity,
     database_path: PathBuf,
     fresh_application_state: bool,
+    application_storage_paths: Option<BTreeMap<String, PathBuf>>,
+    mut startup_shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let (initialized, mut initialized_rx) = watch::channel(false);
     let service = InitializationService::new(
@@ -375,17 +520,100 @@ async fn serve_initialization(
         config.bearer_token.clone(),
         initialized,
         fresh_application_state,
-    )?;
+    )?
+    .with_application_storage_paths(application_storage_paths);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (ready, _) = watch::channel(false);
     let stop = tokio::spawn(async move {
-        let _ = initialized_rx.wait_for(|initialized| *initialized).await;
+        tokio::select! {
+            _ = async { let _ = initialized_rx.wait_for(|initialized| *initialized).await; } => {}
+            _ = async { let _ = startup_shutdown.wait_for(|stopped| *stopped).await; } => {}
+        }
         shutdown.send_replace(true);
     });
-    service
+    let result = service
         .serve(config.control_address, ready, shutdown_rx)
-        .await?;
-    stop.await
-        .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
-    Ok(())
+        .await;
+    stop.abort();
+    let _ = stop.await;
+    result
+}
+
+// Resolve existing ancestors without creating even empty application directories.
+fn resolve_storage_path(path: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let absolute = std::path::absolute(path)?;
+            let parent = absolute.parent().ok_or(error)?;
+            let name = absolute.file_name().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid application path")
+            })?;
+            Ok(resolve_storage_path(parent)?.join(name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelling_progress_joins_and_retains_completed_failures() {
+        let mut pending = tokio::spawn(std::future::pending::<Result<()>>());
+        abort_progress(&mut pending, false).await.unwrap();
+        assert!(pending.is_finished());
+        let mut failed =
+            tokio::spawn(async { Err(AgentError::CommandRejected("outbound failed".into())) });
+        while !failed.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let cleanup = abort_progress(&mut failed, false).await;
+        let result = with_shutdown_error(
+            Err(AgentError::CommandRejected("startup failed".into())),
+            cleanup,
+            "outbound shutdown",
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.find("startup failed").unwrap() < error.find("outbound failed").unwrap());
+    }
+
+    #[tokio::test]
+    async fn agent_shutdown_waits_for_acknowledgement_and_propagates_persistence_failure() {
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut agent = tokio::spawn(async move {
+            wait.await.unwrap();
+            Err(AgentError::CommandRejected(
+                "injected persistence failure".into(),
+            ))
+        });
+        let completion = finish_agent(&mut agent);
+        tokio::pin!(completion);
+        tokio::select! {
+            biased;
+            result = &mut completion => panic!("returned before acknowledgement: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        release.send(()).unwrap();
+        assert!(
+            completion
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected persistence failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_shutdown_rejects_an_already_stopped_consumer_without_deadlock() {
+        let mut agent = tokio::spawn(std::future::pending::<Result<()>>());
+        agent.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), finish_agent(&mut agent))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
 }

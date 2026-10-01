@@ -83,13 +83,15 @@ impl StatefulServiceReplica for KvService {
                 self.provider.persistence().clone(),
             )))
             .create_replicator(
-                self.provider.clone(),
+                Some(self.provider.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
                 }),
             )
             .await?;
-        let state_replicator = interfaces.state_replicator();
+        let state_replicator = interfaces
+            .state_replicator()
+            .expect("default operation/copy capability");
         let replication = state_replicator.get_replication_stream().await?;
         let copy = state_replicator.get_copy_stream().await?;
         tokio::spawn(consume_stream(

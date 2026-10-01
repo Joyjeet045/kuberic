@@ -245,7 +245,7 @@ fn secondary_removal_rejects_missing_unknown_and_mismatched_wire_authority() {
         match mutation {
             0 => request.protocol_version = 5,
             1 => request.protocol_version = 0,
-            2 => request.protocol_version = 9,
+            2 => request.protocol_version = 10,
             3 => request.expected_process_session_id.clear(),
             4 => request.target = None,
             5 => request.resource_uid = "other-resource".into(),
@@ -1268,6 +1268,45 @@ fn initialized_status_rejects_unknown_enums_and_malformed_configuration() {
         validate_agent_status_report(&malformed),
         Err(WireError::InvalidAuthority(_))
     ));
+}
+
+#[test]
+fn custom_replication_address_survives_wire_validation() {
+    let configuration: proto::Configuration = configuration().into();
+    let report = proto::AgentStatusReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource".into(),
+        identity: Some(proto::ReplicaIdentity {
+            replica_id: 2,
+            instance_id: "pod-2".into(),
+            agent_generation: "generation-2".into(),
+        }),
+        process_session_id: "session-2".into(),
+        report_sequence: 1,
+        role: proto::ReplicaRole::ActiveSecondary as i32,
+        write_status: proto::AccessStatus::NotPrimary as i32,
+        read_status: proto::AccessStatus::Granted as i32,
+        epoch: configuration.epoch,
+        current_configuration: Some(configuration),
+        current_progress: 12,
+        verified_replication_lsn: Some(11),
+        committed_lsn: 11,
+        catch_up_capability: Some(12),
+        storage_state: proto::AgentStorageState::Initialized as i32,
+        pod_uid: "pod-2".into(),
+        pvc_uid: "pvc-2".into(),
+        healthy: true,
+        replica_id: 2,
+        replication_address: "http://127.0.0.1:30123".into(),
+        ..Default::default()
+    };
+    use prost::Message;
+    let decoded = proto::AgentStatusReport::decode(report.encode_to_vec().as_slice()).unwrap();
+    validate_agent_status_report(&decoded).unwrap();
+    assert_eq!(decoded.replication_address, report.replication_address);
+    let mut invalid = decoded;
+    invalid.replication_address = "x".repeat(513);
+    assert!(validate_agent_status_report(&invalid).is_err());
 }
 
 #[test]

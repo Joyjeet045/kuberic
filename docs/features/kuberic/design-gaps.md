@@ -1063,9 +1063,13 @@ operator-sequenced local reconfiguration candidate.
 
 ### E9. PostgreSQL correlated topology integration
 
-The retired mutable-driver Postgres suites were not recreated. PostgreSQL
-instance/adapter tests remain, while durable topology checkpoint integration
-is covered with real KV pods and correlated SQLite replication covers the
-external data-plane shape. A future Postgres-specific `ClusterApi` harness
-should exercise durable failover and switchover without restoring a public
-mutation bypass.
+**Resolved in v2; classic correlated topology is retired.** The mutable-driver
+Postgres suites and proposed classic `ClusterApi` harness were not restored.
+The [implemented PostgreSQL v2 contract](../postgres/design.md) uses the
+SF-style custom replicator and real host-local agents/PostgreSQL subprocesses
+to validate durable topology transitions, failover, switchover, scaling,
+replacement and restart without a public mutation bypass.
+
+This completes Workstream 4's host-local validation, not deployment validation.
+Images, deployment assets and distribution remain Workstream 5; there is no
+PostgreSQL KinD or live-cluster coverage.

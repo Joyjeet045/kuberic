@@ -45,24 +45,31 @@ public-path documented field crate::application::RoleChange::service_address: Op
 public-path documented field crate::application::WriteReceipt::committed_lsn: Lsn
 public-path documented field crate::application::WriteReceipt::lsn: Lsn
 public-path documented field crate::replicator::ReplicaInformation::build_id: OperationId
+public-path documented field crate::replicator::ReplicaInformation::catch_up_capability: Lsn
+public-path documented field crate::replicator::ReplicaInformation::current_progress: Lsn
 public-path documented field crate::replicator::ReplicaInformation::identity: ReplicaIdentity
+public-path documented field crate::replicator::ReplicaInformation::process_session_id: ProcessSessionId
 public-path documented field crate::replicator::ReplicaInformation::replication_address: String
+public-path documented field crate::replicator::ReplicaInformation::role: ReplicaRole
+public-path documented field crate::replicator::ReplicaSetConfiguration::configuration: ConfigurationDescriptor
+public-path documented field crate::replicator::ReplicaSetConfiguration::replicas: Vec < ReplicaInformation >
 public-path documented field crate::replicator::ReplicatorSettings::replication_address: String
 public-path documented field crate::replicator::stream::StreamOperation::data: Bytes
 public-path documented field crate::replicator::stream::StreamOperation::metadata: OperationMetadata
 public-path documented impl crate::replicator::DefaultReplicatorFactory::fn new (storage : Arc < dyn DurableState >) -> Self
+public-path documented impl crate::replicator::ReplicaInformation::fn new (build_id : OperationId , identity : ReplicaIdentity , replication_address : String ,) -> Self
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn read_status (& self) -> Result < AccessStatus >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn report_fault (& self , fault : FaultType) -> Result < () >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn report_load (& self , metrics : Vec < LoadMetric >) -> Result < () >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn write_status (& self) -> Result < AccessStatus >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::fn identity (& self) -> Result < ReplicaIdentity >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::fn partition_information (& self) -> PartitionInformation
-public-path documented impl crate::replicator::ReplicatorInterfaces::fn primary < T > (primary_replicator : Arc < T > , state_replicator : Arc < dyn StateReplicator > ,) -> Self where T : PrimaryReplicator + 'static ,
+public-path documented impl crate::replicator::ReplicatorInterfaces::fn primary < T > (primary_replicator : Arc < T > , state_replicator : Option < Arc < dyn StateReplicator > > ,) -> Self where T : PrimaryReplicator + 'static ,
 public-path documented impl crate::replicator::ReplicatorInterfaces::fn primary_replicator (& self) -> Option < Arc < dyn PrimaryReplicator > >
 public-path documented impl crate::replicator::ReplicatorInterfaces::fn replicator (& self) -> Arc < dyn Replicator >
-public-path documented impl crate::replicator::ReplicatorInterfaces::fn secondary (replicator : Arc < dyn Replicator > , state_replicator : Arc < dyn StateReplicator > ,) -> Self
-public-path documented impl crate::replicator::ReplicatorInterfaces::fn state_replicator (& self) -> Arc < dyn StateReplicator >
-public-path documented impl crate::replicator::StatefulServicePartition::async fn create_replicator (& self , state_provider : Arc < dyn StateProvider > , settings : Option < ReplicatorSettings > ,) -> Result < ReplicatorInterfaces >
+public-path documented impl crate::replicator::ReplicatorInterfaces::fn secondary (replicator : Arc < dyn Replicator > , state_replicator : Option < Arc < dyn StateReplicator > > ,) -> Self
+public-path documented impl crate::replicator::ReplicatorInterfaces::fn state_replicator (& self) -> Option < Arc < dyn StateReplicator > >
+public-path documented impl crate::replicator::StatefulServicePartition::async fn create_replicator (& self , state_provider : Option < Arc < dyn StateProvider > > , settings : Option < ReplicatorSettings > ,) -> Result < ReplicatorInterfaces >
 public-path documented impl crate::replicator::StatefulServicePartition::async fn get_read_status (& self) -> Result < AccessStatus >
 public-path documented impl crate::replicator::StatefulServicePartition::async fn get_write_status (& self) -> Result < AccessStatus >
 public-path documented impl crate::replicator::StatefulServicePartition::async fn report_fault (& self , fault : FaultType) -> Result < () >
@@ -88,6 +95,7 @@ public-path documented struct crate::application::WriteReceipt
 public-path documented struct crate::replicator::DefaultReplicator
 public-path documented struct crate::replicator::DefaultReplicatorFactory
 public-path documented struct crate::replicator::ReplicaInformation
+public-path documented struct crate::replicator::ReplicaSetConfiguration
 public-path documented struct crate::replicator::ReplicatorFactoryContext
 public-path documented struct crate::replicator::ReplicatorInterfaces
 public-path documented struct crate::replicator::ReplicatorSettings
@@ -110,8 +118,8 @@ public-path documented trait crate::replicator::PrimaryReplicator: Replicator
 public-path documented trait crate::replicator::PrimaryReplicator::async fn build_replica (& self , replica : ReplicaInformation) -> Result < () >
 public-path documented trait crate::replicator::PrimaryReplicator::async fn on_data_loss (& self) -> Result < bool >
 public-path documented trait crate::replicator::PrimaryReplicator::async fn remove_replica (& self , replica_id : ReplicaId) -> Result < () >
-public-path documented trait crate::replicator::PrimaryReplicator::async fn update_catch_up_replica_set_configuration (& self , current : ConfigurationDescriptor , previous : ConfigurationDescriptor ,) -> Result < () >
-public-path documented trait crate::replicator::PrimaryReplicator::async fn update_current_replica_set_configuration (& self , current : ConfigurationDescriptor ,) -> Result < () >
+public-path documented trait crate::replicator::PrimaryReplicator::async fn update_catch_up_replica_set_configuration (& self , current : ReplicaSetConfiguration , previous : ReplicaSetConfiguration ,) -> Result < () >
+public-path documented trait crate::replicator::PrimaryReplicator::async fn update_current_replica_set_configuration (& self , current : ReplicaSetConfiguration ,) -> Result < () >
 public-path documented trait crate::replicator::PrimaryReplicator::async fn wait_for_catch_up_quorum (& self , mode : ReplicaSetQuorumMode) -> Result < () >
 public-path documented trait crate::replicator::Replicator: Send + Sync
 public-path documented trait crate::replicator::Replicator::async fn catch_up_capability (& self) -> Result < Lsn >
@@ -122,7 +130,7 @@ public-path documented trait crate::replicator::Replicator::async fn open (& sel
 public-path documented trait crate::replicator::Replicator::async fn update_epoch (& self , epoch : Epoch) -> Result < () >
 public-path documented trait crate::replicator::Replicator::fn abort (& self)
 public-path documented trait crate::replicator::ReplicatorFactory: Send + Sync
-public-path documented trait crate::replicator::ReplicatorFactory::async fn create_replicator (& self , context : ReplicatorFactoryContext , state_provider : Arc < dyn StateProvider > , settings : ReplicatorSettings ,) -> Result < ReplicatorInterfaces >
+public-path documented trait crate::replicator::ReplicatorFactory::async fn create_replicator (& self , context : ReplicatorFactoryContext , state_provider : Option < Arc < dyn StateProvider > > , settings : ReplicatorSettings ,) -> Result < ReplicatorInterfaces >
 public-path documented trait crate::replicator::StateReplicator: Send + Sync
 public-path documented trait crate::replicator::StateReplicator::async fn get_copy_stream (& self) -> Result < OperationStream >
 public-path documented trait crate::replicator::StateReplicator::async fn get_replication_stream (& self) -> Result < OperationStream >
@@ -265,7 +273,7 @@ public-path hidden trait crate::replicator::PartitionAccessView::async fn report
 public-path hidden trait crate::replicator::PartitionAccessView::async fn write_status (& self) -> Result < AccessStatus >
 public-path hidden trait crate::replicator::PartitionAccessView::fn partition_information (& self) -> PartitionInformation
 public-path hidden trait crate::replicator::ReplicatorRegistration: Send + Sync
-public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_interfaces (& self , interfaces : & ReplicatorInterfaces , provider : Arc < dyn StateProvider > , reservation : ReplicatorCreationReservation ,) -> Result < () >
+public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_interfaces (& self , interfaces : & ReplicatorInterfaces , provider : Option < Arc < dyn StateProvider > > , reservation : ReplicatorCreationReservation ,) -> Result < () >
 public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_managed (& self , managed : Arc < dyn ManagedReplicator > , reservation : ReplicatorCreationReservation ,) -> Result < () >
 public-path hidden trait crate::replicator::ReplicatorRegistration::fn cancel_replicator_creation (& self , reservation : ReplicatorCreationReservation)
 public-path hidden trait crate::replicator::ReplicatorRegistration::fn reserve_replicator_creation (& self) -> Result < ReplicatorCreationReservation >

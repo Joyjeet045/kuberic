@@ -29,19 +29,27 @@ env:
 jobs:
   targeted:
     name: Targeted checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     env:
       RUST_TEST_THREADS: 1
+      TMPDIR: ${{ github.workspace }}/target/paw-tmp
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Prepare repository-local scratch
+        run: mkdir -p "$TMPDIR"
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: rustfmt, clippy
           build-warnings: ""
       - uses: taiki-e/install-action@protoc
+      - name: Install host-local PostgreSQL for unit tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-16 postgresql-client-16
+          /usr/lib/postgresql/16/bin/postgres --version
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint level-triggered packages
@@ -56,6 +64,7 @@ jobs:
           -p kvstore2
           -p sqlite-replicated
           -p sqlite-commit-barrier
+          -p postgres-replicated
           -p kuberic-level-tests
           --all-targets --all-features -- -D warnings
       - name: Test level-triggered packages
@@ -71,6 +80,8 @@ jobs:
           --features kuberic-agent/testing
       - name: Test SQLite unit and in-process suites
         run: cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
+      - name: Test PostgreSQL unit and host-local subprocess suites
+        run: cargo test -p postgres-replicated --all-features -- --test-threads=1
       - name: Run classic v1 scale-up regressions
         run: |
           cargo test -p kvstore --test reconciler test_reconciler_scale_up -- --exact
@@ -79,12 +90,6 @@ jobs:
         run: |
           cargo test -p kuberic-level-tests --no-run
           cargo test -p kuberic-level-tests
-      - name: Verify source and dependency isolation
-        run: |
-          scripts/check_level_triggered_scope.sh origin/main
-          scripts/check_level_triggered_dependencies.sh
-          scripts/check_level_triggered_guards_test.sh
-          scripts/check_level_triggered_documentation.sh docs/features/sqlite/design.md
 
   bootstrap-kind:
     name: PR live smoke

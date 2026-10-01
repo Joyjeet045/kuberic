@@ -27,7 +27,7 @@ from the replica role.
 Service Open receives a `StatefulServicePartition` in its `OpenContext`.
 The service selects a `ReplicatorFactory` with `partition.with_factory(...)`,
 then calls `create_replicator(state_provider, settings)`. The result contains
-the control and state-replicator interfaces; the optional primary interface is
+the control interface and optional state-replicator capability; the optional primary interface is
 the explicit Rust counterpart of querying `IFabricPrimaryReplicator`.
 
 ```text
@@ -118,7 +118,7 @@ After process termination, a started record is finalized without Open: terminati
 already closed the prior host. The pending agent effect then completes its exact
 durable receipt normally. Failed finalization keeps reconstruction closed.
 Preparation, acceptance, and retirement postconditions are unpublished managed
-contracts, not additions to the SF-shaped application traits. Agent schema-4
+contracts, not additions to the SF-shaped application traits. Agent schema-5
 storage persists preparation, accepted-current-only, and retirement evidence.
 Recovery revalidates accepted evidence before restoring previously granted
 access; preparation and current-only coordination by themselves stay closed.
@@ -139,7 +139,7 @@ authority into the runtime. It freezes a separate post-enumeration catch-up
 boundary, admits the candidate through independently validated previous and
 expanded policies, and may preserve same-primary writes only while both
 configurations remain writable. Candidate readiness/copy completion alone never
-grants membership or quorum credit. Protocol 8/schema 4 require a fresh
+grants membership or quorum credit. Protocol 9/schema 5 require a fresh
 coordinated v2 deployment; classic v1 remains unchanged.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 include separating replication proof from Kubernetes cleanup obligations; neither
@@ -154,6 +154,39 @@ allocation, matching SF's coherent interface-query invariant. The default
 implementation's managed data-plane bridge is transferred through an
 unforgeable unpublished agent/runtime registration boundary; custom
 replicators own their transport independently.
+
+`StateReplicator` and the factory's `StateProvider` argument are optional.
+The default factory requires `Some(provider)` and returns `Some(state_replicator)`;
+a custom replicator such as PostgreSQL supplies neither operation/copy interface.
+It still returns the same `Replicator` from service Open and implements
+`PrimaryReplicator`, not a second application/driver hierarchy.
+
+`ReplicaSetConfiguration` carries the voting configuration and exact
+`ReplicaInformation` descriptions (incarnation, process session, endpoint, role,
+and progress/catch-up boundary), including authorized idle replicas outside the
+voting set. Agent hosting installs these through configuration callbacks before
+dispatching `build_replica`. Configuration/epoch/session changes revoke old work;
+`remove_replica` retires idle build work without removing an admitted secondary.
+The private agent wrapper retains all durable authority/effect/store capabilities.
+An unmanaged custom factory without that hosting support remains rejected for
+managed admission.
+
+Private custom hosting durably selects one build per logical target slot.
+Descriptions for superseded builds are withdrawn, and callback receipts bind
+the full authority/generation to both process sessions and the local attempt.
+An idle custom replicator must withhold build-ready progress until its durable
+copy certificate matches that exact installed description; unrelated existing
+data is not completion of a newly selected build. The platform never fans one
+scalar out as completion of every described build. The default operation engine
+continues to use its own per-build copy acknowledgements.
+
+Custom services retain the partition handle and reconcile direct-client access
+against its read/write statuses, never role notifications alone. Progress
+observation must finish that reconciliation before returning; hosting awaits it
+before publishing an access-effect receipt. Application-specific lineage and
+recovery evidence stay in the application. See the repository's
+[SF interface mapping](../docs/background/service-fabric/references.md) and
+[service-created replicator design](../docs/features/kuberic/implemented/runtime-replicator-separation.md).
 
 Service Fabric custom implementations return a custom control object from
 Open. Kuberic deliberately uses a Rust factory wrapper so creation can reserve

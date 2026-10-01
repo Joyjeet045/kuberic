@@ -5,32 +5,42 @@ edition.workspace = true
 publish = false
 
 [features]
-testing = []
+testing = ["kuberic-agent/testing", "dep:kuberic-runtime-internal"]
 
 [[bin]]
 name = "postgres-replicated"
 path = "src/main.rs"
 
 [dependencies]
-kuberic-core = { path = "../../kuberic-core" }
+kuberic-agent = { path = "../../kuberic-agent" }
+kuberic-wire = { path = "../../kuberic-wire" }
+kuberic-protocol = { path = "../../kuberic-protocol" }
+kuberic-runtime = { path = "../../kuberic-runtime" }
+kuberic-runtime-internal = { path = "../../kuberic-runtime-internal", optional = true }
+async-trait.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
 clap.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 whoami.workspace = true
 tonic.workspace = true
 prost.workspace = true
 tonic-prost.workspace = true
+rustix = { version = "1", features = ["process", "event"] }
 
 [dev-dependencies]
 test-log.workspace = true
 postgres-replicated = { path = ".", features = ["testing"] }
 serial_test.workspace = true
-kuberic-operator = { path = "../../kuberic-operator" }
+rusqlite.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true

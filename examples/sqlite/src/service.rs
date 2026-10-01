@@ -228,13 +228,15 @@ impl StatefulServiceReplica for SqliteService {
                 self.persistence.clone(),
             )))
             .create_replicator(
-                self.provider.clone(),
+                Some(self.provider.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
                 }),
             )
             .await?;
-        let replicator = interfaces.state_replicator();
+        let replicator = interfaces
+            .state_replicator()
+            .expect("default operation/copy capability");
         for stream in [
             replicator.get_copy_stream().await?,
             replicator.get_replication_stream().await?,

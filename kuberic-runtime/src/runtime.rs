@@ -2372,6 +2372,7 @@ impl DefaultReplicatorInner {
             accepted_secondary_removal: snapshot.12,
             current_progress: snapshot.5,
             verified_replication_lsn: snapshot.6,
+            live_builds_only: false,
             committed_lsn: snapshot.7.max(replicator.committed_lsn()),
             current_configuration_quorum_progress: replicator
                 .current_configuration_quorum_progress(),
@@ -3305,14 +3306,14 @@ impl DefaultReplicatorInner {
             if let Some(previous) = authority.previous_configuration.clone() {
                 primary
                     .update_catch_up_replica_set_configuration(
-                        authority.current_configuration.clone(),
-                        previous,
+                        authority.current_configuration.clone().into(),
+                        previous.into(),
                     )
                     .await?;
             } else {
                 primary
                     .update_current_replica_set_configuration(
-                        authority.current_configuration.clone(),
+                        authority.current_configuration.clone().into(),
                     )
                     .await?;
             }
@@ -3562,6 +3563,10 @@ impl DefaultReplicatorInner {
 
 #[async_trait::async_trait]
 impl ManagedReplicator for DefaultReplicatorInner {
+    async fn complete_open(&self, replication_address: String) -> Result<()> {
+        self.complete_open(replication_address).await
+    }
+
     async fn attach_interfaces(
         &self,
         control: Arc<dyn Replicator>,
@@ -3570,8 +3575,46 @@ impl ManagedReplicator for DefaultReplicatorInner {
         self.attach_interfaces(control, primary).await
     }
 
-    async fn complete_open(&self, replication_address: String) -> Result<()> {
-        self.complete_open(replication_address).await
+    async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
+        self.begin_write(write).await
+    }
+
+    async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()> {
+        self.accept_acknowledgement(acknowledgement).await
+    }
+
+    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
+        self.prepare_copy(request).await
+    }
+
+    async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()> {
+        self.accept_copy_acknowledgement(acknowledgement).await
+    }
+
+    async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck> {
+        self.receive_copy_item(item).await
+    }
+
+    async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication> {
+        self.weak_self
+            .upgrade()
+            .ok_or(RuntimeError::Closed)?
+            .receive_replication(item)
+            .await
+    }
+
+    async fn next_outbound(&self) -> Option<OutboundOperation> {
+        let mut receiver = self.outbound_rx.lock().await;
+        loop {
+            let changed = self.changed.notified();
+            if let Some(identity) = self.state.write().await.pending_evictions.pop_first() {
+                return Some(OutboundOperation::Evict(identity));
+            }
+            tokio::select! {
+                item = receiver.recv() => return item,
+                _ = changed => {}
+            }
+        }
     }
 
     async fn fence_writes(&self) -> Result<()> {
@@ -3746,14 +3789,6 @@ impl ManagedReplicator for DefaultReplicatorInner {
         self.snapshot().await
     }
 
-    async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
-        self.begin_write(write).await
-    }
-
-    async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()> {
-        self.accept_acknowledgement(acknowledgement).await
-    }
-
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {
         let _effect = self.effect_lock.lock().await;
         let _delivery = self.delivery_lock.lock().await;
@@ -3763,40 +3798,6 @@ impl ManagedReplicator for DefaultReplicatorInner {
         drop(state);
         self.changed.notify_waiters();
         Ok(())
-    }
-
-    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
-        self.prepare_copy(request).await
-    }
-
-    async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()> {
-        self.accept_copy_acknowledgement(acknowledgement).await
-    }
-
-    async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck> {
-        self.receive_copy_item(item).await
-    }
-
-    async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication> {
-        self.weak_self
-            .upgrade()
-            .ok_or(RuntimeError::Closed)?
-            .receive_replication(item)
-            .await
-    }
-
-    async fn next_outbound(&self) -> Option<OutboundOperation> {
-        let mut receiver = self.outbound_rx.lock().await;
-        loop {
-            let changed = self.changed.notified();
-            if let Some(identity) = self.state.write().await.pending_evictions.pop_first() {
-                return Some(OutboundOperation::Evict(identity));
-            }
-            tokio::select! {
-                item = receiver.recv() => return item,
-                _ = changed => {}
-            }
-        }
     }
 
     fn abort(&self) {

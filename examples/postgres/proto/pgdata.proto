@@ -1,39 +1,23 @@
 syntax = "proto3";
+package pgdata.v2;
 
-package pgdata.v1;
-
-// App-to-app data service for PostgreSQL replication coordination.
-// Runs on each pod's data_bind address. The primary calls CloneFrom
-// on the secondary during BuildReplica to trigger pg_basebackup.
+// The bounded canonical JSON envelopes are versioned and strictly decoded:
+// unknown, duplicate, missing, noncanonical, and oversized values are rejected.
+// This is coordination only; PostgreSQL owns physical WAL and backup transport.
 service PgDataService {
-  // Primary calls this on the secondary during BuildReplica.
-  // Secondary runs pg_basebackup from the given primary address,
-  // configures standby.signal, and starts PG.
-  rpc CloneFrom(CloneFromRequest) returns (CloneFromResponse);
-
-  // Primary calls this on secondaries after failover to update
-  // primary_conninfo to point to the new primary. Restarts PG.
-  rpc ReconfigureStandby(ReconfigureStandbyRequest) returns (ReconfigureStandbyResponse);
+  rpc Build(NativeBuildRequest) returns (NativeBuildResponse);
+  rpc InspectSource(NativeBuildRequest) returns (NativeSourceResponse);
+  rpc Recover(RecoveryRequest) returns (RecoveryResponse);
 }
 
-message CloneFromRequest {
-  string primary_host = 1;
-  uint32 primary_port = 2;
-  int64 replica_id = 3;
+message RecoveryRequest { bytes envelope_json = 1; }
+message RecoveryResponse { bytes envelope_json = 1; }
+message NativeBuildRequest {
+  bytes envelope_json = 1;
 }
-
-message CloneFromResponse {
-  bool success = 1;
-  string error = 2;
+message NativeBuildResponse {
+  bytes progress_json = 1;
 }
-
-message ReconfigureStandbyRequest {
-  string primary_host = 1;
-  uint32 primary_port = 2;
-  int64 replica_id = 3;
-}
-
-message ReconfigureStandbyResponse {
-  bool success = 1;
-  string error = 2;
+message NativeSourceResponse {
+  bytes lineage_json = 1;
 }

@@ -29,6 +29,7 @@ page:replicator/stream/struct.StreamOperation.html
 page:replicator/struct.DefaultReplicator.html
 page:replicator/struct.DefaultReplicatorFactory.html
 page:replicator/struct.ReplicaInformation.html
+page:replicator/struct.ReplicaSetConfiguration.html
 page:replicator/struct.ReplicatorFactoryContext.html
 page:replicator/struct.ReplicatorInterfaces.html
 page:replicator/struct.ReplicatorSettings.html

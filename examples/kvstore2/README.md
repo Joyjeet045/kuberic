@@ -44,7 +44,7 @@ time or supported replica-count budget is promised.
 There is no PVC retention or import path, nor a physical storage erasure promise.
 Frozen-primary loss during removal/cleanup can block service indefinitely.
 Expect HTTP 503/disconnects during convergence, with no interruption-duration
-guarantee. Protocol 8 / store schema 4 require fresh deployment, not data migration.
+guarantee. Protocol 9 / store schema 5 require fresh deployment, not data migration.
 
 After installing into an explicitly owned KinD cluster, run:
 

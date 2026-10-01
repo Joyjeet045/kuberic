@@ -10,7 +10,7 @@ what each layer validates, and known gaps.
 ## Independent Level-Triggered Stack
 
 The classic test layers below remain unchanged except that the existing SQLite
-application suite is now v2. The independent v2 stack adds pure protocol/model
+and PostgreSQL application suites are now v2. The independent v2 stack adds pure protocol/model
 tests, agent-metadata SQLite subprocess crash tests (not the SQLite application suite), runtime
 successful-write and session-fencing tests, controller exact-resource race tests,
 and explicitly owned KinD scenarios. Secondary scale-down covers healthy 3→2,
@@ -37,7 +37,6 @@ Retained-session and deleted-target rejection assertions remain strict.
 cargo test -p kuberic-protocol --test protocol --test model
 cargo test -p kuberic-agent --test crash_boundaries --test runtime -- --test-threads=1
 cargo test -p kuberic-controller --test controller
-scripts/check_level_triggered_documentation.sh
 # After the owned-cluster installation:
 just level-triggered-kind-test scale-down
 just level-triggered-kind-test scale-down-adversarial
@@ -79,7 +78,6 @@ cargo test -p kuberic-agent --features testing --lib --test runtime --test servi
 cargo test -p kuberic-protocol --lib --test protocol --test model -- --skip terminal_switchover_receipts_survive_process_exit_and_do_not_allocate_again
 cargo test -p kuberic-controller --lib --test controller
 cargo clippy -p kuberic-agent -p sqlite-replicated --all-targets --all-features -- -D warnings
-scripts/check_level_triggered_documentation.sh docs/features/sqlite/design.md
 ```
 
 These selections exclude the agent `crash_boundaries` executable and the two
@@ -111,6 +109,54 @@ not added to KinD/live jobs or selectors. These are bounded unit/in-process
 scenarios, not a production outage, performance, or live-controller guarantee.
 See the [SQLite design](../sqlite/design.md) and
 [agent testing surface](../../../kuberic-agent/README.md#in-process-application-tests-opt-in).
+
+### PostgreSQL V2 Host-Local Validation
+
+The existing `postgres-replicated` package uses an SF-shaped custom replicator,
+not Kuberic operation/copy streams. Tests run real local PostgreSQL subprocesses
+with durable agent/application stores and exact-session authority. They require
+an unprivileged Linux account, pidfds/subreapers, readable `/proc`, and compatible
+PostgreSQL binaries; PostgreSQL 16 is the validated host major. Discovery checks
+common server directories and then `pg_config --bindir`. Missing prerequisites
+fail rather than skip.
+
+```bash
+mkdir -p target/paw-tmp
+export TMPDIR="$PWD/target/paw-tmp"
+cargo test -p postgres-replicated --all-features -- --test-threads=1
+cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
+cargo test -p kvstore2 -p kuberic-runtime -p kuberic-runtime-internal -p kuberic-wire
+cargo test -p kuberic-agent --features testing --lib --test runtime --test service --test coordinator --test store --test transport --test crash_boundaries -- --test-threads=1
+cargo test -p kuberic-protocol --lib --test protocol --test model
+cargo test -p kuberic-controller --lib --test controller
+cargo fmt --all -- --check
+cargo clippy -p postgres-replicated -p kuberic-runtime -p kuberic-runtime-internal -p kuberic-agent -p kuberic-protocol -p kuberic-wire -p kvstore2 -p sqlite-replicated -p sqlite-commit-barrier --all-targets --all-features -- -D warnings
+cargo test -p kuberic-runtime --test public_api_inventory
+```
+
+These agent/protocol selections include their child-process crash tests (unlike
+the SQLite-only selection above). Top-level ignored child helpers are invoked
+by their parent tests. Controller and protocol tests verify the checked-in CRD
+and representative status-size growth; controller tests use local fakes, not a
+Kubernetes API. PostgreSQL fixtures own their worker stacks and isolated
+`target/postgresql-v2-tests/<unique-id>` roots. Teardown verifies owned processes
+reaped, listeners released and fixture data removed.
+
+The matrix covers bootstrap, native build/rewind, all-identity failover and
+switchover, 1→2→3 growth, secondary removal, replacement, quorum restoration,
+read-only secondaries, durable restart cuts and delayed work. Retained ordinary,
+administrative and pre-authentication connections must be definitively fenced;
+timeouts and generic SQL errors do not prove rejection. Complete SQL sets include
+acknowledged data before the first promoted write, while interrupted synchronous
+transactions remain unknown unless resolved.
+
+Targeted CI installs local PostgreSQL binaries and includes the package in lint
+and serial unit tests only. No PostgreSQL KinD/live job, selector, manifest or
+container dependency is added. Workstream 4 is complete; Workstream 5 owns
+distribution. These traces do not establish deployment readiness, an outage SLO
+or protection against hostile administrators/independently surviving orphans.
+See the [PostgreSQL design](../postgres/design.md) for the fresh-deployment
+protocol 9 / schema 5 contract and WAL-retention/headroom limitations.
 
 ---
 

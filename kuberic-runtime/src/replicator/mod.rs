@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
-    PartitionInformation, ReplicaId, ReplicaIdentity, ReplicaRole,
+    PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
 };
 use kuberic_runtime_internal::RuntimeHostToken;
 use tokio::sync::{Mutex, RwLock};
@@ -25,8 +25,7 @@ use crate::authority::{
     BuildAuthorityStore, BuildProgressStore, LocalWriteJournal, ReplicaAuthorityStore,
     ReplicationProgressStore,
 };
-use crate::effects::RuntimeEffectAction;
-use crate::effects::RuntimeSnapshot;
+use crate::effects::{RuntimeEffectAction, RuntimeSnapshot};
 use crate::engine::DurableState;
 use crate::internal::{DefaultReplicatorInner, PendingReplication, PendingWrite};
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
@@ -54,13 +53,13 @@ pub trait PrimaryReplicator: Replicator {
     async fn on_data_loss(&self) -> Result<bool>;
     async fn update_catch_up_replica_set_configuration(
         &self,
-        current: ConfigurationDescriptor,
-        previous: ConfigurationDescriptor,
+        current: ReplicaSetConfiguration,
+        previous: ReplicaSetConfiguration,
     ) -> Result<()>;
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()>;
     async fn update_current_replica_set_configuration(
         &self,
-        current: ConfigurationDescriptor,
+        current: ReplicaSetConfiguration,
     ) -> Result<()>;
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()>;
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()>;
@@ -78,12 +77,6 @@ pub trait StateReplicator: Send + Sync {
 #[async_trait]
 #[doc(hidden)]
 pub trait ManagedReplicator: Send + Sync {
-    async fn attach_interfaces(
-        &self,
-        control: Arc<dyn Replicator>,
-        primary: Option<Arc<dyn PrimaryReplicator>>,
-    ) -> Result<()>;
-    async fn complete_open(&self, replication_address: String) -> Result<()>;
     async fn fence_writes(&self) -> Result<()>;
     async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
@@ -92,15 +85,21 @@ pub trait ManagedReplicator: Send + Sync {
     async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()>;
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
+    fn abort(&self);
+    async fn complete_open(&self, replication_address: String) -> Result<()>;
+    async fn attach_interfaces(
+        &self,
+        control: Arc<dyn Replicator>,
+        primary: Option<Arc<dyn PrimaryReplicator>>,
+    ) -> Result<()>;
     async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite>;
     async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()>;
-    async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
     async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy>;
     async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()>;
     async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck>;
     async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication>;
     async fn next_outbound(&self) -> Option<OutboundOperation>;
-    fn abort(&self);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +113,45 @@ pub struct ReplicaInformation {
     pub build_id: OperationId,
     pub identity: ReplicaIdentity,
     pub replication_address: String,
+    pub process_session_id: ProcessSessionId,
+    pub role: ReplicaRole,
+    pub current_progress: Lsn,
+    pub catch_up_capability: Lsn,
+}
+
+impl ReplicaInformation {
+    pub fn new(
+        build_id: OperationId,
+        identity: ReplicaIdentity,
+        replication_address: String,
+    ) -> Self {
+        Self {
+            build_id,
+            identity,
+            replication_address,
+            process_session_id: ProcessSessionId::default(),
+            role: ReplicaRole::IdleSecondary,
+            current_progress: 0,
+            catch_up_capability: 0,
+        }
+    }
+}
+
+/// SF ReplicaSetConfiguration: voting policy plus exact replica descriptions.
+/// Idle replicas may be described without belonging to the voting configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaSetConfiguration {
+    pub configuration: ConfigurationDescriptor,
+    pub replicas: Vec<ReplicaInformation>,
+}
+
+impl From<ConfigurationDescriptor> for ReplicaSetConfiguration {
+    fn from(configuration: ConfigurationDescriptor) -> Self {
+        Self {
+            configuration,
+            replicas: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -124,14 +162,14 @@ pub struct ReplicatorSettings {
 /// Rust's explicit counterpart of obtaining coherent interfaces from CreateReplicator.
 pub struct ReplicatorInterfaces {
     replicator: Arc<dyn Replicator>,
-    state_replicator: Arc<dyn StateReplicator>,
+    state_replicator: Option<Arc<dyn StateReplicator>>,
     primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
 }
 
 impl ReplicatorInterfaces {
     pub fn secondary(
         replicator: Arc<dyn Replicator>,
-        state_replicator: Arc<dyn StateReplicator>,
+        state_replicator: Option<Arc<dyn StateReplicator>>,
     ) -> Self {
         Self {
             replicator,
@@ -142,7 +180,7 @@ impl ReplicatorInterfaces {
 
     pub fn primary<T>(
         primary_replicator: Arc<T>,
-        state_replicator: Arc<dyn StateReplicator>,
+        state_replicator: Option<Arc<dyn StateReplicator>>,
     ) -> Self
     where
         T: PrimaryReplicator + 'static,
@@ -160,7 +198,7 @@ impl ReplicatorInterfaces {
         self.replicator.clone()
     }
 
-    pub fn state_replicator(&self) -> Arc<dyn StateReplicator> {
+    pub fn state_replicator(&self) -> Option<Arc<dyn StateReplicator>> {
         self.state_replicator.clone()
     }
 
@@ -240,7 +278,6 @@ impl ReplicatorFactoryContext {
 #[doc(hidden)]
 pub trait PartitionAccessView: Send + Sync {
     fn partition_information(&self) -> PartitionInformation;
-
     async fn read_status(&self) -> Result<AccessStatus>;
 
     async fn write_status(&self) -> Result<AccessStatus>;
@@ -280,7 +317,7 @@ pub trait ReplicatorRegistration: Send + Sync {
     async fn register_interfaces(
         &self,
         interfaces: &ReplicatorInterfaces,
-        provider: Arc<dyn StateProvider>,
+        provider: Option<Arc<dyn StateProvider>>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()>;
 }
@@ -290,7 +327,7 @@ pub trait ReplicatorFactory: Send + Sync {
     async fn create_replicator(
         &self,
         context: ReplicatorFactoryContext,
-        state_provider: Arc<dyn StateProvider>,
+        state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces>;
 }
@@ -347,7 +384,7 @@ impl StatefulServicePartition {
 
     pub async fn create_replicator(
         &self,
-        state_provider: Arc<dyn StateProvider>,
+        state_provider: Option<Arc<dyn StateProvider>>,
         settings: Option<ReplicatorSettings>,
     ) -> Result<ReplicatorInterfaces> {
         let factory = self.factory.as_ref().ok_or_else(|| {
@@ -397,9 +434,12 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
     async fn create_replicator(
         &self,
         context: ReplicatorFactoryContext,
-        state_provider: Arc<dyn StateProvider>,
+        state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
+        let state_provider = state_provider.ok_or_else(|| {
+            RuntimeError::Application("the default replicator requires a state provider".into())
+        })?;
         let streams = Arc::new(ServiceStreams::new());
         let dependencies = context.default_dependencies.clone().ok_or_else(|| {
             RuntimeError::Application(
@@ -438,7 +478,10 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
             pending,
         });
         context.register_managed(engine).await?;
-        Ok(ReplicatorInterfaces::primary(replicator, state_replicator))
+        Ok(ReplicatorInterfaces::primary(
+            replicator,
+            Some(state_replicator),
+        ))
     }
 }
 
@@ -504,11 +547,11 @@ impl PrimaryReplicator for DefaultReplicator {
 
     async fn update_catch_up_replica_set_configuration(
         &self,
-        current: ConfigurationDescriptor,
-        previous: ConfigurationDescriptor,
+        current: ReplicaSetConfiguration,
+        previous: ReplicaSetConfiguration,
     ) -> Result<()> {
         self.engine
-            .configure_replicas(current, Some(previous))
+            .configure_replicas(current.configuration, Some(previous.configuration))
             .await
     }
 
@@ -518,9 +561,11 @@ impl PrimaryReplicator for DefaultReplicator {
 
     async fn update_current_replica_set_configuration(
         &self,
-        current: ConfigurationDescriptor,
+        current: ReplicaSetConfiguration,
     ) -> Result<()> {
-        self.engine.configure_replicas(current, None).await
+        self.engine
+            .configure_replicas(current.configuration, None)
+            .await
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {

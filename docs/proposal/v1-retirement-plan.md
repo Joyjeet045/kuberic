@@ -1,9 +1,9 @@
 # Kuberic v1 Retirement Plan
 
-> **Status:** In progress — Workstreams 1, 2 and 3 are implemented and validated.
-> SQLite is migrated in place to v2 with unit/in-process validation.
-> Direct primary-removal composition is deferred; the PostgreSQL port,
-> distribution, deprecation, and broader retirement remain outstanding.
+> **Status:** In progress — Workstreams 1, 2, 3 and 4 are implemented and validated.
+> SQLite and PostgreSQL are migrated in place to v2 with local validation.
+> Automatic direct primary removal, distribution, deprecation and broader
+> retirement remain outstanding.
 >
 > **Goal:** Make the level-triggered stack the default Kuberic implementation,
 > deprecate the classic v1 stack, and eventually remove it.
@@ -32,7 +32,8 @@ The work should proceed in this order:
    planned switchover before reducing membership.
 3. Migrate the existing SQLite application in place to v2 — implemented and
    validated with unit/in-process tests; distribution remains separate.
-4. Move the PostgreSQL application to v2.
+4. Move the PostgreSQL application to v2 — implemented and validated with
+   unit/host-local subprocess tests; distribution remains Workstream 5.
 5. Publish and make v2 deployment assets the default.
 6. Deprecate and freeze v1.
 7. Remove v1 after all removal gates are satisfied.
@@ -106,7 +107,7 @@ The principal retirement gaps are:
 | Scale up/down | Supported | Sequential scale-up and secondary-only scale-down implemented/validated; planned switchover composes with removal | Workstream 2 complete; direct primary removal deferred |
 | KVStore | Supported | `kvstore2` supported | Make v2 the default |
 | SQLite | Existing deployed v1 data has no import path | Existing `sqlite-replicated` package migrated in place; unit/in-process scenarios validated | Workstream 3 complete; distribution remains separate |
-| PostgreSQL | Depends on `kuberic-core` and `kuberic-operator` | Not ported | Move to v2 before deprecation |
+| PostgreSQL | Existing deployed v1 data has no import path | Existing `postgres-replicated` package migrated in place; native replication, fencing, failover, switchover, scaling and restart validated locally | Workstream 4 complete; distribution remains Workstream 5 |
 | Destructive data-loss recovery | Supported | Fails closed | Keep v2 behavior |
 | API and status compatibility | Existing v1 contract | Independent contract | No compatibility required |
 | Data migration | Existing data remains in v1 | No import path | No migration required |
@@ -151,9 +152,9 @@ healthy 4.2/4.3 s and adversarial 44.5/48.8 s; the strict retained-session
 rejection adversarial rerun took 45.2 s. All owned clusters and kubeconfigs were
 cleaned. These are scenario timings, not outage guarantees.
 
-This completes only Workstream 1, not v1 retirement. Workstream 2 is complete
-as described below, followed by SQLite, PostgreSQL, distribution,
-deprecation, and separately approved removal. Automatic target selection,
+This completes only Workstream 1, not v1 retirement. Workstreams 2–4 are complete
+as described below; distribution, deprecation and separately approved removal
+remain. Automatic target selection,
 cancellation/retargeting, node maintenance,
 rolling upgrades, destructive recovery, and data migration/import remain
 unsupported or deferred.
@@ -204,8 +205,8 @@ classic `kuberic.io/v1` remains unchanged. Its as-built behavior is:
   UID/resource-version provenance and authoritative absence. Different-UID
   resources survive, and partial PVCs are not resumed.
 
-Protocol 8 and agent schema 4 are exact coordinated-deployment boundaries.
-Protocol 7 and earlier, plus schemas 2 and 3, are rejected with no migration,
+Protocol 9 and agent schema 5 are exact coordinated-deployment boundaries.
+Protocol 8 and earlier, plus older schemas, are rejected with no migration,
 mixed-version mode, or rolling-upgrade contract. The generated CRD is currently 344,907 bytes under a
 strict-below-350,000-byte regression guard; the largest current representative
 18-member serialized scale-up status sample is carried failover at 26,353
@@ -249,7 +250,7 @@ sequential cleanup, and Kubernetes resource deletion.
   cleanup identity.
 - Schema-3 retirement-started/tombstone recovery prevents application Open
   after retirement begins and additionally persists scale-up build/admission
-  authority. Protocol 8/store schema 4 require fresh deployment, without
+  authority. Protocol 9/store schema 5 require fresh deployment, without
   migration or mixed-version support.
 - Active removal cannot be cancelled or retargeted. Cleanup serializes later
   removals and other authority work. Primary loss or missing evidence waits
@@ -342,7 +343,7 @@ alive during handoff. All restart fixtures reopen durable agent and application
 state with fresh sessions. No SQLite KinD, Kubernetes, container, or subprocess
 test is part of this migration.
 
-Fresh v2 application storage and protocol 8 / schema 4 agent metadata are
+Fresh v2 application storage and protocol 9 / schema 5 agent metadata are
 required. This does not import deployed v1 SQLite data, create a second
 application, or establish rolling-upgrade support. Image publication, SQLite
 deployment assets, and live-cluster validation remain separate distribution work.
@@ -351,32 +352,29 @@ See the [SQLite design](../features/sqlite/design.md) and
 
 ## Workstream 4: PostgreSQL on V2
 
-The PostgreSQL application currently depends directly on `kuberic-core`, and
-its tests depend on `kuberic-operator`. It must move to the level-triggered
-runtime before those packages can be deprecated or removed.
+**Implemented and validated in place.** The PostgreSQL application has no `kuberic-core` or
+`kuberic-operator` dependencies. It uses the existing service-created custom
+`Replicator`/`PrimaryReplicator` interfaces, with no operation/copy capability.
+Kuberic owns generic SF choreography and durable authority/effects; PostgreSQL
+owns WAL, timeline/system identity, physical build/rewind, synchronous policy,
+receiver drainage, replay and promotion. No native/external public API mode is
+introduced and raw scalar progress cannot grant quorum credit.
 
-The v2 PostgreSQL application must:
+Unit and host-local PostgreSQL subprocess tests cover fresh bootstrap, exact
+session-bound builds, failover, planned switchover, sequential scale-up,
+secondary removal, replacement, readable secondaries, quorum restoration and
+application/agent restart. Completed process fences disconnect ordinary,
+administrative and pre-authentication sockets; clients overriding synchronous
+durability and independently surviving orphan processes are outside the contract.
+Administrative trust and supervisor-loss boundaries remain explicit.
 
-- integrate PostgreSQL process lifecycle with the public v2 application
-  interfaces;
-- continue using PostgreSQL-native streaming replication for its data plane;
-- translate durable PostgreSQL LSN and recovery evidence into the v2 authority
-  model without granting raw progress quorum credit;
-- fence direct PostgreSQL clients when the replica is not the accepted
-  writable primary;
-- support fresh bootstrap, replica build, failover, planned switchover, and
-  scaling;
-- reconstruct process and replication authority after Pod or process restart;
-- use new v2 metadata and deployment assets with no v1 status or storage
-  import path.
-
-Because PostgreSQL clients connect directly to the database port, routing
-changes alone are not sufficient fencing. Promotion and demotion must enforce
-PostgreSQL read-only/read-write state and reject writes through stale direct
-connections.
-
-The migration is a source and runtime port, not a data migration. Existing v1
-PostgreSQL clusters are deleted and fresh v2 clusters are deployed.
+This completes Workstream 4, not distribution or live-cluster validation.
+Protocol 9 / schema 5 require fresh deployment with no v1 data import.
+PostgreSQL has no KinD, Kubernetes or container test/dependency in this migration.
+Images and deployment assets remain Workstream 5. WAL-retention/headroom limits,
+automatic rolling upgrades and automatic direct primary removal remain deferred.
+See the [PostgreSQL design](../features/postgres/design.md) and
+[host-local test selections](../features/kuberic/testing.md#postgresql-v2-host-local-validation).
 
 SQL Server is not part of this workstream. Its current package has no
 dependency on `kuberic-core` or `kuberic-operator`, so v1 retirement must not
@@ -423,8 +421,8 @@ Final removal must be a separately reviewed change. It may delete:
 
 - `kuberic-core`;
 - `kuberic-operator`;
-- remaining classic KVStore and PostgreSQL examples (the in-place v2 SQLite
-  package is not a classic deletion candidate);
+- remaining classic KVStore example (the in-place v2 SQLite and PostgreSQL
+  packages are not classic deletion candidates);
 - classic CRDs, manifests, image publication, and integration tests;
 - compatibility documentation and CI paths that only exercise v1.
 
@@ -468,7 +466,7 @@ V1 source may be removed when:
 
 ## Validation Strategy
 
-Each new authority transition must be validated at four levels:
+Shared authority transitions use these validation layers:
 
 1. Pure protocol tables and generated traces for safety invariants.
 2. Durable agent/runtime tests at intent, effect, acknowledgement, and
@@ -476,6 +474,10 @@ Each new authority transition must be validated at four levels:
 3. Controller tests for stale observations, ambiguous effects, restart, and
    bounded healing.
 4. Fresh isolated KinD scenarios using explicitly owned clusters.
+
+Application migrations use their applicable local suites: SQLite uses unit and
+in-process tests; PostgreSQL uses unit and host-local PostgreSQL subprocess
+tests. Neither migration adds application-specific KinD/live coverage.
 
 The CI target should remain bounded. Pull requests should run one live
 end-to-end path for each changed operation, while the repeated adversarial
@@ -494,8 +496,8 @@ matrix runs through scheduled and manual workflows.
   membership.
 - **Application durability mismatch:** SQLite acknowledgement must mean its
   replicated state is durable and reconstructible.
-- **Direct PostgreSQL clients:** PostgreSQL role and write-mode fencing must
-  remain effective even when a client bypasses the controller-managed Service.
+- **Direct PostgreSQL clients:** Accepted access and completed process fences
+  must remain effective for retained SQL connections, independently of routing.
 - **Premature removal:** V1 source deletion must not begin before package and
   adapter disposition is explicit.
 - **Unbounded CI time:** Keep PR smoke focused and use the repeated matrix for

@@ -177,6 +177,13 @@ pub fn normalize_agent_status_report(
     if report.resource_uid.is_empty() {
         return Err(WireError::MissingField("agent_status.resource_uid"));
     }
+    if report.replication_address.len() > 512
+        || report.replication_address.chars().any(char::is_control)
+    {
+        return Err(WireError::InvalidAuthority(
+            "replicator address exceeds its bound".into(),
+        ));
+    }
     if report.process_session_id.is_empty() {
         return Err(WireError::MissingField("agent_status.process_session_id"));
     }
@@ -235,6 +242,7 @@ pub fn normalize_agent_status_report(
                 || report.accepted_secondary_removal.is_some()
                 || report.scale_up_intent.is_some()
                 || report.pending_configuration.is_some()
+                || !report.replication_address.is_empty()
             {
                 return Err(WireError::InvalidAuthority(
                     "uninitialized status contains durable authority".to_string(),
@@ -1522,6 +1530,7 @@ impl TryFrom<proto::ReplicaIdentity> for ReplicaIdentity {
                 "replica ID must be positive".to_string(),
             ));
         }
+
         if value.instance_id.is_empty() {
             return Err(WireError::MissingField("replica_identity.instance_id"));
         }

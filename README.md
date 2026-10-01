@@ -27,6 +27,7 @@ kuberic-agent/         Durable replica-local authority and process hosting
 kuberic-controller/    operator.kuberic.io/v1alpha1 controller
 examples/kvstore2/     Level-triggered conformance application
 examples/sqlite/       Existing SQLite example migrated in place to v2
+examples/postgres/     V2 custom replicator using PostgreSQL-native replication
 ```
 
 See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/), and
@@ -49,6 +50,8 @@ cargo clippy --all-targets
 cargo test -p kuberic-core -p kvstore -p sqlite-replicated
 # V2 SQLite unit/in-process validation (no cluster or child-process tests)
 cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
+# V2 PostgreSQL unit/host-local subprocess validation (local PostgreSQL required)
+cargo test -p postgres-replicated --all-features -- --test-threads=1
 
 # Run kvstore in demo mode (single node, no operator)
 cargo run -p kvstore -- --demo
@@ -70,6 +73,16 @@ rebuild fencing. Unit and in-process tests cover replacement, failover, planned
 switchover, sequential scale-up and secondary scale-down. Fresh v2 storage is
 required: there is no v1 data import. SQLite image publication and deployment
 assets remain future work; see the [design and local validation guide](docs/features/sqlite/design.md).
+
+### PostgreSQL
+
+The existing `postgres-replicated` package is migrated in place to v2 through
+ordinary `Replicator`/`PrimaryReplicator`, not operation/copy streams. PostgreSQL
+owns WAL, physical replication and recovery; Kuberic owns generic authority and
+SF choreography. Host-local tests cover fencing, build, failover, switchover,
+scaling and restart. Workstream 4 is complete; images/distribution remain
+Workstream 5. Fresh deployment is required, with no v1 data import or PostgreSQL
+KinD coverage. See the [design and trust boundaries](docs/features/postgres/design.md).
 
 ## Kubernetes Deployment
 
@@ -102,10 +115,10 @@ the production v2 controller configuration enables
 one fresh incarnation at a time. Classic v1 remains unchanged. Automatic
 direct-primary removal is deferred; use planned switchover followed by
 secondary scale-down. An independent minimum replica count, a validated
-maximum replica count, and the PostgreSQL port remain future work. SQLite is
-ported in place and validated without Kubernetes; its distribution remains
+maximum replica count remain future work. SQLite and PostgreSQL are
+ported in place and validated without Kubernetes; their distribution remains
 separate from the existing KVStore2 live deployment.
-Protocol 8 / agent schema 4 require a fresh coordinated v2 deployment.
+Protocol 9 / agent schema 5 require a fresh coordinated v2 deployment.
 
 ## Continuous Delivery
 
@@ -124,6 +137,7 @@ such as `v0.1.0` also publishes the exact version tag.
 - [Operator design](docs/features/kuberic/operator.md) — reconciler, CRD, pod management
 - [User API](docs/features/kuberic/user-api.md) — PodRuntime, lifecycle events, StateProvider
 - [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
+- [PostgreSQL design](docs/features/postgres/design.md) — v2 authority, native replication, SQL fencing and host-local validation
 - [SQL Server design](docs/features/sqlserver/design.md) — native AG contract and safety gates
 - [SQL Server observation](docs/features/sqlserver/observation.md) — observe-only runtime, configuration, and tests
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations

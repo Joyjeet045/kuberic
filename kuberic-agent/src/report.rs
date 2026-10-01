@@ -29,6 +29,11 @@ impl<S: AgentStore> AgentReporter<S> {
     }
 
     pub async fn report(&self, runtime: &PodRuntime) -> Result<proto::AgentStatusReport> {
+        if let Err(error) = runtime.refresh_custom_progress().await
+            && !matches!(error, kuberic_runtime::RuntimeError::ReconfigurationPending)
+        {
+            return Err(error.into());
+        }
         let partition = runtime.partition_report().await;
         self.store
             .record_partition_reports(partition.load_metrics.clone(), partition.reported_fault)
@@ -76,7 +81,8 @@ fn build_report(
         .map(|build| (build.authority.build_id.clone(), build))
         .collect::<BTreeMap<_, _>>();
     for (build_id, command) in &state.build_commands {
-        if command.authority.is_none()
+        if !snapshot.live_builds_only
+            && command.authority.is_none()
             && !state.retired_builds.contains(build_id)
             && !state.abandoned_builds.contains(build_id)
             && let Some(progress) = state.build_progress.get(build_id)
@@ -118,6 +124,7 @@ fn build_report(
         });
     proto::AgentStatusReport {
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        replication_address: snapshot.replication_address.clone().unwrap_or_default(),
         resource_uid: state.identity.resource_uid.to_string(),
         identity: Some(state.identity.local_identity.clone().into()),
         process_session_id: session.id().to_string(),
@@ -210,9 +217,15 @@ fn snapshot_matches_state(
         }
         None => state.previous_configuration.is_none() && state.current_configuration.is_none(),
     };
+    let access_matches = |projected, desired| {
+        projected == desired
+            || (snapshot.live_builds_only
+                && projected == AccessStatus::ReconfigurationPending
+                && desired == AccessStatus::Granted)
+    };
     snapshot.role == state.role
-        && snapshot.read_status == state.read_status
-        && snapshot.write_status == state.write_status
+        && access_matches(snapshot.read_status, state.read_status)
+        && access_matches(snapshot.write_status, state.write_status)
         && authority_matches
         && snapshot.retired_authority == state.retired_authority
 }
@@ -240,5 +253,91 @@ fn fault_to_proto(fault: Option<FaultType>) -> proto::FaultType {
         None => proto::FaultType::Unknown,
         Some(FaultType::Transient) => proto::FaultType::Transient,
         Some(FaultType::Permanent) => proto::FaultType::Permanent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuberic_protocol::command::EnsureReplicaBuild;
+    use kuberic_protocol::types::*;
+    use kuberic_runtime_internal::authority::DurableBuildProgress;
+
+    #[test]
+    fn custom_completion_cannot_be_resurrected_from_a_previous_process_journal() {
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("source"),
+            agent_generation: AgentGeneration::new("generation"),
+        };
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            ..identity.clone()
+        };
+        let configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            identity.replica_id,
+            vec![ConfigurationMember {
+                identity: identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let id = OperationId::new("completed-old-session");
+        let authority = BuildAuthority {
+            build_id: id.clone(),
+            kind: BuildAuthorityKind::Provisioning,
+            source: identity.clone(),
+            target: target.clone(),
+            current_configuration: configuration,
+            replication_boundary_lsn: 10,
+        };
+        let mut state = crate::state::AgentState::new(crate::state::StorageIdentity {
+            schema_version: crate::state::SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource"),
+            local_identity: identity.clone(),
+            pod_uid: PodUid::new("source"),
+            pvc_uid: PvcUid::new("data"),
+            initialization_id: InitializationId::new("init"),
+            effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+        });
+        state.build_commands.insert(
+            id.clone(),
+            EnsureReplicaBuild {
+                operation_id: id.clone(),
+                local_replica_id: identity.replica_id,
+                expected_instance_id: identity.instance_id.clone(),
+                expected_agent_generation: identity.agent_generation.clone(),
+                target,
+                authority: None,
+                source_session_id: None,
+                retire: false,
+            },
+        );
+        state.build_progress.insert(
+            id,
+            DurableBuildProgress {
+                authority,
+                last_sequence: 5,
+                durable_lsn: 10,
+                completed: true,
+                catch_up_boundary_lsn: Some(10),
+            },
+        );
+        let mut snapshot = crate::hosting::empty_snapshot(identity);
+        snapshot.live_builds_only = true;
+        let fresh = ProcessSession::new();
+        assert!(
+            build_report(&fresh, state.clone(), snapshot.clone(), None, None)
+                .builds
+                .is_empty()
+        );
+        snapshot.live_builds_only = false;
+        assert_eq!(
+            build_report(&fresh, state, snapshot, None, None)
+                .builds
+                .len(),
+            1
+        );
     }
 }

@@ -61,7 +61,7 @@ credit. Cleanup freezes Pod, PVC, and endpoint names and UIDs, or explicit
 authoritative exact-name absence, separately from accepted topology.
 
 Lowering `spec.replicas` requests sequential single-secondary removal; the desired
-count is target and minimum, down to one. Increasing it requests protocol-8
+count is target and minimum, down to one. Increasing it requests protocol-9
 sequential scale-up when `EvaluationConfig::allow_scale_up` is enabled; the
 production controller enables that path.
 This `spec.replicas` target=min coupling is Kuberic policy, not general SF
@@ -143,7 +143,7 @@ current-only quorum, exact primary recovery (`ScaleDownPrimaryUnavailable`),
 retirement, exact Pod fencing/absence, and cleanup. `SpecDriftUnsupported`
 leaves combined count/image/delay drift unsatisfied.
 
-Protocol 8 scale-up persists one recoverable allocation before resource
+Protocol 9 scale-up persists one recoverable allocation before resource
 creation, selects the first missing positive ordinal, and admits one fresh
 candidate at a time. Carried primary failure installs a provisional election
 epoch write-closed, collects fresh independently sufficient PC/CC progress,
@@ -206,7 +206,7 @@ published only after that proof; it never starts ordinary failover or replacemen
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
 plus [sequential scale-up](../docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
 and [secondary scale-down](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
-for usage, target/minimum risks, recovery, and the protocol 8 / schema 4
+for usage, target/minimum risks, recovery, and the protocol 9 / schema 5
 fresh-deployment contract.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 separate status/API redesign, mechanical helper refactors, and new recovery protocols.

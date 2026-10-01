@@ -7,6 +7,30 @@ use syn::{Attribute, Fields, ImplItem, Item, ItemMod, Meta, TraitItem, Visibilit
 const ALLOWLIST: &str = include_str!("../../scripts/runtime_source_public_api.allowlist");
 
 #[test]
+fn application_replication_api_has_no_parallel_driver_or_admission_surface() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let mut inventory = Vec::new();
+    inventory_file("crate", &source, true, false, &mut inventory);
+    for entry in inventory {
+        for forbidden in [
+            "ManagedNative",
+            "NativeReplicator",
+            "NativeReplicaSnapshot",
+            "NativeBuildSnapshot",
+            "ExternalReplica",
+            "ReplicaRegistration",
+            "ReplicaAdmission",
+            "AdmissionGuard",
+        ] {
+            assert!(
+                !entry.contains(forbidden),
+                "non-SF application API: {entry}"
+            );
+        }
+    }
+}
+
+#[test]
 fn source_public_api_matches_reviewed_inventory() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = manifest_dir.join("src/lib.rs");

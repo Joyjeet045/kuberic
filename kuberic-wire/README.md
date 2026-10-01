@@ -56,6 +56,11 @@ failover-safe LSN in the receipt. Candidate identities remain outside accepted
 authority until admission, and exact allocation/cleanup provenance is durable
 before controller-created storage.
 
+Protocol version 9 adds the service-created replicator's advertised address to
+agent status. Custom replication uses that exact target's returned endpoint,
+not an operation-stream endpoint or an ordinal-only route. Database lineage and
+recovery evidence remain in the application's own protocol.
+
 `kuberic-wire` contains transport definitions only; protocol decisions remain
 in `kuberic-protocol`.
 
@@ -73,13 +78,13 @@ configurations cannot relabel historical evidence.
 
 ## Integration boundary
 
-This crate does not negotiate or downgrade versions. Protocol version 8 is an
+This crate does not negotiate or downgrade versions. Protocol version 9 is an
 exact coordinated-deployment boundary; incompatible controller, agent, or
 replica peers are rejected. Authentication, DNS resolution, retry policy, and
 session registration are agent-owned transport concerns around these schemas.
 Protocol 6 is rejected; the protobuf package remains `kuberic.level.v1` and
 existing field/enum numbers are unchanged. Use a fresh coordinated v2 deployment,
-not mixed-version operation. Agent storage uses schema 4 and rejects schemas 2 and 3;
+not mixed-version operation. Agent storage uses schema 5 and rejects older schemas;
 there is no metadata conversion or data migration.
 Copy final markers must use the immutable committed snapshot boundary for both
 LSN and committed watermark; applied suffixes retain their own operation

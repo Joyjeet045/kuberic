@@ -1,5 +1,17 @@
 # kuberic-agent
 
+Custom-replicator build receipts are bound to a durably selected immutable
+authority and generation for one logical target slot. Selection supersedes old
+builds/incarnations atomically; live session/attempt bindings are checked before
+progress persistence and reporting. Restart never promotes old scalar build
+journals into current-session completion. This hosting support is private and
+uses the existing SF replica-set configuration and build callbacks.
+
+On shutdown, retained control/replication streams are cancelled and joined before
+the durable fault acknowledgement. Peer-controlled graceful connection draining
+must not delay that acknowledgement; interrupted durable command intents remain
+replayable.
+
 Replica-local hosting and durable authority for the level-triggered Kuberic
 stack.
 
@@ -21,11 +33,28 @@ Missing established metadata, corruption, incompatible schema, or identity
 mismatch fails closed instead of creating empty authority. SQLite uses WAL and
 `synchronous=FULL`; the agent is the single writer.
 
-Primary promotion follows the SF host sequence: replicator role, epoch and
-state-provider update, then application role. Abort stops the returned control
+Primary promotion follows the SF host sequence: replicator role and epoch,
+including any provider-specific work that replicator owns, then application role.
+Abort stops the returned control
 before application teardown. The default replicator's managed capability is
 transferred directly into agent registration and is not returned to
 application code.
+
+Lifecycle hosting is selected independently of the optional `StateReplicator`.
+Every independently implemented `PrimaryReplicator` receives the same private
+SF configuration, role, build, catch-up and durable-effect support, whether or
+not it also supplies operation/copy streams. Its application calls that optional
+state capability directly. Only the registered default engine supplies
+`ManagedReplicator` internals for Kuberic's operation transport and write journal;
+custom lifecycle hosting does not implement or impersonate that capability.
+
+Custom-primary scaling uses the existing generic authority and effect records.
+Candidate admission checks the exact live build selection and boundary.
+Secondary-removal preparation and commit require SF catch-up callbacks; peer
+witnesses are session/configuration checked but never projected into application
+quorum progress. Retirement persists intent before Close and its tombstone only
+after the returned replicator and service have closed. These paths contain no
+database-specific evidence or protocol fields.
 
 The agent now owns fenced `EnsureConfiguration` admission, durable private
 Demote/GetLSN/Catchup/Deactivate/Activate stages, restart-safe runtime effect
@@ -173,7 +202,7 @@ means a retirement tombstone exists. The JSON field is additive; older diagnosti
 responses may omit it. Diagnostics do not expose managed certificates.
 Controller admission and exact Kubernetes cleanup are enabled; these local
 contracts never select the target or authorize arbitrary Pod/PVC deletion.
-Use a fresh coordinated protocol-8/schema-4 deployment, not a rolling upgrade.
+Use a fresh coordinated protocol-9/schema-5 deployment, not a rolling upgrade.
 Exact original PVC provenance must be reconstructable before admission; if Pod
 and PVC already disappeared without that provenance, scale-down waits/fails
 closed rather than treating list omission as absence. Unavailable-target support
@@ -182,7 +211,7 @@ has no retention or import path, not a physical storage erasure guarantee.
 Frozen-primary loss during removal/cleanup can cause indefinite outage. Sequential
 cleanup must finish, and every retained member needs its original completed
 current-only witness or fresh completed local acceptance before superseding the
-bounded receipt. Sequential scale-up uses durable schema-4 build and admission
+bounded receipt. Sequential scale-up uses durable schema-5 build and admission
 authority, preserves healthy same-primary writes only while both PC/CC quorums
 remain authorized, and retries failed unadmitted candidates only after exact
 endpoint→Pod→PVC cleanup. Carried failover first installs a write-closed
@@ -195,7 +224,7 @@ configuration, policy, final epoch, and safe prefix. The completion receipt keep
 that proof with a provisional-primary reference instead of duplicating the full
 intent/configuration, so a returning provisional member can advance through
 final PC/CC and current-only without accepting unrelated stale authority. Protocol
-8/schema 4 require a fresh coordinated deployment; classic v1 remains unchanged.
+9/schema 5 require a fresh coordinated deployment; classic v1 remains unchanged.
 These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in
 [scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).

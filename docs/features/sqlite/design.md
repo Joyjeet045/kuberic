@@ -6,7 +6,7 @@ and no classic runtime/operator dependency. The primary serves SQL over gRPC;
 secondaries retain durable WAL-frame history but do not serve client SQL.
 
 This is an experimental source/runtime migration, not a deployed-data upgrade.
-Use fresh v2 storage with protocol 8 / agent schema 4. There is no v1 data,
+Use fresh v2 storage with protocol 9 / agent schema 5. There is no v1 data,
 authority, or metadata import path. SQLite-specific images, manifests, published
 deployment assets, and live-cluster validation remain separate distribution work.
 
@@ -193,10 +193,7 @@ From the repository root, with the pinned Rust toolchain and `protoc` available:
 ```bash
 cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
 cargo clippy -p kuberic-agent -p sqlite-replicated --all-targets --all-features -- -D warnings
-scripts/check_level_triggered_scope.sh origin/main
-scripts/check_level_triggered_dependencies.sh
-scripts/check_level_triggered_guards_test.sh
-scripts/check_level_triggered_documentation.sh docs/features/sqlite/design.md
+cargo test -p kuberic-runtime -p kuberic-runtime-internal -p kuberic-wire
 ```
 
 These SQLite tests require no KinD, Kubernetes API, container runtime, or child

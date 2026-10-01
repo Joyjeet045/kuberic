@@ -149,6 +149,7 @@ message AgentStatusReport {
   SecondaryScaleDownCleanup accepted_secondary_removal = 36;
   ScaleUpIntent scale_up_intent = 37;
   EnsureConfigurationCommand pending_configuration = 38;
+  string replication_address = 39;
 }
 
 message InitializeAgentStoreCommand {

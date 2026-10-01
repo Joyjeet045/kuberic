@@ -14,4 +14,4 @@ pub mod types;
 pub mod validation;
 
 /// Exact protocol version supported by the current minimum contract.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;

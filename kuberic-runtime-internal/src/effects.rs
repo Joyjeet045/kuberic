@@ -119,6 +119,8 @@ pub struct RuntimeSnapshot {
     pub accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
     pub current_progress: i64,
     pub verified_replication_lsn: Option<i64>,
+    #[serde(default)]
+    pub live_builds_only: bool,
     pub committed_lsn: i64,
     pub current_configuration_quorum_progress: i64,
     pub catch_up_boundary: Option<i64>,

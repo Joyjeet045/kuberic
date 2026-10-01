@@ -655,7 +655,7 @@ impl StatefulServiceReplica for ReplayApplication {
             .with_factory(Arc::new(
                 kuberic_runtime::replicator::DefaultReplicatorFactory::new(self),
             ))
-            .create_replicator(provider, None)
+            .create_replicator(Some(provider), None)
             .await?;
         Ok(interfaces.replicator())
     }
@@ -773,9 +773,11 @@ impl StatefulServiceReplica for ResumableCopyApplication {
             .with_factory(Arc::new(
                 kuberic_runtime::replicator::DefaultReplicatorFactory::new(self.clone()),
             ))
-            .create_replicator(self.clone(), None)
+            .create_replicator(Some(self.clone()), None)
             .await?;
-        let state_replicator = interfaces.state_replicator();
+        let state_replicator = interfaces
+            .state_replicator()
+            .expect("operation/copy capability");
         for mut stream in [
             state_replicator.get_replication_stream().await?,
             state_replicator.get_copy_stream().await?,
@@ -1042,7 +1044,7 @@ impl ReplicatorFactory for NoopFactory {
     async fn create_replicator(
         &self,
         _context: ReplicatorFactoryContext,
-        _state_provider: Arc<dyn StateProvider>,
+        _state_provider: Option<Arc<dyn StateProvider>>,
         _settings: ReplicatorSettings,
     ) -> RuntimeResult<ReplicatorInterfaces> {
         let (replication_sender, replication) = OperationStream::channel(1);
@@ -1054,7 +1056,7 @@ impl ReplicatorFactory for NoopFactory {
         });
         Ok(ReplicatorInterfaces::secondary(
             replicator.clone(),
-            replicator,
+            Some(replicator),
         ))
     }
 }
@@ -1065,9 +1067,11 @@ impl StatefulServiceReplica for NoopApplication {
         let interfaces = context
             .partition
             .with_factory(Arc::new(NoopFactory))
-            .create_replicator(self.clone(), None)
+            .create_replicator(Some(self.clone()), None)
             .await?;
-        let state = interfaces.state_replicator();
+        let state = interfaces
+            .state_replicator()
+            .expect("operation/copy capability");
         *self.streams.lock().unwrap() = vec![
             state.get_replication_stream().await?,
             state.get_copy_stream().await?,
@@ -2978,6 +2982,290 @@ async fn replica_host_scale_up_source_recovery_covers_pc_cc_and_abandoned_build_
     );
     restarted.shutdown();
     restarted.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn replica_host_startup_cancellation_joins_and_preserves_acknowledgement_errors() {
+    struct StartupGate {
+        opened: Notify,
+        release: Notify,
+        fault: bool,
+        reject: bool,
+        aborts: AtomicUsize,
+    }
+    #[async_trait]
+    impl StatefulServiceReplica for StartupGate {
+        async fn open(self: Arc<Self>, context: OpenContext) -> RuntimeResult<Arc<dyn Replicator>> {
+            if self.fault {
+                context.partition.report_fault(FaultType::Permanent).await?;
+            }
+            self.opened.notify_one();
+            self.release.notified().await;
+            if self.reject {
+                return Err(RuntimeError::Application("startup gate rejected".into()));
+            }
+            Arc::new(ReplayApplication).open(context).await
+        }
+        async fn change_role(&self, _: ReplicaRole) -> RuntimeResult<RoleChange> {
+            Ok(RoleChange {
+                service_address: None,
+            })
+        }
+        async fn close(&self) -> RuntimeResult<()> {
+            Ok(())
+        }
+        fn abort(&self) {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    for mode in ["cancel", "locked", "reject", "readiness-race", "ready"] {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = SqliteStore::create_authorized(
+            &path,
+            AgentState::new(StorageIdentity {
+                schema_version: SCHEMA_VERSION,
+                resource_uid: ResourceUid::new("resource-1"),
+                pod_uid: PodUid::new("pod-1"),
+                pvc_uid: PvcUid::new("pvc-1"),
+                initialization_id: derive_initialization_id(
+                    &ResourceUid::new("resource-1"),
+                    ReplicaId::new(1),
+                    &PodUid::new("pod-1"),
+                    &PvcUid::new("pvc-1"),
+                ),
+                local_identity: identity(),
+                effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+            }),
+        )
+        .unwrap();
+        let application = Arc::new(StartupGate {
+            opened: Notify::new(),
+            release: Notify::new(),
+            fault: matches!(mode, "cancel" | "locked" | "reject"),
+            reject: mode == "reject",
+            aborts: AtomicUsize::new(0),
+        });
+        let control = free_address();
+        let replication = free_address();
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio::spawn(
+            ReplicaHost::new(
+                ReplicaProcessConfig {
+                    resource_uid: ResourceUid::new("resource-1"),
+                    replica_id: ReplicaId::new(1),
+                    pod_uid: PodUid::new("pod-1"),
+                    pvc_uid: PvcUid::new("pvc-1"),
+                    data_root: directory.path().to_owned(),
+                    control_address: control,
+                    replication_address: replication,
+                    bearer_token: "token".into(),
+                    rpc_deadline: std::time::Duration::from_millis(50),
+                    transport_window_capacity: 8,
+                },
+                application.clone(),
+                ApplicationStorageState::Established,
+                Arc::new(UnreachableResolver),
+            )
+            .start_with_shutdown(receiver),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            application.opened.notified(),
+        )
+        .await
+        .unwrap();
+        let lock = if mode == "locked" {
+            let lock = rusqlite::Connection::open(&path).unwrap();
+            lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+            Some(lock)
+        } else {
+            None
+        };
+        if matches!(mode, "reject" | "readiness-race" | "ready") {
+            application.release.notify_one();
+        }
+        if !matches!(mode, "reject" | "ready") {
+            shutdown.send_replace(true);
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(lock);
+        match (mode, result) {
+            ("locked", Err(error)) => assert!(
+                error.to_string().contains("database is locked")
+                    || error.to_string().contains("persistence timed out"),
+                "{error}"
+            ),
+            ("reject", Err(error)) => assert!(error.to_string().contains("startup gate rejected")),
+            ("cancel" | "readiness-race", Ok(None)) => {}
+            ("ready" | "readiness-race", Ok(Some(mut replica))) => {
+                shutdown.send_replace(true);
+                replica.shutdown();
+                tokio::time::timeout(std::time::Duration::from_secs(5), replica.wait())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            (_, Err(error)) => panic!("{mode}: {error}"),
+            _ => panic!("unexpected startup outcome for {mode}"),
+        }
+        assert_eq!(application.aborts.load(Ordering::SeqCst), 1, "{mode}");
+        assert!(
+            TcpListener::bind(control).is_ok(),
+            "{mode}: control listener leaked"
+        );
+        assert!(
+            TcpListener::bind(replication).is_ok(),
+            "{mode}: replication listener leaked"
+        );
+        if matches!(mode, "cancel" | "reject") {
+            assert_eq!(
+                store.load_state().await.unwrap().reported_fault,
+                Some(FaultType::Permanent)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn startup_and_shutdown_acknowledge_durable_partition_faults() {
+    struct FaultApplication {
+        mode: &'static str,
+        opened: Notify,
+        partition: Mutex<Option<kuberic_runtime::replicator::StatefulServicePartition>>,
+    }
+
+    #[async_trait]
+    impl StatefulServiceReplica for FaultApplication {
+        async fn open(self: Arc<Self>, context: OpenContext) -> RuntimeResult<Arc<dyn Replicator>> {
+            *self.partition.lock().unwrap() = Some(context.partition.clone());
+            if self.mode != "running" {
+                context.partition.report_fault(FaultType::Permanent).await?;
+                context.partition.report_fault(FaultType::Transient).await?;
+            }
+            self.opened.notify_one();
+            match self.mode {
+                "reject" => Err(RuntimeError::Application(
+                    "injected startup rejection".into(),
+                )),
+                "cancel" => std::future::pending().await,
+                _ => Arc::new(ReplayApplication).open(context).await,
+            }
+        }
+        async fn change_role(&self, _: ReplicaRole) -> RuntimeResult<RoleChange> {
+            Ok(RoleChange {
+                service_address: None,
+            })
+        }
+        async fn close(&self) -> RuntimeResult<()> {
+            Ok(())
+        }
+        fn abort(&self) {}
+    }
+
+    for mode in ["reject", "cancel", "running"] {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = Arc::new(
+            SqliteStore::create_authorized(
+                &path,
+                AgentState::new(StorageIdentity {
+                    schema_version: SCHEMA_VERSION,
+                    resource_uid: ResourceUid::new("resource-1"),
+                    pod_uid: PodUid::new("pod-1"),
+                    pvc_uid: PvcUid::new("pvc-1"),
+                    initialization_id: derive_initialization_id(
+                        &ResourceUid::new("resource-1"),
+                        ReplicaId::new(1),
+                        &PodUid::new("pod-1"),
+                        &PvcUid::new("pvc-1"),
+                    ),
+                    local_identity: identity(),
+                    effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+                }),
+            )
+            .unwrap(),
+        );
+        let application = Arc::new(FaultApplication {
+            mode,
+            opened: Notify::new(),
+            partition: Mutex::new(None),
+        });
+        let runtime = Arc::new(PodRuntime::new(
+            identity(),
+            application.clone(),
+            store.clone(),
+        ));
+        let service =
+            AgentService::new(store.clone(), runtime.clone(), runtime.clone(), "token").unwrap();
+        let (ready, mut ready_rx) = watch::channel(false);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(service.serve(free_address(), free_address(), ready, shutdown_rx));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            application.opened.notified(),
+        )
+        .await
+        .unwrap();
+        let partition = application.partition.lock().unwrap().clone().unwrap();
+        if mode == "running" {
+            ready_rx.wait_for(|ready| *ready).await.unwrap();
+            partition.report_fault(FaultType::Permanent).await.unwrap();
+            partition.report_fault(FaultType::Transient).await.unwrap();
+            assert_eq!(store.load_state().await.unwrap().reported_fault, None);
+        }
+        if mode != "reject" {
+            shutdown.send_replace(true);
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        match mode {
+            "reject" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected startup rejection")
+            ),
+            "cancel" => assert!(matches!(
+                result,
+                Err(AgentError::Runtime(RuntimeError::OperationCancelled))
+            )),
+            _ => result.unwrap(),
+        }
+        assert!(!*ready_rx.borrow());
+        assert_eq!(
+            runtime.partition_report().await.reported_fault,
+            Some(FaultType::Permanent)
+        );
+        assert_eq!(
+            SqliteStore::open_existing(&path, None)
+                .unwrap()
+                .load_state()
+                .await
+                .unwrap()
+                .reported_fault,
+            Some(FaultType::Permanent),
+            "completion must acknowledge durable persistence, without a status RPC"
+        );
+        assert!(
+            matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    partition.report_fault(FaultType::Permanent)
+                )
+                .await
+                .unwrap(),
+                Err(RuntimeError::Closed)
+            ),
+            "a stopped consumer must reject promptly rather than waiting for itself"
+        );
+    }
 }
 
 #[tokio::test]

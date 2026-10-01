@@ -522,3 +522,9 @@ impl InProcessTransport {
         }
     }
 }
+pub async fn describe_custom_peer(
+    runtime: &crate::hosting::PodRuntime,
+    replica: kuberic_runtime::replicator::ReplicaInformation,
+) -> kuberic_runtime::Result<()> {
+    runtime.describe_custom_peer(replica).await
+}

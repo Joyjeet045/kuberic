@@ -89,8 +89,9 @@ previous/reduced policies, and durable preparation, acceptance, and retirement
 evidence. Protocol version 7 added sequential scale-up with exact allocation,
 build, admission, completion, and cleanup authority. **Protocol version 8**
 adds epoch-fenced carried-failover election and persists its exact final safe
-LSN in the completion receipt; all level-triggered components must use that
-exact version.
+LSN in the completion receipt. **Protocol version 9** adds the service-created
+replicator's advertised endpoint to agent status; all
+level-triggered components must use that exact version.
 The current primary revalidates the progress certificate
 before it can contribute remote quorum credit.
 
@@ -139,7 +140,7 @@ it manually. Important projections include:
 - conditions describing waiting or unsafe observations.
 
 The checked-in CRD is generated from the Rust type and verified byte-for-byte
-by `scripts/check_level_triggered_documentation.sh`.
+by the `kuberic-controller` Rust tests.
 At the final-review baseline it is **344,907 bytes**, leaving **5,093 bytes** before
 the restored strict-below-350,000-byte regression guard fails. Representative
 serialized scale-up status guards cover 2, 3, 4, 6, 10, and 18 members; the
@@ -488,8 +489,8 @@ scheduling are [deferred](../../proposal/v1-retirement-plan.md#deferred-scale-do
 Scale-up is sequential and restores the first missing positive logical ordinal
 outside accepted authority before allocating a new highest ordinal.
 
-Protocol 8 and agent store schema 4 require a **fresh coordinated deployment**;
-protocol 7 and earlier are rejected, as are schemas 2 and 3, with no migration or
+Protocol 9 and agent store schema 5 require a **fresh coordinated deployment**;
+protocol 8 and earlier are rejected, as are older schemas, with no migration or
 mixed-version mode.
 Schema 3 persists scale-up build and admission authority in addition to the
 schema-2 initialization provenance and admitted policies.
@@ -694,12 +695,13 @@ semantics. Filesystems that cannot provide those semantics, including
 unsupported network-filesystem arrangements, are not valid production
 storage.
 
-The current schema is **4** and accepts only its exact version. The migration hook records
+The current schema is **5** and accepts only its exact version. The migration hook records
 an idempotent current-version migration; it does not upgrade older schemas.
-Schemas 2 and 3 are rejected without conversion. Schema 4 uses committed
-snapshot boundaries for replica builds; the applied suffix follows as retained
-catch-up. Use a fresh deployment for protocol 8 / schema 4; no rolling upgrade
-or existing-data migration is provided.
+Older schemas are rejected without conversion. Schema 5 retains committed
+snapshot boundaries for default-engine replica builds and adds durable
+application-path binding and one-way initialization permission. The applied suffix
+follows as retained catch-up. Use a fresh deployment for protocol 9 / schema 5;
+no rolling upgrade or existing-data migration is provided.
 
 Crash injection is test-only. `KUBERIC_CRASH_WRITER_PATH` and
 `KUBERIC_CRASH_BOUNDARY` are consumed only by the
@@ -977,41 +979,38 @@ production identity or key-rotation design.
 
 ## API and Coexistence Guards
 
-The level-triggered crates have no source dependency on classic v1 crates.
-`scripts/check_level_triggered_scope.sh` rejects changes under protected v1
-paths, and `scripts/check_level_triggered_dependencies.sh` rejects manifest,
-source-link, and include-based dependencies on them.
+The Cargo workspace keeps the level-triggered and classic packages explicit.
+Package manifests and the compiled dependency graph are the source of truth for
+their dependencies.
 The existing `examples/sqlite` path and `sqlite-replicated` package are now v2,
-not protected classic source. SQLite and its standalone commit barrier are
-checked packages; regressions reject reintroduced classic dependencies and
-source includes. This reclassification does not authorize edits to other
-protected v1 paths.
+not protected classic source. This reclassification does not authorize edits
+to other classic v1 paths.
 
-The runtime API guard has two reviewed inventories:
+The runtime Rust tests maintain a reviewed source-public API inventory:
 
-- generated rustdoc for the intended application-facing surface;
 - an exhaustive `syn`-parsed inventory of every source `pub` signature,
   including declarations under private paths and `#[doc(hidden)]` paths.
 
-Compile-fail fixtures additionally prove that safe external application code
-cannot obtain the managed replicator, construct a host partition, inject
-agent authority dependencies, register a managed runtime directly, or access
-the private authority module. Hidden public declarations exist where Rust
-cross-crate hosting requires nameable signatures; `#[doc(hidden)]` is not
-treated as an access-control boundary.
-
-Run all documentation and API checks with:
+Run the API inventory and the generated-schema/status regressions with Cargo:
 
 ```bash
-scripts/check_level_triggered_documentation.sh
+cargo test -p kuberic-runtime --test public_api_inventory
+cargo test -p kuberic-controller --lib
+cargo test -p kuberic-protocol --lib representative_scale_up_status_variants
 ```
 
 Classic v1 remains the documented path for existing `kuberic.io/v1` resources
-and the classic KVStore/PostgreSQL examples. SQLite is migrated in place to v2;
-existing deployed SQLite data has no import path. V2 supports explicit planned switchover,
+and the classic KVStore example. SQLite and PostgreSQL are migrated in place to v2;
+existing deployed application data has no import path. PostgreSQL Workstream 4
+is complete with unit/host-local subprocess tests, not KinD/live coverage; its
+images and deployment assets remain Workstream 5. PostgreSQL owns native WAL and
+recovery behind ordinary custom-replicator callbacks; the shared controller
+does not carry database-native evidence. See the
+[PostgreSQL contract](../postgres/design.md) for trust and supervisor-loss limits.
+V2 supports explicit planned switchover,
 secondary-only scale-down, and sequential scale-up; no v1 conversion, data import, or
 classic-path removal is implied. The [retirement plan](../../proposal/v1-retirement-plan.md)
-keeps direct primary removal deferred and treats the remaining PostgreSQL port,
+keeps direct primary removal deferred and treats
 distribution, deprecation, and source removal as separate workstreams. To
 remove the physical replica currently hosting primary authority, complete a
 planned switchover first and then reduce membership after it becomes an eligible

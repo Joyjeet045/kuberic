@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::types::{
-    AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaRole,
-    SecondaryRemovalPreparation, SwitchoverHandoff, TransitionKind,
+    AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaIdentity,
+    ReplicaRole, SecondaryRemovalPreparation, SwitchoverHandoff, TransitionKind,
 };
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityStore, BuildProgressStore,
@@ -153,6 +153,19 @@ impl AgentStore for SqliteStore {
         load_state_from_connection(&connection)
     }
 
+    async fn complete_application_initialization(&self) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            if let Some(binding) = &mut state.application_storage
+                && binding.initializing
+            {
+                binding.initializing = false;
+                write_agent_state(transaction, &state)?;
+            }
+            Ok(())
+        })
+    }
+
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
@@ -190,6 +203,11 @@ impl AgentStore for SqliteStore {
                     ));
                 }
                 return Ok(BeginEffect::Completed(Box::new(retained.result.clone())));
+            }
+            if state.next_effect_sequence == u64::MAX || effect.sequence == u64::MAX {
+                return Err(AgentError::EffectConflict(
+                    "effect sequence exhausted".into(),
+                ));
             }
             if let Some(pending) = state.pending_effect.as_mut() {
                 if pending.effect != *effect {
@@ -508,7 +526,11 @@ impl AgentStore for SqliteStore {
                     .insert(retained.operation_id.clone(), retained.clone());
             }
             state.retained_result = Some(retained);
-            state.next_effect_sequence = state.next_effect_sequence.max(result.sequence + 1);
+            let next = result
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| AgentError::EffectConflict("effect sequence exhausted".into()))?;
+            state.next_effect_sequence = state.next_effect_sequence.max(next);
             write_agent_state(transaction, &state)
         })
     }
@@ -1411,13 +1433,87 @@ impl LocalWriteJournal for SqliteStore {
 
 #[async_trait]
 impl BuildAuthorityStore for SqliteStore {
+    async fn select_build(
+        &self,
+        authority: &BuildAuthority,
+    ) -> ContractResult<kuberic_runtime_internal::authority::BuildSelection> {
+        use kuberic_runtime_internal::authority::BuildSelection;
+        self.contract_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
+            let admitted: Option<BuildAuthority> = load_json_optional(
+                transaction,
+                "SELECT authority_json FROM build_authority WHERE build_id = ?1",
+                [authority.build_id.as_str()],
+            )?;
+            if admitted.as_ref() != Some(authority)
+                || state.retired_builds.contains(&authority.build_id)
+                || state.abandoned_builds.contains(&authority.build_id)
+            {
+                return Err(ContractError::AuthorityMismatch(
+                    "custom build authority is not admitted".into(),
+                ));
+            }
+            let key = build_selection_key(&authority.target)?;
+            let previous: Option<BuildSelection> = load_lifecycle(transaction, &key)?;
+            if let Some(previous) = &previous {
+                if previous.authority == *authority {
+                    return Ok(previous.clone());
+                }
+                if previous.authority.current_configuration.epoch
+                    > authority.current_configuration.epoch
+                {
+                    return Err(ContractError::AuthorityMismatch(
+                        "custom build epoch regressed".into(),
+                    ));
+                }
+                state
+                    .abandoned_builds
+                    .insert(previous.authority.build_id.clone());
+            }
+            let generation = previous
+                .map_or(Some(1), |previous| previous.generation.checked_add(1))
+                .ok_or_else(|| {
+                    ContractError::AuthorityMismatch("build selection generation exhausted".into())
+                })?;
+            let selection = BuildSelection {
+                authority: authority.clone(),
+                generation,
+            };
+            write_lifecycle(transaction, &key, &selection)?;
+            write_agent_state(transaction, &state)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
+            Ok(selection)
+        })
+    }
+
+    async fn load_build_selection(
+        &self,
+        target: &ReplicaIdentity,
+    ) -> ContractResult<Option<kuberic_runtime_internal::authority::BuildSelection>> {
+        let connection = self.connection.lock().map_err(|_| {
+            ContractError::Persistence("agent database connection mutex was poisoned".into())
+        })?;
+        let selection: Option<kuberic_runtime_internal::authority::BuildSelection> =
+            load_lifecycle(&connection, &build_selection_key(target)?)?;
+        let state = load_state_from_connection(&connection)
+            .map_err(|error| ContractError::Persistence(error.to_string()))?;
+        Ok(selection.filter(|selection| {
+            selection.authority.target == *target
+                && !state.retired_builds.contains(&selection.authority.build_id)
+                && !state
+                    .abandoned_builds
+                    .contains(&selection.authority.build_id)
+        }))
+    }
+
     async fn load_build(&self, build_id: &OperationId) -> ContractResult<Option<BuildAuthority>> {
         let connection = self.connection.lock().map_err(|_| {
             ContractError::Persistence("agent database connection mutex was poisoned".into())
         })?;
         let state = load_state_from_connection(&connection)
             .map_err(|error| ContractError::Persistence(error.to_string()))?;
-        if state.retired_builds.contains(build_id) {
+        if state.retired_builds.contains(build_id) || state.abandoned_builds.contains(build_id) {
             return Ok(None);
         }
         load_json_optional(
@@ -1427,6 +1523,33 @@ impl BuildAuthorityStore for SqliteStore {
         )
     }
 
+    async fn load_builds(&self) -> ContractResult<Vec<BuildAuthority>> {
+        let connection = self.connection.lock().map_err(|_| {
+            ContractError::Persistence("agent database connection mutex was poisoned".into())
+        })?;
+        let state = load_state_from_connection(&connection)
+            .map_err(|error| ContractError::Persistence(error.to_string()))?;
+        let mut statement = connection
+            .prepare("SELECT build_id, authority_json FROM build_authority ORDER BY build_id")
+            .map_err(contract_sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(contract_sqlite_error)?;
+        let mut authorities = Vec::new();
+        for row in rows {
+            let (build_id, json) = row.map_err(contract_sqlite_error)?;
+            let build_id = OperationId::new(build_id);
+            if !state.retired_builds.contains(&build_id)
+                && !state.abandoned_builds.contains(&build_id)
+            {
+                authorities.push(contract_from_json(&json)?);
+            }
+        }
+        Ok(authorities)
+    }
+
     async fn admit_build(&self, authority: &BuildAuthority) -> ContractResult<()> {
         authority
             .validate()
@@ -1434,7 +1557,9 @@ impl BuildAuthorityStore for SqliteStore {
         self.contract_transaction(|transaction| {
             let state = load_state_from_connection(transaction)
                 .map_err(|error| ContractError::Persistence(error.to_string()))?;
-            if state.retired_builds.contains(&authority.build_id) {
+            if state.retired_builds.contains(&authority.build_id)
+                || state.abandoned_builds.contains(&authority.build_id)
+            {
                 return Err(ContractError::AuthorityMismatch(
                     "retired build authority cannot be admitted again".into(),
                 ));
@@ -1481,7 +1606,64 @@ impl BuildProgressStore for SqliteStore {
     }
 
     async fn record_build_progress(&self, progress: &DurableBuildProgress) -> ContractResult<()> {
+        self.record_build_progress_inner(progress, None)
+    }
+
+    async fn record_selected_build_progress(
+        &self,
+        selection: &kuberic_runtime_internal::authority::BuildSelection,
+        progress: &DurableBuildProgress,
+    ) -> ContractResult<()> {
+        self.record_build_progress_inner(progress, Some(selection))
+    }
+}
+
+fn build_selection_key(target: &ReplicaIdentity) -> ContractResult<String> {
+    Ok(format!("build-selection/{}", target.replica_id))
+}
+
+fn load_lifecycle<T: serde::de::DeserializeOwned>(
+    connection: &Connection,
+    key: &str,
+) -> ContractResult<Option<T>> {
+    load_json_optional(
+        connection,
+        "SELECT value_json FROM runtime_lifecycle WHERE kind = ?1",
+        [key],
+    )
+}
+
+impl SqliteStore {
+    fn record_build_progress_inner(
+        &self,
+        progress: &DurableBuildProgress,
+        selection: Option<&kuberic_runtime_internal::authority::BuildSelection>,
+    ) -> ContractResult<()> {
         self.contract_transaction(|transaction| {
+            if let Some(selection) = selection {
+                let current: Option<kuberic_runtime_internal::authority::BuildSelection> =
+                    load_lifecycle(
+                        transaction,
+                        &build_selection_key(&progress.authority.target)?,
+                    )?;
+                if current.as_ref() != Some(selection) || selection.authority != progress.authority
+                {
+                    return Err(ContractError::AuthorityMismatch(
+                        "custom build selection was superseded".into(),
+                    ));
+                }
+            }
+            let state = load_state_from_connection(transaction)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
+            if state.retired_builds.contains(&progress.authority.build_id)
+                || state
+                    .abandoned_builds
+                    .contains(&progress.authority.build_id)
+            {
+                return Err(ContractError::AuthorityMismatch(
+                    "retired or abandoned build cannot publish progress".into(),
+                ));
+            }
             let authority: Option<BuildAuthority> = load_json_optional(
                 transaction,
                 "SELECT authority_json FROM build_authority WHERE build_id = ?1",
@@ -1716,19 +1898,19 @@ mod tests {
     }
 
     #[test]
-    fn frozen_copy_schema_four_rejects_schema_three_without_migration() {
+    fn application_binding_schema_five_rejects_schema_four_without_migration() {
         let directory = tempfile::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let expected = identity();
         drop(SqliteStore::create_authorized(&path, AgentState::new(expected.clone())).unwrap());
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
         assert!(matches!(
             SqliteStore::open_existing(&path, Some(&expected)),
             Err(AgentError::SchemaMismatch {
-                expected: 4,
-                observed: 3
+                expected: 5,
+                observed: 4
             })
         ));
     }

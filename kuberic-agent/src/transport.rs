@@ -104,7 +104,7 @@ pub struct GrpcOutboundDispatcher<R> {
     bearer_token: Arc<str>,
     deadline: std::time::Duration,
     build_locks: Mutex<BTreeMap<kuberic_protocol::types::OperationId, Arc<Mutex<()>>>>,
-    completed_builds: Mutex<BTreeSet<kuberic_protocol::types::OperationId>>,
+    completed_builds: Mutex<BTreeSet<(kuberic_protocol::types::OperationId, ProcessSessionId)>>,
 }
 
 impl<R> GrpcOutboundDispatcher<R>
@@ -162,6 +162,7 @@ where
             .map_err(|_| AgentError::SessionRejected("peer status request timed out".into()))?
             .map_err(|error| AgentError::SessionRejected(error.to_string()))?
             .into_inner();
+        let address = report.replication_address.clone();
         let AgentObservation::Report(report) = kuberic_wire::normalize_agent_status_report(report)
             .map_err(|error| AgentError::SessionRejected(error.to_string()))?
         else {
@@ -173,6 +174,15 @@ where
             return Err(AgentError::SessionRejected(
                 "peer status returned another exact identity".into(),
             ));
+        }
+        if !address.is_empty() {
+            let mut description = kuberic_runtime::replicator::ReplicaInformation::new(
+                kuberic_protocol::types::OperationId::default(),
+                receiver.clone(),
+                address,
+            );
+            description.process_session_id = report.process_session_id.clone();
+            self.runtime.describe_custom_peer(description).await?;
         }
         Ok(*report)
     }
@@ -195,11 +205,15 @@ where
     }
 
     async fn dispatch_build_locked(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+        let target_session = self.peer_session(&endpoint.identity).await?;
+        self.runtime
+            .register_custom_peer_session(endpoint.identity.clone(), target_session.clone())
+            .await?;
         if self
             .completed_builds
             .lock()
             .await
-            .contains(&endpoint.build_id)
+            .contains(&(endpoint.build_id.clone(), target_session.clone()))
         {
             return Ok(());
         }
@@ -221,7 +235,6 @@ where
                 BuildConfiguration::Current,
             )
             .await?;
-        let target_session = self.peer_session(&endpoint.identity).await?;
         self.transport
             .lock()
             .await
@@ -263,6 +276,21 @@ where
             .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
 
         let build_id = endpoint.build_id.clone();
+        if self
+            .runtime
+            .execute_custom_build(kuberic_runtime::replicator::ReplicaInformation::new(
+                build_id.clone(),
+                endpoint.identity.clone(),
+                report.replication_address.clone(),
+            ))
+            .await?
+        {
+            self.completed_builds
+                .lock()
+                .await
+                .insert((build_id, target_session));
+            return Ok(());
+        }
         let mut prepared = self
             .runtime
             .data_plane()
@@ -277,7 +305,10 @@ where
             self.dispatch_copy(endpoint.identity.clone(), item?, false)
                 .await?;
         }
-        self.completed_builds.lock().await.insert(build_id);
+        self.completed_builds
+            .lock()
+            .await
+            .insert((build_id, target_session));
         Ok(())
     }
 
@@ -552,7 +583,6 @@ pub async fn run_outbound<D: OutboundDispatcher + 'static>(
     dispatcher: Arc<D>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let data_plane = runtime.data_plane();
     let mut workers = BTreeMap::new();
     let mut worker_tasks = tokio::task::JoinSet::new();
     loop {
@@ -567,7 +597,7 @@ pub async fn run_outbound<D: OutboundDispatcher + 'static>(
                     tracing::warn!(%error, "outbound peer worker failed");
                 }
             }
-            outbound = data_plane.next_domain_outbound() => {
+            outbound = runtime.next_outbound() => {
                 let Some(outbound) = outbound else {
                     let mut retry_shutdown = shutdown.clone();
                     tokio::select! {
