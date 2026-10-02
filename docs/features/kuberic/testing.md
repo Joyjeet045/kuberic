@@ -69,10 +69,6 @@ scale-down and scale-up scenarios. Run it on fresh bootstrap; standalone
 failover requires another fresh cluster. `scale-up-full` expands to healthy,
 multi-add and adversarial scale-up.
 
-The `scale-up-adversarial` carried-failover receipt oracle currently fails
-independently of classic v1 removal; it is tracked in [#102](https://github.com/youyuanwu/kuberic/issues/102).
-The other nine full-matrix scenarios and all PR smoke selectors remain required.
-
 On failure, run `just level-triggered-diagnostics` before deleting the owned
 cluster. Every mutation and deletion verifies the ownership receipt and exact
 context.

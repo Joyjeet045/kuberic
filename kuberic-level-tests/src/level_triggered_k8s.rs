@@ -6593,13 +6593,33 @@ fn scale_up_post_admission_recovery_and_replacement(
         topology_primary_id(&stable) == Some(new_primary_id),
         "post-PC/CC failover did not retain its exact elected primary"
     );
-    let receipt = &stable["status"]["lastScaleUp"];
+    let accepted_status =
+        serde_json::from_value::<kuberic_protocol::types::AcceptedStatus>(stable["status"].clone())
+            .context("deserialize stable carried-failover status")?;
+    kuberic_protocol::validation::validate_status(&accepted_status)
+        .context("validate stable carried-failover status")?;
+    let receipt = accepted_status
+        .last_scale_up
+        .as_deref()
+        .context("stable status omitted carried-failover receipt")?;
+    let stable_topology = &accepted_status
+        .topology
+        .as_ref()
+        .context("stable status omitted expanded topology")?
+        .configuration;
     ensure!(
-        receipt["intent"]["operationId"].as_str() == Some(intent.operation_id.as_str())
-            && receipt["failoverEvidence"]["intent"]["operationId"].as_str()
-                == Some(intent.operation_id.as_str())
-            && receipt["acceptedConfiguration"] == stable["status"]["topology"],
-        "stable expanded membership omitted exact carried failover receipt: {receipt}"
+        receipt.intent.operation_id == intent.operation_id
+            && &receipt.accepted_configuration == stable_topology
+            && receipt
+                .failover_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence
+                    .final_election
+                    .selected_primary_replica_id
+                    .value()
+                    == new_primary_id),
+        "stable expanded membership omitted exact carried failover receipt: {}",
+        stable["status"]["lastScaleUp"]
     );
     let expected_identities = start["status"]["topology"]["members"]
         .as_array()
