@@ -3,7 +3,7 @@
 The existing `postgres-replicated` package is **migrated in place** to the
 level-triggered v2 runtime. PostgreSQL Workstream 4 is complete with unit and
 host-local subprocess validation. Images, deployment assets and distribution
-remain Workstream 5; there is no PostgreSQL KinD or live-cluster coverage.
+remain deferred; there is no PostgreSQL KinD or live-cluster coverage.
 This is experimental software, not a production deployment guide.
 
 Use a **fresh deployment** with protocol 9 / agent schema 5. There is no v1 data
@@ -315,7 +315,7 @@ Shared regressions and guard commands are in the
 
 ## Limitations and Future Work
 
-- Workstream 5 owns images, distribution and deployment assets. No PostgreSQL
+- Images, distribution and deployment assets remain future work. No PostgreSQL
   Kubernetes/container dependency, manifest or live test is part of this port.
 - Physical-slot lifecycle is implemented, but WAL-retention limits
   (`max_slot_wal_keep_size`) and free-space headroom admission are not. Unavailable
@@ -328,6 +328,6 @@ Shared regressions and guard commands are in the
   count, throughput guarantee or complete failure-interleaving model. Fencing,
   catch-up, restart and handoff may interrupt service without a duration promise.
 
-See the [retirement plan](../../proposal/v1-retirement-plan.md#workstream-4-postgresql-on-v2),
+See the [v1 removal record](../../proposal/v1-retirement-plan.md#workstream-4-postgresql-on-v2),
 [SF callback reference](../../background/service-fabric/references.md) and
 [runtime interface boundary](../../../kuberic-runtime/README.md).

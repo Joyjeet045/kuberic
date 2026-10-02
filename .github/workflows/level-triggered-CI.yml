@@ -82,10 +82,6 @@ jobs:
         run: cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
       - name: Test PostgreSQL unit and host-local subprocess suites
         run: cargo test -p postgres-replicated --all-features -- --test-threads=1
-      - name: Run classic v1 scale-up regressions
-        run: |
-          cargo test -p kvstore --test reconciler test_reconciler_scale_up -- --exact
-          cargo test -p kvstore --test reconciler test_scale_up_replays_writes_buffered_during_copy -- --exact
       - name: Compile isolated KinD tests
         run: |
           cargo test -p kuberic-level-tests --no-run

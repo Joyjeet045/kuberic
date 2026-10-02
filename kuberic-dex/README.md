@@ -1,9 +1,9 @@
 # Kuberic DEX
 
 Kuberic DEX (`kuberic-dex`) is the project's durable execution kernel. It
-provides deterministic, linear workflow replay, has no dependency on
-`kuberic-core` or `kuberic-operator`. It is not currently integrated into the
-operator and is not an end-user runtime.
+provides deterministic, linear workflow replay and remained independent when
+the classic stack was removed. It is not currently integrated into the
+level-triggered controller and is not an end-user runtime.
 
 Run the in-memory end-to-end example:
 
@@ -405,10 +405,9 @@ observation's trust source or transport.
 
 ## Validation
 
-Run the bounded feasibility evidence and the complete crate/workspace gates:
+Run the complete crate/workspace gates:
 
 ```console
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --test feasibility -- --nocapture
 CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --all-targets
 CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --doc
 cargo fmt --all -- --check

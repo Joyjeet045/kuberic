@@ -13,10 +13,9 @@ The production v2 controller configuration enables sequential scale-up. This
 means the normal controller binary runs the implemented path; it does not
 change the stack's experimental release status.
 
-The stack coexists with the classic `kuberic.io/v1` operator. It uses a
-different API group, controller deployment, image names, labels, Services,
-source crates, and example. It does not migrate, reinterpret, replace, or
-remove classic resources.
+The classic `kuberic.io/v1` stack has been removed. There is no resource
+conversion or application-data import path. This guide documents only the
+independent `operator.kuberic.io/v1alpha1` development/CI stack.
 
 The historical rationale and protocol design remain in the
 [level-triggered operator proposal](../../proposal/level-triggered-operator-design.md).
@@ -203,8 +202,7 @@ application data-loss callback. Unsupported evidence produces `Wait` or
 ## Sequential Scale-Up
 
 This is **Service Fabric-inspired replica-add semantics**, not general Service
-Fabric placement or scaling parity. The normal v2 controller enables the
-feature, while classic `kuberic.io/v1` reconciliation remains unchanged.
+Fabric placement or scaling parity. The normal controller enables the feature.
 
 Increase only `spec.replicas` on a stable initialized set. For example, after a
 completed 3→2 secondary scale-down:
@@ -832,9 +830,8 @@ cluster rather than prepending it to that matrix.
 The [PR workflow](../../../.github/workflows/level-triggered-CI.yml) separately
 runs bootstrap, replacement, failover, healthy switchover, and healthy scale-down
 plus healthy sequential scale-up smoke tests. Targeted tests run serially and
-retain classic v1 scale-up/write-during-copy regressions. Scheduled
-and manually dispatched full CI runs the matrix twice on separate fresh
-clusters.
+scheduled and manually dispatched full CI runs the matrix twice on separate
+fresh clusters.
 
 `scale-down` covers healthy 3→2→1, singleton process restarts and new writes,
 plus a separate five-member set reduced sequentially to two. It checks every
@@ -977,14 +974,11 @@ Authentication is a shared bearer token distributed through Kubernetes
 Secrets. It is suitable for the isolated development harness, not a complete
 production identity or key-rotation design.
 
-## API and Coexistence Guards
+## API and Source Boundaries
 
-The Cargo workspace keeps the level-triggered and classic packages explicit.
-Package manifests and the compiled dependency graph are the source of truth for
-their dependencies.
-The existing `examples/sqlite` path and `sqlite-replicated` package are now v2,
-not protected classic source. This reclassification does not authorize edits
-to other classic v1 paths.
+The Cargo workspace contains only the current level-triggered, application,
+SQL Server and DEX packages. Package manifests and the compiled dependency
+graph are the source of truth for their dependencies.
 
 The runtime Rust tests maintain a reviewed source-public API inventory:
 
@@ -999,19 +993,18 @@ cargo test -p kuberic-controller --lib
 cargo test -p kuberic-protocol --lib representative_scale_up_status_variants
 ```
 
-Classic v1 remains the documented path for existing `kuberic.io/v1` resources
-and the classic KVStore example. SQLite and PostgreSQL are migrated in place to v2;
-existing deployed application data has no import path. PostgreSQL Workstream 4
-is complete with unit/host-local subprocess tests, not KinD/live coverage; its
-images and deployment assets remain Workstream 5. PostgreSQL owns native WAL and
+Classic v1 source and operational guidance have been removed. SQLite and
+PostgreSQL are v2 applications; existing deployed application data has no
+import path. PostgreSQL is validated with unit/host-local subprocess tests, not
+KinD/live coverage, and its images/deployment assets remain deferred.
+PostgreSQL owns native WAL and
 recovery behind ordinary custom-replicator callbacks; the shared controller
 does not carry database-native evidence. See the
 [PostgreSQL contract](../postgres/design.md) for trust and supervisor-loss limits.
 V2 supports explicit planned switchover,
-secondary-only scale-down, and sequential scale-up; no v1 conversion, data import, or
-classic-path removal is implied. The [retirement plan](../../proposal/v1-retirement-plan.md)
-keeps direct primary removal deferred and treats
-distribution, deprecation, and source removal as separate workstreams. To
+secondary-only scale-down, and sequential scale-up; no v1 conversion or data
+import is provided. The [v1 removal record](../../proposal/v1-retirement-plan.md)
+keeps direct primary removal and v2 distribution deferred. To
 remove the physical replica currently hosting primary authority, complete a
 planned switchover first and then reduce membership after it becomes an eligible
 secondary under the deterministic removal policy. There is no user-selected

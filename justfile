@@ -5,8 +5,8 @@ kind_config := env_var_or_default("KIND_CONFIG", "deploy/kind-config.yaml")
 ownership_receipt := kubeconfig + ".kuberic-owner"
 level_token := env_var_or_default("KUBERIC_AGENT_BEARER_TOKEN", "")
 
-# Build and load all container images into Kind.
-default: images
+# Build the retained level-triggered binaries.
+default: level-triggered-build
 
 # Create the local Kind cluster and write its kubeconfig.
 create-kind-cluster:
@@ -45,63 +45,6 @@ delete-kind-cluster: verify-kind-context
     kind delete cluster --name {{ cluster_name }}
     rm -f "{{ kubeconfig }}" "{{ ownership_receipt }}"
 
-# Build all workspace binaries used by the container images.
-build-rust-bins:
-    cargo build --bins --workspace
-
-# Build and load all container images.
-images: kuberic-operator-image kvstore-image
-
-# Build and load the kuberic-operator image.
-kuberic-operator-image: verify-kind-context build-rust-bins
-    docker build -t localhost/kuberic-operator \
-        -f kuberic-operator/deploy/Dockerfile .
-    kind load docker-image localhost/kuberic-operator:latest --name {{ cluster_name }}
-
-# Deploy kuberic-operator.
-kuberic-operator-deploy: verify-kind-context
-    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        apply -f kuberic-operator/deploy/deployment.yaml
-
-# Delete kuberic-operator.
-kuberic-operator-delete: verify-kind-context
-    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        delete -f kuberic-operator/deploy/deployment.yaml
-
-# Build and load the kvstore image.
-kvstore-image: verify-kind-context build-rust-bins
-    docker build -t localhost/kvstore \
-        -f examples/kvstore/deploy/Dockerfile .
-    kind load docker-image localhost/kvstore:latest --name {{ cluster_name }}
-
-# Deploy the KVStore applications through the shared Gateway.
-kvstore-deploy: gateway-install
-
-# Download and verify the pinned external test dependencies.
-prepare-external-dependencies:
-    bash scripts/external_dependencies.sh prepare
-
-# Verify the prepared dependency bundle without network access.
-verify-external-dependencies:
-    bash scripts/external_dependencies.sh verify
-
-# Delete the KVStore applications and their Gateway routes.
-kvstore-delete: verify-kind-context
-    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        delete -f deploy/gateway/resources.yaml -f deploy/gateway/applications.yaml
-
-# Install the pinned Gateway and both KVStore applications in the owned cluster.
-gateway-install: verify-external-dependencies verify-kind-context kuberic-operator-deploy
-    timeout --kill-after=15s 15m bash scripts/gateway_kind.sh install
-
-# Run the KVStore Gateway integration scenario.
-gateway-test: verify-kind-context
-    cargo test -p kuberic-tests gateway_k8s::test_gateway_k8s_multi_application -- --exact --nocapture
-
-# Collect Gateway and application diagnostics from the owned cluster.
-gateway-diagnostics: verify-kind-context
-    timeout --kill-after=5s 180s bash scripts/gateway_kind.sh diagnostics
-
 # Build the isolated level-triggered packages.
 level-triggered-build:
     cargo build -p kuberic-controller -p kvstore2 -p kuberic-level-tests
@@ -115,7 +58,7 @@ level-triggered-images: verify-kind-context
     kind load docker-image localhost/kuberic-controller:level-triggered-v1 --name {{ cluster_name }}
     kind load docker-image localhost/kvstore2:level-triggered-v1 --name {{ cluster_name }}
 
-# Install the level-triggered controller and sample without changing classic v1.
+# Install the level-triggered controller and sample.
 level-triggered-install: verify-kind-context
     test -n "{{ level_token }}"
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \

@@ -1,4 +1,4 @@
 [env]
-# All-feature operator futures make several legacy integration-test harness
-# frames larger than Rust's 2 MiB test-thread default.
+# Durable all-feature integration tests can exceed Rust's 2 MiB test-thread
+# default.
 RUST_MIN_STACK = { value = "4194304", force = false }

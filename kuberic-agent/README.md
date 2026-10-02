@@ -224,7 +224,8 @@ configuration, policy, final epoch, and safe prefix. The completion receipt keep
 that proof with a provisional-primary reference instead of duplicating the full
 intent/configuration, so a returning provisional member can advance through
 final PC/CC and current-only without accepting unrelated stale authority. Protocol
-9/schema 5 require a fresh coordinated deployment; classic v1 remains unchanged.
+9/schema 5 require a fresh coordinated deployment; the removed classic v1 stack
+has no conversion path.
 These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in
 [scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).

@@ -3,13 +3,14 @@
 > **Status:** Implemented MVP; retained as the historical design proposal
 >
 > **Scope:** The independent operator and replica-agent contract. This design
-> does not change the existing `kuberic.io/v1` operator or CRD.
+> originally left the classic `kuberic.io/v1` operator unchanged; that stack
+> was later removed.
 >
 > The as-built operational contract, deployment commands, supported behavior,
 > and limitations are documented in the
 > [level-triggered operator guide](../features/kuberic/level-triggered-operator.md).
 > This document preserves the design rationale and does not define a migration
-> from classic v1.
+> from the removed classic stack.
 > The implemented scaling subset is SF-inspired secondary scale-down using PC/CC
 > quorum principles, with Kuberic-specific target/minimum coupling, deterministic
 > selection, write closure, sequential cleanup, and Kubernetes resource deletion.

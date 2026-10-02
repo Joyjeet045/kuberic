@@ -5177,8 +5177,6 @@ fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
     assert!(recipes.contains("-- --ignored --exact --nocapture"));
     assert!(workflow.contains("just level-triggered-kind-test scale-up"));
     assert!(workflow.contains("just level-triggered-kind-test all"));
-    assert!(workflow.contains("test_reconciler_scale_up -- --exact"));
-    assert!(workflow.contains("test_scale_up_replays_writes_buffered_during_copy -- --exact"));
 }
 
 #[test]

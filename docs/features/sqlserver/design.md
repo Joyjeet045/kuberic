@@ -77,7 +77,8 @@ with either Kuberic operator.
 Mutation configuration is therefore only a contract for later stages, not an
 enabled execution path.
 
-The crate has no dependency on `kuberic-core`. The `sqlserver-observer` binary
+The crate remained independent when the classic runtime was removed. The
+`sqlserver-observer` binary
 and runtime remain independently testable without the replication runtime.
 See the [observe-only runtime guide](observation.md) for configuration,
 permissions, output semantics, and tests.
@@ -109,7 +110,7 @@ the [implemented PostgreSQL v2 contract](../postgres/design.md): its executable
 uses the v2 host, completed access fences drain the owned PostgreSQL process,
 and recovery validates fresh, exact-session native lineage and replay evidence.
 Workstream 4 is validated with host-local subprocesses; images, deployment and
-distribution remain Workstream 5, without PostgreSQL KinD coverage.
+distribution remain deferred, without PostgreSQL KinD coverage.
 
 That control-plane/data-plane boundary is useful, but PostgreSQL's WAL,
 timeline and process-fencing mechanisms are not SQL Server AG protocols.
@@ -183,7 +184,7 @@ snapshot.
 
 SQL Server exposes multiple progress concepts. Hardened-block, redone-record,
 and committed-record positions remain distinct exact decimal values. They
-cannot be truncated into `kuberic-core`'s current `i64`, compared across
+cannot be truncated into the former classic runtime's scalar `i64`, compared across
 different databases, or compared across incompatible recovery histories.
 Every progress-bearing transition therefore includes both the database GUID
 and recovery-fork GUID.
@@ -279,8 +280,7 @@ wired into the current operator2 prototype until that work provides:
 - separate persistence and dispatch reconciliation cycles.
 
 Until then, the SQL Server code remains an independently testable adapter
-library and laboratory tool. It must not modify the classic operator or claim
-automatic Kubernetes failover.
+library and laboratory tool. It does not claim automatic Kubernetes failover.
 
 ## Delivery Sequence
 

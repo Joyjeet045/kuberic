@@ -6,8 +6,8 @@ not deploy a container, accept an EULA, start or restart `sqlservr`, create an
 AG, change a role, renew a write lease, or execute any mutation command.
 
 The library is compatible with the observation side of the level-triggered
-contract. It has no dependency on `kuberic-core` and is not wired into either
-the classic operator or operator2. This is not a complete Kubernetes HA
+contract. It remained independent when the classic stack was removed and is
+not wired into the level-triggered controller. This is not a complete Kubernetes HA
 integration or an automatic failover implementation. The
 [support and safety design](design.md) remains authoritative.
 

@@ -1363,35 +1363,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kube-leader-election"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1c0fbeb1ff2aa855f0cab552655aa6e4a5ffc56aced22a81371bacd32fefcf8"
-dependencies = [
- "jiff",
- "k8s-openapi",
- "kube",
- "log",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "kube-lease-manager"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bef0716ec7c48420690430e408c7f2579e4252962a33b29d36e53b4618afc33"
-dependencies = [
- "k8s-openapi",
- "kube",
- "rand",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "kube-runtime"
 version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1464,24 +1435,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kuberic-core"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "bytes",
- "prost",
- "rand",
- "thiserror 2.0.21",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
-]
-
-[[package]]
 name = "kuberic-dex"
 version = "0.1.0"
 dependencies = [
@@ -1513,26 +1466,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
-]
-
-[[package]]
-name = "kuberic-operator"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "futures",
- "k8s-openapi",
- "kube",
- "kuberic-core",
- "schemars",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1574,28 +1507,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kuberic-tests"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "k8s-openapi",
- "kube",
- "kube-leader-election",
- "kube-lease-manager",
- "kuberic-operator",
- "kvstore",
- "prost",
- "rand",
- "serde_json",
- "test-log",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tracing",
-]
-
-[[package]]
 name = "kuberic-wire"
 version = "0.1.0"
 dependencies = [
@@ -1605,34 +1516,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
-]
-
-[[package]]
-name = "kvstore"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "clap",
- "k8s-openapi",
- "kube",
- "kuberic-core",
- "kuberic-operator",
- "kvstore",
- "prost",
- "rand",
- "serde",
- "serde_json",
- "serial_test",
- "test-log",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

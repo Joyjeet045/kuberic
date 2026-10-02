@@ -61,8 +61,8 @@ persists one allocation, creates/freeze the annotated canonical PVC before the
 bound Pod, builds from the exact accepted primary through a post-enumeration
 catch-up boundary, and admits one fresh ordinal through independent PC/CC
 policies. Cancellation before admission and exact endpoint→Pod→PVC cleanup use
-frozen provenance; after admission, accepted authority rolls forward. Classic
-v1 remains unchanged. Primary/explicit-target removal, independent target and
+frozen provenance; after admission, accepted authority rolls forward.
+Primary/explicit-target removal, independent target and
 minimum counts, a validated maximum replica-count budget, and active-removal
 cancellation are unsupported. There is no maximum write-interruption guarantee.
 Frozen-primary loss during removal or cleanup can cause indefinite outage;
@@ -70,9 +70,9 @@ there is no overlapping failover even after membership commit.
 See the [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 for provenance, status/API redesign, helper refactors and recovery/policy expansion.
 
-Deployment assets are under `deploy/` and are intentionally isolated from the
-classic `kuberic.io/v1` operator. The controller and sample images are
-development/CI artifacts and are not currently published release targets.
+Deployment assets are under `deploy/`. The controller and sample images are
+development/CI artifacts and are not currently published release targets. The
+removed classic `kuberic.io/v1` stack has no compatibility or migration path.
 
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
 for the CRD, deployment, supported operations, diagnostics, and limitations.

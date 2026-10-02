@@ -1,11 +1,3 @@
 target/*
-!target/debug/
-target/debug/*
-!target/debug/kvstore
-!target/debug/kuberic-operator
-!target/release/
-target/release/*
-!target/release/kvstore
-!target/release/kuberic-operator
 .git/
 .paw/

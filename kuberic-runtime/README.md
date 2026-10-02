@@ -140,7 +140,7 @@ boundary, admits the candidate through independently validated previous and
 expanded policies, and may preserve same-primary writes only while both
 configurations remain writable. Candidate readiness/copy completion alone never
 grants membership or quorum credit. Protocol 9/schema 5 require a fresh
-coordinated v2 deployment; classic v1 remains unchanged.
+coordinated v2 deployment; the removed classic v1 stack has no conversion path.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 include separating replication proof from Kubernetes cleanup obligations; neither
 desired policy nor Kubernetes deletion authority belongs in the runtime.
@@ -186,7 +186,7 @@ observation must finish that reconciliation before returning; hosting awaits it
 before publishing an access-effect receipt. Application-specific lineage and
 recovery evidence stay in the application. See the repository's
 [SF interface mapping](../docs/background/service-fabric/references.md) and
-[service-created replicator design](../docs/features/kuberic/implemented/runtime-replicator-separation.md).
+[service-created replicator design](../docs/archive/v1/implemented/runtime-replicator-separation.md).
 
 Service Fabric custom implementations return a custom control object from
 Open. Kuberic deliberately uses a Rust factory wrapper so creation can reserve

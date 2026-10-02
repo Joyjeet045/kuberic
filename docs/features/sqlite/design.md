@@ -232,7 +232,7 @@ control/replication/application listener settings. Listener defaults are
   and memory budgets are not established.
 - No throughput, maximum replica-count, or outage guarantee; no group commit.
 - Direct primary removal, placement policy, destructive data-loss recovery,
-  PostgreSQL migration, and v1 retirement are separate work.
+  and PostgreSQL deployment are separate work.
 - Image publication, SQLite deployment assets, and SQLite live-cluster tests are
   not provided by this migration.
 
@@ -243,4 +243,4 @@ control/replication/application listener settings. Listener defaults are
 - [Commit-barrier VFS](../../../sqlite-commit-barrier/src/lib.rs)
 - [SQLite WAL format](https://sqlite.org/walformat.html)
 - [SQLite VFS](https://sqlite.org/vfs.html)
-- [V1 retirement and deferred work](../../proposal/v1-retirement-plan.md)
+- [V1 removal record and deferred work](../../proposal/v1-retirement-plan.md)

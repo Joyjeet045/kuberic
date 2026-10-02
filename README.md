@@ -1,152 +1,147 @@
 # Kuberic
 
-> **⚠️ Experimental** — This project is under active development and not ready for production use.
+> **Experimental** — Kuberic is under active development and is not ready for
+> production use. The classic v1 stack has been removed. Published v2 images
+> and a supported release installation are not available yet.
 
-A stateful replication framework for Kubernetes. Provides quorum-based replication with automatic failover, switchover, copy-based replica building, and epoch-based fencing.
+Kuberic is a Service Fabric-inspired stateful replication framework for
+Kubernetes. The current level-triggered stack provides quorum replication,
+automatic failover, planned switchover, copy-based replica building,
+sequential scale-up, secondary scale-down, and epoch/session fencing.
 
-## Features
+## Repository
 
-- **Quorum replication** — primary replicates to secondaries, blocks until write quorum ACKs
-- **Automatic failover** — operator detects primary failure, promotes best secondary
-- **Graceful switchover** — write revocation → demotion → promotion with rollback on failure
-- **Copy protocol** — new replicas built from full snapshot + incremental replay
-- **Epoch fencing** — stale primaries rejected via monotonic epoch numbers
-- **Kubernetes native** — custom operator with `KubericSet` CRD, bare pod management
+```text
+kuberic-protocol/          Authority, topology and command model
+kuberic-wire/              Generated control and replication wire contracts
+kuberic-runtime/           Stateful application and replicator interfaces
+kuberic-runtime-internal/  Durable authority/effect implementation
+kuberic-agent/             Replica-local authority and process hosting
+kuberic-controller/        operator.kuberic.io/v1alpha1 controller
+kuberic-level-tests/       Isolated KinD scenario harness
+kuberic-dex/               Durable execution and checkpoint kernel
 
-## Architecture
-
-```
-kuberic-core/          Core replication framework (replicator, driver, runtime)
-kuberic-operator/      K8s operator (reconciler, CRD, pod management)
-kuberic-dex/           Durable execution and deterministic replay kernel
-examples/kvstore/      Replicated key-value store (HashMap + WAL)
-
-kuberic-protocol/      Independent level-triggered domain model and evaluator
-kuberic-runtime/       Independent application and replication runtime
-kuberic-agent/         Durable replica-local authority and process hosting
-kuberic-controller/    operator.kuberic.io/v1alpha1 controller
-examples/kvstore2/     Level-triggered conformance application
-examples/sqlite/       Existing SQLite example migrated in place to v2
-examples/postgres/     V2 custom replicator using PostgreSQL-native replication
+examples/kvstore2/         Level-triggered conformance application
+examples/sqlite/           SQLite v2 application
+examples/postgres/         PostgreSQL-native v2 custom replicator
+examples/sqlserver/        Independent SQL Server observer
+sqlite-commit-barrier/     SQLite durability helper
 ```
 
-See [kuberic-core](kuberic-core/), [kuberic-operator](kuberic-operator/), and
-[Kuberic DEX](kuberic-dex/) for classic crate-level documentation. The
-[level-triggered operator guide](docs/features/kuberic/level-triggered-operator.md)
-documents the independent experimental stack.
+The former `kuberic-core`, `kuberic-operator`, classic KVStore and classic
+integration-test packages were removed because they had no active users.
+There is no compatibility layer, resource conversion or application-data
+migration path.
 
-Classic [kvstore](examples/kvstore/) uses `PodRuntime` and `WalReplicator`.
-The v2 [SQLite example](docs/features/sqlite/design.md) uses public
-`StatefulServiceReplica`/`StateProvider` interfaces and agent-owned `ReplicaHost`.
+## Local Validation
 
-## Quick Start
+Install the pinned Rust toolchain and `protoc`, then run:
 
 ```bash
-# Build
-cargo check
-cargo clippy --all-targets
+cargo check --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Test (no K8s required)
-cargo test -p kuberic-core -p kvstore -p sqlite-replicated
-# V2 SQLite unit/in-process validation (no cluster or child-process tests)
-cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
-# V2 PostgreSQL unit/host-local subprocess validation (local PostgreSQL required)
-cargo test -p postgres-replicated --all-features -- --test-threads=1
+cargo test -p kuberic-protocol -p kuberic-wire -p kuberic-runtime \
+  -p kuberic-runtime-internal -p kuberic-agent -p kuberic-controller \
+  -p kvstore2 --features kuberic-agent/testing
 
-# Run kvstore in demo mode (single node, no operator)
-cargo run -p kvstore -- --demo
+cargo test -p sqlite-commit-barrier -p sqlite-replicated \
+  --all-features -- --test-threads=1
 ```
 
-## Examples
+PostgreSQL validation requires compatible host-local PostgreSQL binaries and an
+unprivileged Linux account:
 
-### KVStore
+```bash
+mkdir -p target/paw-tmp
+export TMPDIR="$PWD/target/paw-tmp"
+cargo test -p postgres-replicated --all-features -- --test-threads=1
+```
 
-Replicated `HashMap<String, String>` with gRPC Put/Get/Delete API. Demonstrates the full protocol: quorum writes, copy-based rebuild, failover, switchover, epoch rollback. 23 integration tests including an 8-test mock reconciler suite.
+SQL Server's default validation is server-free:
+
+```bash
+cargo test --locked -p sqlserver-replicated --all-features
+```
+
+DEX's default and Kubernetes-provider commands are documented in
+[its README](kuberic-dex/README.md).
+
+## Experimental Kubernetes Validation
+
+The retained controller and KVStore2 Dockerfiles are development/CI assets.
+They are not published release images.
+
+```bash
+export KIND_CLUSTER_NAME=kuberic-level-dev
+mkdir -p target/kuberic-level-dev
+export KUBECONFIG="$PWD/target/kuberic-level-dev/kubeconfig"
+export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+export KUBERIC_AGENT_BEARER_TOKEN=local-level-triggered-token
+
+just create-kind-cluster
+just level-triggered-images
+just level-triggered-install
+just level-triggered-kind-test bootstrap replacement failover
+just delete-kind-cluster
+```
+
+Use nondefault owned cluster coordinates. The recipes verify the exact
+cluster/context/kubeconfig tuple before every mutation and deletion.
+
+## Applications
+
+### KVStore2
+
+The conformance application exercises the complete level-triggered controller,
+agent and runtime path through an HTTP key/value API. Its isolated live matrix
+covers bootstrap, replacement, failover, quorum loss, planned switchover,
+secondary scale-down, sequential scale-up and adversarial recovery.
 
 ### SQLite
 
-The existing `sqlite-replicated` package is migrated in place to v2, with no
-classic runtime/operator dependencies or second SQLite application. Its gRPC
-Execute/Query/ExecuteBatch API uses quorum-before-publication WAL-frame replication,
-committed snapshots plus retained catch-up, and durable restart/reconciliation/
-rebuild fencing. Unit and in-process tests cover replacement, failover, planned
-switchover, sequential scale-up and secondary scale-down. Fresh v2 storage is
-required: there is no v1 data import. SQLite image publication and deployment
-assets remain future work; see the [design and local validation guide](docs/features/sqlite/design.md).
+`sqlite-replicated` uses quorum-before-publication WAL-frame replication,
+committed snapshots and retained catch-up. Fresh v2 storage is required; no
+classic data is imported. See the [SQLite design](docs/features/sqlite/design.md).
 
 ### PostgreSQL
 
-The existing `postgres-replicated` package is migrated in place to v2 through
-ordinary `Replicator`/`PrimaryReplicator`, not operation/copy streams. PostgreSQL
-owns WAL, physical replication and recovery; Kuberic owns generic authority and
-SF choreography. Host-local tests cover fencing, build, failover, switchover,
-scaling and restart. Workstream 4 is complete; images/distribution remain
-Workstream 5. Fresh deployment is required, with no v1 data import or PostgreSQL
-KinD coverage. See the [design and trust boundaries](docs/features/postgres/design.md).
+`postgres-replicated` is an application-owned SF-style custom replicator.
+PostgreSQL owns WAL streaming, physical recovery, synchronous policy and
+promotion while Kuberic owns generic authority and lifecycle choreography.
+Fresh protocol-9/schema-5 storage is required. See the
+[PostgreSQL design](docs/features/postgres/design.md).
 
-## Kubernetes Deployment
+### SQL Server
 
-For local development and CI, use the [shared Gateway KinD setup](docs/features/envoy-gateway-kind.md).
-It deploys the operator and two three-replica KVStore applications behind one
-loopback port. Run `just prepare-external-dependencies` once, then
-`just kvstore-deploy` installs this setup in the owned cluster without downloading
-external manifests or Helm charts.
+`sqlserver-replicated` is an independent native availability-group observer. It
+does not deploy or mutate SQL Server. See the
+[SQL Server observation guide](docs/features/sqlserver/observation.md).
 
-The operator watches `KubericSet` resources and manages the full lifecycle: pod creation, Open → Idle → Active → Primary promotion, failover, and scale up/down.
+## Distribution Status
 
-The independent level-triggered controller uses
-`operator.kuberic.io/v1alpha1` and distinct deployment assets. It currently
-supports full-set bootstrap, replacement, ordinary failover, explicit
-named-target [planned switchover](docs/features/kuberic/level-triggered-operator.md#planned-switchover),
-[secondary scale-down](docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
-down to one, and non-destructive quorum-loss recovery for `kvstore2`.
-This is SF-inspired secondary scale-down using PC/CC quorum principles, with
-Kuberic-specific target/minimum coupling, deterministic selection, write closure,
-sequential cleanup, and Kubernetes resource deletion. `spec.replicas` target=min
-is Kuberic policy; SF target and minimum are independently configurable.
-Retained read-quorum preflight preserves existing service when admission must
-wait. Exact original PVC provenance must be reconstructable before admission;
-PVC object deletion has no retention or import path, not a physical-erasure
-guarantee. After admission, frozen-primary loss can block recovery indefinitely.
-Reconfiguration may interrupt writes and connections with no duration guarantee.
-V2 images remain local/CI-only;
-the production v2 controller configuration enables
-[sequential scale-up](docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
-one fresh incarnation at a time. Classic v1 remains unchanged. Automatic
-direct-primary removal is deferred; use planned switchover followed by
-secondary scale-down. An independent minimum replica count, a validated
-maximum replica count remain future work. SQLite and PostgreSQL are
-ported in place and validated without Kubernetes; their distribution remains
-separate from the existing KVStore2 live deployment.
-Protocol 9 / agent schema 5 require a fresh coordinated v2 deployment.
+Classic source and image publication have been removed. Existing external
+classic registry artifacts, if still present, are unsupported historical
+artifacts.
 
-## Continuous Delivery
+V2 distribution is deferred. Main-branch and version-tag workflows currently
+publish no Kuberic controller or application images. Build from source and use
+the isolated development/CI assets above.
 
-After CI passes, pushes to `main` and version tags publish Linux AMD64 images to
-GitHub Container Registry:
+## Documentation
 
-- `ghcr.io/${{ github.repository_owner }}/kvstore`
-- `ghcr.io/${{ github.repository_owner }}/kuberic-operator`
+- [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md)
+- [Testing strategy](docs/features/kuberic/testing.md)
+- [SQLite design](docs/features/sqlite/design.md)
+- [PostgreSQL design](docs/features/postgres/design.md)
+- [SQL Server design](docs/features/sqlserver/design.md)
+- [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md)
+- [V1 removal record](docs/proposal/v1-retirement-plan.md)
+- [Archived classic architecture](docs/archive/v1/README.md)
 
-Main-branch images receive immutable commit SHA tags. A semantic version tag
-such as `v0.1.0` also publishes the exact version tag.
-
-## Design
-
-- [Core protocols](docs/features/kuberic/protocols.md) — replication, copy, failover, switchover
-- [Operator design](docs/features/kuberic/operator.md) — reconciler, CRD, pod management
-- [User API](docs/features/kuberic/user-api.md) — PodRuntime, lifecycle events, StateProvider
-- [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
-- [PostgreSQL design](docs/features/postgres/design.md) — v2 authority, native replication, SQL fencing and host-local validation
-- [SQL Server design](docs/features/sqlserver/design.md) — native AG contract and safety gates
-- [SQL Server observation](docs/features/sqlserver/observation.md) — observe-only runtime, configuration, and tests
-- [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
-- [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
-- [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md) — independent stack deployment, authority, supported operations, and diagnostics
-- [Secondary scale-down](docs/features/kuberic/level-triggered-operator.md#secondary-scale-down) — lower desired membership, singleton risks, and exact permanent cleanup
-- [Sequential scale-up](docs/features/kuberic/level-triggered-operator.md#sequential-scale-up) — add or restore one fresh ordinal at a time through copy, catch-up, and PC/CC admission
-- [V1 retirement plan](docs/proposal/v1-retirement-plan.md) — completed switchover and scaling workstreams, deferred direct-primary removal, and remaining application/distribution/deprecation gates
-- [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
+Service Fabric and other background material under `docs/background/` remains
+technology reference material rather than a Kuberic compatibility promise.
 
 ## License
 

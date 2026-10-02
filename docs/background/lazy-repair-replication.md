@@ -7,7 +7,7 @@ lower write latency and reduced write amplification.
 
 > Related: [Leaderless Quorum Replication](leaderless-quorum-replication.md)
 > (Dynamo-family systems that send to ALL replicas but wait for W),
-> [Peer-Repair Design](../features/future/peer-repair-replication.md)
+> [Peer-Repair Design](../archive/v1/future/peer-repair-replication.md)
 
 ---
 

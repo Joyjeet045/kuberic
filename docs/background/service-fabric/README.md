@@ -21,7 +21,7 @@ Source code reference: `build/service-fabric/` (depth-1 clone).
 
 ## Related Kuberic Documents
 
-- [Kuberic Replication Protocols](../../features/kuberic/protocols.md)
-- [Design Gaps](../../features/kuberic/design-gaps.md)
-- [WAL Persistence Design (Future)](../../features/future/wal-persistence.md)
+- [Archived Kuberic Replication Protocols](../../archive/v1/protocols.md)
+- [Archived Design Gaps](../../archive/v1/design-gaps.md)
+- [Archived WAL Persistence Design](../../archive/v1/future/wal-persistence.md)
 - [CloudNativePG Architecture](../cloudnative-pg-architecture.md)
