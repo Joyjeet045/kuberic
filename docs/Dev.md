@@ -14,6 +14,36 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+## Repository Test Runner
+
+Install the checksum-verified pinned nextest binary and list the semantic tiers:
+
+```bash
+just install-nextest
+just nextest-list ordinary
+just nextest-list postgres
+just nextest-list kind
+just nextest-list dex-live
+just nextest-list helper
+just nextest-list external
+```
+
+The ordinary tier is bounded to four test processes and keeps the combined
+SQLite group serial. Run it whole or as the same four slices used by CI:
+
+```bash
+just nextest-test
+just nextest-test 1/4
+```
+
+Create the all-features archive once, then validate exact-one tier assignment
+and complete, disjoint ordinary/PostgreSQL partitions:
+
+```bash
+just nextest-archive
+just nextest-validate-archive
+```
+
 ## Level-Triggered Local Cluster
 
 Install Docker, KinD, kubectl and Just. Always use a nondefault owned cluster:
@@ -50,7 +80,9 @@ subreapers and readable `/proc`. PostgreSQL 16 is the validated major.
 ```bash
 mkdir -p target/paw-tmp
 export TMPDIR="$PWD/target/paw-tmp"
-cargo test -p postgres-replicated --all-features -- --test-threads=1
+just nextest-postgres
+# Or run one deterministic isolated-runner shard:
+just nextest-postgres 1/4
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 

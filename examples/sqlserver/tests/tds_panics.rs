@@ -2,7 +2,7 @@ mod common;
 #[path = "common/tds.rs"]
 mod tds_peer;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -13,6 +13,14 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use common::Fixture;
+
+fn observer_binary() -> PathBuf {
+    std::env::var_os("NEXTEST_BIN_EXE_sqlserver_observer")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_sqlserver-observer"))
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_sqlserver-observer").map(PathBuf::from))
+        .expect("sqlserver-observer binary path")
+}
 
 const UNKNOWN_TOKEN: &[u8] = &[
     4, 1, 0, 21, 0, 0, 1, 0, 1, 0, 11, 0, 1, 8, 0, 12, 0, 1, 255, 2, 0,
@@ -105,7 +113,7 @@ async fn run_probe(fault: Fault, watch: bool) {
         listener.local_addr().unwrap().port()
     );
     let roots = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_sqlserver-observer"));
+    let mut command = Command::new(observer_binary());
     command
         .arg("--config")
         .arg(fixture.config_path())

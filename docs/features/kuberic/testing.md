@@ -1,38 +1,49 @@
 # Kuberic Test Strategy
 
-Kuberic validation is split between Cargo-native local suites and explicitly
-owned Kubernetes scenarios. The removed classic v1 stack has no remaining test
-selection.
+Kuberic validation is split into repository-wide nextest tiers, doctests and
+explicitly owned Kubernetes scenarios. The removed classic v1 stack has no
+remaining test selection.
 
 ## Workspace Validation
 
 ```bash
+just install-nextest
 cargo check --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --doc --workspace
+cargo test --doc --workspace --all-features
+just nextest-test
 ```
 
-The aggregate `cargo test --workspace --all-features` includes DEX's real
-Kubernetes provider target and therefore requires its isolated cluster
-prerequisites. It is not a cluster-free command.
+The `ordinary` profile is cluster-free and excludes PostgreSQL plus DEX's real
+Kubernetes target. It runs with four global slots; the SQLite group has one
+slot, and each agent process-boundary test reserves all four slots so its
+subprocess recovery deadlines are not competing with another test. CI divides
+the 900 current ordinary tests into four 225-test slices.
+
+The all-features archive includes every test binary, including resource-backed
+tiers. Validate its exact-one disposition and partition union before relying on
+it:
+
+```bash
+just nextest-archive
+just nextest-validate-archive
+```
+
+The validator accounts for 1,105 current tests: 900 ordinary, 170 directly
+runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test, 18
+parent-driven subprocess helpers and four external SQL Server fixtures.
 
 ## Level-Triggered Unit and Durable Validation
 
+Use `just nextest-test` for the complete cluster-free tier. For focused
+debugging, nextest accepts Cargo package/target selectors in addition to the
+repository profile:
+
 ```bash
-cargo test -p kuberic-protocol -p kuberic-wire \
-  -p kuberic-runtime -p kuberic-runtime-internal \
-  -p kuberic-agent -p kuberic-controller -p kvstore2 \
-  --features kuberic-agent/testing
-
-cargo test -p kuberic-agent --features testing \
-  --lib --test runtime --test service --test coordinator \
-  --test store --test transport --test crash_boundaries \
-  -- --test-threads=1
-
-cargo test -p kuberic-protocol --lib --test protocol --test model
-cargo test -p kuberic-controller --lib --test controller
-cargo test -p kuberic-runtime --test public_api_inventory
+cargo nextest run --profile ordinary -p kuberic-agent --features testing
+cargo nextest run --profile ordinary -p kuberic-protocol
+cargo nextest run --profile ordinary -p kuberic-controller
 ```
 
 The agent crash suite's parent tests execute their ignored child helpers and
@@ -45,9 +56,11 @@ evidence expansion.
 
 ## Level-Triggered Live Validation
 
-Live scenarios require Docker, KinD, kubectl, Just, the pinned Rust toolchain
-and `protoc`. Use a nondefault cluster, repository-local kubeconfig and exact
-matching context:
+Live scenarios require Docker, KinD, kubectl, Just, the pinned Rust toolchain,
+the pinned nextest binary and `protoc`. The `kind` profile and `kind-live`
+group select exactly the 12 ignored live scenarios and use one execution slot.
+Use a nondefault cluster, repository-local kubeconfig and exact matching
+context:
 
 ```bash
 export KIND_CLUSTER_NAME=kuberic-level-dev
@@ -90,6 +103,9 @@ cargo clippy -p kuberic-agent -p sqlite-replicated \
   --all-targets --all-features -- -D warnings
 ```
 
+The ordinary nextest tier includes both SQLite packages under one serial
+`sqlite` group, so `just nextest-test` preserves the same resource boundary.
+
 Coverage includes bootstrap, replacement, failover, planned switchover,
 sequential scale-up, secondary scale-down, quorum restoration, copy restart and
 authority races. Fresh v2 storage is required; no classic data import exists.
@@ -106,13 +122,18 @@ is the validated host major. Missing prerequisites fail rather than skip.
 ```bash
 mkdir -p target/paw-tmp
 export TMPDIR="$PWD/target/paw-tmp"
-cargo test -p postgres-replicated --all-features -- --test-threads=1
+just nextest-postgres
+# Same deterministic four-way hash partition used by an isolated CI runner:
+just nextest-postgres 1/4
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
 The matrix covers physical build/rewind, fencing, failover, switchover,
 replacement, scaling, quorum restoration, read-only secondaries and
-application/agent restart. PostgreSQL has no application-specific KinD test.
+application/agent restart. The profile has one execution slot. Its complete
+172-test inventory is 170 directly partitioned tests plus two ignored
+subprocess helpers executed by mapped parent tests. PostgreSQL has no
+application-specific KinD test.
 
 See the [PostgreSQL design](../postgres/design.md).
 
@@ -129,7 +150,8 @@ cargo test --locked -p sqlserver-replicated --all-features
 
 The ignored live observation target requires an externally provisioned SQL
 Server and explicit image/EULA/TLS/credential configuration. It is independent
-of Kuberic controller deployment.
+of Kuberic controller deployment. `just nextest-list external` lists exactly
+those four manual fixtures; they are not silently run in hosted CI.
 
 ## DEX Validation
 
@@ -153,7 +175,9 @@ CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex \
 
 The real target requires explicit nondefault `KIND_CLUSTER_NAME`,
 `KUBECONFIG`, and matching `KUBE_CONTEXT`. It performs access review and owns
-its temporary namespace lifecycle.
+its temporary namespace lifecycle. `just nextest-list dex-live` selects exactly
+that target. Pull requests run it on the owned smoke cluster; main, version-tag
+and CI-manual events run it on a separate receipt-gated cluster.
 
 ## Distribution Boundary
 

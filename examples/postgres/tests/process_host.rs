@@ -31,6 +31,14 @@ use tonic::{Request, transport::Channel};
 
 const TOKEN: &str = "host-local-postgres-test";
 
+fn postgres_binary() -> PathBuf {
+    std::env::var_os("NEXTEST_BIN_EXE_postgres_replicated")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_postgres-replicated"))
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_postgres-replicated").map(PathBuf::from))
+        .expect("postgres-replicated binary path")
+}
+
 #[path = "../src/testing/layout.rs"]
 mod layout;
 use layout::SINGLE_REPLICA_DIRECTORY;
@@ -1529,7 +1537,7 @@ async fn spawn_binary(root: &Path, pg_bin: &Path) -> BinaryHost {
     let pgport = allocate_port().await;
     let log = root.join("binary.log");
     let output = std::fs::File::create(&log).unwrap();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_postgres-replicated"))
+    let child = std::process::Command::new(postgres_binary())
         .current_dir(root)
         .args([
             "--resource-uid",
@@ -2618,7 +2626,7 @@ async fn executable_launcher_exit_keeps_owned_postmaster_until_shutdown() {
 
 #[test]
 fn executable_exposes_v2_host_configuration() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_postgres-replicated"))
+    let output = std::process::Command::new(postgres_binary())
         .arg("--help")
         .output()
         .unwrap();

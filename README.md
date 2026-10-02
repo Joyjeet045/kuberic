@@ -35,19 +35,16 @@ migration path.
 
 ## Local Validation
 
-Install the pinned Rust toolchain and `protoc`, then run:
+Install the pinned Rust toolchain and `protoc`. The repository installer pins
+`cargo-nextest` and verifies its archive checksum:
 
 ```bash
+just install-nextest
 cargo check --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-cargo test -p kuberic-protocol -p kuberic-wire -p kuberic-runtime \
-  -p kuberic-runtime-internal -p kuberic-agent -p kuberic-controller \
-  -p kvstore2 --features kuberic-agent/testing
-
-cargo test -p sqlite-commit-barrier -p sqlite-replicated \
-  --all-features -- --test-threads=1
+cargo test --doc --workspace --all-features
+just nextest-test
 ```
 
 PostgreSQL validation requires compatible host-local PostgreSQL binaries and an
@@ -56,17 +53,19 @@ unprivileged Linux account:
 ```bash
 mkdir -p target/paw-tmp
 export TMPDIR="$PWD/target/paw-tmp"
-cargo test -p postgres-replicated --all-features -- --test-threads=1
+just nextest-postgres
 ```
 
-SQL Server's default validation is server-free:
+Build once and verify the exact ordinary/PostgreSQL partitions with:
 
 ```bash
-cargo test --locked -p sqlserver-replicated --all-features
+just nextest-archive
+just nextest-validate-archive
 ```
 
-DEX's default and Kubernetes-provider commands are documented in
-[its README](kuberic-dex/README.md).
+The complete tier inventory, shard commands, SQL Server external fixtures and
+DEX Kubernetes-provider commands are documented in the
+[test strategy](docs/features/kuberic/testing.md).
 
 ## Experimental Kubernetes Validation
 

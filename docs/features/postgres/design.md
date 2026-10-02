@@ -282,7 +282,9 @@ Configuration is implementation-owned, not a general PostgreSQL tuning API.
 ```sh
 mkdir -p target/paw-tmp
 export TMPDIR="$PWD/target/paw-tmp"
-cargo test -p postgres-replicated --all-features -- --test-threads=1
+just nextest-postgres
+# One deterministic shard, normally run on its own isolated CI runner:
+just nextest-postgres 1/4
 # Smaller native build/recovery and reconfiguration selections:
 cargo test -p postgres-replicated --all-features --test native_build --test failover -- --test-threads=1
 cargo test -p postgres-replicated --all-features --test reconfiguration --test authority_races --test switchover_checkpoints --test validation_oracles -- --test-threads=1
@@ -308,9 +310,13 @@ Compact IDs encode the Linux PID and a bounded process-local counter to leave
 room for PostgreSQL Unix sockets in the hosted CI checkout. Existing directories
 are skipped, never removed to allocate a new fixture.
 
-Targeted CI installs host-local PostgreSQL binaries and runs this serial suite
-and lint selection. PostgreSQL is absent from KinD/live jobs and selectors.
-Shared regressions and guard commands are in the
+CI builds one all-features nextest archive, then runs four deterministic hash
+partitions on isolated runners. The `postgres` profile and test group both
+enforce one test process at a time within each runner; the measured unsafe
+same-runner four-way mode is not used. The 172-test inventory consists of 170
+directly partitioned tests and two subprocess helpers reached through their
+mapped parent tests. PostgreSQL is absent from KinD/live jobs and selectors.
+Shared regressions, partition validation and guard commands are in the
 [testing guide](../kuberic/testing.md#postgresql-v2-host-local-validation).
 
 ## Limitations and Future Work

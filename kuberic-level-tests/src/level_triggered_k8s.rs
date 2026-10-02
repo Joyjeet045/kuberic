@@ -3733,6 +3733,7 @@ fn scale_down_reduction_parser_rejects_skipped_epochs_primary_or_identity_change
 #[test]
 fn scale_down_selectors_are_exact_ignored_and_in_all() {
     let recipes = include_str!("../../justfile");
+    let nextest = include_str!("../../.config/nextest.toml");
     for (selector, test) in [
         ("scale-down", "scale_down"),
         ("scale-down-adversarial", "scale_down_adversarial"),
@@ -3746,7 +3747,11 @@ fn scale_down_selectors_are_exact_ignored_and_in_all() {
                 .any(|line| line.contains("expanded+=(") && line.contains(selector))
         );
     }
-    assert!(recipes.contains("-- --ignored --exact --nocapture"));
+    assert!(recipes.contains("cargo nextest run -p kuberic-level-tests"));
+    assert!(recipes.contains("--profile kind --run-ignored only"));
+    assert!(recipes.contains("group(=kind-live) and test(=${test_name})"));
+    assert!(nextest.contains("[profile.kind]"));
+    assert!(nextest.contains("test-group = 'kind-live'"));
 }
 
 struct CollectionWatch {
@@ -5158,7 +5163,8 @@ fn scale_up_multi() -> Result<()> {
 #[test]
 fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
     let recipes = include_str!("../../justfile");
-    let workflow = include_str!("../../.github/workflows/level-triggered-CI.yml");
+    let nextest = include_str!("../../.config/nextest.toml");
+    let workflow = include_str!("../../.github/workflows/CI.yml");
     for (selector, test) in [
         ("scale-up", "scale_up"),
         ("scale-up-multi", "scale_up_multi"),
@@ -5174,9 +5180,48 @@ fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
         );
     }
     assert!(recipes.contains("expanded+=(scale-up scale-up-multi scale-up-adversarial)"));
-    assert!(recipes.contains("-- --ignored --exact --nocapture"));
+    assert!(recipes.contains("cargo nextest run -p kuberic-level-tests"));
+    assert!(recipes.contains("--profile kind --run-ignored only"));
+    assert!(recipes.contains("group(=kind-live) and test(=${test_name})"));
+    assert!(nextest.contains("[profile.kind]"));
+    assert!(nextest.contains("test-group = 'kind-live'"));
     assert!(workflow.contains("just level-triggered-kind-test scale-up"));
     assert!(workflow.contains("just level-triggered-kind-test all"));
+    assert!(workflow.contains("  bootstrap-kind:"));
+    assert!(workflow.contains("  full-kind:"));
+    assert!(
+        workflow
+            .contains("extract_dir=\"$(mktemp -d \"$RUNNER_TEMP/nextest-extracted.XXXXXXXXXX\")\"")
+    );
+    assert!(!workflow.contains("--extract-to target/nextest/extracted"));
+    let bootstrap_job = workflow
+        .split("  bootstrap-kind:")
+        .nth(1)
+        .unwrap()
+        .split("  full-kind:")
+        .next()
+        .unwrap();
+    for required in [
+        "KIND_CLUSTER_NAME: kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}",
+        "KUBECONFIG: ${{ github.workspace }}/target/kind/level-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig",
+        "KUBE_CONTEXT: kind-kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}",
+        "KUBERIC_AGENT_BEARER_TOKEN: level-${{ github.run_id }}-${{ github.run_attempt }}",
+    ] {
+        assert!(bootstrap_job.contains(required), "{required}");
+    }
+    let postgres_job = workflow
+        .split("  postgres-tests:")
+        .nth(1)
+        .unwrap()
+        .split("  dex-live:")
+        .next()
+        .unwrap();
+    assert!(
+        postgres_job
+            .find("Prepare repository-local scratch")
+            .unwrap()
+            < postgres_job.find("Install pinned cargo-nextest").unwrap()
+    );
 }
 
 #[test]

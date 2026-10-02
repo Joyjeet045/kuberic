@@ -1,13 +1,22 @@
 mod common;
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::json;
 
 use common::Fixture;
 
+fn observer_binary() -> PathBuf {
+    std::env::var_os("NEXTEST_BIN_EXE_sqlserver_observer")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_sqlserver-observer"))
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_sqlserver-observer").map(PathBuf::from))
+        .expect("sqlserver-observer binary path")
+}
+
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_sqlserver-observer"))
+    Command::new(observer_binary())
 }
 
 #[test]
@@ -98,7 +107,7 @@ async fn watch_keeps_reporting_failures_and_sigterm_shuts_it_down() {
     let mut fixture = Fixture::new();
     fixture.document["poll_interval_ms"] = json!(10);
     std::fs::remove_file(fixture.document["observer_username_file"].as_str().unwrap()).unwrap();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sqlserver-observer"))
+    let mut child = tokio::process::Command::new(observer_binary())
         .arg("--config")
         .arg(fixture.config_path())
         .arg("--watch")
@@ -166,7 +175,7 @@ async fn undrained_stdout_does_not_prevent_shutdown_in_either_mode() {
         let stdout: OwnedFd = writer.into();
         let fixture = Fixture::new();
         std::fs::remove_file(fixture.document["observer_username_file"].as_str().unwrap()).unwrap();
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_sqlserver-observer"));
+        let mut command = tokio::process::Command::new(observer_binary());
         command.arg("--config").arg(fixture.config_path());
         if watch {
             command.arg("--watch");
@@ -210,7 +219,7 @@ async fn broken_stdout_reports_a_write_error_and_exits_nonzero() {
     let stdout: OwnedFd = writer.into();
     let fixture = Fixture::new();
     std::fs::remove_file(fixture.document["observer_username_file"].as_str().unwrap()).unwrap();
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sqlserver-observer"))
+    let child = tokio::process::Command::new(observer_binary())
         .arg("--config")
         .arg(fixture.config_path())
         .arg("--watch")

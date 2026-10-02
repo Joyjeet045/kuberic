@@ -6,6 +6,13 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: Run the repeated full crash and partition matrix
+        type: boolean
+        default: true
+  schedule:
+    - cron: "17 3 * * 0"
 
 permissions:
   contents: read
@@ -18,70 +25,399 @@ env:
   XEDIO_CI: true
   CARGO_BUILD_JOBS: 2
   CARGO_INCREMENTAL: 0
+  NEXTEST_ARCHIVE: target/nextest/kuberic-tests.tar.zst
 
 jobs:
-  build:
-    name: Build and test
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      KIND_CLUSTER_NAME: kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
-      KUBECONFIG: ${{ github.workspace }}/target/kind/general-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
-      KUBE_CONTEXT: kind-kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
+  build-test-artifacts:
+    name: Check and build test archive
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
-    - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
 
-    - name: Install Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v2
-      with:
-        components: rustfmt, clippy
-        build-warnings: ""
-    
-    - uses: taiki-e/install-action@protoc
-    - uses: taiki-e/install-action@just
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: rustfmt, clippy
+          build-warnings: ""
 
-    - name: Install PostgreSQL
-      run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq postgresql postgresql-client
-        # Stop the default PG service (tests manage their own instances)
-        sudo systemctl stop postgresql.service || true
-        pg_config --version
+      - uses: taiki-e/install-action@protoc
 
-    - name: Run cargo fmt
-      run: cargo fmt --all -- --check
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
 
-    - name: Run cargo clippy
-      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Format
+        run: cargo fmt --all -- --check
 
-    - name: Prepare owned cluster directory
-      run: mkdir -p "$(dirname "$KUBECONFIG")"
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-    - name: Kubernetes KinD Cluster
-      uses: helm/kind-action@v1
-      with:
-        version: v0.30.0
-        node_image: kindest/node:v1.34.0
-        cluster_name: ${{ env.KIND_CLUSTER_NAME }}
-        config: deploy/kind-config.yaml
-        kubeconfig: ${{ env.KUBECONFIG }}
+      - name: Test workspace documentation
+        run: cargo test --doc --workspace --all-features
 
-    - name: Record and verify isolated KinD ownership
-      run: |
-        printf '%s\n' \
-          "cluster=${KIND_CLUSTER_NAME}" \
-          "context=${KUBE_CONTEXT}" \
-          "kubeconfig=${KUBECONFIG}" \
-          | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
-        just verify-kind-context
+      - name: Build reusable test archive
+        run: |
+          mkdir -p "$(dirname "$NEXTEST_ARCHIVE")"
+          cargo nextest archive --workspace --all-features --profile ci \
+            --archive-file "$NEXTEST_ARCHIVE"
 
-    - name: Run workspace tests
-      run: cargo test --workspace --all-features
+      - name: Upload test archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-archive
+          path: ${{ env.NEXTEST_ARCHIVE }}
+          compression-level: 0
+          retention-days: 1
 
-    - name: Delete owned cluster
-      if: always()
-      timeout-minutes: 3
-      run: |
-        if test -f "${KUBECONFIG}.kuberic-owner"; then
-          just delete-kind-cluster
-        fi
+  validate-archive:
+    name: Validate exact test coverage
+    needs: build-test-artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
+
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive
+          path: target/nextest
+
+      - name: Validate exact-once tiers and partitions
+        run: python3 scripts/validate_nextest_partitions.py --archive-file "$NEXTEST_ARCHIVE"
+
+  ordinary-tests:
+    name: Ordinary tests (${{ matrix.partition }}/4)
+    needs: build-test-artifacts
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        partition: [1, 2, 3, 4]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
+
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive
+          path: target/nextest
+
+      - name: Run bounded ordinary partition
+        run: |
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/nextest-extracted.XXXXXXXXXX")"
+          cargo nextest run \
+            --archive-file "$NEXTEST_ARCHIVE" \
+            --extract-to "$extract_dir" \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --profile ordinary \
+            --partition "slice:${{ matrix.partition }}/4"
+
+  postgres-tests:
+    name: PostgreSQL tests (${{ matrix.partition }}/4)
+    needs: build-test-artifacts
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        partition: [1, 2, 3, 4]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUST_TEST_THREADS: 1
+      TMPDIR: ${{ github.workspace }}/target/paw-tmp
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Prepare repository-local scratch
+        run: mkdir -p "$TMPDIR"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
+
+      - name: Install host-local PostgreSQL
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-16 postgresql-client-16
+          sudo systemctl stop postgresql.service || true
+          /usr/lib/postgresql/16/bin/postgres --version
+
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive
+          path: target/nextest
+
+      - name: Run serial PostgreSQL partition
+        run: |
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/nextest-extracted.XXXXXXXXXX")"
+          cargo nextest run \
+            --archive-file "$NEXTEST_ARCHIVE" \
+            --extract-to "$extract_dir" \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --profile postgres \
+            --partition "hash:${{ matrix.partition }}/4"
+
+  dex-live:
+    name: DEX real Kubernetes provider
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: build-test-artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      KIND_CLUSTER_NAME: kuberic-dex-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBECONFIG: ${{ github.workspace }}/target/kind/dex-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
+      KUBE_CONTEXT: kind-kuberic-dex-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+
+      - uses: taiki-e/install-action@just
+
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
+
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive
+          path: target/nextest
+
+      - name: Prepare owned cluster directory
+        run: mkdir -p "$(dirname "$KUBECONFIG")"
+
+      - name: Create isolated KinD cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.30.0
+          node_image: kindest/node:v1.34.0
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          config: deploy/kind-config.yaml
+          kubeconfig: ${{ env.KUBECONFIG }}
+
+      - name: Record and verify isolated KinD ownership
+        run: |
+          printf '%s\n' \
+            "cluster=${KIND_CLUSTER_NAME}" \
+            "context=${KUBE_CONTEXT}" \
+            "kubeconfig=${KUBECONFIG}" \
+            | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
+          just verify-kind-context
+
+      - name: Run DEX real Kubernetes test
+        run: |
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/nextest-extracted.XXXXXXXXXX")"
+          cargo nextest run \
+            --archive-file "$NEXTEST_ARCHIVE" \
+            --extract-to "$extract_dir" \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --profile dex-live
+
+      - name: Collect DEX cluster diagnostics
+        if: failure()
+        timeout-minutes: 3
+        run: |
+          mkdir -p target
+          {
+            if test -f "${KUBECONFIG}.kuberic-owner"; then
+              just verify-kind-context
+              kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" get namespaces -o wide
+              kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" get all -A -o wide
+              kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
+                get events -A --sort-by=.lastTimestamp
+            else
+              echo "owned cluster receipt was not created"
+            fi
+          } 2>&1 | tee target/dex-live-diagnostics.log
+
+      - name: Upload DEX cluster diagnostics
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: dex-live-diagnostics
+          path: target/dex-live-diagnostics.log
+
+      - name: Delete owned cluster
+        if: always()
+        timeout-minutes: 3
+        run: |
+          if test -f "${KUBECONFIG}.kuberic-owner"; then
+            just delete-kind-cluster
+          fi
+
+  bootstrap-kind:
+    name: PR live smoke
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      KIND_CLUSTER_NAME: kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBECONFIG: ${{ github.workspace }}/target/kind/level-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
+      KUBE_CONTEXT: kind-kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBERIC_AGENT_BEARER_TOKEN: level-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+      - uses: taiki-e/install-action@protoc
+      - uses: taiki-e/install-action@just
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
+      - name: Prepare owned cluster directory outside the image build context
+        run: mkdir -p "$(dirname "$KUBECONFIG")"
+      - name: Create isolated KinD cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.30.0
+          node_image: kindest/node:v1.34.0
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          config: deploy/kind-config.yaml
+          kubeconfig: ${{ env.KUBECONFIG }}
+      - name: Record cluster ownership
+        run: |
+          printf '%s\n' \
+            "cluster=${KIND_CLUSTER_NAME}" \
+            "context=${KUBE_CONTEXT}" \
+            "kubeconfig=${KUBECONFIG}" \
+            | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
+          just verify-kind-context
+      - name: Run DEX real Kubernetes test
+        if: github.event_name == 'pull_request'
+        run: >-
+          cargo nextest run
+          -p kuberic-dex
+          --features kubernetes
+          --test kubernetes_checkpoint_real
+          --profile dex-live
+      - name: Build and load isolated images
+        run: just level-triggered-images
+      - name: Install isolated stack
+        run: just level-triggered-install
+      - name: Run bootstrap scenario
+        run: just level-triggered-kind-test bootstrap
+      - name: Run replacement scenario
+        run: just level-triggered-kind-test replacement
+      - name: Run failover scenario
+        run: just level-triggered-kind-test failover
+      - name: Run healthy planned switchover
+        timeout-minutes: 10
+        run: just level-triggered-kind-test switchover
+      - name: Run healthy secondary scale-down
+        timeout-minutes: 12
+        run: just level-triggered-kind-test scale-down
+      - name: Run healthy sequential scale-up
+        timeout-minutes: 15
+        run: just level-triggered-kind-test scale-up
+      - name: Collect diagnostics
+        if: failure()
+        timeout-minutes: 3
+        run: just level-triggered-diagnostics 2>&1 | tee target/level-diagnostics.log
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: level-smoke-diagnostics
+          path: target/level-diagnostics.log
+      - name: Delete owned cluster
+        if: always()
+        timeout-minutes: 3
+        run: |
+          if test -f "${KUBECONFIG}.kuberic-owner"; then
+            just delete-kind-cluster
+          fi
+
+  full-kind:
+    name: Full adversarial matrix (${{ matrix.run }})
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full_matrix)
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      KIND_CLUSTER_NAME: kuberic-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}
+      KUBECONFIG: ${{ github.workspace }}/target/kind/full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}.kubeconfig
+      KUBE_CONTEXT: kind-kuberic-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}
+      KUBERIC_AGENT_BEARER_TOKEN: level-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+      - uses: taiki-e/install-action@protoc
+      - uses: taiki-e/install-action@just
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
+      - name: Prepare owned cluster directory outside the image build context
+        run: mkdir -p "$(dirname "$KUBECONFIG")"
+      - name: Create isolated KinD cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.30.0
+          node_image: kindest/node:v1.34.0
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          config: deploy/kind-config.yaml
+          kubeconfig: ${{ env.KUBECONFIG }}
+      - name: Record cluster ownership
+        run: |
+          printf '%s\n' \
+            "cluster=${KIND_CLUSTER_NAME}" \
+            "context=${KUBE_CONTEXT}" \
+            "kubeconfig=${KUBECONFIG}" \
+            | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
+          just verify-kind-context
+      - name: Build and load isolated images
+        run: just level-triggered-images
+      - name: Install isolated stack
+        run: just level-triggered-install
+      - name: Run full matrix including scale-up, switchover, and scale-down fault variants
+        timeout-minutes: 95
+        run: just level-triggered-kind-test all
+      - name: Collect diagnostics
+        if: failure()
+        timeout-minutes: 3
+        run: just level-triggered-diagnostics 2>&1 | tee target/level-diagnostics.log
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: level-full-${{ matrix.run }}-diagnostics
+          path: target/level-diagnostics.log
+      - name: Delete owned cluster
+        if: always()
+        timeout-minutes: 3
+        run: |
+          if test -f "${KUBECONFIG}.kuberic-owner"; then
+            just delete-kind-cluster
+          fi
