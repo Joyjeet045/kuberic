@@ -120,6 +120,7 @@ async fn stream_ack_requires_durable_sqlite_acceptance() {
                         error: TransportError::Runtime(_),
                         ..
                     } => return,
+                    TransportEvent::Control { .. } => {}
                     other => panic!("unexpected event: {other:?}"),
                 }
             }

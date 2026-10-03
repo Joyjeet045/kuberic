@@ -202,6 +202,56 @@ impl InProcessTransport {
             }
             self.unregister(&identity, &existing.session.clone())?;
         }
+        for (peer_identity, endpoint) in &self.endpoints {
+            if runtime
+                .snapshot()
+                .await
+                .authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority
+                        .current_configuration
+                        .members
+                        .iter()
+                        .chain(
+                            authority
+                                .previous_configuration
+                                .iter()
+                                .flat_map(|configuration| &configuration.members),
+                        )
+                        .any(|member| &member.identity == peer_identity)
+                })
+            {
+                runtime
+                    .register_peer_session(peer_identity.clone(), endpoint.session.clone())
+                    .await?;
+            }
+            if endpoint
+                .runtime
+                .snapshot()
+                .await
+                .authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority
+                        .current_configuration
+                        .members
+                        .iter()
+                        .chain(
+                            authority
+                                .previous_configuration
+                                .iter()
+                                .flat_map(|configuration| &configuration.members),
+                        )
+                        .any(|member| member.identity == identity)
+                })
+            {
+                endpoint
+                    .runtime
+                    .register_peer_session(identity.clone(), session.clone())
+                    .await?;
+            }
+        }
         self.endpoints.insert(
             identity.clone(),
             Endpoint {
@@ -522,9 +572,48 @@ impl InProcessTransport {
         }
     }
 }
-pub async fn describe_custom_peer(
+pub async fn describe_peer(
     runtime: &crate::hosting::PodRuntime,
     replica: kuberic_runtime::replicator::ReplicaInformation,
 ) -> kuberic_runtime::Result<()> {
-    runtime.describe_custom_peer(replica).await
+    runtime.describe_peer(replica).await
+}
+
+pub async fn execute_build(
+    runtime: &crate::hosting::PodRuntime,
+    replica: kuberic_runtime::replicator::ReplicaInformation,
+) -> kuberic_runtime::Result<()> {
+    match runtime.execute_build(replica).await? {
+        crate::hosting::BuildExecution::ApplicationCompleted => Ok(()),
+        crate::hosting::BuildExecution::BuiltInCopyRequired => {
+            Err(kuberic_runtime::RuntimeError::Application(
+                "testing custom build requested the built-in copy route".into(),
+            ))
+        }
+    }
+}
+
+pub async fn set_lifecycle_access(
+    runtime: &crate::hosting::PodRuntime,
+    read: kuberic_protocol::types::AccessStatus,
+    write: kuberic_protocol::types::AccessStatus,
+) -> kuberic_runtime::Result<()> {
+    runtime.testing_set_access(read, write).await
+}
+
+pub async fn wait_for_lifecycle_catch_up(
+    runtime: &crate::hosting::PodRuntime,
+) -> kuberic_runtime::Result<()> {
+    runtime.testing_wait_for_catch_up().await
+}
+
+pub async fn admit_lifecycle_authority(
+    runtime: &crate::hosting::PodRuntime,
+    authority: kuberic_runtime_internal::authority::AdmittedAuthority,
+) -> kuberic_runtime::Result<()> {
+    runtime.testing_admit_authority(authority).await
+}
+
+pub async fn close_lifecycle(runtime: &crate::hosting::PodRuntime) -> kuberic_runtime::Result<()> {
+    runtime.testing_close().await
 }

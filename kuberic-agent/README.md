@@ -35,18 +35,24 @@ mismatch fails closed instead of creating empty authority. SQLite uses WAL and
 
 Primary promotion follows the SF host sequence: replicator role and epoch,
 including any provider-specific work that replicator owns, then application role.
-Abort stops the returned control
-before application teardown. The default replicator's managed capability is
-transferred directly into agent registration and is not returned to
-application code.
+Abort stops the returned control before application teardown. The default
+replicator's private lifecycle proof and data-plane capabilities are transferred
+directly into agent registration and are not returned to application code.
 
-Lifecycle hosting is selected independently of the optional `StateReplicator`.
-Every independently implemented `PrimaryReplicator` receives the same private
-SF configuration, role, build, catch-up and durable-effect support, whether or
-not it also supplies operation/copy streams. Its application calls that optional
-state capability directly. Only the registered default engine supplies
-`ManagedReplicator` internals for Kuberic's operation transport and write journal;
-custom lifecycle hosting does not implement or impersonate that capability.
+One lifecycle host is retained for every registered `PrimaryReplicator`,
+independently of the optional `StateReplicator`. It owns SF configuration,
+role/epoch, access proof, build selection, catch-up, removal, retirement,
+restart, Close, Abort, and durable effects for both built-in and custom
+implementations. Only the registered default engine supplies the separate
+managed replication/copy data plane and write journal; custom replicators do
+not implement or impersonate that capability.
+
+Lifecycle callbacks publish completion only after exact authority, process
+sessions, and callback generation are revalidated. Close, Abort, authority
+replacement, and session replacement cancel or stale delayed progress,
+configuration, catch-up, build, and removal results. Native build supersession
+may defer configuration without blocking admission; that work is bounded,
+generation-fenced, and cancelled by terminal or authority changes.
 
 Custom-primary scaling uses the existing generic authority and effect records.
 Candidate admission checks the exact live build selection and boundary.

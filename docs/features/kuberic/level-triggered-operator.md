@@ -26,16 +26,17 @@ The historical rationale and protocol design remain in the
 |---|---|
 | `kuberic-protocol` | Canonical identities, epochs, PC/CC configurations, validation, commands, normalized observations, and pure evaluation |
 | `kuberic-wire` | Exact-version protobuf and tonic contracts for controller, peer, copy, and replication traffic |
-| `kuberic-runtime` | Application interfaces, replication/copy streams, exact-authority acknowledgements, and quorum mechanics |
-| `kuberic-agent` | Replica process hosting, durable local authority, reconfiguration coordination, authenticated listeners, and restart reconstruction |
+| `kuberic-runtime` | Application interfaces plus hidden, separately registered default-engine lifecycle proofs and replication/copy data plane |
+| `kuberic-agent` | One lifecycle owner for every primary implementation: durable local authority, sessions, access, builds, removal, retirement, callback fencing, listeners, and restart reconstruction |
 | `kuberic-controller` | Kubernetes observation, normalization, pure-plan execution, routing fences, resource convergence, and bounded re-observation |
 | `kvstore2` | Small HTTP key-value conformance application for the independent stack |
 
 The controller is the Failover Manager-equivalent owner. The agent and its
 coordinator own Replica Agent-equivalent local reconfiguration. `ReplicaHost`
 and `PodRuntime` own hosting and lifecycle effects. The default runtime
-replicator owns data-plane replication, copy, retained send windows, and
-quorum credit.
+replicator supplies the optional data plane for replication, copy, retained send
+windows, and quorum credit. Custom replicators use the same lifecycle host but
+retain their native data plane.
 
 Every reconcile observes the current CR, Pods, PVCs, Services, Secrets, and
 available agent reports; normalizes them; validates the complete snapshot; and

@@ -16,16 +16,18 @@ use async_trait::async_trait;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
     PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
+    SecondaryRemovalPreparation, SecondaryRemovalWitness, SecondaryScaleDownCleanup,
+    SecondaryScaleDownIntent,
 };
 use kuberic_runtime_internal::RuntimeHostToken;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
 use crate::authority::{
-    BuildAuthorityStore, BuildProgressStore, LocalWriteJournal, ReplicaAuthorityStore,
-    ReplicationProgressStore,
+    AdmittedAuthority, BuildAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
+    ReplicaAuthorityStore, ReplicationProgressStore, RetiredAuthority,
 };
-use crate::effects::{RuntimeEffectAction, RuntimeSnapshot};
+use crate::effects::RuntimeSnapshot;
 use crate::engine::DurableState;
 use crate::internal::{DefaultReplicatorInner, PendingReplication, PendingWrite};
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
@@ -76,30 +78,92 @@ pub trait StateReplicator: Send + Sync {
 
 #[async_trait]
 #[doc(hidden)]
-pub trait ManagedReplicator: Send + Sync {
+pub trait ManagedReplicatorLifecycle: Send + Sync {
     async fn fence_writes(&self) -> Result<()>;
     async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
-    async fn restore_authority(&self) -> Result<()>;
-    async fn recover_pending_writes(&self) -> Result<()>;
-    async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()>;
-    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
+    async fn prepare_access(&self, read: AccessStatus, write: AccessStatus) -> Result<u64>;
+    async fn publish_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+        generation: u64,
+    ) -> Result<()>;
+    async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()>;
+    async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()>;
+    async fn wait_for_catch_up_proof(&self) -> Result<()>;
+    async fn prepare_switchover_proof(
+        &self,
+        preparation_generation: u64,
+        request_id: kuberic_protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
+        starting_epoch: Epoch,
+    ) -> Result<()>;
+    async fn prepare_secondary_removal_proof(
+        &self,
+        intent: SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<SecondaryRemovalPreparation>;
+    async fn observe_secondary_removal_proof(&self, witness: SecondaryRemovalWitness)
+    -> Result<()>;
+    async fn observe_secondary_removal_progress_proof(
+        &self,
+        witness: SecondaryRemovalWitness,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<()>;
+    async fn accept_secondary_removal_proof(
+        &self,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<()>;
+    async fn accept_historical_secondary_removal_proof(
+        &self,
+        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()>;
+    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
+    async fn complete_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
+    async fn register_peer_session_proof(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()>;
+    async fn admit_build_authority_proof(&self, authority: BuildAuthority) -> Result<()>;
+    async fn retire_build_proof(&self, build_id: OperationId) -> Result<()>;
+    async fn build_replica_proof(&self, replica: ReplicaInformation) -> Result<()>;
+    async fn remove_replica_proof(&self, replica_id: ReplicaId) -> Result<()>;
+    async fn refresh_progress_proof(&self) -> Result<()>;
+    async fn restore_engine_proof(&self) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
-    fn abort(&self);
     async fn complete_open(&self, replication_address: String) -> Result<()>;
     async fn attach_interfaces(
         &self,
         control: Arc<dyn Replicator>,
         primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()>;
+    fn abort(&self);
+}
+
+#[async_trait]
+#[doc(hidden)]
+pub trait ManagedReplicatorDataPlane: Send + Sync {
+    async fn next_outbound_item(&self) -> Option<OutboundOperation>;
+    async fn recover_pending_writes(&self) -> Result<()>;
+    async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()>;
     async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite>;
+    async fn observe_acknowledgement(
+        &self,
+        acknowledgement: ReplicationAck,
+        session: ProcessSessionId,
+    ) -> Result<()>;
     async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()>;
     async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy>;
     async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()>;
     async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck>;
     async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication>;
-    async fn next_outbound(&self) -> Option<OutboundOperation>;
+    fn abort(&self);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,12 +328,20 @@ impl ReplicatorFactoryContext {
         context
     }
 
-    async fn register_managed(&self, managed: Arc<dyn ManagedReplicator>) -> Result<()> {
+    async fn register_managed<T>(&self, managed: Arc<T>) -> Result<()>
+    where
+        T: ManagedReplicatorLifecycle + ManagedReplicatorDataPlane + 'static,
+    {
         let reservation = self.reservation.ok_or_else(|| {
             RuntimeError::Application("managed replicator registration is not reserved".into())
         })?;
+        let lifecycle: Arc<dyn ManagedReplicatorLifecycle> = managed.clone();
         self.registration
-            .register_managed(managed, reservation)
+            .register_managed_lifecycle(lifecycle, reservation)
+            .await?;
+        let data_plane: Arc<dyn ManagedReplicatorDataPlane> = managed;
+        self.registration
+            .register_managed_data_plane(data_plane, reservation)
             .await
     }
 }
@@ -308,9 +380,15 @@ pub trait ReplicatorRegistration: Send + Sync {
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation);
 
-    async fn register_managed(
+    async fn register_managed_lifecycle(
         &self,
-        managed: Arc<dyn ManagedReplicator>,
+        lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<()>;
+
+    async fn register_managed_data_plane(
+        &self,
+        data_plane: Arc<dyn ManagedReplicatorDataPlane>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()>;
 
@@ -569,11 +647,11 @@ impl PrimaryReplicator for DefaultReplicator {
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        self.engine.wait_for_build(replica).await
+        self.engine.wait_for_build(replica, true).await
     }
 
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
-        self.engine.remove_replica(replica_id).await
+        self.engine.remove_replica(replica_id, true).await
     }
 }
 

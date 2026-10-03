@@ -22,6 +22,7 @@ SQL client -> SqliteServer -> serialized SQLite connection
                               -> durable commitment -> local WAL publication
 
 ReplicaHost -> agent authority/effect/write/build journals
+            -> common lifecycle owner for authority/access/build/removal/restart
             -> StatefulServiceReplica lifecycle + StateProvider callbacks
 
 Secondary stream -> SqlitePersistence base/history -> fsync -> explicit ACK
@@ -34,6 +35,12 @@ v2 lifecycle and creates the default replicator with a separate
 [`ReplicaHost` entry point](../../../examples/sqlite/src/main.rs) owns agent
 startup and recovery; the application owns the SQL listener. Applications never
 select their own membership, verified prefix, or write grant.
+
+The default engine registers private lifecycle proof and replication/copy
+capabilities separately. SQLite uses both: common agent hosting owns lifecycle
+authority, access, builds, removal and restart, while the default data plane
+retains the existing WAL-frame replication, copy, acknowledgement and quorum
+behavior. The public SQLite service/factory call sites are unchanged.
 
 Each service instance registers a process-unique VFS name, including in-process
 restarts. Barrier sender, receipt, cancellation, and same-process fence state are

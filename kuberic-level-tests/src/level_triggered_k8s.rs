@@ -3915,7 +3915,10 @@ fn active_scale_up_copy_checkpoint(
             && candidate["previousConfiguration"].is_null()
             && candidate["currentConfiguration"].is_null()
             && candidate["scaleUpOperation"].is_null()
-            && candidate["readStatus"] == "NotPrimary"
+            && matches!(
+                candidate["readStatus"].as_str(),
+                Some("NotPrimary" | "ReconfigurationPending")
+            )
             && matches!(
                 candidate["writeStatus"].as_str(),
                 Some("NotPrimary" | "ReconfigurationPending")
@@ -7711,7 +7714,43 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
                     .any(|condition| condition["type"] == "Ready" && condition["status"] == "true")
             });
         if authority["initialized"] == true && members == 3 && ready {
-            break;
+            let primary = kubectl(
+                &kubeconfig,
+                &context,
+                &[
+                    "-n",
+                    "default",
+                    "get",
+                    "pod",
+                    "-l",
+                    "operator.kuberic.io/replica-id=1",
+                    "-o",
+                    "jsonpath={.items[0].metadata.name}",
+                ],
+            );
+            if let Ok(primary) = primary {
+                let status = kubectl(
+                    &kubeconfig,
+                    &context,
+                    &[
+                        "-n",
+                        "default",
+                        "exec",
+                        primary.trim(),
+                        "--",
+                        "curl",
+                        "--fail",
+                        "--silent",
+                        "http://127.0.0.1:8080/status",
+                    ],
+                );
+                if let Ok(status) = status {
+                    let status: serde_json::Value = serde_json::from_str(&status)?;
+                    if status["writeStatus"] == "Granted" {
+                        break;
+                    }
+                }
+            }
         }
         if std::time::Instant::now() >= deadline {
             bail!("bootstrap did not accept a three-member topology");
@@ -7878,6 +7917,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
             let after: serde_json::Value = serde_json::from_str(&status)?;
             if after["processSession"] != before["processSession"]
                 && after["currentConfiguration"] == before["currentConfiguration"]
+                && after["readStatus"] == "Granted"
             {
                 break;
             }
@@ -7902,6 +7942,34 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
             "jsonpath={.items[0].metadata.name}",
         ],
     )?;
+    let access_deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let status = kubectl(
+            &kubeconfig,
+            &context,
+            &[
+                "-n",
+                "default",
+                "exec",
+                pod.trim(),
+                "--",
+                "curl",
+                "--fail",
+                "--silent",
+                "http://127.0.0.1:8080/status",
+            ],
+        );
+        if let Ok(status) = status {
+            let status: serde_json::Value = serde_json::from_str(&status)?;
+            if status["writeStatus"] == "Granted" {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= access_deadline {
+            bail!("primary did not restore write access after bootstrap restart");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
     let output = Command::new("kubectl")
         .args([
             "--kubeconfig",

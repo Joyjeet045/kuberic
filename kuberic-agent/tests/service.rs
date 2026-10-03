@@ -1497,7 +1497,11 @@ async fn scale_up_source_service_startup_restores_completed_evidence_without_rep
         .observation
         .unwrap();
     assert_eq!(response.write_status, proto::AccessStatus::Granted as i32);
-    assert!(response.builds.is_empty());
+    assert!(response.builds.iter().any(|build| {
+        build.build_id == fixture.build_id.as_str()
+            && build.completed
+            && build.catch_up_boundary_lsn == Some(0)
+    }));
     assert!(
         fixture
             .store
@@ -1691,9 +1695,9 @@ async fn scale_up_transport_cancellation_reissues_exact_build_and_resumes_partia
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(5), first)
             .await
-            .expect("cancelled source build request completed")
+            .expect("asynchronous source build dispatch completed")
             .unwrap()
-            .is_err()
+            .is_ok()
     );
     let cancelled = fixture.store.load_state().await.unwrap();
     assert!(
@@ -1731,11 +1735,27 @@ async fn scale_up_transport_cancellation_reissues_exact_build_and_resumes_partia
     .into_inner()
     .observation
     .unwrap();
-    let completed_source = retried
-        .builds
-        .iter()
-        .find(|build| build.build_id == fixture.build_id.as_str())
-        .unwrap();
+    assert!(
+        retried
+            .builds
+            .iter()
+            .any(|build| build.build_id == fixture.build_id.as_str())
+    );
+    let completed_source = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status = service_status(source_control, &fixture.primary).await;
+            if let Some(build) = status
+                .builds
+                .into_iter()
+                .find(|build| build.build_id == fixture.build_id.as_str() && build.completed)
+            {
+                break build;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("source observed exact asynchronous build completion");
     assert!(completed_source.completed);
     assert_eq!(
         completed_source.replication_boundary_lsn,

@@ -7,8 +7,9 @@ use std::sync::{Arc, Weak};
 use bytes::Bytes;
 use futures::StreamExt;
 use kuberic_protocol::types::{
-    AccessStatus, ConfigurationDescriptor, Epoch, OperationId, ReplicaId, ReplicaIdentity,
-    ReplicaRole, SecondaryRemovalPreparation, SecondaryRemovalStage, SecondaryScaleDownCleanup,
+    AccessStatus, ConfigurationDescriptor, Epoch, OperationId, ProcessSessionId, ReplicaId,
+    ReplicaIdentity, ReplicaRole, SecondaryRemovalPreparation, SecondaryRemovalStage,
+    SecondaryScaleDownCleanup,
 };
 use kuberic_protocol::validation::{
     validate_secondary_removal_preparation, validate_secondary_scale_down_cleanup,
@@ -36,7 +37,8 @@ use crate::replicator::copy::{
 use crate::replicator::log::{PreparedWrite, ReplicationLog};
 use crate::replicator::stream::{OperationCompletion, OperationMetadata, ServiceStreams};
 use crate::replicator::{
-    ManagedReplicator, PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode, Replicator,
+    ManagedReplicatorDataPlane, ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation,
+    ReplicaSetQuorumMode, Replicator,
 };
 use crate::{Result, RuntimeError};
 
@@ -64,7 +66,6 @@ struct RuntimeState {
     outbound_builds: BTreeMap<OperationId, OutboundBuild>,
     cancelled_outbound_builds: BTreeSet<OperationId>,
     removed_replicas: BTreeSet<ReplicaId>,
-    pending_evictions: BTreeSet<ReplicaIdentity>,
     local_writes: BTreeMap<OperationId, DurableLocalWrite>,
     peer_repair_targets: BTreeMap<ReplicaIdentity, i64>,
 }
@@ -249,7 +250,6 @@ impl DefaultReplicatorInner {
                 outbound_builds: BTreeMap::new(),
                 cancelled_outbound_builds: BTreeSet::new(),
                 removed_replicas: BTreeSet::new(),
-                pending_evictions: BTreeSet::new(),
                 local_writes: BTreeMap::new(),
                 peer_repair_targets: BTreeMap::new(),
             }),
@@ -728,7 +728,11 @@ impl DefaultReplicatorInner {
         }
     }
 
-    pub(crate) async fn wait_for_build(&self, replica: ReplicaInformation) -> Result<()> {
+    pub(crate) async fn wait_for_build(
+        &self,
+        replica: ReplicaInformation,
+        dispatch: bool,
+    ) -> Result<()> {
         self.require_primary().await?;
         let build_generation = self.fence_generation.load(Ordering::Acquire);
         if replica.identity == self.identity {
@@ -749,12 +753,14 @@ impl DefaultReplicatorInner {
             state.removed_replicas.remove(&replica.identity.replica_id);
             state.cancelled_outbound_builds.remove(&build_id);
         }
-        self.send_outbound(OutboundOperation::Build(ReplicaEndpoint {
-            build_id: replica.build_id,
-            identity: replica.identity.clone(),
-            replication_address: replica.replication_address.clone(),
-        }))
-        .await?;
+        if dispatch {
+            self.send_outbound(OutboundOperation::Build(ReplicaEndpoint {
+                build_id: replica.build_id.clone(),
+                identity: replica.identity.clone(),
+                replication_address: replica.replication_address.clone(),
+            }))
+            .await?;
+        }
         loop {
             let changed = self.changed.notified();
             self.require_primary().await?;
@@ -797,7 +803,7 @@ impl DefaultReplicatorInner {
         }
     }
 
-    pub(crate) async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
+    pub(crate) async fn remove_replica(&self, replica_id: ReplicaId, dispatch: bool) -> Result<()> {
         let _guard = self.effect_lock.lock().await;
         self.require_primary().await?;
         let mut state = self.state.write().await;
@@ -817,8 +823,10 @@ impl DefaultReplicatorInner {
             .retain(|_, build| build.progress.authority.target.replica_id != replica_id);
         state.removed_replicas.insert(replica_id);
         drop(state);
-        self.send_outbound(OutboundOperation::Remove(replica_id))
-            .await?;
+        if dispatch {
+            self.send_outbound(OutboundOperation::Remove(replica_id))
+                .await?;
+        }
         self.changed.notify_waiters();
         Ok(())
     }
@@ -947,13 +955,6 @@ impl DefaultReplicatorInner {
             }
         }
         let mut state = self.state.write().await;
-        if authority.previous_configuration.is_none()
-            && let Some(evidence) = &authority.secondary_removal
-        {
-            state
-                .pending_evictions
-                .insert(evidence.preparation.intent.target.clone());
-        }
         state.authority = Some(authority);
         state.replication_progress = Some(replication_progress);
         Ok(())
@@ -2609,7 +2610,6 @@ impl DefaultReplicatorInner {
                         .outbound_builds
                         .retain(|_, b| b.progress.authority.target != target);
                     state.peer_repair_targets.remove(&target);
-                    state.pending_evictions.insert(target);
                 }
                 let mut state = self.state.write().await;
                 if !authority_changed || preserve_scale_up_access {
@@ -3561,8 +3561,76 @@ impl DefaultReplicatorInner {
     }
 }
 
+impl DefaultReplicatorInner {
+    async fn execute_managed_proof_action(&self, action: RuntimeEffectAction) -> Result<()> {
+        if matches!(
+            action,
+            RuntimeEffectAction::Open(_)
+                | RuntimeEffectAction::ChangeRole(_)
+                | RuntimeEffectAction::ChangeReplicatorRole(_)
+                | RuntimeEffectAction::UpdateEpoch
+                | RuntimeEffectAction::ChangeApplicationRole(_)
+                | RuntimeEffectAction::BuildReplica { .. }
+                | RuntimeEffectAction::Close
+                | RuntimeEffectAction::Abort
+        ) {
+            return Err(RuntimeError::Application(
+                "application lifecycle actions belong to the hosting runtime".into(),
+            ));
+        }
+        if matches!(action, RuntimeEffectAction::WaitForCatchup) {
+            self.check_aborted()?;
+            self.execute_action(action).await?;
+            self.changed.notify_waiters();
+            return Ok(());
+        }
+        let granting = matches!(
+            action,
+            RuntimeEffectAction::SetAccessStatus {
+                write: AccessStatus::Granted,
+                ..
+            } | RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+        );
+        let recover_scale_up_writes = matches!(
+            &action,
+            RuntimeEffectAction::AdmitAuthority(authority)
+                if matches!(
+                    authority.scale_up.as_deref(),
+                    Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
+                )
+        );
+        let generation = self.fence_generation.load(Ordering::Acquire);
+        if granting {
+            self.validate_removal_write_grant().await?;
+        }
+        if granting && self.state.read().await.write_status != AccessStatus::Granted {
+            self.recover_pending_local_writes().await?;
+        }
+        {
+            let _guard = self.effect_lock.lock().await;
+            if !matches!(action, RuntimeEffectAction::CompleteRetirement(_)) {
+                self.check_aborted()?;
+                if self.state.read().await.retiring_authority.is_some()
+                    && !matches!(action, RuntimeEffectAction::FenceRetirement(_))
+                {
+                    return Err(RuntimeError::Closed);
+                }
+            }
+            if granting && generation != self.fence_generation.load(Ordering::Acquire) {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            self.execute_action(action).await?;
+        }
+        if recover_scale_up_writes && !self.state.read().await.local_writes.is_empty() {
+            self.recover_pending_local_writes().await?;
+        }
+        self.changed.notify_waiters();
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
-impl ManagedReplicator for DefaultReplicatorInner {
+impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
     async fn complete_open(&self, replication_address: String) -> Result<()> {
         self.complete_open(replication_address).await
     }
@@ -3573,48 +3641,6 @@ impl ManagedReplicator for DefaultReplicatorInner {
         primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()> {
         self.attach_interfaces(control, primary).await
-    }
-
-    async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
-        self.begin_write(write).await
-    }
-
-    async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()> {
-        self.accept_acknowledgement(acknowledgement).await
-    }
-
-    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
-        self.prepare_copy(request).await
-    }
-
-    async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()> {
-        self.accept_copy_acknowledgement(acknowledgement).await
-    }
-
-    async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck> {
-        self.receive_copy_item(item).await
-    }
-
-    async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication> {
-        self.weak_self
-            .upgrade()
-            .ok_or(RuntimeError::Closed)?
-            .receive_replication(item)
-            .await
-    }
-
-    async fn next_outbound(&self) -> Option<OutboundOperation> {
-        let mut receiver = self.outbound_rx.lock().await;
-        loop {
-            let changed = self.changed.notified();
-            if let Some(identity) = self.state.write().await.pending_evictions.pop_first() {
-                return Some(OutboundOperation::Evict(identity));
-            }
-            tokio::select! {
-                item = receiver.recv() => return item,
-                _ = changed => {}
-            }
-        }
     }
 
     async fn fence_writes(&self) -> Result<()> {
@@ -3705,84 +3731,225 @@ impl ManagedReplicator for DefaultReplicatorInner {
         Ok(())
     }
 
-    async fn restore_authority(&self) -> Result<()> {
-        self.restore_authority().await
-    }
-
-    async fn recover_pending_writes(&self) -> Result<()> {
-        self.recover_pending_local_writes().await
-    }
-
-    async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()> {
-        self.repair_peer_from_history(identity, progress).await
-    }
-
-    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
-        if matches!(
-            action,
-            RuntimeEffectAction::Open(_)
-                | RuntimeEffectAction::ChangeRole(_)
-                | RuntimeEffectAction::ChangeReplicatorRole(_)
-                | RuntimeEffectAction::UpdateEpoch
-                | RuntimeEffectAction::ChangeApplicationRole(_)
-                | RuntimeEffectAction::BuildReplica { .. }
-                | RuntimeEffectAction::Close
-                | RuntimeEffectAction::Abort
-        ) {
-            return Err(RuntimeError::Application(
-                "application lifecycle actions belong to the hosting runtime".into(),
-            ));
-        }
-        if matches!(action, RuntimeEffectAction::WaitForCatchup) {
-            self.check_aborted()?;
-            self.execute_action(action).await?;
-            self.changed.notify_waiters();
-            return Ok(());
-        }
-        let granting = matches!(
-            action,
-            RuntimeEffectAction::SetAccessStatus {
-                write: AccessStatus::Granted,
-                ..
-            } | RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
-        );
-        let recover_scale_up_writes = matches!(
-            &action,
-            RuntimeEffectAction::AdmitAuthority(authority)
-                if matches!(
-                    authority.scale_up.as_deref(),
-                    Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
-                )
-        );
+    async fn prepare_access(&self, read: AccessStatus, write: AccessStatus) -> Result<u64> {
+        self.check_aborted()?;
         let generation = self.fence_generation.load(Ordering::Acquire);
-        if granting {
+        if write == AccessStatus::Granted {
             self.validate_removal_write_grant().await?;
         }
-        if granting && self.state.read().await.write_status != AccessStatus::Granted {
-            // Keep public access closed while replaying the original durable identity.
-            // Do not hold effect_lock across the quorum wait: ACKs need that lock.
-            self.recover_pending_local_writes().await?;
-        }
+        if write == AccessStatus::Granted
+            && self.state.read().await.write_status != AccessStatus::Granted
         {
-            let _guard = self.effect_lock.lock().await;
-            if !matches!(action, RuntimeEffectAction::CompleteRetirement(_)) {
-                self.check_aborted()?;
-                if self.state.read().await.retiring_authority.is_some()
-                    && !matches!(action, RuntimeEffectAction::FenceRetirement(_))
-                {
-                    return Err(RuntimeError::Closed);
-                }
-            }
-            if granting && generation != self.fence_generation.load(Ordering::Acquire) {
-                return Err(RuntimeError::OperationCancelled);
-            }
-            self.execute_action(action).await?;
-        }
-        if recover_scale_up_writes && !self.state.read().await.local_writes.is_empty() {
             self.recover_pending_local_writes().await?;
         }
+        let state = self.state.read().await;
+        if read == AccessStatus::Granted
+            && (!state.open
+                || !matches!(
+                    state.role,
+                    ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                ))
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "read access requires an open Primary or Active Secondary".into(),
+            ));
+        }
+        if write == AccessStatus::Granted {
+            if !state.open {
+                return Err(RuntimeError::NotOpen);
+            }
+            if state.role != ReplicaRole::Primary {
+                return Err(RuntimeError::NotPrimary);
+            }
+            let authority = state
+                .authority
+                .as_ref()
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if authority.primary_identity() != &self.identity {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "write grant target is not the admitted primary".into(),
+                ));
+            }
+        }
+        let primary_read = read == AccessStatus::Granted && state.role == ReplicaRole::Primary;
+        drop(state);
+        if primary_read && !self.replicator.lock().await.catch_up_complete() {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        if generation != self.fence_generation.load(Ordering::Acquire) {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        Ok(generation)
+    }
+
+    async fn publish_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+        generation: u64,
+    ) -> Result<()> {
+        let _effect = self.effect_lock.lock().await;
+        self.check_aborted()?;
+        if generation != self.fence_generation.load(Ordering::Acquire) {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        if write != AccessStatus::Granted {
+            self.replicator.lock().await.fence_client_writes();
+        }
+        let mut state = self.state.write().await;
+        state.read_status = read;
+        state.write_status = write;
+        drop(state);
         self.changed.notify_waiters();
         Ok(())
+    }
+
+    async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::AdmitAuthority(Box::new(authority)))
+            .await
+    }
+
+    async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::AuthorizeFailoverPrefix(boundary))
+            .await
+    }
+
+    async fn wait_for_catch_up_proof(&self) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::WaitForCatchup)
+            .await
+    }
+
+    async fn prepare_switchover_proof(
+        &self,
+        preparation_generation: u64,
+        request_id: kuberic_protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
+        starting_epoch: Epoch,
+    ) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation,
+            request_id,
+            source,
+            target,
+            starting_configuration_id,
+            starting_epoch,
+        })
+        .await
+    }
+
+    async fn prepare_secondary_removal_proof(
+        &self,
+        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<kuberic_protocol::types::SecondaryRemovalPreparation> {
+        self.execute_managed_proof_action(RuntimeEffectAction::PrepareSecondaryRemoval {
+            intent: Box::new(intent),
+            process_session_id,
+            report_sequence,
+        })
+        .await?;
+        self.snapshot()
+            .await
+            .prepared_secondary_removal
+            .ok_or(RuntimeError::AuthorityNotAdmitted)
+    }
+
+    async fn observe_secondary_removal_proof(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::ObserveSecondaryRemovalWitness(
+            Box::new(witness),
+        ))
+        .await
+    }
+
+    async fn observe_secondary_removal_progress_proof(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::ObserveSecondaryRemovalProgress {
+            witness: Box::new(witness),
+            committed: Box::new(committed),
+        })
+        .await
+    }
+
+    async fn accept_secondary_removal_proof(
+        &self,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(
+            Box::new(committed),
+        ))
+        .await
+    }
+
+    async fn accept_historical_secondary_removal_proof(
+        &self,
+        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        self.execute_managed_proof_action(
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command)),
+        )
+        .await
+    }
+
+    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::FenceRetirement(Box::new(retired)))
+            .await
+    }
+
+    async fn complete_retirement_proof(&self, retired: RetiredAuthority) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::CompleteRetirement(Box::new(
+            retired,
+        )))
+        .await
+    }
+
+    async fn register_peer_session_proof(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::RegisterPeerSession {
+            identity,
+            session,
+        })
+        .await
+    }
+
+    async fn admit_build_authority_proof(&self, authority: BuildAuthority) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::AdmitBuildAuthority(Box::new(
+            authority,
+        )))
+        .await
+    }
+
+    async fn retire_build_proof(&self, build_id: OperationId) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::RetireBuild(build_id))
+            .await
+    }
+
+    async fn build_replica_proof(&self, replica: ReplicaInformation) -> Result<()> {
+        self.wait_for_build(replica, false).await
+    }
+
+    async fn remove_replica_proof(&self, replica_id: ReplicaId) -> Result<()> {
+        self.remove_replica(replica_id, false).await
+    }
+
+    async fn refresh_progress_proof(&self) -> Result<()> {
+        self.execute_managed_proof_action(RuntimeEffectAction::RefreshApplicationProgress)
+            .await
+    }
+
+    async fn restore_engine_proof(&self) -> Result<()> {
+        self.restore_authority().await
     }
 
     async fn snapshot(&self) -> RuntimeSnapshot {
@@ -3798,6 +3965,74 @@ impl ManagedReplicator for DefaultReplicatorInner {
         drop(state);
         self.changed.notify_waiters();
         Ok(())
+    }
+
+    fn abort(&self) {
+        self.control_abort();
+    }
+}
+
+#[async_trait::async_trait]
+impl ManagedReplicatorDataPlane for DefaultReplicatorInner {
+    async fn next_outbound_item(&self) -> Option<OutboundOperation> {
+        let mut receiver = self.outbound_rx.lock().await;
+        while let Some(item) = receiver.recv().await {
+            if matches!(
+                item,
+                OutboundOperation::Replication(_) | OutboundOperation::Copy(_)
+            ) {
+                return Some(item);
+            }
+        }
+        None
+    }
+
+    async fn recover_pending_writes(&self) -> Result<()> {
+        self.recover_pending_local_writes().await
+    }
+
+    async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()> {
+        self.repair_peer_from_history(identity, progress).await
+    }
+
+    async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
+        self.begin_write(write).await
+    }
+
+    async fn observe_acknowledgement(
+        &self,
+        acknowledgement: ReplicationAck,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        self.execute_action(RuntimeEffectAction::ObserveReplicationAck {
+            acknowledgement: Box::new(acknowledgement),
+            session,
+        })
+        .await
+    }
+
+    async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()> {
+        self.accept_acknowledgement(acknowledgement).await
+    }
+
+    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
+        self.prepare_copy(request).await
+    }
+
+    async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()> {
+        self.accept_copy_acknowledgement(acknowledgement).await
+    }
+
+    async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck> {
+        self.receive_copy_item(item).await
+    }
+
+    async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication> {
+        self.weak_self
+            .upgrade()
+            .ok_or(RuntimeError::Closed)?
+            .receive_replication(item)
+            .await
     }
 
     fn abort(&self) {

@@ -130,6 +130,7 @@ impl PgReplicator {
         self.instance
             .handle_error(
                 PgError::Process(error.to_string()).with_generation(generation),
+                None,
                 |fault, error| self.report(fault, error),
             )
             .await
@@ -142,7 +143,24 @@ impl PgReplicator {
         };
         Err(self
             .instance
-            .handle_error(error, |fault, error| self.report(fault, error))
+            .handle_error(error, None, |fault, error| self.report(fault, error))
+            .await)
+    }
+
+    async fn pg_result_for_access<T>(
+        &self,
+        result: std::result::Result<T, PgError>,
+        access_generation: Option<u64>,
+    ) -> Result<T> {
+        let error = match result {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        Err(self
+            .instance
+            .handle_error(error, access_generation, |fault, error| {
+                self.report(fault, error)
+            })
             .await)
     }
 
@@ -192,10 +210,14 @@ impl PgReplicator {
     }
 
     async fn validate(&self) -> Result<PgDurableState> {
-        self.validate_inner(true).await
+        self.validate_inner(true, None).await
     }
 
-    async fn validate_inner(&self, reconcile_stopped: bool) -> Result<PgDurableState> {
+    async fn validate_inner(
+        &self,
+        reconcile_stopped: bool,
+        access_generation: Option<u64>,
+    ) -> Result<PgDurableState> {
         let generation = self.instance.generation_id();
         let durable = match self.durable.revalidate().await {
             Ok(durable) => durable,
@@ -244,7 +266,7 @@ impl PgReplicator {
                     .await);
             }
             let (actual_system, timeline) = self
-                .pg_result(self.instance.control_identity().await)
+                .pg_result_for_access(self.instance.control_identity().await, access_generation)
                 .await?;
             if system != &actual_system || durable.timeline_id != Some(timeline) {
                 return Err(self
@@ -290,8 +312,11 @@ impl PgReplicator {
                         .await);
                 }
                 // An authorized retry may reuse completed initdb, never erase partial PGDATA.
-                self.pg_result(self.instance.control_identity().await)
-                    .await?;
+                self.pg_result_for_access(
+                    self.instance.control_identity().await,
+                    access_generation,
+                )
+                .await?;
             }
         }
         Ok(durable)
@@ -1200,9 +1225,14 @@ impl PgReplicator {
         }
     }
 
-    async fn set_access_status(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+    async fn set_access_status(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+        access_generation: u64,
+    ) -> Result<()> {
         let state = self.state.lock().await;
-        self.validate().await?;
+        self.validate_inner(true, Some(access_generation)).await?;
         if read == AccessStatus::Granted
             && write != AccessStatus::Granted
             && state.role == ReplicaRole::ActiveSecondary
@@ -1918,16 +1948,23 @@ impl Replicator for PgReplicator {
         PgReplicator::abort(self);
     }
     async fn current_progress(&self) -> Result<i64> {
+        let access_generation = self.instance.access_generation();
         {
             // Access regrant may retire a delayed reader's generation; role
             // publication must finish before any reader inspects native signals.
             let _publication = self.role_publication.read().await;
-            self.validate_inner(false).await?;
+            if let Err(error) = self.validate_inner(false, Some(access_generation)).await {
+                if access_generation != self.instance.access_generation() {
+                    return Err(RuntimeError::OperationCancelled);
+                }
+                return Err(error);
+            }
         }
         let partition = self.partition.upgrade().ok_or(RuntimeError::Closed)?;
         self.set_access_status(
             partition.get_read_status().await?,
             partition.get_write_status().await?,
+            access_generation,
         )
         .await?;
         let durable = self.durable.snapshot().await;

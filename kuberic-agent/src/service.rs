@@ -587,6 +587,10 @@ where
                 r.command.transition_kind
                     == kuberic_protocol::types::TransitionKind::SecondaryScaleDown
             });
+        let planned_switchover_pending = state.reconfiguration.as_ref().is_some_and(|record| {
+            record.command.transition_kind
+                == kuberic_protocol::types::TransitionKind::PlannedSwitchover
+        });
         self.runtime
             .reconstruct(
                 if state
@@ -610,6 +614,7 @@ where
                         .pending_effect
                         .as_ref()
                         .map(|pending| &pending.effect.action),
+                    removal_pending || planned_switchover_pending,
                 ),
                 transition,
             )
@@ -842,9 +847,10 @@ where
                 }
             }
             ProtocolCommand::EnsureConfiguration(command) => {
-                self.coordinator
-                    .ensure_configuration(*command)
+                let coordinator = self.coordinator.clone();
+                tokio::spawn(async move { coordinator.ensure_configuration(*command).await })
                     .await
+                    .map_err(|error| Status::internal(error.to_string()))?
                     .map_err(status_from_agent)?;
             }
             ProtocolCommand::PrepareSwitchover(command) => {
@@ -861,16 +867,14 @@ where
                         .register_peer(authority.source.clone(), source_session_id.clone())
                         .await;
                     self.runtime
-                        .register_custom_peer_session(
-                            authority.source.clone(),
-                            source_session_id.clone(),
-                        )
+                        .register_peer_session(authority.source.clone(), source_session_id.clone())
                         .await
                         .map_err(status_from_runtime)?;
                 }
-                self.coordinator
-                    .ensure_build(*command)
+                let coordinator = self.coordinator.clone();
+                tokio::spawn(async move { coordinator.ensure_build(*command).await })
                     .await
+                    .map_err(|error| Status::internal(error.to_string()))?
                     .map_err(status_from_agent)?;
             }
         }
@@ -891,15 +895,18 @@ where
 fn startup_write_status(
     persisted: kuberic_protocol::types::AccessStatus,
     pending: Option<&kuberic_runtime_internal::effects::RuntimeEffectAction>,
+    lifecycle_pending: bool,
 ) -> kuberic_protocol::types::AccessStatus {
-    if pending.is_some_and(|action| {
-        matches!(
-            action,
-            kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover { .. }
-                | kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
-                | kuberic_runtime_internal::effects::RuntimeEffectAction::RetireReplica(_)
-        )
-    }) {
+    if lifecycle_pending
+        || pending.is_some_and(|action| {
+            matches!(
+                action,
+                kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover { .. }
+                    | kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                    | kuberic_runtime_internal::effects::RuntimeEffectAction::RetireReplica(_)
+            )
+        })
+    {
         kuberic_protocol::types::AccessStatus::ReconfigurationPending
     } else {
         persisted
@@ -1240,7 +1247,8 @@ mod tests {
         assert_eq!(
             startup_write_status(
                 kuberic_protocol::types::AccessStatus::Granted,
-                Some(&action)
+                Some(&action),
+                false,
             ),
             kuberic_protocol::types::AccessStatus::ReconfigurationPending
         );
@@ -1312,7 +1320,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            startup_write_status(AccessStatus::Granted, Some(&pending)),
+            startup_write_status(AccessStatus::Granted, Some(&pending), false),
             AccessStatus::Granted
         );
     }

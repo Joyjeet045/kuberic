@@ -57,12 +57,16 @@ async fn retired_error_inside_sf_effect_cannot_abort_replacement_or_publish_succ
         let (sql, connection) = instance.connect_application().await.unwrap();
         sql.simple_query("SELECT 1").await.unwrap();
         gate.release.notify_one();
-        assert!(matches!(
-            old.await.unwrap(),
-            Err(kuberic_agent::AgentError::Runtime(
-                kuberic_runtime::RuntimeError::OperationCancelled
-            ))
-        ));
+        let old = old.await.unwrap();
+        assert!(
+            matches!(
+                old,
+                Err(kuberic_agent::AgentError::Runtime(
+                    kuberic_runtime::RuntimeError::OperationCancelled
+                ))
+            ),
+            "{old:?}"
+        );
         sql.simple_query("SELECT 1").await.unwrap();
         assert!(instance.is_running().await);
         assert_eq!(pod.runtime.partition_report().await.reported_fault, None);

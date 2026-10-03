@@ -463,15 +463,16 @@ async fn bounded_history_exhaustion_requires_epoch_advance_and_rejects_old_work_
             .authorize(&target, &format!("bounded-{index:04}"))
             .await;
         assert!(
-            source
-                .runtime
-                .execute_custom_build(ReplicaInformation::new(
+            kuberic_agent::testing::execute_build(
+                &source.runtime,
+                ReplicaInformation::new(
                     authority.build_id.clone(),
                     target.identity.clone(),
                     "http://127.0.0.1:0".into()
-                ))
-                .await
-                .is_err()
+                ),
+            )
+            .await
+            .is_err()
         );
         source
             .runtime
@@ -520,15 +521,16 @@ async fn bounded_history_exhaustion_requires_epoch_advance_and_rejects_old_work_
         Some(kuberic_protocol::types::Epoch::new(0, 1))
     );
     assert!(
-        source
-            .runtime
-            .execute_custom_build(ReplicaInformation::new(
+        kuberic_agent::testing::execute_build(
+            &source.runtime,
+            ReplicaInformation::new(
                 OperationId::new("bounded-0000"),
                 target.identity.clone(),
                 target.endpoint.clone()
-            ))
-            .await
-            .is_err()
+            ),
+        )
+        .await
+        .is_err()
     );
     let next = source.authorize(&target, "fresh-epoch-build").await;
     source.build(&target, &next).await.unwrap();

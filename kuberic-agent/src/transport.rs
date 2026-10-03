@@ -182,7 +182,7 @@ where
                 address,
             );
             description.process_session_id = report.process_session_id.clone();
-            self.runtime.describe_custom_peer(description).await?;
+            self.runtime.describe_peer(description).await?;
         }
         Ok(*report)
     }
@@ -207,7 +207,7 @@ where
     async fn dispatch_build_locked(&self, endpoint: ReplicaEndpoint) -> Result<()> {
         let target_session = self.peer_session(&endpoint.identity).await?;
         self.runtime
-            .register_custom_peer_session(endpoint.identity.clone(), target_session.clone())
+            .register_peer_session(endpoint.identity.clone(), target_session.clone())
             .await?;
         if self
             .completed_builds
@@ -278,12 +278,13 @@ where
         let build_id = endpoint.build_id.clone();
         if self
             .runtime
-            .execute_custom_build(kuberic_runtime::replicator::ReplicaInformation::new(
+            .execute_build(kuberic_runtime::replicator::ReplicaInformation::new(
                 build_id.clone(),
                 endpoint.identity.clone(),
                 report.replication_address.clone(),
             ))
             .await?
+            == crate::hosting::BuildExecution::ApplicationCompleted
         {
             self.completed_builds
                 .lock()

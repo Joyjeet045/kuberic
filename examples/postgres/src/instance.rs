@@ -217,6 +217,7 @@ pub struct PgInstanceManager {
     start_parameters: Mutex<Option<StartParameters>>,
     pub(crate) access_lock: Mutex<()>,
     pub(crate) access_state: AtomicU8,
+    access_generation: AtomicU64,
     #[cfg(feature = "testing")]
     cleanup_hook: ProcessMutex<Option<CleanupHook>>,
     #[cfg(feature = "testing")]
@@ -308,6 +309,7 @@ impl PgInstanceManager {
             start_parameters: Mutex::new(None),
             access_lock: Mutex::new(()),
             access_state: AtomicU8::new(crate::access::CLOSED),
+            access_generation: AtomicU64::new(0),
             #[cfg(feature = "testing")]
             cleanup_hook: ProcessMutex::new(None),
             #[cfg(feature = "testing")]
@@ -361,6 +363,19 @@ impl PgInstanceManager {
 
     pub(crate) fn generation_id(&self) -> u64 {
         self.generation().id
+    }
+
+    pub(crate) fn access_generation(&self) -> u64 {
+        self.access_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn advance_access_generation(&self) -> Result<u64, PgError> {
+        self.access_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|generation| generation + 1)
+            .map_err(|_| PgError::GenerationExhausted("access generation".into()))
     }
 
     pub(crate) async fn bind_generation_store(
@@ -457,6 +472,7 @@ impl PgInstanceManager {
     pub(crate) async fn handle_error<F, Fut>(
         &self,
         error: PgError,
+        access_generation: Option<u64>,
         report: F,
     ) -> kuberic_runtime::RuntimeError
     where
@@ -470,6 +486,9 @@ impl PgInstanceManager {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
+        }
+        if access_generation.is_some_and(|generation| generation != self.access_generation()) {
+            return kuberic_runtime::RuntimeError::OperationCancelled;
         }
         let _lifecycle = self.lifecycle().await;
         let generation = self.generation();

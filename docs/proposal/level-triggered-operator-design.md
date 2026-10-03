@@ -705,13 +705,17 @@ discovery. A primary-capable bundle derives control and primary views from one
 implementation; independently supplied control and primary objects are not a
 valid construction. The public factory context exposes immutable identity and partition
 access capabilities, never a concrete hosting or default-engine root.
-A managed bridge carries Kuberic hosting/default-replicator integration
-through agent-owned registration and is not returned in the
-application-visible interface bundle. The construction token comes from the
-unpublished runtime-internal package so ordinary runtime consumers cannot
+A private lifecycle proof capability and a separate optional managed data plane
+carry default-replicator integration through agent-owned registration and are
+not returned in the application-visible interface bundle. The agent constructs
+one common lifecycle host for built-in and custom primaries; only the default
+engine registers replication/copy operations. The construction token comes from
+the unpublished runtime-internal package so ordinary runtime consumers cannot
 forge the hosting boundary.
 User code constructs only the SF-shaped control, primary, and state interface
-bundle. Custom replicators own their data plane independently.
+bundle. Custom replicators own their data plane independently, while the common
+host fences delayed lifecycle callbacks by exact authority, sessions and
+terminal generation before publishing completion.
 Reservations, retries, exact ACK handling, authority admission, durable
 quorum finalization, queues, and copy/build bookkeeping belong to a distinct
 replication engine and MUST NOT be added to the public SF traits.

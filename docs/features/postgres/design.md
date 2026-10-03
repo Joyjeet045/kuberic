@@ -21,7 +21,7 @@ driver hierarchy.
 | Owner | Responsibility |
 |---|---|
 | Kuberic protocol/controller | Generic SF-inspired configuration, role, failover, handoff and membership choreography |
-| Private agent hosting | Durable identity, authority, effects, selected builds, exact process sessions, access decisions and callback receipts |
+| Private agent lifecycle host | Durable identity, authority, effects, selected builds, exact process sessions, proof-before-publication access, callback fencing, Close/Abort and restart reconstruction |
 | PostgreSQL custom replicator | WAL, system identity, timeline/LSN evidence, physical backup/rewind/recovery, synchronous policy, receiver drainage, replay and promotion |
 
 The agent delivers exact incarnation, session, endpoint, role and frozen progress
@@ -29,6 +29,13 @@ descriptions through `ReplicaInformation` / `ReplicaSetConfiguration` and the
 existing configuration/build/catch-up callbacks. Authority stores and mutation
 capabilities remain private. Unmanaged custom replicators remain fail-closed for
 managed admission.
+
+PostgreSQL uses the same common lifecycle owner as the built-in engine but does
+not register the built-in replication/copy data plane. Delayed native callback
+completion is accepted only under the original authority, process sessions and
+lifecycle generation. Authority/session replacement, Close and Abort cancel or
+stale the result before generic progress, access, build or removal credit is
+published.
 
 `GetCurrentProgress` exposes durable WAL end for ordering, not proof of replay;
 catch-up capability reports the beginning of retained WAL. A raw peer scalar,
@@ -94,6 +101,11 @@ Private hosting durably selects one immutable build generation per logical
 target slot. Completion receipts bind that authority to both current sessions
 and the local attempt. Supersession/replacement withdraws the old description;
 one scalar cannot certify multiple builds or resurrect completion after reopen.
+If supersession arrives while the old native callback is unwinding, the new
+configuration is deferred under a bounded generation-owned task. It can return
+durable admission without waiting behind the stale callback, but must complete
+within its deadline and revalidate authority/session/terminal state before the
+configuration becomes visible.
 
 The target validates its locally installed SF description and source evidence
 before destructive work. Configuration replacement cancels and joins stale work.

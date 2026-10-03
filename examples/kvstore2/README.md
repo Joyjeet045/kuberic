@@ -4,6 +4,10 @@
 Kuberic stack. It implements `StatefulServiceReplica`, `StateProvider`, and
 the durable default-engine storage adapter, then delegates replica-process
 assembly to `kuberic-agent::ReplicaHost`.
+The agent's common lifecycle owner handles authority, access, builds, removal,
+retirement and restart; the default engine remains the separately registered
+replication/copy data plane. This example is the live conformance path for that
+split.
 
 The HTTP API is:
 

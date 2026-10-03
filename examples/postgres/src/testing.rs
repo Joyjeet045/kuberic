@@ -237,17 +237,19 @@ impl PgPod {
         )
         .unwrap();
         self.refresh().await;
-        self.effect(RuntimeEffectAction::BuildReplica {
+        let build = self.effect(RuntimeEffectAction::BuildReplica {
             build_id: OperationId::new(id),
             target: target.identity.clone(),
             replication_address: String::new(),
+        });
+        tokio::pin!(build);
+        let data_plane = self.runtime.data_plane();
+        let outbound = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut build => panic!("build completed before dispatch: {result:?}"),
+                outbound = data_plane.next_outbound() => outbound,
+            }
         })
-        .await
-        .unwrap();
-        let outbound = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.runtime.data_plane().next_outbound(),
-        )
         .await
         .unwrap()
         .unwrap();
@@ -261,6 +263,7 @@ impl PgPod {
         .await
         .unwrap()
         .unwrap();
+        build.await.unwrap();
     }
 
     pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_agent::Result<()> {
@@ -383,7 +386,7 @@ impl PgPod {
             other.endpoint.clone(),
         );
         description.process_session_id = other.session.clone();
-        kuberic_agent::testing::describe_custom_peer(&self.runtime, description)
+        kuberic_agent::testing::describe_peer(&self.runtime, description)
             .await
             .unwrap();
     }
@@ -401,10 +404,12 @@ impl PgPod {
             .unwrap();
         self.peer(target).await;
         target.peer(self).await;
-        target
-            .effect(RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary))
-            .await
-            .unwrap();
+        if target.runtime.snapshot().await.role != ReplicaRole::IdleSecondary {
+            target
+                .effect(RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary))
+                .await
+                .unwrap();
+        }
         target
             .store
             .journal_build(&kuberic_protocol::command::EnsureReplicaBuild {
@@ -435,11 +440,14 @@ impl PgPod {
     ) -> kuberic_runtime::Result<()> {
         tokio::time::timeout(
             std::time::Duration::from_secs(70),
-            self.runtime.execute_custom_build(ReplicaInformation::new(
-                authority.build_id.clone(),
-                target.identity.clone(),
-                target.endpoint.clone(),
-            )),
+            kuberic_agent::testing::execute_build(
+                &self.runtime,
+                ReplicaInformation::new(
+                    authority.build_id.clone(),
+                    target.identity.clone(),
+                    target.endpoint.clone(),
+                ),
+            ),
         )
         .await
         .expect("native build deadline")?;

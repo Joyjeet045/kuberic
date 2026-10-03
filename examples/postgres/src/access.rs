@@ -21,6 +21,7 @@ impl<'a> PgAccessController<'a> {
     pub async fn close_external(&self) -> Result<(), PgError> {
         let _access = self.instance.access_lock.lock().await;
         if self.instance.access_state.load(Ordering::Acquire) != CLOSED {
+            self.instance.advance_access_generation()?;
             // A pre-authentication backend can retain the HBA rules inherited at
             // fork and is not yet terminable via pg_stat_activity. Fast shutdown
             // drains every socket; the owned restart installs closed HBA rules
@@ -40,6 +41,7 @@ impl<'a> PgAccessController<'a> {
         if self.instance.access_state.load(Ordering::Acquire) == GRANTED {
             return Ok(());
         }
+        self.instance.advance_access_generation()?;
         // A cancelled or failed grant still requires a full fence on the next
         // close, even if the reload acknowledgement has not completed.
         self.instance

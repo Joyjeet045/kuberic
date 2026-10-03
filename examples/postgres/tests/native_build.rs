@@ -553,14 +553,15 @@ async fn more_than_sixteen_terminal_builds_reclaim_capacity_and_slots_across_reo
                 );
             }
         } else {
-            let result = source
-                .runtime
-                .execute_custom_build(ReplicaInformation::new(
+            let result = kuberic_agent::testing::execute_build(
+                &source.runtime,
+                ReplicaInformation::new(
                     authority.build_id.clone(),
                     target.identity.clone(),
                     "http://127.0.0.1:0".into(),
-                ))
-                .await;
+                ),
+            )
+            .await;
             assert!(result.is_err());
         }
         source
@@ -603,15 +604,16 @@ async fn more_than_sixteen_terminal_builds_reclaim_capacity_and_slots_across_reo
     assert!(state.suspended_builds.is_empty());
     assert_eq!(state.retired_builds.len(), 20);
     assert!(
-        source
-            .runtime
-            .execute_custom_build(ReplicaInformation::new(
+        kuberic_agent::testing::execute_build(
+            &source.runtime,
+            ReplicaInformation::new(
                 OperationId::new("bounded-0"),
                 target.identity.clone(),
                 target.endpoint.clone()
-            ))
-            .await
-            .is_err()
+            ),
+        )
+        .await
+        .is_err()
     );
     let target = target.reopen().await;
     assert!(target.inject(&old_request.unwrap()).await.is_err());

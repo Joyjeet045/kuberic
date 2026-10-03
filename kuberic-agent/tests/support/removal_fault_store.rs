@@ -172,6 +172,18 @@ impl BuildAuthorityStore for FaultAuthorityStore {
     async fn admit_build(&self, authority: &BuildAuthority) -> ContractResult<()> {
         self.inner.admit_build(authority).await
     }
+    async fn select_build(
+        &self,
+        authority: &BuildAuthority,
+    ) -> ContractResult<kuberic_runtime_internal::authority::BuildSelection> {
+        self.inner.select_build(authority).await
+    }
+    async fn load_build_selection(
+        &self,
+        target: &kuberic_protocol::types::ReplicaIdentity,
+    ) -> ContractResult<Option<kuberic_runtime_internal::authority::BuildSelection>> {
+        self.inner.load_build_selection(target).await
+    }
 }
 
 #[async_trait]
@@ -184,5 +196,14 @@ impl BuildProgressStore for FaultAuthorityStore {
     }
     async fn record_build_progress(&self, progress: &DurableBuildProgress) -> ContractResult<()> {
         self.inner.record_build_progress(progress).await
+    }
+    async fn record_selected_build_progress(
+        &self,
+        selection: &kuberic_runtime_internal::authority::BuildSelection,
+        progress: &DurableBuildProgress,
+    ) -> ContractResult<()> {
+        self.inner
+            .record_selected_build_progress(selection, progress)
+            .await
     }
 }

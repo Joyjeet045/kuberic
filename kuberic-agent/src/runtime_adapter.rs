@@ -30,6 +30,38 @@ pub trait RuntimeEffectExecutor: Send + Sync {
     async fn cancel_build(&self, _build_id: &OperationId) -> Result<()> {
         Ok(())
     }
+
+    async fn reissue_build(
+        &self,
+        _build_id: OperationId,
+        _target: kuberic_protocol::types::ReplicaIdentity,
+        _replication_address: String,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn wait_for_build_completion(
+        &self,
+        _build_id: &OperationId,
+        _target: &kuberic_protocol::types::ReplicaIdentity,
+    ) -> Result<()> {
+        Err(AgentError::EffectConflict(
+            "runtime cannot observe build completion".into(),
+        ))
+    }
+
+    async fn observe_build_completion(
+        &self,
+        _effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectResult> {
+        Err(AgentError::EffectConflict(
+            "runtime cannot publish build completion".into(),
+        ))
+    }
+
+    async fn discard_cancelled_build_effect(&self, _effect: &RuntimeEffect) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -51,6 +83,31 @@ impl RuntimeEffectExecutor for PodRuntime {
 
     async fn cancel_build(&self, build_id: &OperationId) -> Result<()> {
         Ok(PodRuntime::cancel_outbound_build(self, build_id).await?)
+    }
+
+    async fn reissue_build(
+        &self,
+        build_id: OperationId,
+        target: kuberic_protocol::types::ReplicaIdentity,
+        replication_address: String,
+    ) -> Result<()> {
+        Ok(PodRuntime::reissue_outbound_build(self, build_id, target, replication_address).await?)
+    }
+
+    async fn wait_for_build_completion(
+        &self,
+        build_id: &OperationId,
+        target: &kuberic_protocol::types::ReplicaIdentity,
+    ) -> Result<()> {
+        Ok(PodRuntime::wait_for_build_completion(self, build_id, target).await?)
+    }
+
+    async fn observe_build_completion(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+        Ok(PodRuntime::observe_build_completion(self, effect).await?)
+    }
+
+    async fn discard_cancelled_build_effect(&self, effect: &RuntimeEffect) -> Result<()> {
+        Ok(PodRuntime::discard_cancelled_build_effect(self, effect).await?)
     }
 }
 
@@ -74,7 +131,19 @@ where
 
     pub async fn execute(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         match self.store.begin_effect(&effect).await? {
-            BeginEffect::Completed(result) => Ok(*result),
+            BeginEffect::Completed(result) => {
+                if let kuberic_runtime_internal::effects::RuntimeEffectAction::BuildReplica {
+                    build_id,
+                    target,
+                    replication_address,
+                } = effect.action
+                {
+                    self.executor
+                        .reissue_build(build_id, target, replication_address)
+                        .await?;
+                }
+                Ok(*result)
+            }
             BeginEffect::Execute(effect) | BeginEffect::Pending(effect) => {
                 let result = match self.executor.apply_runtime_effect(effect.clone()).await {
                     Ok(result) => result,
@@ -105,10 +174,77 @@ where
                     Err(error) => return Err(error),
                 };
                 require_matching_result(&effect, &result)?;
+                let pending_build_completion = match &effect.action {
+                    kuberic_runtime_internal::effects::RuntimeEffectAction::BuildReplica {
+                        build_id,
+                        target,
+                        ..
+                    } => !result.postcondition.builds.iter().any(|build| {
+                        &build.authority.build_id == build_id
+                            && &build.authority.target == target
+                            && build.completed
+                    }),
+                    _ => false,
+                };
+                if pending_build_completion {
+                    return Box::pin(self.await_build_completion(effect, result)).await;
+                }
                 self.store.mark_effect_applied(&effect).await?;
                 self.store.complete_effect(&result).await?;
                 Ok(result)
             }
+        }
+    }
+
+    async fn await_build_completion(
+        &self,
+        effect: RuntimeEffect,
+        dispatched: RuntimeEffectResult,
+    ) -> Result<RuntimeEffectResult> {
+        let (build_id, target) = match &effect.action {
+            kuberic_runtime_internal::effects::RuntimeEffectAction::BuildReplica {
+                build_id,
+                target,
+                ..
+            } => (build_id, target),
+            _ => {
+                return Err(AgentError::EffectConflict(
+                    "build completion wait requires a build effect".into(),
+                ));
+            }
+        };
+        match self
+            .executor
+            .wait_for_build_completion(build_id, target)
+            .await
+        {
+            Ok(()) => {
+                let completed = self
+                    .executor
+                    .observe_build_completion(effect.clone())
+                    .await?;
+                require_matching_result(&effect, &completed)?;
+                self.store.mark_effect_applied(&effect).await?;
+                self.store.complete_effect(&completed).await?;
+                Ok(completed)
+            }
+            Err(
+                error @ AgentError::Runtime(
+                    kuberic_runtime::RuntimeError::OperationCancelled
+                    | kuberic_runtime::RuntimeError::ReplicaRemoved(_),
+                ),
+            ) => {
+                let state = self.store.load_state().await?;
+                if state.abandoned_builds.contains(build_id) {
+                    return Err(error);
+                }
+                self.executor
+                    .discard_cancelled_build_effect(&effect)
+                    .await?;
+                self.store.cancel_effect(&effect).await?;
+                Ok(dispatched)
+            }
+            Err(error) => Err(error),
         }
     }
 

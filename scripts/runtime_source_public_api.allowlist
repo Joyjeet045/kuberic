@@ -246,26 +246,47 @@ public-path hidden trait crate::engine::DurableState::async fn finish_copy (& se
 public-path hidden trait crate::engine::DurableState::async fn get_replication_operations (& self , from_lsn : Lsn , to_lsn : Lsn ,) -> Result < RetainedOperationStream >
 public-path hidden trait crate::engine::DurableState::async fn verify_applied (& self , operation : & Operation) -> Result < bool >
 public-path hidden trait crate::engine::DurableState::async fn verify_copy_chunk (& self , build_id : & OperationId , sequence : u64 , chunk : & CopyChunk ,) -> Result < bool >
-public-path hidden trait crate::replicator::ManagedReplicator: Send + Sync
-public-path hidden trait crate::replicator::ManagedReplicator::async fn accept_acknowledgement (& self , acknowledgement : ReplicationAck) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn accept_copy_acknowledgement (& self , acknowledgement : CopyAck) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn attach_interfaces (& self , control : Arc < dyn Replicator > , primary : Option < Arc < dyn PrimaryReplicator > > ,) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn begin_write (& self , write : ClientWrite) -> Result < PendingWrite >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn cancel_configuration_work (& self) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn cancel_outbound_build (& self , build_id : & OperationId) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn complete_open (& self , replication_address : String) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn execute_action (& self , action : RuntimeEffectAction) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn fence_writes (& self) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn next_outbound (& self) -> Option < OutboundOperation >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn prepare_copy (& self , request : PrepareCopyRequest) -> Result < PreparedCopy >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn receive_copy_item (& self , item : CopyItem) -> Result < CopyAck >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn receive_replication (& self , item : ReplicationItem) -> Result < PendingReplication >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn recover_pending_writes (& self) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn repair_peer (& self , identity : ReplicaIdentity , progress : Lsn) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn restore_authority (& self) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn settle_primary_prefix (& self) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicator::async fn snapshot (& self) -> RuntimeSnapshot
-public-path hidden trait crate::replicator::ManagedReplicator::fn abort (& self)
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane: Send + Sync
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn accept_acknowledgement (& self , acknowledgement : ReplicationAck) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn accept_copy_acknowledgement (& self , acknowledgement : CopyAck) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn begin_write (& self , write : ClientWrite) -> Result < PendingWrite >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn next_outbound_item (& self) -> Option < OutboundOperation >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn observe_acknowledgement (& self , acknowledgement : ReplicationAck , session : ProcessSessionId ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn prepare_copy (& self , request : PrepareCopyRequest) -> Result < PreparedCopy >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn receive_copy_item (& self , item : CopyItem) -> Result < CopyAck >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn receive_replication (& self , item : ReplicationItem) -> Result < PendingReplication >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn recover_pending_writes (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn repair_peer (& self , identity : ReplicaIdentity , progress : Lsn) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::fn abort (& self)
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle: Send + Sync
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn accept_historical_secondary_removal_proof (& self , command : kuberic_protocol :: command :: AcceptSecondaryRemovalCommit ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn accept_secondary_removal_proof (& self , committed : SecondaryScaleDownCleanup ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn admit_authority_proof (& self , authority : AdmittedAuthority) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn admit_build_authority_proof (& self , authority : BuildAuthority) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn attach_interfaces (& self , control : Arc < dyn Replicator > , primary : Option < Arc < dyn PrimaryReplicator > > ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn authorize_failover_prefix_proof (& self , boundary : Lsn) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn build_replica_proof (& self , replica : ReplicaInformation) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn cancel_configuration_work (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn cancel_outbound_build (& self , build_id : & OperationId) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn complete_open (& self , replication_address : String) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn complete_retirement_proof (& self , retired : RetiredAuthority) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn fence_retirement_proof (& self , retired : RetiredAuthority) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn fence_writes (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn observe_secondary_removal_progress_proof (& self , witness : SecondaryRemovalWitness , committed : SecondaryScaleDownCleanup ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn observe_secondary_removal_proof (& self , witness : SecondaryRemovalWitness) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_access (& self , read : AccessStatus , write : AccessStatus) -> Result < u64 >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_secondary_removal_proof (& self , intent : SecondaryScaleDownIntent , process_session_id : ProcessSessionId , report_sequence : u64 ,) -> Result < SecondaryRemovalPreparation >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_switchover_proof (& self , preparation_generation : u64 , request_id : kuberic_protocol :: types :: SwitchoverRequestId , source : ReplicaIdentity , target : ReplicaIdentity , starting_configuration_id : kuberic_protocol :: types :: ConfigurationId , starting_epoch : Epoch ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn publish_access (& self , read : AccessStatus , write : AccessStatus , generation : u64 ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn refresh_progress_proof (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn register_peer_session_proof (& self , identity : ReplicaIdentity , session : ProcessSessionId ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn remove_replica_proof (& self , replica_id : ReplicaId) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn restore_engine_proof (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn retire_build_proof (& self , build_id : OperationId) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn settle_primary_prefix (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn snapshot (& self) -> RuntimeSnapshot
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn wait_for_catch_up_proof (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::fn abort (& self)
 public-path hidden trait crate::replicator::PartitionAccessView: Send + Sync
 public-path hidden trait crate::replicator::PartitionAccessView::async fn read_status (& self) -> Result < AccessStatus >
 public-path hidden trait crate::replicator::PartitionAccessView::async fn report_fault (& self , fault : FaultType) -> Result < () >
@@ -274,7 +295,8 @@ public-path hidden trait crate::replicator::PartitionAccessView::async fn write_
 public-path hidden trait crate::replicator::PartitionAccessView::fn partition_information (& self) -> PartitionInformation
 public-path hidden trait crate::replicator::ReplicatorRegistration: Send + Sync
 public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_interfaces (& self , interfaces : & ReplicatorInterfaces , provider : Option < Arc < dyn StateProvider > > , reservation : ReplicatorCreationReservation ,) -> Result < () >
-public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_managed (& self , managed : Arc < dyn ManagedReplicator > , reservation : ReplicatorCreationReservation ,) -> Result < () >
+public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_managed_data_plane (& self , data_plane : Arc < dyn ManagedReplicatorDataPlane > , reservation : ReplicatorCreationReservation ,) -> Result < () >
+public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_managed_lifecycle (& self , lifecycle : Arc < dyn ManagedReplicatorLifecycle > , reservation : ReplicatorCreationReservation ,) -> Result < () >
 public-path hidden trait crate::replicator::ReplicatorRegistration::fn cancel_replicator_creation (& self , reservation : ReplicatorCreationReservation)
 public-path hidden trait crate::replicator::ReplicatorRegistration::fn reserve_replicator_creation (& self) -> Result < ReplicatorCreationReservation >
 public-path hidden type crate::engine::RetainedOperationStream = Pin < Box < dyn Stream < Item = Result < Operation > > + Send > >

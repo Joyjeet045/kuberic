@@ -48,9 +48,10 @@ separate object. Custom factories use the same partition boundary and need not
 use the default engine or implement `DurableState` on the service.
 `CreateReplicator` is the construction boundary: the default factory creates
 one shared `DefaultReplicatorInner`, and the control, primary, state, and
-agent-managed façades all reference that inner. The managed façade is
-transferred directly to agent registration and is never returned in the
-application-visible interface bundle. `PodRuntime` owns the
+agent-managed capabilities all reference that inner. Private registration
+transfers a lifecycle proof capability and a separate optional replication/copy
+data plane; neither is returned in the application-visible interface bundle.
+`PodRuntime` owns the
 hosting registrar, application lifetime, Open registration, effect ordering,
 and exact returned-interface identity; it does not preconstruct unused default
 replication state for a custom factory. `PodRuntime` and that hosting registrar
@@ -150,10 +151,11 @@ capabilities, not a concrete runtime or default-engine pointer. Application
 and custom-factory code constructs only the SF-shaped interface bundle through
 `ReplicatorInterfaces::secondary` or `ReplicatorInterfaces::primary`. The
 primary constructor derives the control and primary views from the same
-allocation, matching SF's coherent interface-query invariant. The default
-implementation's managed data-plane bridge is transferred through an
-unforgeable unpublished agent/runtime registration boundary; custom
-replicators own their transport independently.
+allocation, matching SF's coherent interface-query invariant. The default implementation's lifecycle proof capability and managed data-plane
+bridge are transferred through an unforgeable unpublished agent/runtime
+registration boundary. Every primary implementation uses the common agent
+lifecycle owner; only the default engine supplies replication/copy operations.
+Custom replicators own their transport independently.
 
 `StateReplicator` and the factory's `StateProvider` argument are optional.
 The default factory requires `Some(provider)` and returns `Some(state_replicator)`;
@@ -167,11 +169,14 @@ and progress/catch-up boundary), including authorized idle replicas outside the
 voting set. Agent hosting installs these through configuration callbacks before
 dispatching `build_replica`. Configuration/epoch/session changes revoke old work;
 `remove_replica` retires idle build work without removing an admitted secondary.
-The private agent wrapper retains all durable authority/effect/store capabilities.
+The private agent lifecycle host retains all durable authority/effect/store
+capabilities, fences delayed callback completion by exact authority and session,
+and publishes access only after implementation-specific proof.
 An unmanaged custom factory without that hosting support remains rejected for
 managed admission.
 
-Private custom hosting durably selects one build per logical target slot.
+The common agent lifecycle host durably selects one build per logical target
+slot for custom implementations.
 Descriptions for superseded builds are withdrawn, and callback receipts bind
 the full authority/generation to both process sessions and the local attempt.
 An idle custom replicator must withhold build-ready progress until its durable

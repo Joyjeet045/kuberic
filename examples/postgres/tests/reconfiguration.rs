@@ -91,7 +91,7 @@ fn production_agent_restart_defers_persisted_grant_until_exact_discovery() {
                     other.endpoint.clone(),
                 );
                 replica.process_session_id = other.session.clone();
-                kuberic_agent::testing::describe_custom_peer(&pod.runtime, replica)
+                kuberic_agent::testing::describe_peer(&pod.runtime, replica)
                     .await
                     .unwrap();
             }

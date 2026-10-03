@@ -19,7 +19,7 @@ The `ordinary` profile is cluster-free and excludes PostgreSQL plus DEX's real
 Kubernetes target. It runs with four global slots; the SQLite group has one
 slot, and each agent process-boundary test reserves all four slots so its
 subprocess recovery deadlines are not competing with another test. CI divides
-the 900 current ordinary tests into four 225-test slices.
+the 920 current ordinary tests into four 230-test slices.
 
 The all-features archive includes every test binary, including resource-backed
 tiers. Validate its exact-one disposition and partition union before relying on
@@ -30,7 +30,7 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The validator accounts for 1,105 current tests: 900 ordinary, 170 directly
+The validator accounts for 1,125 current tests: 920 ordinary, 170 directly
 runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test, 18
 parent-driven subprocess helpers and four external SQL Server fixtures.
 
