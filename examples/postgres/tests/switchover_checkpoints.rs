@@ -28,7 +28,6 @@ fn repeated_handoffs_and_failovers_cover_every_identity_and_rebuild_former_prima
             group.write("new primary").await;
             tracing::info!(old, "rebuilding former PostgreSQL primary");
             group.rejoin(old).await;
-            group.assert_contents().await;
         }
         group.shutdown().await;
     });

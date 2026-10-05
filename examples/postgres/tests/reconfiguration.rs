@@ -1,4 +1,4 @@
-use postgres_replicated::testing::{PgGroup, run_pg_test};
+use postgres_replicated::testing::{AdmissionCut, PgGroup, RestartPart, run_pg_test};
 
 #[test_log::test]
 fn production_agent_restart_defers_persisted_grant_until_exact_discovery() {
@@ -234,23 +234,51 @@ fn application_process_restart_and_metadata_connection_reopen_preserve_committed
     });
 }
 
-#[test_log::test]
-fn scaling_reopens_application_and_agent_state_at_each_durable_admission_boundary() {
-    run_pg_test(|| async {
-        use postgres_replicated::testing::{AdmissionCut, RestartPart};
-        for cut in [
-            AdmissionCut::Built,
-            AdmissionCut::PreviousCurrent,
-            AdmissionCut::CurrentOnly,
-        ] {
-            for part in [RestartPart::ApplicationProcess, RestartPart::AgentHost] {
-                tracing::info!(?cut, ?part, "restarting scale-up at a durable boundary");
-                let mut group = PgGroup::singleton().await;
-                group.add_with_restart(2, Some((cut, part))).await;
-                group.write("after admission recovery").await;
-                group.assert_contents().await;
-                group.shutdown().await;
-            }
-        }
-    });
+async fn scaling_reopens_at(cut: AdmissionCut, part: RestartPart) {
+    tracing::info!(?cut, ?part, "restarting scale-up at a durable boundary");
+    let mut group = PgGroup::singleton().await;
+    group.add_with_restart(2, Some((cut, part))).await;
+    group.write("after admission recovery").await;
+    group.assert_contents().await;
+    group.shutdown().await;
 }
+
+macro_rules! scaling_restart_test {
+    ($name:ident, $cut:expr, $part:expr) => {
+        #[test_log::test]
+        fn $name() {
+            run_pg_test(|| scaling_reopens_at($cut, $part));
+        }
+    };
+}
+
+scaling_restart_test!(
+    scaling_reopens_application_after_built_boundary,
+    AdmissionCut::Built,
+    RestartPart::ApplicationProcess
+);
+scaling_restart_test!(
+    scaling_reopens_agent_after_built_boundary,
+    AdmissionCut::Built,
+    RestartPart::AgentHost
+);
+scaling_restart_test!(
+    scaling_reopens_application_after_previous_current_boundary,
+    AdmissionCut::PreviousCurrent,
+    RestartPart::ApplicationProcess
+);
+scaling_restart_test!(
+    scaling_reopens_agent_after_previous_current_boundary,
+    AdmissionCut::PreviousCurrent,
+    RestartPart::AgentHost
+);
+scaling_restart_test!(
+    scaling_reopens_application_after_current_only_boundary,
+    AdmissionCut::CurrentOnly,
+    RestartPart::ApplicationProcess
+);
+scaling_restart_test!(
+    scaling_reopens_agent_after_current_only_boundary,
+    AdmissionCut::CurrentOnly,
+    RestartPart::AgentHost
+);

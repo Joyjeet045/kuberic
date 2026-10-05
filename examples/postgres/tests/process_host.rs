@@ -1705,121 +1705,172 @@ impl HelperGate {
     }
 }
 
-async fn executable_owned_helpers_cancel_reap_and_retry() {
-    for (command, stage, daemon) in [
-        ("initdb", "empty", false),
-        ("initdb", "empty", true),
-        ("initdb", "partial", true),
-        ("initdb", "complete", true),
-        ("pg_controldata", "startup", false),
-        ("pg_controldata", "startup", true),
-        ("pg_isready", "startup", false),
-        ("pg_isready", "startup", true),
-        ("pg_isready", "health", true),
-    ] {
-        let root = TestDataDir::new("helper-cancel");
-        let gate = HelperGate::new(root.path(), command, stage, daemon);
-        let mut binary = if stage == "health" {
-            start_binary_with(root.path(), &gate.bin).await.0
-        } else {
-            gate.arm();
-            let binary = spawn_binary(root.path(), &gate.bin).await;
-            initialize_binary(&binary, root.path()).await;
-            binary
-        };
+async fn executable_owned_helper_cancel_reap_and_retry(command: &str, stage: &str, daemon: bool) {
+    let root = TestDataDir::new("helper-cancel");
+    let gate = HelperGate::new(root.path(), command, stage, daemon);
+    let mut binary = if stage == "health" {
+        start_binary_with(root.path(), &gate.bin).await.0
+    } else {
         gate.arm();
-        let supervisor = ProcessProbe::process(gate.wait(&mut binary).await);
-        let descendants = ProcessProbe::descendants(binary.child.id());
-        assert!(
-            descendants.len() >= 3,
-            "supervisor, helper and setsid child"
-        );
-        let mut unrelated = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let unrelated_probe = ProcessProbe::process(unrelated.id());
-        binary.signal(
-            if daemon {
-                rustix::process::Signal::TERM
-            } else {
-                rustix::process::Signal::INT
-            },
-            daemon,
-        );
-        let exit = binary.wait().await;
-        assert!(
-            exit.success(),
-            "{command}/{stage}/{daemon}: {exit}: {}",
-            binary.output()
-        );
-        supervisor.assert_reaped();
-        descendants.assert_reaped();
-        assert!(unrelated.try_wait().unwrap().is_none());
-        unrelated_probe.signal(rustix::process::Signal::TERM);
-        unrelated.wait().unwrap();
-        gate.assert_no_late_mutation(&binary).await;
-        binary.assert_stopped().await;
-        if command == "initdb" && stage == "empty" {
-            assert!(!binary.pgdata.join("PG_VERSION").exists());
-            assert!(!binary.pgdata.join("global/pg_control").exists());
-        }
-
-        if stage == "health" {
-            continue;
-        }
-        let before = files(&binary.pgdata);
-        let expected_system = if stage != "partial" && stage != "empty" {
-            Some(
-                PgInstanceManager::new(binary.pgdata.clone(), find_pg_bin(), binary.pgport)
-                    .control_identity()
-                    .await
-                    .unwrap()
-                    .0,
-            )
+        let binary = spawn_binary(root.path(), &gate.bin).await;
+        initialize_binary(&binary, root.path()).await;
+        binary
+    };
+    gate.arm();
+    let supervisor = ProcessProbe::process(gate.wait(&mut binary).await);
+    let descendants = ProcessProbe::descendants(binary.child.id());
+    assert!(
+        descendants.len() >= 3,
+        "supervisor, helper and setsid child"
+    );
+    let mut unrelated = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let unrelated_probe = ProcessProbe::process(unrelated.id());
+    binary.signal(
+        if daemon {
+            rustix::process::Signal::TERM
         } else {
-            None
-        };
-        let mut retry = spawn_binary(root.path(), &find_pg_bin()).await;
-        if stage == "partial" {
-            let exit = retry.wait().await;
-            assert!(!exit.success(), "{exit}: {}", retry.output());
-            assert!(
-                retry
-                    .output()
-                    .contains("cannot inspect PostgreSQL control data"),
-                "{}",
-                retry.output()
-            );
-            assert_eq!(
-                files(&retry.pgdata),
-                before,
-                "partial initdb must fail closed"
-            );
-            retry.assert_stopped().await;
-            continue;
-        }
-        grant_binary(&retry).await;
-        let instance = PgInstanceManager::new(retry.pgdata.clone(), find_pg_bin(), retry.pgport);
-        if let Some(expected) = expected_system {
-            assert_eq!(instance.control_identity().await.unwrap().0, expected);
-        }
-        let (sql, _) = instance.connect_application().await.unwrap();
-        assert_eq!(
-            sql.query_one("SELECT 42::int", &[])
+            rustix::process::Signal::INT
+        },
+        daemon,
+    );
+    let exit = binary.wait().await;
+    assert!(
+        exit.success(),
+        "{command}/{stage}/{daemon}: {exit}: {}",
+        binary.output()
+    );
+    supervisor.assert_reaped();
+    descendants.assert_reaped();
+    assert!(unrelated.try_wait().unwrap().is_none());
+    unrelated_probe.signal(rustix::process::Signal::TERM);
+    unrelated.wait().unwrap();
+    gate.assert_no_late_mutation(&binary).await;
+    binary.assert_stopped().await;
+    if command == "initdb" && stage == "empty" {
+        assert!(!binary.pgdata.join("PG_VERSION").exists());
+        assert!(!binary.pgdata.join("global/pg_control").exists());
+    }
+
+    if stage == "health" {
+        return;
+    }
+    let before = files(&binary.pgdata);
+    let expected_system = if stage != "partial" && stage != "empty" {
+        Some(
+            PgInstanceManager::new(binary.pgdata.clone(), find_pg_bin(), binary.pgport)
+                .control_identity()
                 .await
                 .unwrap()
-                .get::<_, i32>(0),
-            42
-        );
-        let descendants = ProcessProbe::descendants(retry.child.id());
-        retry.terminate();
+                .0,
+        )
+    } else {
+        None
+    };
+    let mut retry = spawn_binary(root.path(), &find_pg_bin()).await;
+    if stage == "partial" {
         let exit = retry.wait().await;
-        assert!(exit.success(), "{exit}: {}", retry.output());
-        descendants.assert_reaped();
+        assert!(!exit.success(), "{exit}: {}", retry.output());
+        assert!(
+            retry
+                .output()
+                .contains("cannot inspect PostgreSQL control data"),
+            "{}",
+            retry.output()
+        );
+        assert_eq!(
+            files(&retry.pgdata),
+            before,
+            "partial initdb must fail closed"
+        );
         retry.assert_stopped().await;
+        return;
     }
+    grant_binary(&retry).await;
+    let instance = PgInstanceManager::new(retry.pgdata.clone(), find_pg_bin(), retry.pgport);
+    if let Some(expected) = expected_system {
+        assert_eq!(instance.control_identity().await.unwrap().0, expected);
+    }
+    let (sql, _) = instance.connect_application().await.unwrap();
+    assert_eq!(
+        sql.query_one("SELECT 42::int", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        42
+    );
+    let descendants = ProcessProbe::descendants(retry.child.id());
+    retry.terminate();
+    let exit = retry.wait().await;
+    assert!(exit.success(), "{exit}: {}", retry.output());
+    descendants.assert_reaped();
+    retry.assert_stopped().await;
 }
+
+macro_rules! helper_cancel_test {
+    ($name:ident, $command:literal, $stage:literal, $daemon:literal) => {
+        async fn $name() {
+            executable_owned_helper_cancel_reap_and_retry($command, $stage, $daemon).await;
+        }
+    };
+}
+
+helper_cancel_test!(
+    cancel_foreground_initdb_on_empty_storage,
+    "initdb",
+    "empty",
+    false
+);
+helper_cancel_test!(
+    cancel_daemon_initdb_on_empty_storage,
+    "initdb",
+    "empty",
+    true
+);
+helper_cancel_test!(
+    cancel_daemon_initdb_on_partial_storage,
+    "initdb",
+    "partial",
+    true
+);
+helper_cancel_test!(
+    cancel_daemon_initdb_on_complete_storage,
+    "initdb",
+    "complete",
+    true
+);
+helper_cancel_test!(
+    cancel_foreground_controldata_during_startup,
+    "pg_controldata",
+    "startup",
+    false
+);
+helper_cancel_test!(
+    cancel_daemon_controldata_during_startup,
+    "pg_controldata",
+    "startup",
+    true
+);
+helper_cancel_test!(
+    cancel_foreground_readiness_during_startup,
+    "pg_isready",
+    "startup",
+    false
+);
+helper_cancel_test!(
+    cancel_daemon_readiness_during_startup,
+    "pg_isready",
+    "startup",
+    true
+);
+helper_cancel_test!(
+    cancel_daemon_readiness_during_health_check,
+    "pg_isready",
+    "health",
+    true
+);
 
 async fn executable_owned_helpers_root_loss_is_failure() {
     const HELPER: &str = "KUBERIC_TEST_HELPER_ROOT_LOSS";
@@ -2879,7 +2930,15 @@ mod tests {
     host_test!(executable_pre_readiness_signals_join_startup_and_reap);
     host_test!(executable_pre_readiness_startup_error_reaps);
     host_test!(executable_pre_readiness_supervisor_loss_never_succeeds);
-    host_test!(executable_owned_helpers_cancel_reap_and_retry);
+    host_test!(cancel_foreground_initdb_on_empty_storage);
+    host_test!(cancel_daemon_initdb_on_empty_storage);
+    host_test!(cancel_daemon_initdb_on_partial_storage);
+    host_test!(cancel_daemon_initdb_on_complete_storage);
+    host_test!(cancel_foreground_controldata_during_startup);
+    host_test!(cancel_daemon_controldata_during_startup);
+    host_test!(cancel_foreground_readiness_during_startup);
+    host_test!(cancel_daemon_readiness_during_startup);
+    host_test!(cancel_daemon_readiness_during_health_check);
     host_test!(executable_owned_helpers_root_loss_is_failure);
     host_test!(established_agent_and_postgres_lineage_mismatches_are_non_mutating);
     host_test!(unsafe_evidence_reports_permanent_fault_and_stops_granted_sql);

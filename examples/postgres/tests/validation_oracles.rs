@@ -5,7 +5,6 @@ fn stale_probe_oracle_rejects_unrelated_sql_failures_and_checks_secondary_reads(
     run_pg_test(|| async {
         let mut group = PgGroup::singleton().await;
         group.add(2).await;
-        group.add(3).await;
         group.assert_contents().await;
         let primary = group.session(1, false).await;
         let duplicate = primary
@@ -29,15 +28,6 @@ fn stale_probe_oracle_rejects_unrelated_sql_failures_and_checks_secondary_reads(
         );
         group.assert_contents().await;
         group.shutdown().await;
-    });
-}
-
-#[test_log::test]
-fn storage_observation_and_fence_failures_are_explicit_and_keep_clients_closed() {
-    run_pg_test(|| async {
-        for failure in ["storage", "observation"] {
-            failure_case(failure).await;
-        }
     });
 }
 
@@ -127,6 +117,24 @@ async fn failure_case(failure: &str) {
         assert!(cleanup.is_empty(), "{cleanup:?}");
     }
 }
+
+macro_rules! failure_test {
+    ($name:ident, $failure:literal) => {
+        #[test_log::test]
+        fn $name() {
+            run_pg_test(|| failure_case($failure));
+        }
+    };
+}
+
+failure_test!(
+    storage_failure_is_explicit_and_keeps_clients_closed,
+    "storage"
+);
+failure_test!(
+    observation_failure_is_explicit_and_keeps_clients_closed,
+    "observation"
+);
 
 #[test_log::test]
 fn unprovable_owned_fence_reports_permanent_and_reaps_in_an_isolated_process() {

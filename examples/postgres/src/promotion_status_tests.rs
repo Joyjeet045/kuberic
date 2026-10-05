@@ -91,7 +91,7 @@ async fn assert_promotion_gap(group: &PgGroup) -> u64 {
     instance.generation_id()
 }
 
-async fn complete_and_fence(mut group: PgGroup, status: bool, generation: u64) {
+async fn complete_and_fence(mut group: PgGroup, generation: u64) {
     let pod = group.pod(3);
     let instance = pod.application.instance();
     let durable = pod.application.native_driver().durable_state().await;
@@ -128,17 +128,14 @@ async fn complete_and_fence(mut group: PgGroup, status: bool, generation: u64) {
     )
     .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
-        if status {
-            assert!(pod.status().await.is_err());
-        } else {
-            assert!(
-                pod.application
-                    .native_driver()
-                    .current_progress()
-                    .await
-                    .is_err()
-            );
-        }
+        assert!(
+            pod.application
+                .native_driver()
+                .current_progress()
+                .await
+                .is_err()
+        );
+        assert!(pod.status().await.is_err());
     })
     .await
     .unwrap();
@@ -159,7 +156,7 @@ async fn complete_and_fence(mut group: PgGroup, status: bool, generation: u64) {
     group.shutdown().await;
 }
 
-async fn concurrent_status(status: bool) {
+async fn concurrent_status() {
     let group = followed_candidate().await;
     let pod = group.pod(3);
     let driver = pod.application.native_driver();
@@ -175,45 +172,41 @@ async fn concurrent_status(status: bool) {
     .unwrap();
     let generation = assert_promotion_gap(&group).await;
     let reporter = AgentReporter::new(pod.store.clone());
-    let mut progress = Box::pin(async {
-        if status {
-            reporter.report(&pod.runtime).await.unwrap();
-        } else {
-            driver.current_progress().await.unwrap();
-        }
-    });
+    let mut progress = Box::pin(driver.current_progress());
+    let mut report = Box::pin(reporter.report(&pod.runtime));
     poll_fn(|cx| {
         assert!(progress.as_mut().poll(cx).is_pending());
+        assert!(report.as_mut().poll(cx).is_pending());
         Poll::Ready(())
     })
     .await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(250), &mut progress)
-            .await
-            .is_err(),
+        tokio::time::timeout(Duration::from_millis(250), async {
+            tokio::join!(&mut progress, &mut report)
+        })
+        .await
+        .is_err(),
         "status must wait for role publication, not inspect the promotion gap"
     );
     assert_eq!(assert_promotion_gap(&group).await, generation);
     gate.release.notify_one();
     tokio::time::timeout(Duration::from_secs(30), async {
-        let (promoted, ()) = tokio::join!(&mut promotion, &mut progress);
+        let (promoted, progress, report) = tokio::join!(&mut promotion, &mut progress, &mut report);
         promoted.unwrap();
+        progress.unwrap();
+        report.unwrap();
     })
     .await
     .unwrap();
+    drop(report);
     drop(progress);
     drop(promotion);
-    complete_and_fence(group, status, generation).await;
+    complete_and_fence(group, generation).await;
 }
 
 #[test_log::test]
-fn authorized_promotion_serializes_direct_progress_without_native_build() {
-    run_pg_test(|| concurrent_status(false));
-}
-
-#[test_log::test]
-fn authorized_promotion_serializes_agent_reporter_without_native_build() {
-    run_pg_test(|| concurrent_status(true));
+fn authorized_promotion_serializes_progress_and_agent_reporter_without_native_build() {
+    run_pg_test(concurrent_status);
 }
 
 #[test_log::test]
@@ -237,7 +230,7 @@ fn interrupted_authorized_promotion_retries_without_native_build() {
         pod.effect(RuntimeEffectAction::ChangeRole(ReplicaRole::Primary))
             .await
             .unwrap();
-        complete_and_fence(group, true, generation).await;
+        complete_and_fence(group, generation).await;
     });
 }
 
@@ -313,6 +306,20 @@ enum InvalidIntent {
 #[test_log::test]
 fn interrupted_promotion_rejects_nonexact_authorization() {
     run_pg_test(|| async {
+        let group = followed_candidate().await;
+        let pod = group.pod(3);
+        let driver = pod.application.native_driver();
+        let gate = driver.pause_recovery(RecoveryStage::Promoted);
+        let mut promotion =
+            Box::pin(pod.effect(RuntimeEffectAction::ChangeRole(ReplicaRole::Primary)));
+        tokio::select! {
+            result = &mut promotion => panic!("promotion missed its cut: {result:?}"),
+            entered = tokio::time::timeout(Duration::from_secs(30), gate.entered.notified()) => entered.unwrap(),
+        }
+        let generation = assert_promotion_gap(&group).await;
+        drop(promotion);
+        let durable = driver.durable.snapshot().await;
+        let installed = driver.configuration.read().await.clone().unwrap();
         for invalid in [
             InvalidIntent::Missing,
             InvalidIntent::Generation,
@@ -321,59 +328,62 @@ fn interrupted_promotion_rejects_nonexact_authorization() {
             InvalidIntent::Session,
         ] {
             tracing::info!(?invalid, "rejecting nonexact promotion intent");
-            let group = followed_candidate().await;
-            let pod = group.pod(3);
-            let driver = pod.application.native_driver();
-            let gate = driver.pause_recovery(RecoveryStage::Promoted);
-            let mut promotion =
-                Box::pin(pod.effect(RuntimeEffectAction::ChangeRole(ReplicaRole::Primary)));
-            tokio::select! {
-                result = &mut promotion => panic!("promotion missed its cut: {result:?}"),
-                entered = tokio::time::timeout(Duration::from_secs(30), gate.entered.notified()) => entered.unwrap(),
+            let mut candidate = durable.clone();
+            let recovery = candidate.recovery.as_mut().unwrap();
+            let election = recovery.pending.as_mut().unwrap();
+            match invalid {
+                InvalidIntent::Missing => election.promotion = None,
+                InvalidIntent::Generation => {
+                    election.promotion.as_mut().unwrap().process_generation += 1;
+                }
+                InvalidIntent::Policy => {
+                    recovery.accepted_policy.as_mut().unwrap().generation += 1;
+                }
+                InvalidIntent::ReceiverEpoch => recovery.receiver_epoch = None,
+                InvalidIntent::Session => {
+                    let mut mismatched = installed.clone();
+                    mismatched
+                        .replicas
+                        .iter_mut()
+                        .find(|replica| replica.identity == pod.identity)
+                        .unwrap()
+                        .process_session_id = ProcessSessionId::new("different-candidate-session");
+                    *driver.configuration.write().await = Some(mismatched);
+                }
             }
-            assert_promotion_gap(&group).await;
-            drop(promotion);
-            let processes = ProcessProbe::postgres(pod.application.instance().data_dir());
-            if matches!(invalid, InvalidIntent::Session) {
-                let mut installed = driver.configuration.write().await;
-                let local = installed
+            assert!(
+                !driver
+                    .interrupted_promotion(&candidate, generation, false)
+                    .await
+                    .unwrap(),
+                "{invalid:?}"
+            );
+            *driver.configuration.write().await = Some(installed.clone());
+        }
+
+        let processes = ProcessProbe::postgres(pod.application.instance().data_dir());
+        driver
+            .durable
+            .update(|state| {
+                state
+                    .recovery
                     .as_mut()
                     .unwrap()
-                    .replicas
-                    .iter_mut()
-                    .find(|replica| replica.identity == pod.identity)
-                    .unwrap();
-                local.process_session_id = ProcessSessionId::new("different-candidate-session");
-            } else {
-                driver
-                    .durable
-                    .update(|state| {
-                        let recovery = state.recovery.as_mut().unwrap();
-                        let election = recovery.pending.as_mut().unwrap();
-                        match invalid {
-                            InvalidIntent::Missing => election.promotion = None,
-                            InvalidIntent::Generation => {
-                                election.promotion.as_mut().unwrap().process_generation += 1;
-                            }
-                            InvalidIntent::Policy => {
-                                recovery.accepted_policy.as_mut().unwrap().generation += 1;
-                            }
-                            InvalidIntent::ReceiverEpoch => recovery.receiver_epoch = None,
-                            InvalidIntent::Session => unreachable!(),
-                        }
-                        Ok(())
-                    })
-                    .await
-                    .unwrap();
-            }
-            assert!(driver.current_progress().await.is_err());
-            assert!(!pod.application.instance().is_running().await);
-            assert_eq!(
-                pod.runtime.partition_report().await.reported_fault,
-                Some(FaultType::Permanent)
-            );
-            processes.assert_reaped();
-            group.shutdown().await;
-        }
+                    .pending
+                    .as_mut()
+                    .unwrap()
+                    .promotion = None;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(driver.current_progress().await.is_err());
+        assert!(!pod.application.instance().is_running().await);
+        assert_eq!(
+            pod.runtime.partition_report().await.reported_fault,
+            Some(FaultType::Permanent)
+        );
+        processes.assert_reaped();
+        group.shutdown().await;
     });
 }

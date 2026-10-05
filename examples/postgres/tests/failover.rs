@@ -1316,82 +1316,167 @@ mod scenarios {
         .await;
     }
 
-    pub(super) async fn planned_source_restarts_preserve_handoff_fencing_at_each_checkpoint() {
-        for point in [
-            PlannedRestart::SourcePreFence,
-            PlannedRestart::SourceAuthorityInstalled,
-            PlannedRestart::SourceFenceIntent,
-            PlannedRestart::SourceFenced,
-            PlannedRestart::SourceDemoted,
-        ] {
-            exercise_primary_change(Case {
-                planned: true,
-                planned_restart: Some(point),
-                ..Default::default()
-            })
-            .await;
-        }
+    async fn planned_restart(point: PlannedRestart) {
+        exercise_primary_change(Case {
+            planned: true,
+            planned_restart: Some(point),
+            ..Default::default()
+        })
+        .await;
     }
 
-    pub(super) async fn planned_target_restarts_preserve_handoff_fencing_at_each_checkpoint() {
-        for point in [
-            PlannedRestart::TargetAuthorityInstalled,
-            PlannedRestart::TargetPromotion,
-            PlannedRestart::TargetActivated,
-            PlannedRestart::TargetGranted,
-        ] {
-            exercise_primary_change(Case {
-                planned: true,
-                planned_restart: Some(point),
-                ..Default::default()
-            })
-            .await;
-        }
+    async fn cancelled_election(stage: RecoveryStage, reopen_cut: bool) {
+        exercise_primary_change(Case {
+            cut: Some(stage),
+            reopen_cut,
+            ..Default::default()
+        })
+        .await;
     }
 
-    pub(super) async fn cancelled_election_callbacks_resume_only_their_durable_recovery_cut() {
-        for stage in [
-            RecoveryStage::InitialRound,
-            RecoveryStage::ReceiversDrained,
-            RecoveryStage::FinalRound,
-            RecoveryStage::Promoted,
-            RecoveryStage::Ready,
-        ] {
-            exercise_primary_change(Case {
-                cut: Some(stage),
-                ..Default::default()
-            })
-            .await;
-        }
+    macro_rules! primary_change_scenario {
+        ($name:ident, $body:expr) => {
+            pub(super) async fn $name() {
+                $body.await;
+            }
+        };
     }
 
-    pub(super) async fn cancelled_source_demotion_replays_the_stopped_receipt_before_handoff() {
-        for stage in [
-            RecoveryStage::SourceFenceIntent,
-            RecoveryStage::SourceStopped,
-        ] {
-            exercise_primary_change(Case {
-                planned: true,
-                cut: Some(stage),
-                ..Default::default()
-            })
-            .await;
-        }
-    }
-
-    pub(super) async fn interrupted_policy_acceptance_allows_only_the_matched_generation() {
-        for stage in [
-            RecoveryStage::PolicyInvalidated,
-            RecoveryStage::PolicyApplied,
-            RecoveryStage::PolicyAccepted,
-        ] {
-            exercise_primary_change(Case {
-                policy_cut: Some(stage),
-                ..Default::default()
-            })
-            .await;
-        }
-    }
+    primary_change_scenario!(
+        planned_source_restart_before_fence,
+        planned_restart(PlannedRestart::SourcePreFence)
+    );
+    primary_change_scenario!(
+        planned_source_restart_after_authority_install,
+        planned_restart(PlannedRestart::SourceAuthorityInstalled)
+    );
+    primary_change_scenario!(
+        planned_source_restart_after_fence_intent,
+        planned_restart(PlannedRestart::SourceFenceIntent)
+    );
+    primary_change_scenario!(
+        planned_source_restart_after_fence,
+        planned_restart(PlannedRestart::SourceFenced)
+    );
+    primary_change_scenario!(
+        planned_source_restart_after_demotion,
+        planned_restart(PlannedRestart::SourceDemoted)
+    );
+    primary_change_scenario!(
+        planned_target_restart_after_authority_install,
+        planned_restart(PlannedRestart::TargetAuthorityInstalled)
+    );
+    primary_change_scenario!(
+        planned_target_restart_during_promotion,
+        planned_restart(PlannedRestart::TargetPromotion)
+    );
+    primary_change_scenario!(
+        planned_target_restart_after_activation,
+        planned_restart(PlannedRestart::TargetActivated)
+    );
+    primary_change_scenario!(
+        planned_target_restart_after_access_grant,
+        planned_restart(PlannedRestart::TargetGranted)
+    );
+    primary_change_scenario!(
+        cancelled_election_resumes_initial_round,
+        cancelled_election(RecoveryStage::InitialRound, false)
+    );
+    primary_change_scenario!(
+        cancelled_election_resumes_receiver_drain,
+        cancelled_election(RecoveryStage::ReceiversDrained, false)
+    );
+    primary_change_scenario!(
+        cancelled_election_resumes_final_round,
+        cancelled_election(RecoveryStage::FinalRound, false)
+    );
+    primary_change_scenario!(
+        cancelled_election_resumes_promotion,
+        cancelled_election(RecoveryStage::Promoted, false)
+    );
+    primary_change_scenario!(
+        cancelled_election_resumes_ready_publication,
+        cancelled_election(RecoveryStage::Ready, false)
+    );
+    primary_change_scenario!(
+        fresh_session_reopen_at_initial_round_remains_write_closed,
+        cancelled_election(RecoveryStage::InitialRound, true)
+    );
+    primary_change_scenario!(
+        fresh_session_reopen_at_receiver_drain_remains_write_closed,
+        cancelled_election(RecoveryStage::ReceiversDrained, true)
+    );
+    primary_change_scenario!(
+        fresh_session_reopen_at_final_round_remains_write_closed,
+        cancelled_election(RecoveryStage::FinalRound, true)
+    );
+    primary_change_scenario!(
+        fresh_session_reopen_at_promotion_remains_write_closed,
+        cancelled_election(RecoveryStage::Promoted, true)
+    );
+    primary_change_scenario!(
+        fresh_session_reopen_at_ready_publication_remains_write_closed,
+        cancelled_election(RecoveryStage::Ready, true)
+    );
+    primary_change_scenario!(
+        cancelled_source_demotion_resumes_fence_intent,
+        exercise_primary_change(Case {
+            planned: true,
+            cut: Some(RecoveryStage::SourceFenceIntent),
+            ..Default::default()
+        })
+    );
+    primary_change_scenario!(
+        cancelled_source_demotion_resumes_stopped_receipt,
+        exercise_primary_change(Case {
+            planned: true,
+            cut: Some(RecoveryStage::SourceStopped),
+            ..Default::default()
+        })
+    );
+    primary_change_scenario!(
+        interrupted_policy_invalidation_stays_write_closed,
+        exercise_primary_change(Case {
+            policy_cut: Some(RecoveryStage::PolicyInvalidated),
+            ..Default::default()
+        })
+    );
+    primary_change_scenario!(
+        interrupted_policy_application_stays_write_closed,
+        exercise_primary_change(Case {
+            policy_cut: Some(RecoveryStage::PolicyApplied),
+            ..Default::default()
+        })
+    );
+    primary_change_scenario!(
+        interrupted_policy_acceptance_resumes_matched_generation,
+        exercise_primary_change(Case {
+            policy_cut: Some(RecoveryStage::PolicyAccepted),
+            ..Default::default()
+        })
+    );
+    primary_change_scenario!(
+        promotion_failure_stays_closed_with_permanent_fault,
+        exercise_primary_change(Case {
+            failure: Some(Failure::Promotion),
+            ..Default::default()
+        })
+    );
+    primary_change_scenario!(
+        observation_failure_stays_closed_with_permanent_fault,
+        exercise_primary_change(Case {
+            failure: Some(Failure::Observation),
+            ..Default::default()
+        })
+    );
+    primary_change_scenario!(
+        planned_shutdown_failure_stays_closed_with_permanent_fault,
+        exercise_primary_change(Case {
+            planned: true,
+            failure: Some(Failure::Shutdown),
+            ..Default::default()
+        })
+    );
 
     pub(super) async fn final_round_includes_between_round_commit_and_draining_revokes_old_acknowledgements()
      {
@@ -1414,39 +1499,6 @@ mod scenarios {
     pub(super) async fn stale_required_responder_session_cannot_activate_candidate() {
         exercise_primary_change(Case {
             changed_session: true,
-            ..Default::default()
-        })
-        .await;
-    }
-
-    pub(super) async fn fresh_session_reopen_at_each_election_cut_remains_write_closed() {
-        for stage in [
-            RecoveryStage::InitialRound,
-            RecoveryStage::ReceiversDrained,
-            RecoveryStage::FinalRound,
-            RecoveryStage::Promoted,
-            RecoveryStage::Ready,
-        ] {
-            exercise_primary_change(Case {
-                cut: Some(stage),
-                reopen_cut: true,
-                ..Default::default()
-            })
-            .await;
-        }
-    }
-
-    pub(super) async fn promotion_and_observation_failures_stay_closed_with_classified_faults() {
-        for failure in [Failure::Promotion, Failure::Observation] {
-            exercise_primary_change(Case {
-                failure: Some(failure),
-                ..Default::default()
-            })
-            .await;
-        }
-        exercise_primary_change(Case {
-            planned: true,
-            failure: Some(Failure::Shutdown),
             ..Default::default()
         })
         .await;
@@ -1548,16 +1600,36 @@ mod scenarios {
 
 host_test!(acknowledged_row_is_replayed_before_candidate_primary_callback_completes);
 host_test!(planned_switchover_requires_source_shutdown_before_target_writes);
-host_test!(planned_source_restarts_preserve_handoff_fencing_at_each_checkpoint);
-host_test!(planned_target_restarts_preserve_handoff_fencing_at_each_checkpoint);
-host_test!(cancelled_election_callbacks_resume_only_their_durable_recovery_cut);
-host_test!(cancelled_source_demotion_replays_the_stopped_receipt_before_handoff);
-host_test!(interrupted_policy_acceptance_allows_only_the_matched_generation);
+host_test!(planned_source_restart_before_fence);
+host_test!(planned_source_restart_after_authority_install);
+host_test!(planned_source_restart_after_fence_intent);
+host_test!(planned_source_restart_after_fence);
+host_test!(planned_source_restart_after_demotion);
+host_test!(planned_target_restart_after_authority_install);
+host_test!(planned_target_restart_during_promotion);
+host_test!(planned_target_restart_after_activation);
+host_test!(planned_target_restart_after_access_grant);
+host_test!(cancelled_election_resumes_initial_round);
+host_test!(cancelled_election_resumes_receiver_drain);
+host_test!(cancelled_election_resumes_final_round);
+host_test!(cancelled_election_resumes_promotion);
+host_test!(cancelled_election_resumes_ready_publication);
+host_test!(cancelled_source_demotion_resumes_fence_intent);
+host_test!(cancelled_source_demotion_resumes_stopped_receipt);
+host_test!(interrupted_policy_invalidation_stays_write_closed);
+host_test!(interrupted_policy_application_stays_write_closed);
+host_test!(interrupted_policy_acceptance_resumes_matched_generation);
 host_test!(final_round_includes_between_round_commit_and_draining_revokes_old_acknowledgements);
 host_test!(insufficient_exact_responders_keep_the_sf_role_and_partition_write_closed);
 host_test!(stale_required_responder_session_cannot_activate_candidate);
-host_test!(fresh_session_reopen_at_each_election_cut_remains_write_closed);
-host_test!(promotion_and_observation_failures_stay_closed_with_classified_faults);
+host_test!(fresh_session_reopen_at_initial_round_remains_write_closed);
+host_test!(fresh_session_reopen_at_receiver_drain_remains_write_closed);
+host_test!(fresh_session_reopen_at_final_round_remains_write_closed);
+host_test!(fresh_session_reopen_at_promotion_remains_write_closed);
+host_test!(fresh_session_reopen_at_ready_publication_remains_write_closed);
+host_test!(promotion_failure_stays_closed_with_permanent_fault);
+host_test!(observation_failure_stays_closed_with_permanent_fault);
+host_test!(planned_shutdown_failure_stays_closed_with_permanent_fault);
 host_test!(pc_cc_policy_change_and_report_gap_preserve_the_between_round_acknowledgement);
 host_test!(explicit_demotion_fences_retained_clients_and_former_primary_restart);
 host_test!(absent_accepted_policy_cannot_activate_a_durably_built_candidate);

@@ -666,7 +666,10 @@ impl ProcessProbe {
 
     pub fn signal(&self, signal: rustix::process::Signal) {
         for (_, fd) in &self.0 {
-            rustix::process::pidfd_send_signal(fd, signal).unwrap();
+            match rustix::process::pidfd_send_signal(fd, signal) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                Err(error) => panic!("signal owned test process: {error}"),
+            }
         }
     }
 
