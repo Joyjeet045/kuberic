@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::authority::RetiredAuthority;
 use crate::authority::{AdmittedAuthority, BuildAuthority};
+use crate::receipts::TopologyReceipt;
 use kuberic_protocol::types::{
     ProcessSessionId, SecondaryRemovalPreparation, SecondaryRemovalWitness,
     SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
@@ -155,6 +156,8 @@ pub struct RuntimePostcondition {
 pub struct RuntimeEffectResult {
     pub operation_id: OperationId,
     pub sequence: u64,
+    #[serde(default)]
+    pub topology_receipt: Option<Box<TopologyReceipt>>,
     pub postcondition: RuntimePostcondition,
 }
 

@@ -8,6 +8,9 @@ rust-version.workspace = true
 description = "Independent level-triggered application and replication runtime for Kuberic"
 readme = "README.md"
 
+[features]
+testing = []
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true

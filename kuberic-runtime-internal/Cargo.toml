@@ -14,3 +14,4 @@ bytes.workspace = true
 kuberic-protocol = { path = "../kuberic-protocol" }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+uuid = { workspace = true, features = ["v4"] }

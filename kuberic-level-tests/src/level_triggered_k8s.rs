@@ -8361,6 +8361,18 @@ fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
         }
         std::thread::sleep(Duration::from_secs(2));
     };
+    let write_ready_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if replica_diagnostics(&kubeconfig, &context, old_primary).is_ok_and(|diagnostics| {
+            diagnostics["readStatus"] == "Granted" && diagnostics["writeStatus"] == "Granted"
+        }) {
+            break;
+        }
+        if std::time::Instant::now() >= write_ready_deadline {
+            bail!("pre-failover primary did not expose granted read/write readiness");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
     if put_from_replica(
         &kubeconfig,
         &context,

@@ -3,13 +3,17 @@
 use std::sync::Arc;
 
 use kuberic_runtime::replicator::{
-    PrimaryReplicator, Replicator, ReplicatorFactoryContext, ReplicatorInterfaces,
-    ReplicatorRegistration, StateReplicator, StatefulServicePartition,
+    PrimaryReplicator, Replicator, ReplicatorAttachment, ReplicatorCreationReservation,
+    ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration, StateReplicator,
+    StatefulServicePartition,
 };
 use kuberic_runtime::authority::AdmittedAuthority;
 
-pub fn obtain_managed(interfaces: &ReplicatorInterfaces) {
-    let _ = interfaces.managed_replicator();
+pub fn extract_attachment(
+    interfaces: &ReplicatorInterfaces,
+    reservation: ReplicatorCreationReservation,
+) {
+    let _ = interfaces.prepare_attachment(reservation);
 }
 
 pub fn infer_host_token(
@@ -24,11 +28,22 @@ pub fn assemble_split_bundle(
     state: Arc<dyn StateReplicator>,
     primary: Arc<dyn PrimaryReplicator>,
 ) {
-    let _ = ReplicatorInterfaces::new(control, state, Some(primary));
+    let _ = ReplicatorInterfaces {
+        replicator: control,
+        state_replicator: Some(state),
+        primary_replicator: Some(primary),
+    };
 }
 
-pub async fn register_managed_directly(context: ReplicatorFactoryContext) {
-    context.register_managed(panic!("no managed capability")).await;
+pub fn forge_attachment(control: Arc<dyn Replicator>, primary: Arc<dyn PrimaryReplicator>) {
+    let _ = ReplicatorAttachment {
+        replicator: control,
+        primary_replicator: Some(primary),
+    };
+}
+
+pub fn disarm_bundle_guard(attachment: &ReplicatorAttachment) {
+    attachment.disarm();
 }
 
 pub fn inspect_host_dependencies(context: &ReplicatorFactoryContext) {

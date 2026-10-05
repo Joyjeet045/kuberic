@@ -2951,24 +2951,29 @@ fn evaluate_transition(
             }
         }
 
-        let pc_cc_reports = union
+        let exact_pc_cc_reports = union
             .iter()
             .filter_map(|member| {
-                let report = healthy_report(snapshot, &member.identity)?;
+                let report = exact_report(snapshot, &member.identity)?;
                 (report.epoch == current.epoch
                     && report.previous_configuration.as_ref() == Some(previous)
                     && report.current_configuration.as_ref() == Some(current))
                 .then_some(report)
             })
             .collect::<Vec<_>>();
+        let live_pc_cc_reports = exact_pc_cc_reports
+            .iter()
+            .copied()
+            .filter(|report| healthy_report(snapshot, &report.identity).is_some())
+            .collect::<Vec<_>>();
         if !current_only_started
             && (!configuration_read_quorum(
                 previous,
-                &pc_cc_reports,
+                &exact_pc_cc_reports,
                 transition.effective_policy.read_quorum,
             ) || !configuration_read_quorum(
                 current,
-                &pc_cc_reports,
+                &exact_pc_cc_reports,
                 transition.effective_policy.read_quorum,
             ))
         {
@@ -2984,7 +2989,7 @@ fn evaluate_transition(
         }
 
         if !current_only_started {
-            let election_reports = pc_cc_reports
+            let election_reports = exact_pc_cc_reports
                 .iter()
                 .copied()
                 .filter(|report| {
@@ -3010,7 +3015,18 @@ fn evaluate_transition(
                     requeue_after_seconds: config.wait_requeue_seconds,
                 };
             };
-            let primary_report = pc_cc_reports
+            if healthy_report(snapshot, &candidate.identity).is_none() {
+                return Plan::Wait {
+                    reason: WaitReason::AwaitingStableEvidence,
+                    status: waiting_status(
+                        status,
+                        "ElectionWinnerUnavailable",
+                        "The highest exact epoch-fenced progress winner is not currently available",
+                    ),
+                    requeue_after_seconds: config.wait_requeue_seconds,
+                };
+            }
+            let primary_report = live_pc_cc_reports
                 .iter()
                 .copied()
                 .find(|report| report.identity == primary.identity);
@@ -3074,7 +3090,7 @@ fn evaluate_transition(
                 current,
                 primary,
                 primary_report,
-                &pc_cc_reports,
+                &live_pc_cc_reports,
                 status.clone(),
             ) {
                 return plan;
@@ -3104,12 +3120,12 @@ fn evaluate_transition(
             }
             if !configuration_deactivation_quorum(
                 previous,
-                &pc_cc_reports,
+                &exact_pc_cc_reports,
                 transition.effective_policy.read_quorum,
                 current.epoch,
             ) || !configuration_deactivation_quorum(
                 current,
-                &pc_cc_reports,
+                &exact_pc_cc_reports,
                 transition.effective_policy.read_quorum,
                 current.epoch,
             ) {

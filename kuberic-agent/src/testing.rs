@@ -583,14 +583,42 @@ pub async fn execute_build(
     runtime: &crate::hosting::PodRuntime,
     replica: kuberic_runtime::replicator::ReplicaInformation,
 ) -> kuberic_runtime::Result<()> {
-    match runtime.execute_build(replica).await? {
-        crate::hosting::BuildExecution::ApplicationCompleted => Ok(()),
-        crate::hosting::BuildExecution::BuiltInCopyRequired => {
+    runtime
+        .execute_admitted_build(replica, || async {
             Err(kuberic_runtime::RuntimeError::Application(
                 "testing custom build requested the built-in copy route".into(),
             ))
-        }
-    }
+        })
+        .await
+}
+
+pub async fn execute_build_with_copy<F, Fut>(
+    runtime: &crate::hosting::PodRuntime,
+    replica: kuberic_runtime::replicator::ReplicaInformation,
+    managed_copy: F,
+) -> kuberic_runtime::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = kuberic_runtime::Result<()>>,
+{
+    runtime.execute_admitted_build(replica, managed_copy).await
+}
+
+pub async fn build_generation(
+    runtime: &crate::hosting::PodRuntime,
+    build_id: &kuberic_protocol::types::OperationId,
+) -> kuberic_runtime::Result<u64> {
+    runtime.build_generation(build_id).await
+}
+
+pub async fn cancel_build_attempt(
+    runtime: &crate::hosting::PodRuntime,
+    build_id: &kuberic_protocol::types::OperationId,
+    generation: u64,
+) -> kuberic_runtime::Result<()> {
+    runtime
+        .cancel_outbound_build_attempt(build_id, generation, true)
+        .await
 }
 
 pub async fn set_lifecycle_access(
@@ -599,6 +627,14 @@ pub async fn set_lifecycle_access(
     write: kuberic_protocol::types::AccessStatus,
 ) -> kuberic_runtime::Result<()> {
     runtime.testing_set_access(read, write).await
+}
+
+pub async fn register_lifecycle_peer_session(
+    runtime: &crate::hosting::PodRuntime,
+    identity: kuberic_protocol::types::ReplicaIdentity,
+    session: kuberic_protocol::types::ProcessSessionId,
+) -> kuberic_runtime::Result<()> {
+    runtime.register_peer_session(identity, session).await
 }
 
 pub async fn wait_for_lifecycle_catch_up(

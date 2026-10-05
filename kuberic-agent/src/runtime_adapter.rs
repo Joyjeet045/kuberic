@@ -4,15 +4,97 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use kuberic_protocol::types::OperationId;
+use kuberic_runtime::RuntimeError;
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
+use tokio::sync::oneshot;
 
 use crate::hosting::PodRuntime;
 use crate::store::{AgentStore, BeginEffect};
 use crate::{AgentError, Result};
 
+#[doc(hidden)]
+pub struct RuntimeEffectCommit {
+    decision: Option<oneshot::Sender<bool>>,
+    completion: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl RuntimeEffectCommit {
+    pub(crate) fn new(
+        decision: oneshot::Sender<bool>,
+        completion: tokio::task::JoinHandle<Result<()>>,
+    ) -> Self {
+        Self {
+            decision: Some(decision),
+            completion,
+        }
+    }
+
+    async fn finish(mut self, committed: bool) -> Result<()> {
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(committed);
+        }
+        self.completion
+            .await
+            .map_err(|error| AgentError::Runtime(RuntimeError::Application(error.to_string())))?
+    }
+}
+
+#[doc(hidden)]
+pub struct RuntimeEffectExecution {
+    result: RuntimeEffectResult,
+    commit: Option<RuntimeEffectCommit>,
+}
+
+impl RuntimeEffectExecution {
+    pub fn completed(result: RuntimeEffectResult) -> Self {
+        Self {
+            result,
+            commit: None,
+        }
+    }
+
+    pub(crate) fn prepared(result: RuntimeEffectResult, commit: RuntimeEffectCommit) -> Self {
+        Self {
+            result,
+            commit: Some(commit),
+        }
+    }
+
+    pub fn result(&self) -> &RuntimeEffectResult {
+        &self.result
+    }
+
+    pub async fn accept(mut self) -> Result<RuntimeEffectResult> {
+        if let Some(commit) = self.commit.take() {
+            commit.finish(true).await?;
+        }
+        Ok(self.result)
+    }
+
+    pub async fn reject(mut self) -> Result<()> {
+        if let Some(commit) = self.commit.take() {
+            commit.finish(false).await?;
+        }
+        Ok(())
+    }
+}
+
+impl From<RuntimeEffectResult> for RuntimeEffectExecution {
+    fn from(result: RuntimeEffectResult) -> Self {
+        Self::completed(result)
+    }
+}
+
 #[async_trait]
 pub trait RuntimeEffectExecutor: Send + Sync {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult>;
+
+    async fn prepare_runtime_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectExecution> {
+        self.apply_runtime_effect(effect).await.map(Into::into)
+    }
 
     async fn consume_cancelled_build_effect(
         &self,
@@ -68,6 +150,13 @@ pub trait RuntimeEffectExecutor: Send + Sync {
 impl RuntimeEffectExecutor for PodRuntime {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         Ok(self.apply_effect(effect).await?)
+    }
+
+    async fn prepare_runtime_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectExecution> {
+        Ok(self.prepare_effect(effect).await?)
     }
 
     async fn consume_cancelled_build_effect(
@@ -145,8 +234,8 @@ where
                 Ok(*result)
             }
             BeginEffect::Execute(effect) | BeginEffect::Pending(effect) => {
-                let result = match self.executor.apply_runtime_effect(effect.clone()).await {
-                    Ok(result) => result,
+                let execution = match self.executor.prepare_runtime_effect(effect.clone()).await {
+                    Ok(execution) => execution,
                     Err(
                         error @ AgentError::Runtime(
                             kuberic_runtime::RuntimeError::OperationCancelled
@@ -173,7 +262,11 @@ where
                     }
                     Err(error) => return Err(error),
                 };
-                require_matching_result(&effect, &result)?;
+                let result = execution.result().clone();
+                if let Err(error) = require_matching_result(&effect, &result) {
+                    execution.reject().await?;
+                    return Err(error);
+                }
                 let pending_build_completion = match &effect.action {
                     kuberic_runtime_internal::effects::RuntimeEffectAction::BuildReplica {
                         build_id,
@@ -187,11 +280,18 @@ where
                     _ => false,
                 };
                 if pending_build_completion {
+                    let result = execution.accept().await?;
                     return Box::pin(self.await_build_completion(effect, result)).await;
                 }
-                self.store.mark_effect_applied(&effect).await?;
-                self.store.complete_effect(&result).await?;
-                Ok(result)
+                if let Err(error) = self.store.mark_effect_applied(&effect).await {
+                    execution.reject().await?;
+                    return Err(error);
+                }
+                if let Err(error) = self.store.complete_effect(&result).await {
+                    execution.reject().await?;
+                    return Err(error);
+                }
+                execution.accept().await
             }
         }
     }

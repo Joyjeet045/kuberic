@@ -9,14 +9,19 @@ use futures::StreamExt;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, OperationId, ProcessSessionId, ReplicaId,
     ReplicaIdentity, ReplicaRole, SecondaryRemovalPreparation, SecondaryRemovalStage,
-    SecondaryScaleDownCleanup,
+    SecondaryRemovalWitness, SecondaryScaleDownCleanup,
 };
 use kuberic_protocol::validation::{
     validate_secondary_removal_preparation, validate_secondary_scale_down_cleanup,
 };
 use kuberic_runtime_internal::authority::RetiredAuthority;
+use kuberic_runtime_internal::receipts::{
+    AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
+    NativeTopologyStatus, RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt,
+    TopologyReceipt,
+};
 use kuberic_runtime_internal::transport::{
-    CopyAck, CopyItem, OutboundOperation, ReplicaEndpoint, ReplicationAck, ReplicationItem,
+    CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem,
 };
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot, watch};
 
@@ -37,8 +42,8 @@ use crate::replicator::copy::{
 use crate::replicator::log::{PreparedWrite, ReplicationLog};
 use crate::replicator::stream::{OperationCompletion, OperationMetadata, ServiceStreams};
 use crate::replicator::{
-    ManagedReplicatorDataPlane, ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation,
-    ReplicaSetQuorumMode, Replicator,
+    ManagedFenceGuard, ManagedReplicatorDataPlane, ManagedReplicatorLifecycle, PrimaryReplicator,
+    ReplicaInformation, ReplicaSetQuorumMode, Replicator,
 };
 use crate::{Result, RuntimeError};
 
@@ -78,45 +83,22 @@ struct OutboundBuild {
     emitted: BTreeMap<u64, EmittedBuildItem>,
     pending_operations: BTreeMap<i64, Operation>,
     catching_up: bool,
-    stream_tx: mpsc::Sender<Result<CopyItem>>,
+    stream_tx: Option<mpsc::Sender<Result<CopyItem>>>,
     generation: u64,
 }
 
 struct BuildPreparationGuard {
-    engine: Weak<DefaultReplicatorInner>,
-    build_id: OperationId,
-    generation: u64,
-    armed: bool,
+    decision: Option<tokio::sync::oneshot::Sender<bool>>,
+    completion: tokio::task::JoinHandle<()>,
 }
 
 impl BuildPreparationGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for BuildPreparationGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let Some(engine) = self.engine.upgrade() else {
-            return;
-        };
-        let build_id = self.build_id.clone();
-        let generation = self.generation;
-        if let Ok(mut state) = engine.state.try_write() {
-            if state
-                .outbound_builds
-                .get(&build_id)
-                .is_some_and(|build| build.generation == generation)
+    fn new(engine: Weak<DefaultReplicatorInner>, build_id: OperationId, generation: u64) -> Self {
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let completion = tokio::spawn(async move {
+            if completion.await != Ok(true)
+                && let Some(engine) = engine.upgrade()
             {
-                state.outbound_builds.remove(&build_id);
-            }
-            return;
-        }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
                 let mut state = engine.state.write().await;
                 if state
                     .outbound_builds
@@ -125,8 +107,19 @@ impl Drop for BuildPreparationGuard {
                 {
                     state.outbound_builds.remove(&build_id);
                 }
-            });
+            }
+        });
+        Self {
+            decision: Some(decision),
+            completion,
         }
+    }
+
+    async fn finish(mut self, success: bool) {
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(success);
+        }
+        let _ = self.completion.await;
     }
 }
 
@@ -728,11 +721,7 @@ impl DefaultReplicatorInner {
         }
     }
 
-    pub(crate) async fn wait_for_build(
-        &self,
-        replica: ReplicaInformation,
-        dispatch: bool,
-    ) -> Result<()> {
+    pub(crate) async fn wait_for_build(&self, replica: ReplicaInformation) -> Result<()> {
         self.require_primary().await?;
         let build_generation = self.fence_generation.load(Ordering::Acquire);
         if replica.identity == self.identity {
@@ -752,14 +741,6 @@ impl DefaultReplicatorInner {
             let mut state = self.state.write().await;
             state.removed_replicas.remove(&replica.identity.replica_id);
             state.cancelled_outbound_builds.remove(&build_id);
-        }
-        if dispatch {
-            self.send_outbound(OutboundOperation::Build(ReplicaEndpoint {
-                build_id: replica.build_id.clone(),
-                identity: replica.identity.clone(),
-                replication_address: replica.replication_address.clone(),
-            }))
-            .await?;
         }
         loop {
             let changed = self.changed.notified();
@@ -787,10 +768,14 @@ impl DefaultReplicatorInner {
                 ));
             }
             if state.outbound_builds.values().any(|build| {
-                build.progress.authority.target == replica.identity
+                build.progress.authority.build_id == build_id
+                    && build.progress.authority.target == replica.identity
                     && build.generation == build_generation
                     && build.progress.completed
-                    && build.progress.durable_lsn >= state.current_progress
+                    && build
+                        .progress
+                        .catch_up_boundary_lsn
+                        .is_some_and(|boundary| build.progress.durable_lsn >= boundary)
                     && state.authority.as_ref().is_none_or(|authority| {
                         build.progress.authority.current_configuration
                             == authority.current_configuration
@@ -803,7 +788,7 @@ impl DefaultReplicatorInner {
         }
     }
 
-    pub(crate) async fn remove_replica(&self, replica_id: ReplicaId, dispatch: bool) -> Result<()> {
+    pub(crate) async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
         let _guard = self.effect_lock.lock().await;
         self.require_primary().await?;
         let mut state = self.state.write().await;
@@ -823,10 +808,6 @@ impl DefaultReplicatorInner {
             .retain(|_, build| build.progress.authority.target.replica_id != replica_id);
         state.removed_replicas.insert(replica_id);
         drop(state);
-        if dispatch {
-            self.send_outbound(OutboundOperation::Remove(replica_id))
-                .await?;
-        }
         self.changed.notify_waiters();
         Ok(())
     }
@@ -1194,7 +1175,9 @@ impl DefaultReplicatorInner {
                     snapshot_chunk: false,
                 },
             );
-            live_items.push((build.stream_tx.clone(), item));
+            if let Some(sender) = build.stream_tx.clone() {
+                live_items.push((sender, item));
+            }
         }
         drop(state);
         for (sender, item) in live_items {
@@ -1340,16 +1323,15 @@ impl DefaultReplicatorInner {
                 emitted: BTreeMap::new(),
                 pending_operations: BTreeMap::new(),
                 catching_up: true,
-                stream_tx: stream_tx.clone(),
+                stream_tx: Some(stream_tx.clone()),
                 generation: prepare_generation,
             },
         );
-        let mut preparation = BuildPreparationGuard {
-            engine: self.weak_self.clone(),
-            build_id: build_authority.build_id.clone(),
-            generation: prepare_generation,
-            armed: true,
-        };
+        let preparation = BuildPreparationGuard::new(
+            self.weak_self.clone(),
+            build_authority.build_id.clone(),
+            prepare_generation,
+        );
         drop(guard);
         let operations_result = async {
             let mut operations = BTreeMap::new();
@@ -1378,23 +1360,13 @@ impl DefaultReplicatorInner {
         let operations = match operations_result {
             Ok(operations) => operations,
             Err(error) => {
-                self.state
-                    .write()
-                    .await
-                    .outbound_builds
-                    .remove(&build_authority.build_id);
-                preparation.disarm();
+                preparation.finish(false).await;
                 return Err(error);
             }
         };
         let guard = self.effect_lock.lock().await;
         if let Err(error) = self.check_delivery_generation(prepare_generation) {
-            self.state
-                .write()
-                .await
-                .outbound_builds
-                .remove(&build_authority.build_id);
-            preparation.disarm();
+            preparation.finish(false).await;
             return Err(error);
         }
         let replicator = self.replicator.lock().await;
@@ -1403,12 +1375,7 @@ impl DefaultReplicatorInner {
         if replicator_epoch != Epoch::default()
             && replicator_epoch != build_authority.current_configuration.epoch
         {
-            self.state
-                .write()
-                .await
-                .outbound_builds
-                .remove(&build_authority.build_id);
-            preparation.disarm();
+            preparation.finish(false).await;
             return Err(RuntimeError::AuthorityMismatch(
                 "build authority was fenced during preparation".into(),
             ));
@@ -1416,12 +1383,7 @@ impl DefaultReplicatorInner {
         if current_highest > boundary
             && ((boundary + 1)..=current_highest).any(|lsn| !operations.contains_key(&lsn))
         {
-            self.state
-                .write()
-                .await
-                .outbound_builds
-                .remove(&build_authority.build_id);
-            preparation.disarm();
+            preparation.finish(false).await;
             return Err(RuntimeError::InvalidReplication(
                 "retained operations do not close the post-snapshot gap".to_string(),
             ));
@@ -1435,16 +1397,11 @@ impl DefaultReplicatorInner {
         {
             Ok(stream) => stream,
             Err(error) => {
-                self.state
-                    .write()
-                    .await
-                    .outbound_builds
-                    .remove(&build_authority.build_id);
-                preparation.disarm();
+                preparation.finish(false).await;
                 return Err(error);
             }
         };
-        preparation.disarm();
+        preparation.finish(true).await;
         let engine = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
         let producer_authority = build_authority.clone();
         tokio::spawn(async move {
@@ -3627,6 +3584,97 @@ impl DefaultReplicatorInner {
         self.changed.notify_waiters();
         Ok(())
     }
+
+    async fn certified_prefix_receipt(&self, settled_lsn: i64) -> Result<CertifiedPrefixReceipt> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        let state = self.state.read().await;
+        let verified_lsn = state
+            .replication_progress
+            .as_ref()
+            .map_or(state.current_progress, |progress| progress.verified_lsn);
+        let committed_lsn = state.committed_lsn;
+        let authority = state.authority.clone();
+        drop(state);
+        Ok(CertifiedPrefixReceipt {
+            token: NativeOperationToken {
+                authority,
+                engine_session_id: self.session_id.clone(),
+                engine_generation: self.fence_generation.load(Ordering::Acquire),
+            },
+            verified_lsn,
+            settled_lsn,
+            committed_lsn,
+        })
+    }
+
+    async fn secondary_removal_receipt(
+        &self,
+        witness: Option<SecondaryRemovalWitness>,
+    ) -> Result<SecondaryRemovalReceipt> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        let state = self.state.read().await;
+        Ok(SecondaryRemovalReceipt {
+            token: NativeOperationToken {
+                authority: state.authority.clone(),
+                engine_session_id: self.session_id.clone(),
+                engine_generation: self.fence_generation.load(Ordering::Acquire),
+            },
+            preparation: state.prepared_secondary_removal.clone(),
+            witness,
+            accepted: state.accepted_secondary_removal.clone(),
+            verified_lsn: state
+                .replication_progress
+                .as_ref()
+                .map(|progress| progress.verified_lsn),
+            committed_lsn: state.committed_lsn,
+        })
+    }
+
+    async fn prepare_switchover_with_token(
+        &self,
+        action: RuntimeEffectAction,
+    ) -> Result<NativeOperationToken> {
+        let _effect = self.effect_lock.lock().await;
+        self.check_aborted()?;
+        if self.state.read().await.retiring_authority.is_some() {
+            return Err(RuntimeError::Closed);
+        }
+        let token = NativeOperationToken {
+            authority: self.state.read().await.authority.clone(),
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+        };
+        self.execute_action(action).await?;
+        self.changed.notify_waiters();
+        Ok(token)
+    }
+}
+
+impl DefaultReplicatorInner {
+    async fn progress_status_unlocked(&self) -> NativeProgressStatus {
+        let state = self.state.read().await;
+        let current_progress = state.current_progress;
+        let verified_replication_lsn = state
+            .replication_progress
+            .as_ref()
+            .map(|progress| progress.verified_lsn);
+        let committed_lsn = state.committed_lsn;
+        drop(state);
+        let replicator = self.replicator.lock().await;
+        NativeProgressStatus {
+            current_progress,
+            verified_replication_lsn,
+            committed_lsn: committed_lsn.max(replicator.committed_lsn()),
+            current_configuration_quorum_progress: replicator
+                .current_configuration_quorum_progress(),
+            catch_up_boundary: replicator.catch_up_boundary(),
+            catch_up_complete: replicator.catch_up_complete(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -3651,7 +3699,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         Ok(())
     }
 
-    async fn settle_primary_prefix(&self) -> Result<()> {
+    async fn settle_primary_prefix(&self) -> Result<CertifiedPrefixReceipt> {
         let _effect = self.effect_lock.lock().await;
         let _delivery = self.delivery_lock.lock().await;
         self.check_aborted()?;
@@ -3675,17 +3723,17 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         drop(state);
         let storage = self.storage().await?;
         let durable = storage.durable_progress().await?;
-        let verified_lsn = match (authority, progress) {
+        let verified_lsn = match (authority.as_ref(), progress.as_ref()) {
             (Some(authority), Some(progress)) => {
                 if authority.primary_identity() != &self.identity
                     || progress.fence != authority.fence()
-                    || self.replica_authority_store.load().await?.as_ref() != Some(&authority)
+                    || self.replica_authority_store.load().await?.as_ref() != Some(authority)
                     || self
                         .replication_progress_store
                         .load_replication_progress(&authority.fence())
                         .await?
                         .as_ref()
-                        != Some(&progress)
+                        != Some(progress)
                 {
                     return Err(RuntimeError::AuthorityMismatch(
                         "primary activation lacks durable authority-fenced progress".into(),
@@ -3718,7 +3766,16 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             .await
             .restore_committed_prefix(settled_lsn);
         self.state.write().await.committed_lsn = committed.committed_lsn;
-        Ok(())
+        Ok(CertifiedPrefixReceipt {
+            token: NativeOperationToken {
+                authority,
+                engine_session_id: self.session_id.clone(),
+                engine_generation: self.fence_generation.load(Ordering::Acquire),
+            },
+            verified_lsn: verified_lsn.max(settled_lsn),
+            settled_lsn,
+            committed_lsn: committed.committed_lsn,
+        })
     }
 
     async fn cancel_configuration_work(&self) -> Result<()> {
@@ -3731,7 +3788,11 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         Ok(())
     }
 
-    async fn prepare_access(&self, read: AccessStatus, write: AccessStatus) -> Result<u64> {
+    async fn prepare_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<AccessPreparation> {
         self.check_aborted()?;
         let generation = self.fence_generation.load(Ordering::Acquire);
         if write == AccessStatus::Granted {
@@ -3779,29 +3840,86 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         if generation != self.fence_generation.load(Ordering::Acquire) {
             return Err(RuntimeError::OperationCancelled);
         }
-        Ok(generation)
+        let state = self.state.read().await;
+        Ok(AccessPreparation {
+            authority: state.authority.clone(),
+            engine_session_id: self.session_id.clone(),
+            engine_generation: generation,
+            read,
+            write,
+            current_progress: state.current_progress,
+            committed_lsn: state.committed_lsn,
+        })
     }
 
-    async fn publish_access(
-        &self,
-        read: AccessStatus,
-        write: AccessStatus,
-        generation: u64,
-    ) -> Result<()> {
+    async fn publish_access(&self, preparation: AccessPreparation) -> Result<()> {
         let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
         self.check_aborted()?;
-        if generation != self.fence_generation.load(Ordering::Acquire) {
+        if preparation.engine_session_id != self.session_id
+            || preparation.engine_generation != self.fence_generation.load(Ordering::Acquire)
+        {
             return Err(RuntimeError::OperationCancelled);
         }
-        if write != AccessStatus::Granted {
+        let mut state = self.state.write().await;
+        if preparation.authority != state.authority
+            || ((preparation.read == AccessStatus::Granted
+                || preparation.write == AccessStatus::Granted)
+                && (preparation.current_progress != state.current_progress
+                    || preparation.committed_lsn != state.committed_lsn))
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        if preparation.write != AccessStatus::Granted {
             self.replicator.lock().await.fence_client_writes();
         }
-        let mut state = self.state.write().await;
-        state.read_status = read;
-        state.write_status = write;
+        state.read_status = preparation.read;
+        state.write_status = preparation.write;
         drop(state);
         self.changed.notify_waiters();
         Ok(())
+    }
+
+    async fn lock_native_fence(
+        &self,
+        expected: &NativeOperationToken,
+    ) -> Result<ManagedFenceGuard> {
+        let _effect = self.effect_lock.lock().await;
+        let delivery = self.delivery_lock.clone().lock_owned().await;
+        self.check_aborted()?;
+        if expected.engine_session_id != self.session_id
+            || expected.engine_generation != self.fence_generation.load(Ordering::Acquire)
+            || expected.authority != self.state.read().await.authority
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        let progress = self.progress_status_unlocked().await;
+        Ok(ManagedFenceGuard::new(delivery, progress))
+    }
+
+    async fn native_fence(&self) -> Result<NativeOperationToken> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        Ok(NativeOperationToken {
+            authority: self.state.read().await.authority.clone(),
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+        })
+    }
+
+    async fn progress_status(&self) -> NativeProgressStatus {
+        let _effect = self.effect_lock.lock().await;
+        self.progress_status_unlocked().await
+    }
+
+    async fn topology_status(&self) -> NativeTopologyStatus {
+        let state = self.state.read().await;
+        NativeTopologyStatus {
+            prepared_secondary_removal: state.prepared_secondary_removal.clone(),
+            accepted_secondary_removal: state.accepted_secondary_removal.clone(),
+            retired_authority: state.retired_authority.clone(),
+        }
     }
 
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()> {
@@ -3809,106 +3927,137 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             .await
     }
 
-    async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::AuthorizeFailoverPrefix(boundary))
-            .await
-    }
-
-    async fn wait_for_catch_up_proof(&self) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::WaitForCatchup)
-            .await
-    }
-
-    async fn prepare_switchover_proof(
-        &self,
-        preparation_generation: u64,
-        request_id: kuberic_protocol::types::SwitchoverRequestId,
-        source: ReplicaIdentity,
-        target: ReplicaIdentity,
-        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
-        starting_epoch: Epoch,
-    ) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::PrepareSwitchover {
-            preparation_generation,
-            request_id,
-            source,
-            target,
-            starting_configuration_id,
-            starting_epoch,
-        })
-        .await
-    }
-
-    async fn prepare_secondary_removal_proof(
-        &self,
-        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
-        process_session_id: ProcessSessionId,
-        report_sequence: u64,
-    ) -> Result<kuberic_protocol::types::SecondaryRemovalPreparation> {
-        self.execute_managed_proof_action(RuntimeEffectAction::PrepareSecondaryRemoval {
-            intent: Box::new(intent),
-            process_session_id,
-            report_sequence,
-        })
-        .await?;
-        self.snapshot()
-            .await
-            .prepared_secondary_removal
-            .ok_or(RuntimeError::AuthorityNotAdmitted)
-    }
-
-    async fn observe_secondary_removal_proof(
-        &self,
-        witness: kuberic_protocol::types::SecondaryRemovalWitness,
-    ) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::ObserveSecondaryRemovalWitness(
-            Box::new(witness),
-        ))
-        .await
-    }
-
-    async fn observe_secondary_removal_progress_proof(
-        &self,
-        witness: kuberic_protocol::types::SecondaryRemovalWitness,
-        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::ObserveSecondaryRemovalProgress {
-            witness: Box::new(witness),
-            committed: Box::new(committed),
-        })
-        .await
-    }
-
-    async fn accept_secondary_removal_proof(
-        &self,
-        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(
-            Box::new(committed),
-        ))
-        .await
-    }
-
-    async fn accept_historical_secondary_removal_proof(
-        &self,
-        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<()> {
-        self.execute_managed_proof_action(
-            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command)),
-        )
-        .await
-    }
-
-    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::FenceRetirement(Box::new(retired)))
-            .await
-    }
-
-    async fn complete_retirement_proof(&self, retired: RetiredAuthority) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::CompleteRetirement(Box::new(
-            retired,
-        )))
-        .await
+    async fn apply_topology(&self, action: RuntimeEffectAction) -> Result<TopologyReceipt> {
+        match action {
+            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
+                self.execute_managed_proof_action(RuntimeEffectAction::AuthorizeFailoverPrefix(
+                    boundary,
+                ))
+                .await?;
+                Ok(TopologyReceipt::CertifiedPrefix(Box::new(
+                    self.certified_prefix_receipt(boundary).await?,
+                )))
+            }
+            RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            } => {
+                let token = self
+                    .prepare_switchover_with_token(RuntimeEffectAction::PrepareSwitchover {
+                        preparation_generation,
+                        request_id: request_id.clone(),
+                        source: source.clone(),
+                        target: target.clone(),
+                        starting_configuration_id: starting_configuration_id.clone(),
+                        starting_epoch,
+                    })
+                    .await?;
+                let state = self.state.read().await;
+                let handoff_lsn = state
+                    .replication_progress
+                    .as_ref()
+                    .map_or(state.current_progress, |progress| progress.verified_lsn)
+                    .min(state.current_progress)
+                    .max(state.committed_lsn);
+                Ok(TopologyReceipt::Switchover(Box::new(SwitchoverReceipt {
+                    token,
+                    preparation_generation,
+                    request_id,
+                    source,
+                    target,
+                    starting_configuration_id,
+                    starting_epoch,
+                    handoff_lsn,
+                    committed_lsn: state.committed_lsn,
+                })))
+            }
+            RuntimeEffectAction::PrepareSecondaryRemoval {
+                intent,
+                process_session_id,
+                report_sequence,
+            } => {
+                self.execute_managed_proof_action(RuntimeEffectAction::PrepareSecondaryRemoval {
+                    intent,
+                    process_session_id,
+                    report_sequence,
+                })
+                .await?;
+                Ok(TopologyReceipt::SecondaryRemoval(Box::new(
+                    self.secondary_removal_receipt(None).await?,
+                )))
+            }
+            RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness) => {
+                let receipt_witness = (*witness).clone();
+                self.execute_managed_proof_action(
+                    RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness),
+                )
+                .await?;
+                Ok(TopologyReceipt::SecondaryRemoval(Box::new(
+                    self.secondary_removal_receipt(Some(receipt_witness))
+                        .await?,
+                )))
+            }
+            RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed } => {
+                let receipt_witness = (*witness).clone();
+                self.execute_managed_proof_action(
+                    RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed },
+                )
+                .await?;
+                Ok(TopologyReceipt::SecondaryRemoval(Box::new(
+                    self.secondary_removal_receipt(Some(receipt_witness))
+                        .await?,
+                )))
+            }
+            RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed) => {
+                self.execute_managed_proof_action(
+                    RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed),
+                )
+                .await?;
+                Ok(TopologyReceipt::SecondaryRemoval(Box::new(
+                    self.secondary_removal_receipt(None).await?,
+                )))
+            }
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
+                self.execute_managed_proof_action(
+                    RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command),
+                )
+                .await?;
+                Ok(TopologyReceipt::SecondaryRemoval(Box::new(
+                    self.secondary_removal_receipt(None).await?,
+                )))
+            }
+            RuntimeEffectAction::FenceRetirement(retired) => {
+                self.execute_managed_proof_action(RuntimeEffectAction::FenceRetirement(
+                    retired.clone(),
+                ))
+                .await?;
+                Ok(TopologyReceipt::Retirement(Box::new(RetirementReceipt {
+                    engine_session_id: self.session_id.clone(),
+                    engine_generation: self.fence_generation.load(Ordering::Acquire),
+                    retired: *retired,
+                    completed: false,
+                })))
+            }
+            RuntimeEffectAction::CompleteRetirement(retired) => {
+                self.execute_managed_proof_action(RuntimeEffectAction::CompleteRetirement(
+                    retired.clone(),
+                ))
+                .await?;
+                Ok(TopologyReceipt::Retirement(Box::new(RetirementReceipt {
+                    engine_session_id: self.session_id.clone(),
+                    engine_generation: self.fence_generation.load(Ordering::Acquire),
+                    retired: *retired,
+                    completed: true,
+                })))
+            }
+            _ => Err(RuntimeError::Application(
+                "unsupported native topology operation".into(),
+            )),
+        }
     }
 
     async fn register_peer_session_proof(
@@ -3935,14 +4084,6 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             .await
     }
 
-    async fn build_replica_proof(&self, replica: ReplicaInformation) -> Result<()> {
-        self.wait_for_build(replica, false).await
-    }
-
-    async fn remove_replica_proof(&self, replica_id: ReplicaId) -> Result<()> {
-        self.remove_replica(replica_id, false).await
-    }
-
     async fn refresh_progress_proof(&self) -> Result<()> {
         self.execute_managed_proof_action(RuntimeEffectAction::RefreshApplicationProgress)
             .await
@@ -3964,6 +4105,20 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         state.cancelled_outbound_builds.insert(build_id.clone());
         drop(state);
         self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn detach_outbound_build_stream(&self, build_id: &OperationId) -> Result<()> {
+        let _effect = self.effect_lock.lock().await;
+        let mut state = self.state.write().await;
+        let build = state
+            .outbound_builds
+            .get_mut(build_id)
+            .ok_or(RuntimeError::OperationCancelled)?;
+        if !build.progress.completed {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        build.stream_tx = None;
         Ok(())
     }
 

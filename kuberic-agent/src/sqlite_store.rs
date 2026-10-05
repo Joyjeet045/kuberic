@@ -16,6 +16,7 @@ use kuberic_runtime_internal::authority::{
     ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore, RetiredAuthority,
 };
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
+use kuberic_runtime_internal::receipts::TopologyReceipt;
 use kuberic_runtime_internal::{ContractError, Result as ContractResult};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
@@ -26,6 +27,101 @@ use crate::state::{
 };
 use crate::store::{AgentStore, BeginConfiguration, BeginEffect};
 use crate::{AgentError, Result};
+
+fn switchover_receipt_matches(
+    receipt: &kuberic_runtime_internal::receipts::SwitchoverReceipt,
+    preparation_generation: u64,
+    request_id: &kuberic_protocol::types::SwitchoverRequestId,
+    source: &ReplicaIdentity,
+    target: &ReplicaIdentity,
+    starting_configuration_id: &ConfigurationId,
+    starting_epoch: Epoch,
+) -> bool {
+    receipt.preparation_generation == preparation_generation
+        && &receipt.request_id == request_id
+        && &receipt.source == source
+        && &receipt.target == target
+        && &receipt.starting_configuration_id == starting_configuration_id
+        && receipt.starting_epoch == starting_epoch
+        && receipt.handoff_lsn >= 0
+}
+
+fn validate_topology_receipt(effect: &RuntimeEffect, result: &RuntimeEffectResult) -> Result<()> {
+    let Some(receipt) = result.topology_receipt.as_deref() else {
+        return Ok(());
+    };
+    let valid = match (&effect.action, receipt) {
+        (
+            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary),
+            TopologyReceipt::CertifiedPrefix(receipt),
+        ) => receipt.settled_lsn == *boundary,
+        (
+            RuntimeEffectAction::ChangeApplicationRole(ReplicaRole::Primary),
+            TopologyReceipt::CertifiedPrefix(_),
+        ) => true,
+        (
+            RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            },
+            TopologyReceipt::Switchover(receipt),
+        ) => switchover_receipt_matches(
+            receipt,
+            *preparation_generation,
+            request_id,
+            source,
+            target,
+            starting_configuration_id,
+            *starting_epoch,
+        ),
+        (
+            RuntimeEffectAction::PrepareSecondaryRemoval { intent, .. },
+            TopologyReceipt::SecondaryRemoval(receipt),
+        ) => receipt
+            .preparation
+            .as_ref()
+            .is_some_and(|preparation| preparation.intent == **intent),
+        (
+            RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness),
+            TopologyReceipt::SecondaryRemoval(receipt),
+        ) => receipt.witness.as_ref() == Some(witness),
+        (
+            RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed },
+            TopologyReceipt::SecondaryRemoval(receipt),
+        ) => {
+            receipt.witness.as_ref() == Some(witness)
+                && receipt.accepted.as_ref() == Some(committed)
+        }
+        (
+            RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed),
+            TopologyReceipt::SecondaryRemoval(receipt),
+        ) => receipt.accepted.as_ref() == Some(committed),
+        (
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command),
+            TopologyReceipt::SecondaryRemoval(receipt),
+        ) => receipt.accepted.as_ref() == Some(&command.committed),
+        (RuntimeEffectAction::FenceRetirement(retired), TopologyReceipt::Retirement(receipt)) => {
+            receipt.retired == **retired && !receipt.completed
+        }
+        (
+            RuntimeEffectAction::RetireReplica(retired)
+            | RuntimeEffectAction::CompleteRetirement(retired),
+            TopologyReceipt::Retirement(receipt),
+        ) => receipt.retired == **retired && receipt.completed,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(AgentError::EffectConflict(
+            "topology receipt does not match durable intent".into(),
+        ))
+    }
+}
 
 const DATABASE_FILE: &str = "agent.sqlite3";
 
@@ -273,6 +369,7 @@ impl AgentStore for SqliteStore {
                     "effect completion does not match durable intent".into(),
                 ));
             }
+            validate_topology_receipt(&pending.effect, result)?;
             if let RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) =
                 &pending.effect.action
             {
@@ -345,12 +442,19 @@ impl AgentStore for SqliteStore {
                     kuberic_protocol::validation::validate_accept_secondary_removal_commit(command)
                         .map_err(|e| AgentError::EffectConflict(e.to_string()))?;
                     let intent = &command.committed.evidence.preparation.intent;
+                    let receipt = match result.topology_receipt.as_deref() {
+                        Some(TopologyReceipt::SecondaryRemoval(receipt)) => Some(receipt),
+                        _ => None,
+                    };
                     if !command.local_recovery
                         || command.operation_id != pending.effect.operation_id
                         || command.target != state.identity.local_identity
                         || intent.resource_uid != state.identity.resource_uid
                         || result.postcondition.accepted_secondary_removal.as_ref()
                             != Some(&command.committed)
+                        || receipt.is_some_and(|receipt| {
+                            receipt.accepted.as_ref() != Some(&command.committed)
+                        })
                         || result.postcondition.role != ReplicaRole::ActiveSecondary
                         || result.postcondition.write_status == AccessStatus::Granted
                         || result.postcondition.role_transition.is_some()
@@ -377,6 +481,10 @@ impl AgentStore for SqliteStore {
                     process_session_id,
                     report_sequence,
                 } => {
+                    let receipt = match result.topology_receipt.as_deref() {
+                        Some(TopologyReceipt::SecondaryRemoval(receipt)) => Some(receipt),
+                        _ => None,
+                    };
                     let prepared = result
                         .postcondition
                         .prepared_secondary_removal
@@ -392,6 +500,8 @@ impl AgentStore for SqliteStore {
                         || &prepared.process_session_id != process_session_id
                         || prepared.report_sequence != *report_sequence
                         || prepared.operation_id != pending.effect.operation_id
+                        || receipt
+                            .is_some_and(|receipt| receipt.preparation.as_ref() != Some(prepared))
                         || result.postcondition.role != ReplicaRole::Primary
                         || result.postcondition.read_status == AccessStatus::Granted
                         || result.postcondition.write_status == AccessStatus::Granted
@@ -417,7 +527,13 @@ impl AgentStore for SqliteStore {
                     retired
                         .validate(&state.identity.local_identity)
                         .map_err(|e| AgentError::EffectConflict(e.to_string()))?;
-                    if result.postcondition.retired_authority.as_ref() != Some(retired)
+                    let retirement_receipt = match result.topology_receipt.as_deref() {
+                        Some(TopologyReceipt::Retirement(receipt)) => Some(receipt),
+                        _ => None,
+                    };
+                    if retirement_receipt
+                        .is_some_and(|receipt| !receipt.completed || receipt.retired != **retired)
+                        || result.postcondition.retired_authority.as_ref() != Some(retired)
                         || result.postcondition.open
                         || result.postcondition.role != ReplicaRole::None
                         || result.postcondition.read_status != AccessStatus::NotPrimary
@@ -462,6 +578,10 @@ impl AgentStore for SqliteStore {
                 starting_epoch,
             } = &pending.effect.action
             {
+                let switchover_receipt = match result.topology_receipt.as_deref() {
+                    Some(TopologyReceipt::Switchover(receipt)) => Some(receipt),
+                    _ => None,
+                };
                 let authority = result.postcondition.authority.as_ref().ok_or_else(|| {
                     AgentError::EffectConflict(
                         "planned switchover preparation omitted admitted authority".into(),
@@ -477,6 +597,17 @@ impl AgentStore for SqliteStore {
                         != *starting_configuration_id
                     || authority.current_configuration.epoch != *starting_epoch
                     || authority.primary_identity() != source
+                    || switchover_receipt.is_some_and(|receipt| {
+                        !switchover_receipt_matches(
+                            receipt,
+                            *preparation_generation,
+                            request_id,
+                            source,
+                            target,
+                            starting_configuration_id,
+                            *starting_epoch,
+                        )
+                    })
                     || !authority
                         .current_configuration
                         .members
@@ -497,7 +628,11 @@ impl AgentStore for SqliteStore {
                     target: target.clone(),
                     starting_configuration_id: starting_configuration_id.clone(),
                     starting_epoch: *starting_epoch,
-                    handoff_lsn: result.postcondition.current_progress,
+                    handoff_lsn: switchover_receipt
+                        .as_ref()
+                        .map_or(result.postcondition.current_progress, |receipt| {
+                            receipt.handoff_lsn
+                        }),
                 };
                 if state
                     .prepared_switchover
@@ -1912,6 +2047,64 @@ mod tests {
                 expected: 5,
                 observed: 4
             })
+        ));
+    }
+
+    #[test]
+    fn switchover_receipt_rejects_negative_or_changed_handoff() {
+        let source = identity().local_identity;
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(3),
+            instance_id: ReplicaInstanceId::new("target"),
+            agent_generation: AgentGeneration::new("target-generation"),
+        };
+        let request_id = kuberic_protocol::types::SwitchoverRequestId::new("metadata-validation");
+        let configuration_id = ConfigurationId::new("starting");
+        let epoch = Epoch::new(0, 1);
+        let mut receipt = kuberic_runtime_internal::receipts::SwitchoverReceipt {
+            token: kuberic_runtime_internal::receipts::NativeOperationToken {
+                authority: None,
+                engine_session_id: "engine".into(),
+                engine_generation: 3,
+            },
+            request_id: request_id.clone(),
+            preparation_generation: 1,
+            source: source.clone(),
+            target: target.clone(),
+            starting_configuration_id: configuration_id.clone(),
+            starting_epoch: epoch,
+            handoff_lsn: 7,
+            committed_lsn: 7,
+        };
+        assert!(switchover_receipt_matches(
+            &receipt,
+            1,
+            &request_id,
+            &source,
+            &target,
+            &configuration_id,
+            epoch,
+        ));
+        receipt.handoff_lsn = -1;
+        assert!(!switchover_receipt_matches(
+            &receipt,
+            1,
+            &request_id,
+            &source,
+            &target,
+            &configuration_id,
+            epoch,
+        ));
+        receipt.handoff_lsn = 7;
+        receipt.request_id = kuberic_protocol::types::SwitchoverRequestId::new("changed");
+        assert!(!switchover_receipt_matches(
+            &receipt,
+            1,
+            &request_id,
+            &source,
+            &target,
+            &configuration_id,
+            epoch,
         ));
     }
 }

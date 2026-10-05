@@ -5758,6 +5758,185 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
 }
 
 #[test]
+fn failover_uses_exact_surviving_deactivation_evidence_when_old_primary_cannot_return() {
+    let previous = configuration();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        ReplicaId::new(2),
+        previous
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity.replica_id == ReplicaId::new(2) {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        2,
+    );
+    let transition_id = derive_transition_id(
+        &ResourceUid::new("resource-uid"),
+        TransitionKind::Failover,
+        &current.configuration_id,
+    );
+    let mut snapshot = empty_snapshot(3);
+    snapshot.routing.service_present = true;
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
+        topology: Some(AcceptedTopology {
+            configuration: previous.clone(),
+        }),
+        transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
+            transition_id: transition_id.clone(),
+            kind: TransitionKind::Failover,
+            spec_generation: 1,
+            effective_policy: EffectivePolicy::fixed(3, 10).unwrap(),
+            previous_configuration_id: Some(previous.configuration_id.clone()),
+            current_configuration: current.clone(),
+            election_lsn: Some(10),
+            build_id: None,
+            repair: None,
+            switchover: None,
+        }),
+        primary_failure: Some(kuberic_protocol::types::PrimaryFailureObservation {
+            primary: previous.members[0].identity.clone(),
+            started_at_unix_seconds: 90,
+        }),
+        ..AcceptedStatus::default()
+    };
+    for replica_id in [2, 3] {
+        let member = current
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == ReplicaId::new(replica_id))
+            .unwrap();
+        let primary = replica_id == 2;
+        snapshot.replicas.insert(
+            ReplicaObservationKey::new(
+                member.identity.replica_id,
+                member.identity.instance_id.clone(),
+            ),
+            ReplicaObservation {
+                kubernetes: Some(KubernetesReplicaObservation {
+                    replica_id: member.identity.replica_id,
+                    pod_name: format!("pod-{replica_id}"),
+                    pod_uid: Some(PodUid::new(member.identity.instance_id.as_str())),
+                    pvc_name: format!("pvc-{replica_id}"),
+                    pvc_uid: Some(PvcUid::new(format!("pvc-{replica_id}"))),
+                    image: Some("example:v1".to_string()),
+                    pod_ready: primary,
+                    peer_endpoint_ready: primary,
+                }),
+                agent: AgentObservation::Report(Box::new(AgentReport {
+                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    resource_uid: snapshot.resource_uid.clone(),
+                    identity: member.identity.clone(),
+                    process_session_id: ProcessSessionId::new(format!("session-{replica_id}")),
+                    report_sequence: 1,
+                    role: member.role,
+                    read_status: AccessStatus::Granted,
+                    write_status: if primary {
+                        AccessStatus::Granted
+                    } else {
+                        AccessStatus::ReconfigurationPending
+                    },
+                    healthy: true,
+                    epoch: current.epoch,
+                    previous_configuration: Some(previous.clone()),
+                    current_configuration: Some(current.clone()),
+                    current_progress: 10,
+                    committed_lsn: 10,
+                    catch_up_capability: Some(1),
+                    current_configuration_quorum_progress: 10,
+                    catch_up_boundary: Some(10),
+                    catch_up_complete: true,
+                    deactivated_lsn: Some(10),
+                    deactivation_epoch: Some(current.epoch),
+                    ..AgentReport::default()
+                })),
+            },
+        );
+    }
+
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("transition condition must be persisted first");
+    };
+    let KubernetesChange::PersistStatus { status } = changes.last().unwrap() else {
+        panic!("expected transition status");
+    };
+    snapshot.status = (**status).clone();
+
+    let secondary = current
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == ReplicaId::new(3))
+        .unwrap();
+    let secondary_key = ReplicaObservationKey::new(
+        secondary.identity.replica_id,
+        secondary.identity.instance_id.clone(),
+    );
+    let AgentObservation::Report(report) =
+        &mut snapshot.replicas.get_mut(&secondary_key).unwrap().agent
+    else {
+        panic!("secondary report");
+    };
+    report.current_progress = 11;
+    report.committed_lsn = 11;
+    report.deactivated_lsn = Some(11);
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Wait {
+            reason: WaitReason::AwaitingStableEvidence,
+            status,
+            ..
+        } if status.conditions.iter().any(|condition|
+            condition.reason == "ElectionWinnerUnavailable")
+    ));
+    let AgentObservation::Report(report) =
+        &mut snapshot.replicas.get_mut(&secondary_key).unwrap().agent
+    else {
+        panic!("secondary report");
+    };
+    report.current_progress = 10;
+    report.committed_lsn = 10;
+    report.deactivated_lsn = None;
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Wait {
+            reason: WaitReason::ActiveTransition,
+            status,
+            ..
+        } if status.conditions.iter().any(|condition|
+            condition.reason == "DeactivationQuorumPending")
+    ));
+    let AgentObservation::Report(report) =
+        &mut snapshot.replicas.get_mut(&secondary_key).unwrap().agent
+    else {
+        panic!("secondary report");
+    };
+    report.deactivated_lsn = Some(10);
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(command),
+    } = evaluate(&snapshot, &EvaluationConfig::default())
+    else {
+        panic!("exact surviving deactivation quorum must allow current-only installation");
+    };
+    assert!(command.current_only);
+    assert_eq!(command.local_replica_id, ReplicaId::new(2));
+    assert_eq!(command.primary_write_status, AccessStatus::Granted);
+    assert!(snapshot.routing.write_target.is_none());
+}
+
+#[test]
 fn failover_current_only_keeps_secondary_write_access_non_primary() {
     let previous = configuration();
     let current = ConfigurationDescriptor::new(

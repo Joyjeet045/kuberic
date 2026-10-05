@@ -131,6 +131,7 @@ the isolated development/CI assets above.
 ## Documentation
 
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md)
+- [Replicator boundary and native proof](docs/features/kuberic/replicator-boundary.md)
 - [Testing strategy](docs/features/kuberic/testing.md)
 - [SQLite design](docs/features/sqlite/design.md)
 - [PostgreSQL design](docs/features/postgres/design.md)

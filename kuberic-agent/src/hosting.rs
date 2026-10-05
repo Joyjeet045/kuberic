@@ -1,8 +1,9 @@
 //! Service Fabric-aligned process hosting boundary.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use async_trait::async_trait;
@@ -21,13 +22,11 @@ use kuberic_runtime::replicator::copy::{
     BuildConfiguration, PrepareCopyRequest, PreparedCopy as RuntimePreparedCopy,
 };
 use kuberic_runtime::replicator::{
-    DefaultReplicatorDependencies, ManagedReplicatorDataPlane, ManagedReplicatorLifecycle,
-    PartitionAccessView, PrimaryReplicator, Replicator, ReplicatorCreationReservation,
-    ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration,
-    StatefulServicePartition,
+    DefaultReplicatorDependencies, ManagedReplicatorDataPlane, PartitionAccessView,
+    PrimaryReplicator, Replicator, ReplicatorAttachment, ReplicatorCreationReservation,
+    ReplicatorFactoryContext, ReplicatorRegistration, StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
-use kuberic_runtime_internal::RuntimeHostToken;
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityStore, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
     BuildProgressStore, LocalWriteJournal, ReplicaAuthorityStore, ReplicationProgressStore,
@@ -37,6 +36,7 @@ use kuberic_runtime_internal::effects::{
     RuntimeSnapshot,
 };
 use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
+use kuberic_runtime_internal::{ReplicatorCreationIdentity, RuntimeHostToken};
 use kuberic_wire::proto;
 use tokio::sync::{Mutex, RwLock};
 
@@ -55,20 +55,15 @@ where
     ACCESS_PROOF_VIEW.scope((read, write), future).await
 }
 
+use crate::runtime_adapter::RuntimeEffectExecution;
 use crate::transport::{
     copy_ack_from_proto, copy_ack_to_proto, copy_from_proto, copy_to_proto,
     replication_ack_from_proto, replication_ack_to_proto, replication_from_proto,
     replication_to_proto,
 };
 
-const REPLICATOR_CREATION_AVAILABLE: u8 = 0;
-const REPLICATOR_CREATION_RESERVED: u8 = 1;
-const REPLICATOR_CREATION_REGISTERED: u8 = 2;
-const REPLICATOR_RESERVATION_ID: u64 = 1;
-
 #[path = "custom.rs"]
 mod custom;
-pub(crate) use custom::BuildExecution;
 
 #[async_trait]
 pub trait RuntimeControlPlane: Send {
@@ -140,6 +135,12 @@ struct RegisteredReplicator {
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
 }
 
+enum ReplicatorCreationState {
+    Available,
+    Reserved(ReplicatorCreationIdentity),
+    Registered,
+}
+
 struct HostedPrimaryReplicator {
     inner: Arc<dyn PrimaryReplicator>,
     lifecycle: Arc<custom::ReplicatorLifecycleHost>,
@@ -152,14 +153,17 @@ impl Replicator for HostedPrimaryReplicator {
     }
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        self.lifecycle.invalidate_public_access().await?;
         self.inner.change_role(epoch, role).await
     }
 
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        self.lifecycle.invalidate_public_access().await?;
         self.inner.update_epoch(epoch).await
     }
 
     async fn close(&self) -> Result<()> {
+        self.lifecycle.invalidate_public_access().await?;
         self.inner.close().await
     }
 
@@ -221,49 +225,6 @@ impl PrimaryReplicator for HostedPrimaryReplicator {
     }
 }
 
-struct PendingManagedCapabilities {
-    reservation: u64,
-    lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
-    data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
-}
-
-struct ManagedCapabilityRegistrationGuard {
-    lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
-    data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
-    armed: bool,
-}
-
-impl ManagedCapabilityRegistrationGuard {
-    fn new(
-        lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
-        data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
-    ) -> Self {
-        Self {
-            lifecycle,
-            data_plane,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ManagedCapabilityRegistrationGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Some(lifecycle) = self.lifecycle.as_ref() {
-            lifecycle.abort();
-        }
-        if let Some(data_plane) = self.data_plane.as_ref() {
-            data_plane.abort();
-        }
-    }
-}
-
 impl RegisteredReplicator {
     fn managed_data_plane(&self) -> Option<Arc<dyn ManagedReplicatorDataPlane>> {
         self.managed_data_plane.clone()
@@ -305,6 +266,49 @@ pub struct PodRuntime {
     host: Arc<RuntimeHost>,
 }
 
+struct ExactBuildCancellation {
+    decision: Option<tokio::sync::oneshot::Sender<BuildCancellationDecision>>,
+    completion: tokio::task::JoinHandle<Result<()>>,
+}
+
+enum BuildCancellationDecision {
+    Commit,
+    Cancel { public_cleanup: bool },
+}
+
+impl ExactBuildCancellation {
+    fn new(host: &Arc<RuntimeHost>, build_id: OperationId, generation: u64) -> Self {
+        let host = Arc::downgrade(host);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let completion = tokio::spawn(async move {
+            let public_cleanup = match completion.await {
+                Ok(BuildCancellationDecision::Commit) => return Ok(()),
+                Ok(BuildCancellationDecision::Cancel { public_cleanup }) => public_cleanup,
+                Err(_) => true,
+            };
+            let Some(host) = host.upgrade() else {
+                return Ok(());
+            };
+            host.lifecycle()?
+                .cancel_outbound_build_attempt(&build_id, generation, public_cleanup)
+                .await
+        });
+        Self {
+            decision: Some(decision),
+            completion,
+        }
+    }
+
+    async fn finish(mut self, decision: BuildCancellationDecision) -> Result<()> {
+        if let Some(sender) = self.decision.take() {
+            let _ = sender.send(decision);
+        }
+        self.completion
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeDataPlane {
     host: Arc<RuntimeHost>,
@@ -317,6 +321,13 @@ pub struct PartitionReportSnapshot {
     pub write_status: AccessStatus,
     pub load_metrics: Vec<LoadMetric>,
     pub reported_fault: Option<FaultType>,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Clone)]
+pub struct AccessEffectAcceptanceGate {
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for PodRuntime {
@@ -384,14 +395,48 @@ impl PodRuntime {
                 }),
                 effect_lock: Mutex::new(()),
                 registered: OnceLock::new(),
-                pending_managed_capabilities: StdMutex::new(None),
+                replicator_creation: StdMutex::new(ReplicatorCreationState::Available),
                 weak_self: weak_self.clone(),
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
-                replicator_creation: AtomicU8::new(REPLICATOR_CREATION_AVAILABLE),
                 replica_session: OnceLock::new(),
+                #[cfg(feature = "testing")]
+                access_effect_acceptance_gate: StdMutex::new(None),
             }),
         }
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_pause_access_effect_acceptance(&self) -> AccessEffectAcceptanceGate {
+        let gate = AccessEffectAcceptanceGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.host.access_effect_acceptance_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_resume_access_effect_acceptance(&self) {
+        if let Some(gate) = self
+            .host
+            .access_effect_acceptance_gate
+            .lock()
+            .unwrap()
+            .take()
+        {
+            gate.release.notify_waiters();
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn testing_has_applied_effect(&self, sequence: u64) -> bool {
+        self.host.state.read().await.effects.contains_key(&sequence)
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn testing_cancel_configuration_work(&self) -> Result<()> {
+        self.host.lifecycle()?.cancel_configuration_work().await
     }
 
     pub async fn serve<C: RuntimeControlPlane>(&self, control_plane: &mut C) -> Result<()> {
@@ -632,7 +677,21 @@ impl PodRuntime {
     }
 
     pub async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
-        Box::pin(self.host.apply_effect(effect)).await
+        Box::pin(self.host.prepare_effect(effect))
+            .await?
+            .accept()
+            .await
+            .map_err(|error| match error {
+                crate::AgentError::Runtime(error) => error,
+                error => RuntimeError::Application(error.to_string()),
+            })
+    }
+
+    pub(crate) async fn prepare_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectExecution> {
+        Box::pin(self.host.prepare_effect(effect)).await
     }
 
     pub(crate) async fn consume_cancelled_build_effect(
@@ -727,9 +786,6 @@ impl PodRuntime {
     ) -> Result<()> {
         if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
             lifecycle.restore_access(read, write).await?;
-            self.host
-                .sync_access_projection(lifecycle.snapshot().await)
-                .await;
         } else {
             let mut state = self.host.state.write().await;
             state.fallback_snapshot.read_status = read;
@@ -761,6 +817,22 @@ impl PodRuntime {
 
     pub async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {
         self.host.lifecycle()?.cancel_outbound_build(build_id).await
+    }
+
+    pub(crate) async fn cancel_outbound_build_attempt(
+        &self,
+        build_id: &OperationId,
+        generation: u64,
+        public_cleanup: bool,
+    ) -> Result<()> {
+        self.host
+            .lifecycle()?
+            .cancel_outbound_build_attempt(build_id, generation, public_cleanup)
+            .await
+    }
+
+    pub(crate) async fn build_generation(&self, build_id: &OperationId) -> Result<u64> {
+        Ok(self.host.lifecycle()?.build_generation(build_id).await)
     }
 
     pub async fn wait_for_build_completion(
@@ -853,11 +925,54 @@ impl PodRuntime {
         Ok(())
     }
 
-    pub(crate) async fn execute_build(
+    pub(crate) async fn execute_admitted_build<F, Fut, E>(
         &self,
         replica: kuberic_runtime::replicator::ReplicaInformation,
-    ) -> Result<custom::BuildExecution> {
-        self.host.lifecycle()?.execute_build(replica).await
+        managed_copy: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<(), E>>,
+        E: From<RuntimeError>,
+    {
+        let lifecycle = self.host.lifecycle().map_err(E::from)?;
+        let managed = lifecycle.is_managed();
+        let generation = lifecycle.build_generation(&replica.build_id).await;
+        let cancellation =
+            ExactBuildCancellation::new(&self.host, replica.build_id.clone(), generation);
+        let (result, public_cleanup) = if managed {
+            (
+                async {
+                    let execution =
+                        async { lifecycle.execute_build(replica).await.map_err(E::from) };
+                    let (receipt, ()) = tokio::try_join!(execution, managed_copy())?;
+                    lifecycle.accept_build(receipt).await.map_err(E::from)
+                }
+                .await,
+                true,
+            )
+        } else {
+            match lifecycle.execute_build(replica).await {
+                Ok(receipt) => (lifecycle.accept_build(receipt).await.map_err(E::from), true),
+                Err(error) => (Err(E::from(error)), false),
+            }
+        };
+        match result {
+            Ok(()) => {
+                cancellation
+                    .finish(BuildCancellationDecision::Commit)
+                    .await
+                    .map_err(E::from)?;
+                Ok(())
+            }
+            Err(error) => {
+                cancellation
+                    .finish(BuildCancellationDecision::Cancel { public_cleanup })
+                    .await
+                    .map_err(E::from)?;
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn next_outbound(&self) -> Option<OutboundOperation> {
@@ -1028,11 +1143,12 @@ struct RuntimeHost {
     state: RwLock<HostState>,
     effect_lock: Mutex<()>,
     registered: OnceLock<RegisteredReplicator>,
-    pending_managed_capabilities: StdMutex<Option<PendingManagedCapabilities>>,
+    replicator_creation: StdMutex<ReplicatorCreationState>,
     weak_self: Weak<Self>,
     aborted: AtomicBool,
     closed: AtomicBool,
-    replicator_creation: AtomicU8,
+    #[cfg(feature = "testing")]
+    access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
 }
 
 struct HostAccessView {
@@ -1102,168 +1218,73 @@ impl PartitionAccessView for HostAccessView {
 #[async_trait]
 impl ReplicatorRegistration for RuntimeHost {
     fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation> {
-        self.replicator_creation
-            .compare_exchange(
-                REPLICATOR_CREATION_AVAILABLE,
-                REPLICATOR_CREATION_RESERVED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| {
-                RuntimeError::Application(
+        let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+        let mut creation = self.replicator_creation.lock().map_err(|_| {
+            RuntimeError::Application("replicator creation state was poisoned".into())
+        })?;
+        match &*creation {
+            ReplicatorCreationState::Available => {
+                *creation = ReplicatorCreationState::Reserved(
+                    reservation.identity(RuntimeHostToken::new()),
+                );
+                Ok(reservation)
+            }
+            ReplicatorCreationState::Reserved(_) | ReplicatorCreationState::Registered => {
+                Err(RuntimeError::Application(
                     "CreateReplicator may be called only once per Open".into(),
-                )
-            })?;
-        Ok(ReplicatorCreationReservation(REPLICATOR_RESERVATION_ID))
+                ))
+            }
+        }
     }
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation) {
-        if reservation.0 == REPLICATOR_RESERVATION_ID {
-            if let Ok(mut pending) = self.pending_managed_capabilities.lock()
-                && pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.reservation == reservation.0)
-                && let Some(pending) = pending.take()
-            {
-                if let Some(lifecycle) = pending.lifecycle {
-                    lifecycle.abort();
-                }
-                if let Some(data_plane) = pending.data_plane {
-                    data_plane.abort();
-                }
-            }
-            let _ = self.replicator_creation.compare_exchange(
-                REPLICATOR_CREATION_RESERVED,
-                REPLICATOR_CREATION_AVAILABLE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
-    }
-
-    async fn register_managed_lifecycle(
-        &self,
-        lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
-        reservation: ReplicatorCreationReservation,
-    ) -> Result<()> {
-        if reservation.0 != REPLICATOR_RESERVATION_ID
-            || self.replicator_creation.load(Ordering::Acquire) != REPLICATOR_CREATION_RESERVED
+        if let Ok(mut creation) = self.replicator_creation.lock()
+            && matches!(
+                &*creation,
+                ReplicatorCreationState::Reserved(identity)
+                    if *identity == reservation.identity(RuntimeHostToken::new())
+            )
         {
-            return Err(RuntimeError::Application(
-                "CreateReplicator reservation is not active".into(),
-            ));
+            *creation = ReplicatorCreationState::Available;
         }
-        let mut pending = self.pending_managed_capabilities.lock().map_err(|_| {
-            RuntimeError::Application("managed capability registration was poisoned".into())
-        })?;
-        match pending.as_mut() {
-            Some(pending) if pending.reservation != reservation.0 => {
-                return Err(RuntimeError::Application(
-                    "managed capability reservation does not match".into(),
-                ));
-            }
-            Some(pending) if pending.lifecycle.is_some() => {
-                return Err(RuntimeError::Application(
-                    "managed lifecycle may be registered only once".into(),
-                ));
-            }
-            Some(pending) => pending.lifecycle = Some(lifecycle),
-            None => {
-                *pending = Some(PendingManagedCapabilities {
-                    reservation: reservation.0,
-                    lifecycle: Some(lifecycle),
-                    data_plane: None,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    async fn register_managed_data_plane(
-        &self,
-        data_plane: Arc<dyn ManagedReplicatorDataPlane>,
-        reservation: ReplicatorCreationReservation,
-    ) -> Result<()> {
-        if reservation.0 != REPLICATOR_RESERVATION_ID
-            || self.replicator_creation.load(Ordering::Acquire) != REPLICATOR_CREATION_RESERVED
-        {
-            return Err(RuntimeError::Application(
-                "CreateReplicator reservation is not active".into(),
-            ));
-        }
-        let mut pending = self.pending_managed_capabilities.lock().map_err(|_| {
-            RuntimeError::Application("managed capability registration was poisoned".into())
-        })?;
-        match pending.as_mut() {
-            Some(pending) if pending.reservation != reservation.0 => {
-                return Err(RuntimeError::Application(
-                    "managed capability reservation does not match".into(),
-                ));
-            }
-            Some(pending) if pending.data_plane.is_some() => {
-                return Err(RuntimeError::Application(
-                    "managed data plane may be registered only once".into(),
-                ));
-            }
-            Some(pending) => pending.data_plane = Some(data_plane),
-            None => {
-                *pending = Some(PendingManagedCapabilities {
-                    reservation: reservation.0,
-                    lifecycle: None,
-                    data_plane: Some(data_plane),
-                });
-            }
-        }
-        Ok(())
     }
 
     async fn register_interfaces(
         &self,
-        interfaces: &ReplicatorInterfaces,
+        attachment: &ReplicatorAttachment,
         provider: Option<Arc<dyn StateProvider>>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()> {
-        if reservation.0 != REPLICATOR_RESERVATION_ID
-            || self.replicator_creation.load(Ordering::Acquire) != REPLICATOR_CREATION_RESERVED
+        let reservation_identity = reservation.identity(RuntimeHostToken::new());
         {
-            return Err(RuntimeError::Application(
-                "CreateReplicator reservation is not active".into(),
-            ));
-        }
-        let (managed_lifecycle, managed_data_plane) = {
-            let mut pending = self.pending_managed_capabilities.lock().map_err(|_| {
-                RuntimeError::Application("managed capability registration was poisoned".into())
+            let creation = self.replicator_creation.lock().map_err(|_| {
+                RuntimeError::Application("replicator creation state was poisoned".into())
             })?;
-            match pending.as_ref() {
-                None => (None, None),
-                Some(pending) if pending.reservation != reservation.0 => {
-                    return Err(RuntimeError::Application(
-                        "managed capability reservation does not match".into(),
-                    ));
-                }
-                Some(pending) if pending.lifecycle.is_none() || pending.data_plane.is_none() => {
-                    return Err(RuntimeError::Application(
-                        "managed lifecycle and data plane must be registered together".into(),
-                    ));
-                }
-                Some(_) => {
-                    let pending = pending.take().expect("pending capabilities");
-                    (pending.lifecycle, pending.data_plane)
-                }
+            if !matches!(
+                &*creation,
+                ReplicatorCreationState::Reserved(identity)
+                    if *identity == reservation_identity
+                        && attachment.identity(RuntimeHostToken::new()) == *identity
+            ) {
+                return Err(RuntimeError::Application(
+                    "CreateReplicator reservation is not active".into(),
+                ));
             }
-        };
-        let mut managed =
-            ManagedCapabilityRegistrationGuard::new(managed_lifecycle, managed_data_plane);
-        if let Some(lifecycle) = managed.lifecycle.as_ref() {
+        }
+        let managed_lifecycle = attachment.managed_lifecycle(RuntimeHostToken::new());
+        let managed_data_plane = attachment.managed_data_plane(RuntimeHostToken::new());
+        let control = attachment.replicator(RuntimeHostToken::new());
+        let primary = attachment.primary_replicator(RuntimeHostToken::new());
+        if let Some(lifecycle) = managed_lifecycle.as_ref() {
             lifecycle
-                .attach_interfaces(interfaces.replicator(), interfaces.primary_replicator())
+                .attach_interfaces(control.clone(), primary.clone())
                 .await?;
         }
-        let lifecycle = match (managed.lifecycle.as_ref(), interfaces.primary_replicator()) {
+        let lifecycle = match (managed_lifecycle.as_ref(), primary.clone()) {
             (Some(lifecycle), Some(primary)) => {
                 Some(Arc::new(custom::ReplicatorLifecycleHost::managed(
                     self.weak_self.clone(),
-                    interfaces.replicator(),
+                    control.clone(),
                     primary,
                     lifecycle.clone(),
                 )))
@@ -1275,39 +1296,38 @@ impl ReplicatorRegistration for RuntimeHost {
             }
             (None, Some(primary)) => Some(Arc::new(custom::ReplicatorLifecycleHost::service(
                 self.weak_self.clone(),
-                interfaces.replicator(),
+                control.clone(),
                 primary,
             ))),
             (None, None) => None,
         };
-        if self
-            .registered
-            .set(RegisteredReplicator {
-                control: interfaces.replicator(),
-                primary: interfaces.primary_replicator(),
-                provider,
-                lifecycle,
-                managed_data_plane: managed.data_plane.clone(),
-            })
-            .is_err()
-        {
+        let mut creation = self.replicator_creation.lock().map_err(|_| {
+            RuntimeError::Application("replicator creation state was poisoned".into())
+        })?;
+        if !matches!(
+            &*creation,
+            ReplicatorCreationState::Reserved(identity)
+                if *identity == reservation_identity
+                    && attachment.identity(RuntimeHostToken::new()) == *identity
+        ) {
             return Err(RuntimeError::Application(
-                "CreateReplicator may be called only once per Open".into(),
+                "CreateReplicator reservation was lost before registration".into(),
             ));
         }
-        managed.disarm();
-        self.replicator_creation
-            .compare_exchange(
-                REPLICATOR_CREATION_RESERVED,
-                REPLICATOR_CREATION_REGISTERED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+        self.registered
+            .set(RegisteredReplicator {
+                control,
+                primary,
+                provider,
+                lifecycle,
+                managed_data_plane,
+            })
             .map_err(|_| {
                 RuntimeError::Application(
-                    "CreateReplicator reservation was lost before registration".into(),
+                    "CreateReplicator may be called only once per Open".into(),
                 )
             })?;
+        *creation = ReplicatorCreationState::Registered;
         Ok(())
     }
 }
@@ -1359,20 +1379,11 @@ impl RuntimeHost {
                 lifecycle.notify_abort();
             }
             registered.abort();
-        } else if let Ok(mut pending) = self.pending_managed_capabilities.lock()
-            && let Some(pending) = pending.take()
-        {
-            if let Some(lifecycle) = pending.lifecycle {
-                lifecycle.abort();
-            }
-            if let Some(data_plane) = pending.data_plane {
-                data_plane.abort();
-            }
         }
         self.application.abort();
     }
 
-    async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+    async fn prepare_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectExecution> {
         let _guard = self.effect_lock.lock().await;
         if !matches!(
             effect.action,
@@ -1396,7 +1407,7 @@ impl RuntimeHost {
             let state = self.state.read().await;
             if let Some(previous) = state.effects.get(&effect.sequence) {
                 if effect == previous.effect {
-                    return Ok(previous.result.clone());
+                    return Ok(RuntimeEffectExecution::completed(previous.result.clone()));
                 }
                 return Err(RuntimeError::EffectConflict {
                     sequence: effect.sequence,
@@ -1442,6 +1453,7 @@ impl RuntimeHost {
         {
             return Err(RuntimeError::Closed);
         }
+        let mut access_commit = None;
         match effect.action.clone() {
             RuntimeEffectAction::RetireReplica(retired) => {
                 retired.validate(&self.identity)?;
@@ -1520,9 +1532,7 @@ impl RuntimeHost {
             }
             RuntimeEffectAction::SetAccessStatus { read, write } => {
                 if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
-                    lifecycle.set_access(read, write).await?;
-                    self.sync_access_projection(lifecycle.snapshot().await)
-                        .await;
+                    access_commit = Some(lifecycle.begin_access_effect(read, write).await?);
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::SetAccessStatus {
                         read,
@@ -1533,10 +1543,8 @@ impl RuntimeHost {
             }
             RuntimeEffectAction::SetReadStatus(read) => {
                 if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
-                    let write = lifecycle.snapshot().await.write_status;
-                    lifecycle.set_access(read, write).await?;
-                    self.sync_access_projection(lifecycle.snapshot().await)
-                        .await;
+                    let write = self.state.read().await.fallback_snapshot.write_status;
+                    access_commit = Some(lifecycle.begin_access_effect(read, write).await?);
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::SetReadStatus(read))
                         .await?;
@@ -1544,10 +1552,8 @@ impl RuntimeHost {
             }
             RuntimeEffectAction::SetWriteStatus(write) => {
                 if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
-                    let read = lifecycle.snapshot().await.read_status;
-                    lifecycle.set_access(read, write).await?;
-                    self.sync_access_projection(lifecycle.snapshot().await)
-                        .await;
+                    let read = self.state.read().await.fallback_snapshot.read_status;
+                    access_commit = Some(lifecycle.begin_access_effect(read, write).await?);
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::SetWriteStatus(write))
                         .await?;
@@ -1635,19 +1641,50 @@ impl RuntimeHost {
             RuntimeEffectAction::Close => self.close().await?,
             RuntimeEffectAction::Abort => self.abort_action().await,
         }
+        #[cfg(feature = "testing")]
+        if access_commit.is_some() {
+            let gate = self.access_effect_acceptance_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.entered.notify_waiters();
+                gate.release.notified().await;
+            }
+        }
+        let access_progress = match access_commit.as_mut() {
+            Some(transaction) => transaction.accept().await?,
+            None => None,
+        };
+        let lifecycle = self.lifecycle().ok();
+        let topology_receipt = match lifecycle.as_ref() {
+            Some(lifecycle) => lifecycle
+                .topology_receipt(&effect.action)
+                .await
+                .map(Box::new),
+            None => None,
+        };
+        let postcondition = match lifecycle.as_ref() {
+            Some(lifecycle) => lifecycle.postcondition(access_progress.as_ref()).await,
+            None => snapshot_postcondition(self.snapshot().await),
+        };
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
-            postcondition: snapshot_postcondition(self.snapshot().await),
+            topology_receipt,
+            postcondition,
         };
-        self.state.write().await.effects.insert(
-            result.sequence,
-            AppliedEffect {
-                effect,
-                result: result.clone(),
-            },
-        );
-        Ok(result)
+        let applied = AppliedEffect {
+            effect,
+            result: result.clone(),
+        };
+        if let Some(commit) = access_commit {
+            let commit = commit.into_runtime_commit(self.weak_self.clone(), applied);
+            return Ok(RuntimeEffectExecution::prepared(result, commit));
+        }
+        self.state
+            .write()
+            .await
+            .effects
+            .insert(result.sequence, applied);
+        Ok(RuntimeEffectExecution::completed(result))
     }
 
     async fn consume_cancelled_build_effect(
@@ -1703,6 +1740,7 @@ impl RuntimeHost {
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
+            topology_receipt: None,
             postcondition: snapshot_postcondition(snapshot),
         };
         self.state.write().await.effects.insert(
@@ -1763,18 +1801,13 @@ impl RuntimeHost {
                 sequence: effect.sequence,
             });
         }
-        let snapshot = self.snapshot().await;
-        if !snapshot.builds.iter().any(|build| {
-            &build.authority.build_id == build_id
-                && &build.authority.target == target
-                && build.completed
-        }) {
-            return Err(RuntimeError::ReconfigurationPending);
-        }
+        let lifecycle = self.lifecycle()?;
+        let confirmation = lifecycle.confirm_build_completion(build_id, target).await?;
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
-            postcondition: snapshot_postcondition(snapshot),
+            topology_receipt: None,
+            postcondition: confirmation.postcondition.clone(),
         };
         self.state.write().await.effects.insert(
             result.sequence,
@@ -1783,6 +1816,7 @@ impl RuntimeHost {
                 result: result.clone(),
             },
         );
+        drop(confirmation);
         Ok(result)
     }
 
@@ -1818,7 +1852,6 @@ impl RuntimeHost {
                 host: self.weak_self.clone(),
                 partition_information: self.state.read().await.partition_information.clone(),
             }),
-            registration.clone(),
             self.default_dependencies.clone(),
         );
         let registration = self

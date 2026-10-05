@@ -47,6 +47,26 @@ implementations. Only the registered default engine supplies the separate
 managed replication/copy data plane and write journal; custom replicators do
 not implement or impersonate that capability.
 
+Standard catch-up, build, and remove operations are invoked through the
+returned public primary. Successful public completion is the built-in engine's
+durable catch-up/build/ordinary-removal contract. The host validates current
+authority, process sessions, attempt/configuration generations, and exact
+targets, but does not fetch a second native receipt. The unpublished capability
+is limited to local write fencing/access preparation, pending-write recovery,
+committed-prefix reconciliation, exact topology proof, and narrow observation.
+Independent custom primaries never need default-engine proof types.
+
+Access publication is an explicit generation-scoped transaction. Native
+admission, common projection, external projection, and host-memory effect
+acceptance complete coherently; cancellation or invalidation explicitly fences
+native writes and rolls back an unaccepted projection without revoking a newer
+grant. The transaction is started before publication and owns cleanup if its
+decision channel closes, so `Drop` never spawns correctness-critical work.
+Durable applied/completed recording follows through the intent-first adapter;
+recovery stays write-closed while interrupted work is reissued or reobserved.
+Only canonical topology receipts are persisted alongside narrow lifecycle
+postconditions.
+
 Lifecycle callbacks publish completion only after exact authority, process
 sessions, and callback generation are revalidated. Close, Abort, authority
 replacement, and session replacement cancel or stale delayed progress,

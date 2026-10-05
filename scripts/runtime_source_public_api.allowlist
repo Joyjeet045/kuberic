@@ -57,7 +57,16 @@ public-path documented field crate::replicator::ReplicatorSettings::replication_
 public-path documented field crate::replicator::stream::StreamOperation::data: Bytes
 public-path documented field crate::replicator::stream::StreamOperation::metadata: OperationMetadata
 public-path documented impl crate::replicator::DefaultReplicatorFactory::fn new (storage : Arc < dyn DurableState >) -> Self
+public-path documented impl crate::replicator::ManagedFenceGuard::fn progress (& self) -> & NativeProgressStatus
 public-path documented impl crate::replicator::ReplicaInformation::fn new (build_id : OperationId , identity : ReplicaIdentity , replication_address : String ,) -> Self
+public-path documented impl crate::replicator::ReplicatorAttachment::fn identity (& self , _token : RuntimeHostToken) -> ReplicatorCreationIdentity
+public-path documented impl crate::replicator::ReplicatorAttachment::fn managed_data_plane (& self , _token : RuntimeHostToken ,) -> Option < Arc < dyn ManagedReplicatorDataPlane > >
+public-path documented impl crate::replicator::ReplicatorAttachment::fn managed_lifecycle (& self , _token : RuntimeHostToken ,) -> Option < Arc < dyn ManagedReplicatorLifecycle > >
+public-path documented impl crate::replicator::ReplicatorAttachment::fn primary_replicator (& self , _token : RuntimeHostToken ,) -> Option < Arc < dyn PrimaryReplicator > >
+public-path documented impl crate::replicator::ReplicatorAttachment::fn replicator (& self , _token : RuntimeHostToken) -> Arc < dyn Replicator >
+public-path documented impl crate::replicator::ReplicatorAttachment::fn testing_disarm (& self , _token : RuntimeHostToken)
+public-path documented impl crate::replicator::ReplicatorCreationReservation::fn identity (& self , _token : RuntimeHostToken) -> ReplicatorCreationIdentity
+public-path documented impl crate::replicator::ReplicatorCreationReservation::fn new (_token : RuntimeHostToken) -> Self
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn read_status (& self) -> Result < AccessStatus >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn report_fault (& self , fault : FaultType) -> Result < () >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn report_load (& self , metrics : Vec < LoadMetric >) -> Result < () >
@@ -69,6 +78,7 @@ public-path documented impl crate::replicator::ReplicatorInterfaces::fn primary_
 public-path documented impl crate::replicator::ReplicatorInterfaces::fn replicator (& self) -> Arc < dyn Replicator >
 public-path documented impl crate::replicator::ReplicatorInterfaces::fn secondary (replicator : Arc < dyn Replicator > , state_replicator : Option < Arc < dyn StateReplicator > > ,) -> Self
 public-path documented impl crate::replicator::ReplicatorInterfaces::fn state_replicator (& self) -> Option < Arc < dyn StateReplicator > >
+public-path documented impl crate::replicator::ReplicatorInterfaces::fn wrap_primary < T > (self , primary_replicator : Arc < T > , state_replicator : Option < Arc < dyn StateReplicator > > ,) -> Self where T : PrimaryReplicator + 'static ,
 public-path documented impl crate::replicator::StatefulServicePartition::async fn create_replicator (& self , state_provider : Option < Arc < dyn StateProvider > > , settings : Option < ReplicatorSettings > ,) -> Result < ReplicatorInterfaces >
 public-path documented impl crate::replicator::StatefulServicePartition::async fn get_read_status (& self) -> Result < AccessStatus >
 public-path documented impl crate::replicator::StatefulServicePartition::async fn get_write_status (& self) -> Result < AccessStatus >
@@ -162,7 +172,6 @@ public-path hidden field crate::replicator::DefaultReplicatorDependencies::build
 public-path hidden field crate::replicator::DefaultReplicatorDependencies::local_write_journal: Arc < dyn LocalWriteJournal >
 public-path hidden field crate::replicator::DefaultReplicatorDependencies::replica_authority_store: Arc < dyn ReplicaAuthorityStore >
 public-path hidden field crate::replicator::DefaultReplicatorDependencies::replication_progress_store: Arc < dyn ReplicationProgressStore >
-public-path hidden field crate::replicator::ReplicatorCreationReservation::0: u64
 public-path hidden field crate::replicator::copy::PrepareCopyRequest::build_id: OperationId
 public-path hidden field crate::replicator::copy::PrepareCopyRequest::configuration: BuildConfiguration
 public-path hidden field crate::replicator::copy::PrepareCopyRequest::copy_context: OperationDataStream
@@ -181,7 +190,9 @@ public-path hidden impl crate::internal::DefaultReplicatorInner::async fn restor
 public-path hidden impl crate::internal::DefaultReplicatorInner::async fn snapshot (& self) -> RuntimeSnapshot
 public-path hidden impl crate::internal::PendingReplication::async fn applied (self) -> Result < ReplicationAck >
 public-path hidden impl crate::internal::PendingWrite::async fn committed (self) -> Result < WriteReceipt >
-public-path hidden impl crate::replicator::ReplicatorFactoryContext::fn new (_token : RuntimeHostToken , identity : ReplicaIdentity , access : Arc < dyn PartitionAccessView > , registration : Arc < dyn ReplicatorRegistration > , default_dependencies : DefaultReplicatorDependencies ,) -> Self
+public-path hidden impl crate::replicator::ReplicatorFactoryContext::fn new (_token : RuntimeHostToken , identity : ReplicaIdentity , access : Arc < dyn PartitionAccessView > , default_dependencies : DefaultReplicatorDependencies ,) -> Self
+public-path hidden impl crate::replicator::ReplicatorInterfaces::fn testing_managed_primary < T , M > (_token : RuntimeHostToken , identity : ReplicatorCreationIdentity , primary_replicator : Arc < T > , state_replicator : Option < Arc < dyn StateReplicator > > , managed : Arc < M > ,) -> Self where T : PrimaryReplicator + 'static , M : ManagedReplicatorLifecycle + ManagedReplicatorDataPlane + 'static ,
+public-path hidden impl crate::replicator::ReplicatorInterfaces::fn testing_prepare_attachment (& self , _token : RuntimeHostToken , reservation : ReplicatorCreationReservation ,) -> Result < ReplicatorAttachment >
 public-path hidden impl crate::replicator::StatefulServicePartition::fn new (_token : RuntimeHostToken , registration : Arc < dyn ReplicatorRegistration > , context : ReplicatorFactoryContext ,) -> Self
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn acknowledge (& mut self , acknowledgement : & ReplicationAck) -> Result < () >
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn acknowledge_in_session (& mut self , acknowledgement : & ReplicationAck , session : & ProcessSessionId ,) -> Result < () >
@@ -230,6 +241,8 @@ public-path hidden module crate::replicator::sender
 public-path hidden struct crate::internal::PendingReplication
 public-path hidden struct crate::internal::PendingWrite
 public-path hidden struct crate::replicator::DefaultReplicatorDependencies
+public-path hidden struct crate::replicator::ManagedFenceGuard
+public-path hidden struct crate::replicator::ReplicatorAttachment
 public-path hidden struct crate::replicator::ReplicatorCreationReservation
 public-path hidden struct crate::replicator::copy::PrepareCopyRequest
 public-path hidden struct crate::replicator::copy::PreparedCopy
@@ -259,33 +272,27 @@ public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn
 public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn repair_peer (& self , identity : ReplicaIdentity , progress : Lsn) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::fn abort (& self)
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle: Send + Sync
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn accept_historical_secondary_removal_proof (& self , command : kuberic_protocol :: command :: AcceptSecondaryRemovalCommit ,) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn accept_secondary_removal_proof (& self , committed : SecondaryScaleDownCleanup ,) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn admit_authority_proof (& self , authority : AdmittedAuthority) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn admit_build_authority_proof (& self , authority : BuildAuthority) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn apply_topology (& self , action : RuntimeEffectAction) -> Result < TopologyReceipt >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn attach_interfaces (& self , control : Arc < dyn Replicator > , primary : Option < Arc < dyn PrimaryReplicator > > ,) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn authorize_failover_prefix_proof (& self , boundary : Lsn) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn build_replica_proof (& self , replica : ReplicaInformation) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn cancel_configuration_work (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn cancel_outbound_build (& self , build_id : & OperationId) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn complete_open (& self , replication_address : String) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn complete_retirement_proof (& self , retired : RetiredAuthority) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn fence_retirement_proof (& self , retired : RetiredAuthority) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn detach_outbound_build_stream (& self , build_id : & OperationId) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn fence_writes (& self) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn observe_secondary_removal_progress_proof (& self , witness : SecondaryRemovalWitness , committed : SecondaryScaleDownCleanup ,) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn observe_secondary_removal_proof (& self , witness : SecondaryRemovalWitness) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_access (& self , read : AccessStatus , write : AccessStatus) -> Result < u64 >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_secondary_removal_proof (& self , intent : SecondaryScaleDownIntent , process_session_id : ProcessSessionId , report_sequence : u64 ,) -> Result < SecondaryRemovalPreparation >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_switchover_proof (& self , preparation_generation : u64 , request_id : kuberic_protocol :: types :: SwitchoverRequestId , source : ReplicaIdentity , target : ReplicaIdentity , starting_configuration_id : kuberic_protocol :: types :: ConfigurationId , starting_epoch : Epoch ,) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn publish_access (& self , read : AccessStatus , write : AccessStatus , generation : u64 ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn lock_native_fence (& self , expected : & NativeOperationToken) -> Result < ManagedFenceGuard >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn native_fence (& self) -> Result < NativeOperationToken >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_access (& self , read : AccessStatus , write : AccessStatus ,) -> Result < AccessPreparation >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn progress_status (& self) -> NativeProgressStatus
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn publish_access (& self , preparation : AccessPreparation) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn refresh_progress_proof (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn register_peer_session_proof (& self , identity : ReplicaIdentity , session : ProcessSessionId ,) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn remove_replica_proof (& self , replica_id : ReplicaId) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn restore_engine_proof (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn retire_build_proof (& self , build_id : OperationId) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn settle_primary_prefix (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn settle_primary_prefix (& self) -> Result < CertifiedPrefixReceipt >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn snapshot (& self) -> RuntimeSnapshot
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn wait_for_catch_up_proof (& self) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn topology_status (& self) -> NativeTopologyStatus
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::fn abort (& self)
 public-path hidden trait crate::replicator::PartitionAccessView: Send + Sync
 public-path hidden trait crate::replicator::PartitionAccessView::async fn read_status (& self) -> Result < AccessStatus >
@@ -294,9 +301,7 @@ public-path hidden trait crate::replicator::PartitionAccessView::async fn report
 public-path hidden trait crate::replicator::PartitionAccessView::async fn write_status (& self) -> Result < AccessStatus >
 public-path hidden trait crate::replicator::PartitionAccessView::fn partition_information (& self) -> PartitionInformation
 public-path hidden trait crate::replicator::ReplicatorRegistration: Send + Sync
-public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_interfaces (& self , interfaces : & ReplicatorInterfaces , provider : Option < Arc < dyn StateProvider > > , reservation : ReplicatorCreationReservation ,) -> Result < () >
-public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_managed_data_plane (& self , data_plane : Arc < dyn ManagedReplicatorDataPlane > , reservation : ReplicatorCreationReservation ,) -> Result < () >
-public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_managed_lifecycle (& self , lifecycle : Arc < dyn ManagedReplicatorLifecycle > , reservation : ReplicatorCreationReservation ,) -> Result < () >
+public-path hidden trait crate::replicator::ReplicatorRegistration::async fn register_interfaces (& self , attachment : & ReplicatorAttachment , provider : Option < Arc < dyn StateProvider > > , reservation : ReplicatorCreationReservation ,) -> Result < () >
 public-path hidden trait crate::replicator::ReplicatorRegistration::fn cancel_replicator_creation (& self , reservation : ReplicatorCreationReservation)
 public-path hidden trait crate::replicator::ReplicatorRegistration::fn reserve_replicator_creation (& self) -> Result < ReplicatorCreationReservation >
 public-path hidden type crate::engine::RetainedOperationStream = Pin < Box < dyn Stream < Item = Result < Operation > > + Send > >

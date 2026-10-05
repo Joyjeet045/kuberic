@@ -9,25 +9,27 @@ pub mod stream;
 
 pub(crate) mod log;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
     PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
-    SecondaryRemovalPreparation, SecondaryRemovalWitness, SecondaryScaleDownCleanup,
-    SecondaryScaleDownIntent,
 };
-use kuberic_runtime_internal::RuntimeHostToken;
-use tokio::sync::{Mutex, RwLock};
+use kuberic_runtime_internal::receipts::{
+    AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
+    NativeTopologyStatus, TopologyReceipt,
+};
+use kuberic_runtime_internal::{ReplicatorCreationIdentity, RuntimeHostToken};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
 use crate::authority::{
     AdmittedAuthority, BuildAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
-    ReplicaAuthorityStore, ReplicationProgressStore, RetiredAuthority,
+    ReplicaAuthorityStore, ReplicationProgressStore,
 };
-use crate::effects::RuntimeSnapshot;
+use crate::effects::{RuntimeEffectAction, RuntimeSnapshot};
 use crate::engine::DurableState;
 use crate::internal::{DefaultReplicatorInner, PendingReplication, PendingWrite};
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
@@ -80,50 +82,21 @@ pub trait StateReplicator: Send + Sync {
 #[doc(hidden)]
 pub trait ManagedReplicatorLifecycle: Send + Sync {
     async fn fence_writes(&self) -> Result<()>;
-    async fn settle_primary_prefix(&self) -> Result<()>;
+    async fn settle_primary_prefix(&self) -> Result<CertifiedPrefixReceipt>;
     async fn cancel_configuration_work(&self) -> Result<()>;
-    async fn prepare_access(&self, read: AccessStatus, write: AccessStatus) -> Result<u64>;
-    async fn publish_access(
+    async fn prepare_access(
         &self,
         read: AccessStatus,
         write: AccessStatus,
-        generation: u64,
-    ) -> Result<()>;
+    ) -> Result<AccessPreparation>;
+    async fn publish_access(&self, preparation: AccessPreparation) -> Result<()>;
+    async fn lock_native_fence(&self, expected: &NativeOperationToken)
+    -> Result<ManagedFenceGuard>;
+    async fn native_fence(&self) -> Result<NativeOperationToken>;
+    async fn progress_status(&self) -> NativeProgressStatus;
+    async fn topology_status(&self) -> NativeTopologyStatus;
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()>;
-    async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()>;
-    async fn wait_for_catch_up_proof(&self) -> Result<()>;
-    async fn prepare_switchover_proof(
-        &self,
-        preparation_generation: u64,
-        request_id: kuberic_protocol::types::SwitchoverRequestId,
-        source: ReplicaIdentity,
-        target: ReplicaIdentity,
-        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
-        starting_epoch: Epoch,
-    ) -> Result<()>;
-    async fn prepare_secondary_removal_proof(
-        &self,
-        intent: SecondaryScaleDownIntent,
-        process_session_id: ProcessSessionId,
-        report_sequence: u64,
-    ) -> Result<SecondaryRemovalPreparation>;
-    async fn observe_secondary_removal_proof(&self, witness: SecondaryRemovalWitness)
-    -> Result<()>;
-    async fn observe_secondary_removal_progress_proof(
-        &self,
-        witness: SecondaryRemovalWitness,
-        committed: SecondaryScaleDownCleanup,
-    ) -> Result<()>;
-    async fn accept_secondary_removal_proof(
-        &self,
-        committed: SecondaryScaleDownCleanup,
-    ) -> Result<()>;
-    async fn accept_historical_secondary_removal_proof(
-        &self,
-        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<()>;
-    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
-    async fn complete_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
+    async fn apply_topology(&self, action: RuntimeEffectAction) -> Result<TopologyReceipt>;
     async fn register_peer_session_proof(
         &self,
         identity: ReplicaIdentity,
@@ -131,12 +104,11 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
     ) -> Result<()>;
     async fn admit_build_authority_proof(&self, authority: BuildAuthority) -> Result<()>;
     async fn retire_build_proof(&self, build_id: OperationId) -> Result<()>;
-    async fn build_replica_proof(&self, replica: ReplicaInformation) -> Result<()>;
-    async fn remove_replica_proof(&self, replica_id: ReplicaId) -> Result<()>;
     async fn refresh_progress_proof(&self) -> Result<()>;
     async fn restore_engine_proof(&self) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
+    async fn detach_outbound_build_stream(&self, build_id: &OperationId) -> Result<()>;
     async fn complete_open(&self, replication_address: String) -> Result<()>;
     async fn attach_interfaces(
         &self,
@@ -144,6 +116,25 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
         primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()>;
     fn abort(&self);
+}
+
+#[doc(hidden)]
+pub struct ManagedFenceGuard {
+    _delivery: OwnedMutexGuard<()>,
+    progress: NativeProgressStatus,
+}
+
+impl ManagedFenceGuard {
+    pub(crate) fn new(delivery: OwnedMutexGuard<()>, progress: NativeProgressStatus) -> Self {
+        Self {
+            _delivery: delivery,
+            progress,
+        }
+    }
+
+    pub fn progress(&self) -> &NativeProgressStatus {
+        &self.progress
+    }
 }
 
 #[async_trait]
@@ -228,6 +219,141 @@ pub struct ReplicatorInterfaces {
     replicator: Arc<dyn Replicator>,
     state_replicator: Option<Arc<dyn StateReplicator>>,
     primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
+    creation: Arc<ReplicatorCreation>,
+}
+
+#[derive(Clone)]
+struct ManagedReplicatorCapabilities {
+    lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
+    data_plane: Arc<dyn ManagedReplicatorDataPlane>,
+}
+
+struct ReplicatorCreation {
+    identity: OnceLock<ReplicatorCreationIdentity>,
+    guarded_control: StdMutex<Arc<dyn Replicator>>,
+    managed: Option<ManagedReplicatorCapabilities>,
+    armed: AtomicBool,
+}
+
+impl ReplicatorCreation {
+    fn new(
+        guarded_control: Arc<dyn Replicator>,
+        identity: Option<ReplicatorCreationIdentity>,
+        managed: Option<ManagedReplicatorCapabilities>,
+    ) -> Self {
+        let creation_identity = OnceLock::new();
+        if let Some(identity) = identity {
+            creation_identity
+                .set(identity)
+                .expect("new creation identity is unset");
+        }
+        Self {
+            identity: creation_identity,
+            guarded_control: StdMutex::new(guarded_control),
+            managed,
+            armed: AtomicBool::new(true),
+        }
+    }
+
+    fn bind_identity(&self, expected: ReplicatorCreationIdentity) -> Result<()> {
+        if let Some(actual) = self.identity.get() {
+            if *actual != expected {
+                return Err(RuntimeError::Application(
+                    "replicator capability creation identity does not match reservation".into(),
+                ));
+            }
+            return Ok(());
+        }
+        self.identity.set(expected).map_err(|actual| {
+            RuntimeError::Application(format!(
+                "replicator capability creation identity was concurrently bound to {actual:?}"
+            ))
+        })
+    }
+
+    fn replace_guarded_control(&self, control: Arc<dyn Replicator>) {
+        let mut guarded = self
+            .guarded_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guarded = control;
+    }
+}
+
+impl Drop for ReplicatorCreation {
+    fn drop(&mut self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        let control = self
+            .guarded_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        control.abort();
+        if let Some(managed) = self.managed.as_ref() {
+            managed.lifecycle.abort();
+            managed.data_plane.abort();
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct ReplicatorAttachment {
+    creation: Arc<ReplicatorCreation>,
+    replicator: Arc<dyn Replicator>,
+    primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
+}
+
+#[doc(hidden)]
+impl ReplicatorAttachment {
+    pub fn identity(&self, _token: RuntimeHostToken) -> ReplicatorCreationIdentity {
+        *self
+            .creation
+            .identity
+            .get()
+            .expect("replicator attachment identity is bound")
+    }
+
+    pub fn managed_lifecycle(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<Arc<dyn ManagedReplicatorLifecycle>> {
+        self.creation
+            .managed
+            .as_ref()
+            .map(|managed| managed.lifecycle.clone())
+    }
+
+    pub fn managed_data_plane(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<Arc<dyn ManagedReplicatorDataPlane>> {
+        self.creation
+            .managed
+            .as_ref()
+            .map(|managed| managed.data_plane.clone())
+    }
+
+    pub fn replicator(&self, _token: RuntimeHostToken) -> Arc<dyn Replicator> {
+        self.replicator.clone()
+    }
+
+    pub fn primary_replicator(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<Arc<dyn PrimaryReplicator>> {
+        self.primary_replicator.clone()
+    }
+
+    fn disarm(&self) {
+        self.creation.armed.store(false, Ordering::Release);
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_disarm(&self, _token: RuntimeHostToken) {
+        self.disarm();
+    }
 }
 
 impl ReplicatorInterfaces {
@@ -235,10 +361,12 @@ impl ReplicatorInterfaces {
         replicator: Arc<dyn Replicator>,
         state_replicator: Option<Arc<dyn StateReplicator>>,
     ) -> Self {
+        let creation = Arc::new(ReplicatorCreation::new(replicator.clone(), None, None));
         Self {
             replicator,
             state_replicator,
             primary_replicator: None,
+            creation,
         }
     }
 
@@ -251,10 +379,79 @@ impl ReplicatorInterfaces {
     {
         let replicator: Arc<dyn Replicator> = primary_replicator.clone();
         let primary_replicator: Arc<dyn PrimaryReplicator> = primary_replicator;
+        let creation = Arc::new(ReplicatorCreation::new(replicator.clone(), None, None));
         Self {
             replicator,
             state_replicator,
             primary_replicator: Some(primary_replicator),
+            creation,
+        }
+    }
+
+    fn managed_primary<T, M>(
+        identity: ReplicatorCreationIdentity,
+        primary_replicator: Arc<T>,
+        state_replicator: Option<Arc<dyn StateReplicator>>,
+        managed: Arc<M>,
+    ) -> Self
+    where
+        T: PrimaryReplicator + 'static,
+        M: ManagedReplicatorLifecycle + ManagedReplicatorDataPlane + 'static,
+    {
+        let replicator: Arc<dyn Replicator> = primary_replicator.clone();
+        let primary_replicator: Arc<dyn PrimaryReplicator> = primary_replicator;
+        let lifecycle: Arc<dyn ManagedReplicatorLifecycle> = managed.clone();
+        let data_plane: Arc<dyn ManagedReplicatorDataPlane> = managed;
+        let creation = Arc::new(ReplicatorCreation::new(
+            replicator.clone(),
+            Some(identity),
+            Some(ManagedReplicatorCapabilities {
+                lifecycle,
+                data_plane,
+            }),
+        ));
+        Self {
+            replicator,
+            state_replicator,
+            primary_replicator: Some(primary_replicator),
+            creation,
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn testing_managed_primary<T, M>(
+        _token: RuntimeHostToken,
+        identity: ReplicatorCreationIdentity,
+        primary_replicator: Arc<T>,
+        state_replicator: Option<Arc<dyn StateReplicator>>,
+        managed: Arc<M>,
+    ) -> Self
+    where
+        T: PrimaryReplicator + 'static,
+        M: ManagedReplicatorLifecycle + ManagedReplicatorDataPlane + 'static,
+    {
+        Self::managed_primary(identity, primary_replicator, state_replicator, managed)
+    }
+
+    /// Replaces the public primary interfaces while preserving this bundle's
+    /// opaque creation identity and optional host-only capabilities.
+    pub fn wrap_primary<T>(
+        self,
+        primary_replicator: Arc<T>,
+        state_replicator: Option<Arc<dyn StateReplicator>>,
+    ) -> Self
+    where
+        T: PrimaryReplicator + 'static,
+    {
+        let replicator: Arc<dyn Replicator> = primary_replicator.clone();
+        let primary_replicator: Arc<dyn PrimaryReplicator> = primary_replicator;
+        self.creation.replace_guarded_control(replicator.clone());
+        Self {
+            replicator,
+            state_replicator,
+            primary_replicator: Some(primary_replicator),
+            creation: self.creation.clone(),
         }
     }
 
@@ -269,13 +466,35 @@ impl ReplicatorInterfaces {
     pub fn primary_replicator(&self) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary_replicator.clone()
     }
+
+    fn prepare_attachment(
+        &self,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<ReplicatorAttachment> {
+        self.creation
+            .bind_identity(reservation.identity(RuntimeHostToken::new()))?;
+        Ok(ReplicatorAttachment {
+            creation: self.creation.clone(),
+            replicator: self.replicator(),
+            primary_replicator: self.primary_replicator(),
+        })
+    }
+
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn testing_prepare_attachment(
+        &self,
+        _token: RuntimeHostToken,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<ReplicatorAttachment> {
+        self.prepare_attachment(reservation)
+    }
 }
 
 #[derive(Clone)]
 pub struct ReplicatorFactoryContext {
     identity: ReplicaIdentity,
     access: Arc<dyn PartitionAccessView>,
-    registration: Arc<dyn ReplicatorRegistration>,
     reservation: Option<ReplicatorCreationReservation>,
     pub(crate) default_dependencies: Option<DefaultReplicatorDependencies>,
 }
@@ -286,13 +505,11 @@ impl ReplicatorFactoryContext {
         _token: RuntimeHostToken,
         identity: ReplicaIdentity,
         access: Arc<dyn PartitionAccessView>,
-        registration: Arc<dyn ReplicatorRegistration>,
         default_dependencies: DefaultReplicatorDependencies,
     ) -> Self {
         Self {
             identity,
             access,
-            registration,
             reservation: None,
             default_dependencies: Some(default_dependencies),
         }
@@ -328,21 +545,10 @@ impl ReplicatorFactoryContext {
         context
     }
 
-    async fn register_managed<T>(&self, managed: Arc<T>) -> Result<()>
-    where
-        T: ManagedReplicatorLifecycle + ManagedReplicatorDataPlane + 'static,
-    {
-        let reservation = self.reservation.ok_or_else(|| {
-            RuntimeError::Application("managed replicator registration is not reserved".into())
-        })?;
-        let lifecycle: Arc<dyn ManagedReplicatorLifecycle> = managed.clone();
-        self.registration
-            .register_managed_lifecycle(lifecycle, reservation)
-            .await?;
-        let data_plane: Arc<dyn ManagedReplicatorDataPlane> = managed;
-        self.registration
-            .register_managed_data_plane(data_plane, reservation)
-            .await
+    fn creation_identity(&self) -> Result<ReplicatorCreationIdentity> {
+        self.reservation
+            .map(|reservation| reservation.identity(RuntimeHostToken::new()))
+            .ok_or_else(|| RuntimeError::Application("replicator creation is not reserved".into()))
     }
 }
 
@@ -371,7 +577,18 @@ pub struct DefaultReplicatorDependencies {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
-pub struct ReplicatorCreationReservation(pub u64);
+pub struct ReplicatorCreationReservation(ReplicatorCreationIdentity);
+
+#[doc(hidden)]
+impl ReplicatorCreationReservation {
+    pub fn new(_token: RuntimeHostToken) -> Self {
+        Self(ReplicatorCreationIdentity::new(RuntimeHostToken::new()))
+    }
+
+    pub fn identity(&self, _token: RuntimeHostToken) -> ReplicatorCreationIdentity {
+        self.0
+    }
+}
 
 #[async_trait]
 #[doc(hidden)]
@@ -380,21 +597,9 @@ pub trait ReplicatorRegistration: Send + Sync {
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation);
 
-    async fn register_managed_lifecycle(
-        &self,
-        lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
-        reservation: ReplicatorCreationReservation,
-    ) -> Result<()>;
-
-    async fn register_managed_data_plane(
-        &self,
-        data_plane: Arc<dyn ManagedReplicatorDataPlane>,
-        reservation: ReplicatorCreationReservation,
-    ) -> Result<()>;
-
     async fn register_interfaces(
         &self,
-        interfaces: &ReplicatorInterfaces,
+        attachment: &ReplicatorAttachment,
         provider: Option<Arc<dyn StateProvider>>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()>;
@@ -484,15 +689,22 @@ impl StatefulServicePartition {
                 return Err(error);
             }
         };
+        let attachment = match interfaces.prepare_attachment(reservation) {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                self.registration.cancel_replicator_creation(reservation);
+                return Err(error);
+            }
+        };
         if let Err(error) = self
             .registration
-            .register_interfaces(&interfaces, state_provider, reservation)
+            .register_interfaces(&attachment, state_provider, reservation)
             .await
         {
-            interfaces.replicator().abort();
             self.registration.cancel_replicator_creation(reservation);
             return Err(error);
         }
+        attachment.disarm();
         Ok(interfaces)
     }
 }
@@ -555,10 +767,11 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
             next_operation,
             pending,
         });
-        context.register_managed(engine).await?;
-        Ok(ReplicatorInterfaces::primary(
+        Ok(ReplicatorInterfaces::managed_primary(
+            context.creation_identity()?,
             replicator,
             Some(state_replicator),
+            engine,
         ))
     }
 }
@@ -647,11 +860,11 @@ impl PrimaryReplicator for DefaultReplicator {
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        self.engine.wait_for_build(replica, true).await
+        self.engine.wait_for_build(replica).await
     }
 
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
-        self.engine.remove_replica(replica_id, true).await
+        self.engine.remove_replica(replica_id).await
     }
 }
 

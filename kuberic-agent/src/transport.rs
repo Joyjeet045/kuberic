@@ -27,7 +27,7 @@ use crate::store::AgentStore;
 use crate::{AgentError, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 use tokio_stream::iter;
 use tonic::Request;
 
@@ -105,6 +105,55 @@ pub struct GrpcOutboundDispatcher<R> {
     deadline: std::time::Duration,
     build_locks: Mutex<BTreeMap<kuberic_protocol::types::OperationId, Arc<Mutex<()>>>>,
     completed_builds: Mutex<BTreeSet<(kuberic_protocol::types::OperationId, ProcessSessionId)>>,
+}
+
+struct BuildDispatchCancellation {
+    decision: Option<tokio::sync::oneshot::Sender<bool>>,
+    completion: tokio::task::JoinHandle<()>,
+}
+
+impl BuildDispatchCancellation {
+    fn new(
+        runtime: Arc<PodRuntime>,
+        build_id: kuberic_protocol::types::OperationId,
+        generation: u64,
+        guard: OwnedMutexGuard<()>,
+    ) -> Self {
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let completion = tokio::spawn(async move {
+            if completion.await != Ok(true) {
+                let _ = runtime
+                    .cancel_outbound_build_attempt(&build_id, generation, true)
+                    .await;
+            }
+            drop(guard);
+        });
+        Self {
+            decision: Some(decision),
+            completion,
+        }
+    }
+
+    async fn finish(mut self, success: bool) {
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(success);
+        }
+        let _ = self.completion.await;
+    }
+}
+
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub async fn testing_cancel_build_dispatch(
+    runtime: Arc<PodRuntime>,
+    build_id: kuberic_protocol::types::OperationId,
+    generation: u64,
+    lock: Arc<Mutex<()>>,
+) {
+    let guard = lock.lock_owned().await;
+    BuildDispatchCancellation::new(runtime, build_id, generation, guard)
+        .finish(false)
+        .await;
 }
 
 impl<R> GrpcOutboundDispatcher<R>
@@ -195,12 +244,13 @@ where
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _build = build_lock.lock().await;
         let build_id = endpoint.build_id.clone();
+        let guard = build_lock.lock_owned().await;
+        let generation = self.runtime.build_generation(&build_id).await?;
+        let cancellation =
+            BuildDispatchCancellation::new(self.runtime.clone(), build_id, generation, guard);
         let result = self.dispatch_build_locked(endpoint).await;
-        if result.is_err() {
-            let _ = self.runtime.cancel_outbound_build(&build_id).await;
-        }
+        cancellation.finish(result.is_ok()).await;
         result
     }
 
@@ -276,36 +326,43 @@ where
             .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
 
         let build_id = endpoint.build_id.clone();
-        if self
-            .runtime
-            .execute_build(kuberic_runtime::replicator::ReplicaInformation::new(
-                build_id.clone(),
-                endpoint.identity.clone(),
-                report.replication_address.clone(),
-            ))
-            .await?
-            == crate::hosting::BuildExecution::ApplicationCompleted
-        {
-            self.completed_builds
-                .lock()
-                .await
-                .insert((build_id, target_session));
-            return Ok(());
-        }
-        let mut prepared = self
-            .runtime
-            .data_plane()
-            .prepare_copy(PrepareCopyRequest {
-                build_id: build_id.clone(),
-                target: endpoint.identity.clone(),
-                configuration: BuildConfiguration::Current,
-                copy_context: Box::pin(stream::empty()),
-            })
+        self.runtime
+            .execute_admitted_build(
+                kuberic_runtime::replicator::ReplicaInformation::new(
+                    build_id.clone(),
+                    endpoint.identity.clone(),
+                    report.replication_address.clone(),
+                ),
+                || async {
+                    let mut prepared = self
+                        .runtime
+                        .data_plane()
+                        .prepare_copy(PrepareCopyRequest {
+                            build_id: build_id.clone(),
+                            target: endpoint.identity.clone(),
+                            configuration: BuildConfiguration::Current,
+                            copy_context: Box::pin(stream::empty()),
+                        })
+                        .await?;
+                    let mut catch_up_boundary = None;
+                    while let Some(item) = prepared.items.next().await {
+                        let item = item?;
+                        if item.final_item {
+                            catch_up_boundary = item.catch_up_boundary_lsn;
+                        }
+                        let delivered_lsn = item.lsn;
+                        self.dispatch_copy(endpoint.identity.clone(), item, false)
+                            .await?;
+                        if catch_up_boundary.is_some_and(|boundary| delivered_lsn >= boundary) {
+                            return Ok::<(), AgentError>(());
+                        }
+                    }
+                    Err(AgentError::SessionRejected(
+                        "copy stream ended before its final durable boundary".into(),
+                    ))
+                },
+            )
             .await?;
-        while let Some(item) = prepared.items.next().await {
-            self.dispatch_copy(endpoint.identity.clone(), item?, false)
-                .await?;
-        }
         self.completed_builds
             .lock()
             .await

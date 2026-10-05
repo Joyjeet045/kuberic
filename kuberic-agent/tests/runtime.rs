@@ -13,9 +13,12 @@ use kuberic_agent::hosting::{OutboundReplication, PodRuntime, PreparedCopy, Runt
 use kuberic_agent::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use kuberic_agent::service::AgentService;
 use kuberic_agent::sqlite_store::SqliteStore;
-use kuberic_agent::state::{AgentState, CoordinatorStage, SCHEMA_VERSION, StorageIdentity};
-use kuberic_agent::store::AgentStore;
-use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_agent::state::{
+    AgentState, CoordinatorStage, ReconfigurationRecord, RetainedCommandResult, RetainedResult,
+    SCHEMA_VERSION, StorageIdentity,
+};
+use kuberic_agent::store::{AgentStore, BeginConfiguration, BeginEffect};
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{
     AgentBuildReport, AgentObservation, AgentReport, DesiredState, KubernetesReplicaObservation,
@@ -59,9 +62,9 @@ use kuberic_runtime_internal::transport::{
     CopyAck as RuntimeCopyAck, CopyItem as RuntimeCopyItem, OutboundOperation,
     ReplicationAck as RuntimeReplicationAck, ReplicationItem as RuntimeReplicationItem,
 };
-use kuberic_runtime_internal::{ContractError, Result as ContractResult};
+use kuberic_runtime_internal::{ContractError, Result as ContractResult, RuntimeHostToken};
 use kuberic_wire::proto;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::time::{Duration, timeout};
 
 #[allow(dead_code)]
@@ -601,9 +604,10 @@ mod in_process_transport_tests {
 
     #[tokio::test]
     async fn build_remove_and_evict_are_surfaced_without_automatic_authority_changes() {
-        let source = open_primary(
+        let source = open_primary_with_session(
             Arc::new(TestApplication::default()),
             vec![identity(1, "source")],
+            "in-process-control",
         )
         .await;
         let before = source.snapshot().await.authority;
@@ -633,13 +637,52 @@ mod in_process_transport_tests {
             )
         })
         .await;
-        assert!(
-            matches!(output, TransportEvent::Control { output: ControlOutput::Build(endpoint), .. } if endpoint.identity == target)
-        );
+        let endpoint = match output {
+            TransportEvent::Control {
+                output: ControlOutput::Build(endpoint),
+                ..
+            } if endpoint.identity == target => endpoint,
+            other => panic!("expected exact Build control output, got {other:?}"),
+        };
         assert!(!building.is_finished());
         assert_eq!(source.snapshot().await.authority, before);
+        let mut description = ReplicaInformation::new(
+            endpoint.build_id.clone(),
+            target.clone(),
+            endpoint.replication_address,
+        );
+        description.process_session_id = ProcessSessionId::new("in-process-target");
+        kuberic_agent::testing::describe_peer(&source, description)
+            .await
+            .unwrap();
+        source
+            .authorize_build(
+                endpoint.build_id.clone(),
+                target.clone(),
+                BuildConfiguration::Current,
+            )
+            .await
+            .unwrap();
+        let coordinator = {
+            let source = source.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                kuberic_agent::testing::execute_build_with_copy(
+                    &source,
+                    ReplicaInformation::new(
+                        OperationId::new("control-build"),
+                        target,
+                        "in-process://replacement".into(),
+                    ),
+                    std::future::pending,
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
         primary.remove_replica(target.replica_id).await.unwrap();
         event(&mut transport, |e| matches!(e, TransportEvent::Control { output: ControlOutput::Remove(id), .. } if *id == target.replica_id)).await;
+        assert!(coordinator.await.unwrap().is_err());
         assert!(building.await.unwrap().is_err());
         assert!(transport.pump().idle);
 
@@ -3355,6 +3398,13 @@ struct TestControlPlane {
 }
 
 #[derive(Clone)]
+struct BuildReturnGate {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    fail: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
 struct CountingFactory {
     storage: std::sync::Weak<TestApplication>,
     opened: Arc<AtomicUsize>,
@@ -3363,6 +3413,8 @@ struct CountingFactory {
     events: Arc<Mutex<Vec<String>>>,
     fail_change_role: Arc<AtomicBool>,
     fail_close: Arc<AtomicBool>,
+    build_return_gate: Option<BuildReturnGate>,
+    catchup_return_gate: Option<BuildReturnGate>,
 }
 
 struct CountingReplicator {
@@ -3460,110 +3512,61 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn settle_primary_prefix(&self) -> Result<()> {
-        Ok(())
+    async fn settle_primary_prefix(
+        &self,
+    ) -> Result<kuberic_runtime_internal::receipts::CertifiedPrefixReceipt> {
+        panic!("registration tests do not settle certified prefixes")
     }
 
     async fn cancel_configuration_work(&self) -> Result<()> {
         Ok(())
     }
 
-    async fn prepare_access(&self, _read: AccessStatus, _write: AccessStatus) -> Result<u64> {
-        Ok(0)
+    async fn prepare_access(
+        &self,
+        _read: AccessStatus,
+        _write: AccessStatus,
+    ) -> Result<kuberic_runtime_internal::receipts::AccessPreparation> {
+        panic!("registration tests do not prepare access")
     }
 
     async fn publish_access(
         &self,
-        _read: AccessStatus,
-        _write: AccessStatus,
-        _generation: u64,
+        _preparation: kuberic_runtime_internal::receipts::AccessPreparation,
     ) -> Result<()> {
-        Ok(())
+        panic!("registration tests do not publish access")
+    }
+
+    async fn lock_native_fence(
+        &self,
+        _expected: &kuberic_runtime_internal::receipts::NativeOperationToken,
+    ) -> Result<kuberic_runtime::replicator::ManagedFenceGuard> {
+        panic!("registration tests do not lock native fencing")
+    }
+
+    async fn native_fence(
+        &self,
+    ) -> Result<kuberic_runtime_internal::receipts::NativeOperationToken> {
+        panic!("registration tests do not request native fencing")
+    }
+
+    async fn progress_status(&self) -> kuberic_runtime_internal::receipts::NativeProgressStatus {
+        panic!("registration tests do not request native progress")
+    }
+
+    async fn topology_status(&self) -> kuberic_runtime_internal::receipts::NativeTopologyStatus {
+        panic!("registration tests do not request native topology status")
     }
 
     async fn admit_authority_proof(&self, _authority: AdmittedAuthority) -> Result<()> {
         Ok(())
     }
 
-    async fn authorize_failover_prefix_proof(&self, _boundary: i64) -> Result<()> {
-        Ok(())
-    }
-
-    async fn wait_for_catch_up_proof(&self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn prepare_switchover_proof(
+    async fn apply_topology(
         &self,
-        _preparation_generation: u64,
-        _request_id: SwitchoverRequestId,
-        _source: ReplicaIdentity,
-        _target: ReplicaIdentity,
-        _starting_configuration_id: kuberic_protocol::types::ConfigurationId,
-        _starting_epoch: Epoch,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn prepare_secondary_removal_proof(
-        &self,
-        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
-        process_session_id: ProcessSessionId,
-        report_sequence: u64,
-    ) -> Result<kuberic_protocol::types::SecondaryRemovalPreparation> {
-        Ok(kuberic_protocol::types::SecondaryRemovalPreparation {
-            operation_id: intent.command_operation_id(
-                kuberic_protocol::types::SecondaryRemovalStage::Prepare,
-                &intent.primary,
-            ),
-            intent,
-            process_session_id,
-            report_sequence,
-            boundary_lsn: 0,
-        })
-    }
-
-    async fn observe_secondary_removal_proof(
-        &self,
-        _witness: kuberic_protocol::types::SecondaryRemovalWitness,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn observe_secondary_removal_progress_proof(
-        &self,
-        _witness: kuberic_protocol::types::SecondaryRemovalWitness,
-        _committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn accept_secondary_removal_proof(
-        &self,
-        _committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn accept_historical_secondary_removal_proof(
-        &self,
-        _command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn fence_retirement_proof(
-        &self,
-        _retired: kuberic_runtime_internal::authority::RetiredAuthority,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn complete_retirement_proof(
-        &self,
-        _retired: kuberic_runtime_internal::authority::RetiredAuthority,
-    ) -> Result<()> {
-        Ok(())
+        _action: RuntimeEffectAction,
+    ) -> Result<kuberic_runtime_internal::receipts::TopologyReceipt> {
+        panic!("registration tests do not apply native topology")
     }
 
     async fn register_peer_session_proof(
@@ -3582,14 +3585,6 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn build_replica_proof(&self, _replica: ReplicaInformation) -> Result<()> {
-        Ok(())
-    }
-
-    async fn remove_replica_proof(&self, _replica_id: ReplicaId) -> Result<()> {
-        Ok(())
-    }
-
     async fn refresh_progress_proof(&self) -> Result<()> {
         Ok(())
     }
@@ -3603,6 +3598,10 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
     }
 
     async fn cancel_outbound_build(&self, _build_id: &OperationId) -> Result<()> {
+        Ok(())
+    }
+
+    async fn detach_outbound_build_stream(&self, _build_id: &OperationId) -> Result<()> {
         Ok(())
     }
 
@@ -3723,7 +3722,7 @@ impl ReplicatorFactory for CountingFactory {
                 .ok_or(RuntimeError::NotPrimary)?,
             counts: self.clone(),
         });
-        Ok(ReplicatorInterfaces::primary(replicator, state_replicator))
+        Ok(interfaces.wrap_primary(replicator, state_replicator))
     }
 }
 
@@ -3823,7 +3822,22 @@ impl PrimaryReplicator for CountingReplicator {
     }
 
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
-        self.primary.wait_for_catch_up_quorum(mode).await
+        self.counts
+            .events
+            .lock()
+            .unwrap()
+            .push("primary.wait_for_catch_up_quorum".to_string());
+        self.primary.wait_for_catch_up_quorum(mode).await?;
+        if let Some(gate) = &self.counts.catchup_return_gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+            if gate.fail.load(Ordering::SeqCst) {
+                return Err(RuntimeError::Application(
+                    "injected public catch-up completion failure".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn update_current_replica_set_configuration(
@@ -3836,10 +3850,30 @@ impl PrimaryReplicator for CountingReplicator {
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        self.primary.build_replica(replica).await
+        self.counts
+            .events
+            .lock()
+            .unwrap()
+            .push("primary.build_replica".to_string());
+        self.primary.build_replica(replica).await?;
+        if let Some(gate) = &self.counts.build_return_gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+            if gate.fail.load(Ordering::SeqCst) {
+                return Err(RuntimeError::Application(
+                    "injected public build completion failure".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
+        self.counts
+            .events
+            .lock()
+            .unwrap()
+            .push("primary.remove_replica".to_string());
         self.primary.remove_replica(replica_id).await
     }
 }
@@ -4348,6 +4382,12 @@ struct CustomRoleGate {
     block_progress: AtomicBool,
     progress_entered: Notify,
     progress_released: Notify,
+    native_access_granted: AtomicBool,
+    block_revocation: AtomicBool,
+    revocation_entered: Notify,
+    revocation_released: Notify,
+    revoke_error: AtomicBool,
+    abort_count: AtomicUsize,
     block_configuration: AtomicBool,
     configuration_entered: Notify,
     configuration_released: Notify,
@@ -4360,6 +4400,7 @@ struct CustomRoleGate {
     block_remove: AtomicBool,
     remove_entered: Notify,
     remove_released: Notify,
+    remove_count: AtomicUsize,
     partition: Mutex<Option<StatefulServicePartition>>,
     configurations: Mutex<Vec<kuberic_runtime::replicator::ReplicaSetConfiguration>>,
     operations: Mutex<Vec<Bytes>>,
@@ -4387,7 +4428,10 @@ impl Replicator for CustomRoleGate {
     async fn close(&self) -> Result<()> {
         Ok(())
     }
-    fn abort(&self) {}
+    fn abort(&self) {
+        self.native_access_granted.store(false, Ordering::SeqCst);
+        self.abort_count.fetch_add(1, Ordering::SeqCst);
+    }
     async fn current_progress(&self) -> Result<i64> {
         if self.block_progress.swap(false, Ordering::SeqCst) {
             self.progress_entered.notify_one();
@@ -4405,7 +4449,17 @@ impl Replicator for CustomRoleGate {
                 3 => return Err(RuntimeError::OperationCancelled),
                 _ => {}
             }
+        } else {
+            if self.block_revocation.swap(false, Ordering::SeqCst) {
+                self.revocation_entered.notify_one();
+                self.revocation_released.notified().await;
+            }
+            if self.revoke_error.swap(false, Ordering::SeqCst) {
+                return Err(RuntimeError::Application("revocation failed".into()));
+            }
         }
+        self.native_access_granted
+            .store(grant_attempt, Ordering::SeqCst);
         Ok(10)
     }
     async fn catch_up_capability(&self) -> Result<i64> {
@@ -4452,6 +4506,7 @@ impl PrimaryReplicator for CustomRoleGate {
         Ok(())
     }
     async fn remove_replica(&self, _: ReplicaId) -> Result<()> {
+        self.remove_count.fetch_add(1, Ordering::SeqCst);
         if self.block_remove.swap(false, Ordering::SeqCst) {
             self.remove_entered.notify_one();
             self.remove_released.notified().await;
@@ -4857,6 +4912,7 @@ async fn blocked_lifecycle_callbacks_reject_fencing_session_replacement_close_an
         control.progress_released.notify_one();
         assert_stale_lifecycle_result(grant.await.unwrap());
         assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        assert!(!control.native_access_granted.load(Ordering::SeqCst));
     }
     {
         let (runtime, control, _, peer) = blocked_lifecycle_fixture("configuration").await;
@@ -6054,11 +6110,7 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
         ),
     )
     .await;
-    assert!(matches!(
-        default_build_route,
-        Err(RuntimeError::Application(message))
-            if message.contains("built-in copy route")
-    ));
+    assert!(default_build_route.is_err());
     kuberic_agent::testing::execute_build(
         &custom,
         ReplicaInformation::new(
@@ -6307,6 +6359,59 @@ async fn synthetic_custom_switchover_requires_all_catchup() {
 }
 
 #[tokio::test]
+async fn configuration_cancellation_does_not_deadlock_blocked_switchover_fencing() {
+    let (runtime, control, local, peer) =
+        blocked_lifecycle_fixture("switchover-cancellation-lock-order").await;
+    let configuration = runtime
+        .snapshot()
+        .await
+        .authority
+        .unwrap()
+        .current_configuration;
+    control.block_catchup.store(true, Ordering::SeqCst);
+    let switchover = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::PrepareSwitchover {
+                        preparation_generation: 1,
+                        request_id: SwitchoverRequestId::new("lock-order"),
+                        source: local,
+                        target: peer,
+                        starting_configuration_id: configuration.configuration_id,
+                        starting_epoch: configuration.epoch,
+                    },
+                ))
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.catchup_entered.notified())
+        .await
+        .unwrap();
+    let cancellation = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.testing_cancel_configuration_work().await })
+    };
+    control.catchup_released.notify_one();
+    timeout(Duration::from_secs(1), switchover)
+        .await
+        .expect("switchover remained deadlocked")
+        .unwrap()
+        .ok();
+    timeout(Duration::from_secs(1), cancellation)
+        .await
+        .expect("configuration cancellation remained deadlocked")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+}
+
+#[tokio::test]
 async fn synthetic_custom_replacement_rejects_retired_session() {
     exercise_blocked_lifecycle_invalidation(
         BlockedLifecycleCallback::Build,
@@ -6337,6 +6442,82 @@ async fn synthetic_custom_access_is_proof_before_publish() {
     control.progress_released.notify_one();
     grant.await.unwrap().unwrap();
     assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn cancelled_custom_access_preparation_stops_publication_and_closes_access() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("cancelled-access-preparation").await;
+    control.block_progress.store(true, Ordering::SeqCst);
+    let grant = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::set_lifecycle_access(
+                &runtime,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.progress_entered.notified())
+        .await
+        .unwrap();
+    grant.abort();
+    assert!(grant.await.unwrap_err().is_cancelled());
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    control.progress_released.notify_one();
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn cancelled_custom_access_preparation_cannot_fence_a_newer_grant() {
+    let (runtime, control, _, _) =
+        blocked_lifecycle_fixture("cancelled-preparation-newer-grant").await;
+    control.block_progress.store(true, Ordering::SeqCst);
+    let old = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::set_lifecycle_access(
+                &runtime,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.progress_entered.notified())
+        .await
+        .unwrap();
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    old.abort();
+    assert!(old.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    control.progress_released.notify_one();
 }
 
 #[tokio::test]
@@ -7148,6 +7329,43 @@ async fn open_primary(
     runtime
 }
 
+async fn open_primary_with_session(
+    application: Arc<TestApplication>,
+    members: Vec<ReplicaIdentity>,
+    suffix: &str,
+) -> Arc<PodRuntime> {
+    let local = members[0].clone();
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        application,
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new(format!("build-{suffix}")),
+            ProcessSessionId::new(format!("source-{suffix}")),
+        )
+        .unwrap();
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority(local, members))),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    runtime
+}
+
 #[tokio::test]
 async fn existing_build_id_rejects_a_different_exact_target() {
     let runtime = open_primary(
@@ -7203,6 +7421,7 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     let lifecycle = include_str!("../src/custom.rs");
     let report = include_str!("../src/report.rs");
     let service = include_str!("../src/service.rs");
+    let testing = include_str!("../src/testing.rs");
     let transport = include_str!("../src/transport.rs");
     assert!(
         replication.contains("#[doc(hidden)]\npub trait ManagedReplicatorLifecycle")
@@ -7252,10 +7471,41 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         .split_once("\n}")
         .unwrap()
         .0;
+    for duplicate in [
+        "wait_for_catch_up_proof",
+        "build_replica_proof",
+        "remove_replica_proof",
+    ] {
+        assert!(
+            !managed_lifecycle.contains(duplicate),
+            "standard primary operation must not remain on the private managed contract: {duplicate}"
+        );
+    }
     assert!(
         replication.contains("async fn next_outbound_item(&self) -> Option<OutboundOperation>")
             && !managed_lifecycle.contains("next_outbound"),
         "only the optional built-in data plane may expose replication/copy outbound polling"
+    );
+    assert!(
+        !lifecycle.contains("install_engine_removal_proof"),
+        "migrated topology completion must not restore a broad runtime snapshot"
+    );
+    let removal_completion = lifecycle
+        .split_once("async fn execute_removal_action")
+        .unwrap()
+        .1
+        .split_once("async fn execute_access")
+        .unwrap()
+        .0;
+    assert!(
+        !removal_completion.contains(".snapshot()"),
+        "secondary-removal and retirement completion must consume typed receipts"
+    );
+    assert!(
+        hosting.contains("async fn execute_admitted_build")
+            && transport.contains(".execute_admitted_build(")
+            && testing.contains(".execute_admitted_build("),
+        "production and manual build drivers must share the admitted-build coordinator"
     );
     assert!(!replication.contains("fn managed_replicator("));
     assert!(!replication.contains("ReplicatorInterfaces::new"));
@@ -7743,7 +7993,47 @@ async fn peer_repair_status_does_not_grant_commit_quorum() {
 async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced() {
     let primary = identity(1, "primary");
     let replacement = identity(2, "replacement");
-    let source = open_primary(Arc::new(TestApplication::default()), vec![primary.clone()]).await;
+    let source_app = Arc::new(TestApplication::default());
+    let events = source_app.events.clone();
+    let build_gate = BuildReturnGate {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        fail: Arc::new(AtomicBool::new(false)),
+    };
+    *source_app.factory.lock().unwrap() = Some(Arc::new(CountingFactory {
+        storage: Arc::downgrade(&source_app),
+        opened: Arc::new(AtomicUsize::new(0)),
+        role_changes: Arc::new(AtomicUsize::new(0)),
+        epoch_updates: Arc::new(AtomicUsize::new(0)),
+        events: events.clone(),
+        fail_change_role: Arc::new(AtomicBool::new(false)),
+        fail_close: Arc::new(AtomicBool::new(false)),
+        build_return_gate: Some(build_gate.clone()),
+        catchup_return_gate: None,
+    }));
+    let source =
+        open_primary_with_session(source_app, vec![primary.clone()], "primary-control").await;
+    events.lock().unwrap().clear();
+    source
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+    let build_effect = effect(
+        6,
+        RuntimeEffectAction::BuildReplica {
+            build_id: OperationId::new("sf-build"),
+            target: replacement.clone(),
+            replication_address: "target".into(),
+        },
+    );
+    let dispatched = source.apply_effect(build_effect.clone()).await.unwrap();
+    assert!(
+        dispatched
+            .postcondition
+            .builds
+            .iter()
+            .all(|build| !build.completed)
+    );
     let control = source.primary_replicator().await.unwrap();
     let build = {
         let control = control.clone();
@@ -7758,10 +8048,19 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
                 .await
         })
     };
-    assert!(matches!(
-        source.data_plane().next_outbound().await,
-        Some(OutboundReplication::Build(_))
-    ));
+    let endpoint = match source.data_plane().next_outbound().await {
+        Some(OutboundReplication::Build(endpoint)) => endpoint,
+        other => panic!("expected common hosted Build, got {other:?}"),
+    };
+    let mut description = ReplicaInformation::new(
+        endpoint.build_id.clone(),
+        replacement.clone(),
+        endpoint.replication_address.clone(),
+    );
+    description.process_session_id = ProcessSessionId::new("replacement-session");
+    kuberic_agent::testing::describe_peer(&source, description)
+        .await
+        .unwrap();
     let mut prepared = prepare_copy_authorized(
         &source,
         PrepareCopyRequest {
@@ -7793,32 +8092,130 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
             .await
             .unwrap();
     }
+
     let mut copy = target_app.held_streams.lock().unwrap().remove(1);
-    let delivery = {
+    let copy_release = Arc::new(Notify::new());
+    let mut coordinator = {
+        let source = source.clone();
+        let copy_source = source.clone();
         let target = target.clone();
-        let item = next_copy_item(&mut prepared).await;
-        tokio::spawn(async move { target.data_plane().receive_copy_item(item).await })
+        let replacement = replacement.clone();
+        let copy_release = copy_release.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::execute_build_with_copy(
+                &source,
+                ReplicaInformation::new(OperationId::new("sf-build"), replacement, "target".into()),
+                || async move {
+                    let item = next_copy_item(&mut prepared).await;
+                    let acknowledgement = target.data_plane().receive_copy_item(item).await?;
+                    copy_source
+                        .data_plane()
+                        .accept_copy_acknowledgement(acknowledgement)
+                        .await?;
+                    copy_release.notified().await;
+                    Ok(())
+                },
+            )
+            .await
+        })
     };
-    let operation = copy.get_operation().await.unwrap().unwrap();
+    let operation = timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = &mut coordinator => {
+                panic!("shared build coordinator exited before copy delivery: {result:?}");
+            }
+            operation = copy.get_operation() => operation,
+        }
+    })
+    .await
+    .expect("shared build coordinator must drive the native copy stream")
+    .unwrap()
+    .unwrap();
     assert!(matches!(
         operation.metadata,
         OperationMetadata::CopyComplete { .. }
     ));
-    assert!(!delivery.is_finished());
+    assert!(!coordinator.is_finished());
     assert!(!build.is_finished());
     operation
         .acknowledge(DurableApplicationProgress::default())
         .unwrap();
-    source
-        .data_plane()
-        .accept_copy_acknowledgement(delivery.await.unwrap().unwrap())
+    timeout(Duration::from_secs(1), build_gate.entered.notified())
         .await
+        .expect("public default build must establish native proof before returning");
+    assert!(!coordinator.is_finished());
+    assert!(!build.is_finished());
+    assert!(
+        source
+            .snapshot()
+            .await
+            .builds
+            .iter()
+            .all(|build| !build.completed),
+        "native copy completion alone must not open the hosted acceptance gate"
+    );
+    assert!(matches!(
+        source.observe_build_completion(build_effect.clone()).await,
+        Err(RuntimeError::ReconfigurationPending)
+    ));
+    build_gate.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !coordinator.is_finished(),
+        "public completion must not discard a still-pending copy branch"
+    );
+    copy_release.notify_one();
+    timeout(Duration::from_secs(1), coordinator)
+        .await
+        .expect("shared build coordinator must finish after the native copy ACK")
+        .unwrap()
         .unwrap();
     timeout(Duration::from_secs(1), build)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+    assert!(
+        source
+            .observe_build_completion(build_effect.clone())
+            .await
+            .unwrap()
+            .postcondition
+            .builds
+            .iter()
+            .any(
+                |build| build.authority.build_id == OperationId::new("sf-build") && build.completed
+            ),
+        "durable effect reobservation must complete after exact host acceptance"
+    );
+    timeout(
+        Duration::from_secs(1),
+        control.build_replica(ReplicaInformation::new(
+            OperationId::new("sf-build"),
+            replacement.clone(),
+            "target".into(),
+        )),
+    )
+    .await
+    .expect("an identical accepted hosted build must complete idempotently")
+    .unwrap();
+    let write = source
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("post-accepted-build-write"),
+            data: Bytes::from_static(b"after-build"),
+        })
+        .await
+        .expect("accepted build stream must detach from future primary writes");
+    write
+        .committed()
+        .await
+        .expect("post-build primary write must retain native durability semantics");
+    control.update_epoch(Epoch::new(0, 2)).await.unwrap();
+    assert!(matches!(
+        source.observe_build_completion(build_effect).await,
+        Err(RuntimeError::ReconfigurationPending | RuntimeError::OperationCancelled)
+    ));
     assert!(matches!(
         control.remove_replica(primary.replica_id).await,
         Err(RuntimeError::AuthorityMismatch(_))
@@ -7832,6 +8229,1698 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         source.data_plane().next_outbound().await,
         Some(OutboundReplication::Remove(_))
     ));
+    let events = events.lock().unwrap();
+    for (operation, expected) in [
+        ("primary.wait_for_catch_up_quorum", 1),
+        ("primary.build_replica", 1),
+        ("primary.remove_replica", 2),
+    ] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.as_str() == operation)
+                .count(),
+            expected,
+            "{operation} must cross the returned public primary exactly once"
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EffectPersistenceFailure {
+    MarkApplied = 1,
+    Complete = 2,
+    BlockComplete = 3,
+}
+
+struct FailingEffectStore {
+    inner: Arc<SqliteStore>,
+    failure: AtomicUsize,
+    complete_entered: Notify,
+    complete_release: Notify,
+}
+
+impl FailingEffectStore {
+    fn new(inner: Arc<SqliteStore>, failure: EffectPersistenceFailure) -> Self {
+        Self {
+            inner,
+            failure: AtomicUsize::new(failure as usize),
+            complete_entered: Notify::new(),
+            complete_release: Notify::new(),
+        }
+    }
+
+    fn fail(&self, stage: EffectPersistenceFailure) -> kuberic_agent::Result<()> {
+        if self
+            .failure
+            .compare_exchange(stage as usize, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Err(kuberic_agent::AgentError::EffectConflict(
+                "injected effect persistence failure".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl AgentStore for FailingEffectStore {
+    async fn identity(&self) -> kuberic_agent::Result<StorageIdentity> {
+        self.inner.identity().await
+    }
+
+    async fn load_state(&self) -> kuberic_agent::Result<AgentState> {
+        self.inner.load_state().await
+    }
+
+    async fn complete_application_initialization(&self) -> kuberic_agent::Result<()> {
+        self.inner.complete_application_initialization().await
+    }
+
+    async fn begin_effect(&self, effect: &RuntimeEffect) -> kuberic_agent::Result<BeginEffect> {
+        self.inner.begin_effect(effect).await
+    }
+
+    async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> kuberic_agent::Result<()> {
+        self.fail(EffectPersistenceFailure::MarkApplied)?;
+        self.inner.mark_effect_applied(effect).await
+    }
+
+    async fn complete_effect(&self, result: &RuntimeEffectResult) -> kuberic_agent::Result<()> {
+        if self
+            .failure
+            .compare_exchange(
+                EffectPersistenceFailure::BlockComplete as usize,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.complete_entered.notify_one();
+            self.complete_release.notified().await;
+        }
+        self.fail(EffectPersistenceFailure::Complete)?;
+        self.inner.complete_effect(result).await
+    }
+
+    async fn cancel_effect(&self, effect: &RuntimeEffect) -> kuberic_agent::Result<()> {
+        self.inner.cancel_effect(effect).await
+    }
+
+    async fn begin_configuration(
+        &self,
+        command: &EnsureConfiguration,
+    ) -> kuberic_agent::Result<BeginConfiguration> {
+        self.inner.begin_configuration(command).await
+    }
+
+    async fn journal_build(
+        &self,
+        command: &EnsureReplicaBuild,
+    ) -> kuberic_agent::Result<EnsureReplicaBuild> {
+        self.inner.journal_build(command).await
+    }
+
+    async fn abandon_build(&self, command: &EnsureReplicaBuild) -> kuberic_agent::Result<()> {
+        self.inner.abandon_build(command).await
+    }
+
+    async fn advance_configuration(
+        &self,
+        operation_id: &OperationId,
+        expected: CoordinatorStage,
+        next: CoordinatorStage,
+        observed_lsn: Option<i64>,
+    ) -> kuberic_agent::Result<ReconfigurationRecord> {
+        self.inner
+            .advance_configuration(operation_id, expected, next, observed_lsn)
+            .await
+    }
+
+    async fn complete_configuration(
+        &self,
+        operation_id: &OperationId,
+    ) -> kuberic_agent::Result<RetainedCommandResult> {
+        self.inner.complete_configuration(operation_id).await
+    }
+
+    async fn retained_result(&self) -> kuberic_agent::Result<Option<RetainedResult>> {
+        self.inner.retained_result().await
+    }
+
+    async fn set_reconfiguration(&self, data: Option<String>) -> kuberic_agent::Result<()> {
+        self.inner.set_reconfiguration(data).await
+    }
+
+    async fn clear_reconfiguration(&self) -> kuberic_agent::Result<()> {
+        self.inner.clear_reconfiguration().await
+    }
+
+    async fn migrate_schema(
+        &self,
+        expected_version: u32,
+        target_version: u32,
+    ) -> kuberic_agent::Result<()> {
+        self.inner
+            .migrate_schema(expected_version, target_version)
+            .await
+    }
+
+    async fn record_partition_reports(
+        &self,
+        load_metrics: Vec<LoadMetric>,
+        reported_fault: Option<FaultType>,
+    ) -> kuberic_agent::Result<()> {
+        self.inner
+            .record_partition_reports(load_metrics, reported_fault)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn cancelled_access_effect_rolls_back_projection_before_effect_acceptance() {
+    let primary = identity(1, "access-cancel-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(
+        open_primary_with_session(application, vec![primary], "access-cancel-session").await,
+    );
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let access = effect(
+        6,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    );
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let task_runtime = runtime.clone();
+    let task_effect = access.clone();
+    let task = tokio::spawn(async move { task_runtime.apply_effect(task_effect).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+        .await
+        .unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert!(matches!(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("cancelled-access-write"),
+                data: Bytes::from_static(b"must-remain-fenced"),
+            })
+            .await,
+        Err(RuntimeError::WriteClosed(
+            AccessStatus::ReconfigurationPending
+        ))
+    ));
+
+    runtime.testing_resume_access_effect_acceptance();
+    let accepted = runtime.apply_effect(access).await.unwrap();
+    assert!(accepted.topology_receipt.is_none());
+    assert_eq!(accepted.postcondition.write_status, AccessStatus::Granted);
+    assert!(runtime.testing_has_applied_effect(6).await);
+    runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("accepted-access-write"),
+            data: Bytes::from_static(b"live-after-retry"),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn prepared_access_effect_holds_native_fence_until_durable_decision() {
+    let primary = identity(1, "access-durable-boundary-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = open_primary_with_session(
+        application,
+        vec![primary],
+        "access-durable-boundary-session",
+    )
+    .await;
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let execution = <PodRuntime as RuntimeEffectExecutor>::prepare_runtime_effect(
+        runtime.as_ref(),
+        effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    assert!(!runtime.testing_has_applied_effect(6).await);
+
+    let invalidation = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.testing_cancel_configuration_work().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !invalidation.is_finished(),
+        "native generation mutation crossed the uncommitted effect boundary"
+    );
+
+    execution.reject().await.unwrap();
+    invalidation.await.unwrap().unwrap();
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+}
+
+#[tokio::test]
+async fn peer_session_replacement_waits_for_the_durable_access_decision() {
+    let (runtime, control, _, peer) = blocked_lifecycle_fixture("session-durable-boundary").await;
+    let execution = <PodRuntime as RuntimeEffectExecutor>::prepare_runtime_effect(
+        runtime.as_ref(),
+        effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+
+    let replacement = {
+        let runtime = runtime.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::register_lifecycle_peer_session(
+                &runtime,
+                peer,
+                ProcessSessionId::new("replacement-peer-session"),
+            )
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !replacement.is_finished(),
+        "peer-session mutation crossed the durable access decision"
+    );
+
+    execution.reject().await.unwrap();
+    replacement.await.unwrap().unwrap();
+    assert!(!control.native_access_granted.load(Ordering::SeqCst));
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+}
+
+#[tokio::test]
+async fn abort_rejects_prepared_managed_and_custom_access() {
+    let primary = identity(1, "managed-access-abort");
+    let managed = open_primary_with_session(
+        Arc::new(TestApplication::default()),
+        vec![primary],
+        "managed-access-abort-session",
+    )
+    .await;
+    managed
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+    let managed_execution = <PodRuntime as RuntimeEffectExecutor>::prepare_runtime_effect(
+        managed.as_ref(),
+        effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    managed.abort();
+    assert!(managed_execution.accept().await.is_err());
+    assert!(!managed.testing_has_applied_effect(6).await);
+
+    let (custom, control, _, _) = blocked_lifecycle_fixture("custom-access-abort").await;
+    let custom_execution = <PodRuntime as RuntimeEffectExecutor>::prepare_runtime_effect(
+        custom.as_ref(),
+        effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+    custom.abort();
+    assert!(custom_execution.accept().await.is_err());
+    assert!(!control.native_access_granted.load(Ordering::SeqCst));
+    assert!(!custom.testing_has_applied_effect(5).await);
+}
+
+#[tokio::test]
+async fn access_effect_persistence_failures_reject_then_retry_the_exact_pending_generation() {
+    for (suffix, failure) in [
+        ("mark-applied", EffectPersistenceFailure::MarkApplied),
+        ("complete", EffectPersistenceFailure::Complete),
+    ] {
+        let primary = identity(1, &format!("access-persistence-{suffix}"));
+        let application = Arc::new(TestApplication::default());
+        let runtime = open_primary_with_session(
+            application,
+            vec![primary.clone()],
+            &format!("access-persistence-{suffix}-session"),
+        )
+        .await;
+        runtime
+            .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+            .await
+            .unwrap();
+
+        let resource_uid = ResourceUid::new(format!("access-persistence-{suffix}"));
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid,
+            pod_uid: PodUid::new(primary.instance_id.as_str()),
+            pvc_uid: PvcUid::new(format!("access-persistence-{suffix}-pvc")),
+            initialization_id: InitializationId::new(format!(
+                "access-persistence-{suffix}-initialization"
+            )),
+            local_identity: primary,
+            effective_policy: EffectivePolicy::fixed(1, 10).unwrap(),
+        });
+        state.next_effect_sequence = 6;
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let inner = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        let store = Arc::new(FailingEffectStore::new(inner.clone(), failure));
+        let adapter = RuntimeAdapter::new(store, runtime.clone());
+        let access = effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        );
+
+        assert!(adapter.execute(access.clone()).await.is_err(), "{suffix}");
+        assert!(!runtime.testing_has_applied_effect(6).await, "{suffix}");
+        assert_eq!(
+            runtime.snapshot().await.write_status,
+            AccessStatus::ReconfigurationPending,
+            "{suffix}"
+        );
+        assert!(inner.load_state().await.unwrap().pending_effect.is_some());
+
+        adapter.execute(access).await.unwrap();
+        assert!(runtime.testing_has_applied_effect(6).await, "{suffix}");
+        assert_eq!(
+            runtime.snapshot().await.write_status,
+            AccessStatus::Granted,
+            "{suffix}"
+        );
+        assert!(inner.load_state().await.unwrap().pending_effect.is_none());
+    }
+}
+
+#[tokio::test]
+async fn cancelling_durable_access_completion_rolls_back_and_preserves_pending_retry() {
+    let primary = identity(1, "access-persistence-cancel");
+    let application = Arc::new(TestApplication::default());
+    let runtime = open_primary_with_session(
+        application,
+        vec![primary.clone()],
+        "access-persistence-cancel-session",
+    )
+    .await;
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let mut state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: ResourceUid::new("access-persistence-cancel"),
+        pod_uid: PodUid::new(primary.instance_id.as_str()),
+        pvc_uid: PvcUid::new("access-persistence-cancel-pvc"),
+        initialization_id: InitializationId::new("access-persistence-cancel-initialization"),
+        local_identity: primary,
+        effective_policy: EffectivePolicy::fixed(1, 10).unwrap(),
+    });
+    state.next_effect_sequence = 6;
+    let directory = tempfile::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let inner = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    let store = Arc::new(FailingEffectStore::new(
+        inner.clone(),
+        EffectPersistenceFailure::BlockComplete,
+    ));
+    let access = effect(
+        6,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    );
+    let execution = {
+        let store = store.clone();
+        let runtime = runtime.clone();
+        let access = access.clone();
+        tokio::spawn(async move { RuntimeAdapter::new(store, runtime).execute(access).await })
+    };
+    timeout(Duration::from_secs(1), store.complete_entered.notified())
+        .await
+        .unwrap();
+    execution.abort();
+    assert!(execution.await.unwrap_err().is_cancelled());
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert!(inner.load_state().await.unwrap().pending_effect.is_some());
+
+    RuntimeAdapter::new(store, runtime.clone())
+        .execute(access)
+        .await
+        .unwrap();
+    assert!(runtime.testing_has_applied_effect(6).await);
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    assert!(inner.load_state().await.unwrap().pending_effect.is_none());
+}
+
+#[tokio::test]
+async fn custom_access_durable_rejection_closes_native_access_and_retries_exactly() {
+    for (suffix, failure) in [
+        ("complete", EffectPersistenceFailure::Complete),
+        ("cancel", EffectPersistenceFailure::BlockComplete),
+    ] {
+        let (runtime, control, local, _) =
+            blocked_lifecycle_fixture(&format!("custom-persistence-{suffix}")).await;
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new(format!("custom-persistence-{suffix}")),
+            pod_uid: PodUid::new(local.instance_id.as_str()),
+            pvc_uid: PvcUid::new(format!("custom-persistence-{suffix}-pvc")),
+            initialization_id: InitializationId::new(format!(
+                "custom-persistence-{suffix}-initialization"
+            )),
+            local_identity: local,
+            effective_policy: EffectivePolicy::fixed(2, 10).unwrap(),
+        });
+        state.next_effect_sequence = 5;
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let inner = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        let store = Arc::new(FailingEffectStore::new(inner.clone(), failure));
+        let access = effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        );
+
+        if matches!(failure, EffectPersistenceFailure::BlockComplete) {
+            let execution = {
+                let store = store.clone();
+                let runtime = runtime.clone();
+                let access = access.clone();
+                tokio::spawn(
+                    async move { RuntimeAdapter::new(store, runtime).execute(access).await },
+                )
+            };
+            timeout(Duration::from_secs(1), store.complete_entered.notified())
+                .await
+                .unwrap();
+            assert!(control.native_access_granted.load(Ordering::SeqCst));
+            execution.abort();
+            assert!(execution.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(
+                RuntimeAdapter::new(store.clone(), runtime.clone())
+                    .execute(access.clone())
+                    .await
+                    .is_err()
+            );
+        }
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !control.native_access_granted.load(Ordering::SeqCst)
+                    && runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!runtime.testing_has_applied_effect(5).await);
+        assert!(inner.load_state().await.unwrap().pending_effect.is_some());
+
+        RuntimeAdapter::new(store, runtime.clone())
+            .execute(access)
+            .await
+            .unwrap();
+        assert!(control.native_access_granted.load(Ordering::SeqCst));
+        assert!(runtime.testing_has_applied_effect(5).await);
+        assert!(inner.load_state().await.unwrap().pending_effect.is_none());
+    }
+}
+
+#[tokio::test]
+async fn failed_or_stalled_custom_revocation_aborts_after_closing_projection() {
+    for (suffix, blocked) in [("error", false), ("blocked", true)] {
+        let (runtime, control, local, _) =
+            blocked_lifecycle_fixture(&format!("custom-revocation-{suffix}")).await;
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new(format!("custom-revocation-{suffix}")),
+            pod_uid: PodUid::new(local.instance_id.as_str()),
+            pvc_uid: PvcUid::new(format!("custom-revocation-{suffix}-pvc")),
+            initialization_id: InitializationId::new(format!(
+                "custom-revocation-{suffix}-initialization"
+            )),
+            local_identity: local,
+            effective_policy: EffectivePolicy::fixed(2, 10).unwrap(),
+        });
+        state.next_effect_sequence = 5;
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let inner = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        let store = Arc::new(FailingEffectStore::new(
+            inner,
+            EffectPersistenceFailure::Complete,
+        ));
+        if blocked {
+            control.block_revocation.store(true, Ordering::SeqCst);
+        } else {
+            control.revoke_error.store(true, Ordering::SeqCst);
+        }
+        let access = effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        );
+        let execution = {
+            let store = store.clone();
+            let runtime = runtime.clone();
+            tokio::spawn(async move { RuntimeAdapter::new(store, runtime).execute(access).await })
+        };
+        if blocked {
+            timeout(
+                Duration::from_secs(1),
+                control.revocation_entered.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                runtime.snapshot().await.write_status,
+                AccessStatus::ReconfigurationPending
+            );
+        }
+        assert!(execution.await.unwrap().is_err());
+        assert!(control.abort_count.load(Ordering::SeqCst) > 0);
+        assert!(!control.native_access_granted.load(Ordering::SeqCst));
+        assert_eq!(
+            runtime.snapshot().await.write_status,
+            AccessStatus::ReconfigurationPending
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_old_access_transaction_cannot_fence_a_newer_grant() {
+    let primary = identity(1, "access-newer-grant-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(
+        open_primary_with_session(application, vec![primary], "access-newer-grant-session").await,
+    );
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let task_runtime = runtime.clone();
+    let old = tokio::spawn(async move {
+        task_runtime
+            .apply_effect(effect(
+                6,
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::Granted,
+                    write: AccessStatus::Granted,
+                },
+            ))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+        .await
+        .unwrap();
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    old.abort();
+    assert!(old.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("newer-access-write"),
+            data: Bytes::from_static(b"newer-grant-remains-live"),
+        })
+        .await
+        .unwrap();
+    runtime.testing_resume_access_effect_acceptance();
+}
+
+#[tokio::test]
+async fn cancelled_published_custom_grant_cannot_fence_a_newer_grant() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("published-custom-newer-grant").await;
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let old = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::SetAccessStatus {
+                        read: AccessStatus::Granted,
+                        write: AccessStatus::Granted,
+                    },
+                ))
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), entered).await.unwrap();
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    old.abort();
+    assert!(old.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    runtime.testing_resume_access_effect_acceptance();
+}
+
+#[tokio::test]
+async fn stale_fatal_progress_callback_cannot_abort_a_newer_access_grant() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("stale-fatal-access").await;
+    control.block_progress.store(true, Ordering::SeqCst);
+    let old = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::set_lifecycle_access(
+                &runtime,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.progress_entered.notified())
+        .await
+        .unwrap();
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    control.grant_error.store(2, Ordering::SeqCst);
+    control.progress_released.notify_one();
+    assert!(matches!(
+        old.await.unwrap(),
+        Err(RuntimeError::Application(message)) if message == "grant failed"
+    ));
+    assert_eq!(control.abort_count.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn configuration_invalidation_rejects_gated_access_effect() {
+    let primary = identity(1, "access-invalidation-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(
+        open_primary_with_session(application, vec![primary], "access-invalidation-session").await,
+    );
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let access = effect(
+        6,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    );
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let task_runtime = runtime.clone();
+    let task = tokio::spawn(async move { task_runtime.apply_effect(access).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+        .await
+        .unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+
+    runtime.testing_cancel_configuration_work().await.unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    runtime.testing_resume_access_effect_acceptance();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert!(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("invalidated-access-write"),
+                data: Bytes::from_static(b"must-remain-fenced"),
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn direct_epoch_fence_rejects_gated_access_effect() {
+    let primary = identity(1, "access-epoch-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(
+        open_primary_with_session(application.clone(), vec![primary], "access-epoch-session").await,
+    );
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let access = effect(
+        6,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    );
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let task_runtime = runtime.clone();
+    let task = tokio::spawn(async move { task_runtime.apply_effect(access).await });
+    tokio::time::timeout(Duration::from_secs(1), entered)
+        .await
+        .unwrap();
+    let retained_control = application
+        .returned_control
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+    retained_control
+        .update_epoch(Epoch::new(0, 2))
+        .await
+        .unwrap();
+    runtime.testing_resume_access_effect_acceptance();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+}
+
+#[tokio::test]
+async fn public_build_wrapper_failure_keeps_managed_acceptance_closed() {
+    let primary = identity(1, "failure-primary");
+    let replacement = identity(2, "failure-replacement");
+    let source_app = Arc::new(TestApplication::default());
+    let events = source_app.events.clone();
+    let build_gate = BuildReturnGate {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        fail: Arc::new(AtomicBool::new(true)),
+    };
+    *source_app.factory.lock().unwrap() = Some(Arc::new(CountingFactory {
+        storage: Arc::downgrade(&source_app),
+        opened: Arc::new(AtomicUsize::new(0)),
+        role_changes: Arc::new(AtomicUsize::new(0)),
+        epoch_updates: Arc::new(AtomicUsize::new(0)),
+        events: events.clone(),
+        fail_change_role: Arc::new(AtomicBool::new(false)),
+        fail_close: Arc::new(AtomicBool::new(false)),
+        build_return_gate: Some(build_gate.clone()),
+        catchup_return_gate: None,
+    }));
+    let source = open_primary_with_session(source_app, vec![primary], "public-build-failure").await;
+    events.lock().unwrap().clear();
+
+    let build_id = OperationId::new("public-build-failure");
+    let facade = {
+        let primary = source.primary_replicator().await.unwrap();
+        let build_id = build_id.clone();
+        let replacement = replacement.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    replacement,
+                    "failure-target".into(),
+                ))
+                .await
+        })
+    };
+    let endpoint = match source.data_plane().next_outbound().await {
+        Some(OutboundReplication::Build(endpoint)) => endpoint,
+        other => panic!("expected common hosted Build, got {other:?}"),
+    };
+    let mut description = ReplicaInformation::new(
+        endpoint.build_id.clone(),
+        replacement.clone(),
+        endpoint.replication_address,
+    );
+    description.process_session_id = ProcessSessionId::new("failure-target-session");
+    kuberic_agent::testing::describe_peer(&source, description)
+        .await
+        .unwrap();
+    let mut prepared = prepare_copy_authorized(
+        &source,
+        PrepareCopyRequest {
+            build_id: build_id.clone(),
+            target: replacement.clone(),
+            configuration: BuildConfiguration::Current,
+            copy_context: empty_copy_context(),
+        },
+    )
+    .await
+    .unwrap();
+    let target = Arc::new(PodRuntime::new(
+        replacement.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::New),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
+        RuntimeEffectAction::AdmitBuildAuthority(Box::new(prepared.authority.clone())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        target
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let coordinator = {
+        let source = source.clone();
+        let copy_source = source.clone();
+        let target = target.clone();
+        let replacement = replacement.clone();
+        let build_id = build_id.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::execute_build_with_copy(
+                &source,
+                ReplicaInformation::new(build_id, replacement, "failure-target".into()),
+                || async move {
+                    while let Some(item) = prepared.items.next().await {
+                        let acknowledgement = target.data_plane().receive_copy_item(item?).await?;
+                        copy_source
+                            .data_plane()
+                            .accept_copy_acknowledgement(acknowledgement)
+                            .await?;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), build_gate.entered.notified())
+        .await
+        .expect("wrapped public build must reach native completion");
+    assert!(!facade.is_finished());
+    assert!(
+        source
+            .snapshot()
+            .await
+            .builds
+            .iter()
+            .all(|build| !build.completed),
+        "native completion must remain hidden while the public wrapper is pending"
+    );
+    build_gate.release.notify_one();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), coordinator)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RuntimeError::Application(message))
+            if message == "injected public build completion failure"
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(1), facade)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+    assert!(
+        source
+            .snapshot()
+            .await
+            .builds
+            .iter()
+            .all(|build| !build.completed),
+        "a failed public wrapper must never publish managed host acceptance"
+    );
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "primary.build_replica")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn dropping_shared_build_coordinator_cancels_pending_public_build() {
+    let primary = identity(1, "drop-primary");
+    let replacement = identity(2, "drop-replacement");
+    let source_app = Arc::new(TestApplication::default());
+    let events = source_app.events.clone();
+    *source_app.factory.lock().unwrap() = Some(Arc::new(CountingFactory {
+        storage: Arc::downgrade(&source_app),
+        opened: Arc::new(AtomicUsize::new(0)),
+        role_changes: Arc::new(AtomicUsize::new(0)),
+        epoch_updates: Arc::new(AtomicUsize::new(0)),
+        events: events.clone(),
+        fail_change_role: Arc::new(AtomicBool::new(false)),
+        fail_close: Arc::new(AtomicBool::new(false)),
+        build_return_gate: None,
+        catchup_return_gate: None,
+    }));
+    let source = open_primary_with_session(source_app, vec![primary], "drop-coordinator").await;
+    events.lock().unwrap().clear();
+    let build_id = OperationId::new("drop-coordinator-build");
+    let facade = {
+        let primary = source.primary_replicator().await.unwrap();
+        let build_id = build_id.clone();
+        let replacement = replacement.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    replacement,
+                    "drop-target".into(),
+                ))
+                .await
+        })
+    };
+    let endpoint = match source.data_plane().next_outbound().await {
+        Some(OutboundReplication::Build(endpoint)) => endpoint,
+        other => panic!("expected common hosted Build, got {other:?}"),
+    };
+    let mut description = ReplicaInformation::new(
+        endpoint.build_id.clone(),
+        replacement.clone(),
+        endpoint.replication_address,
+    );
+    description.process_session_id = ProcessSessionId::new("drop-target-session");
+    kuberic_agent::testing::describe_peer(&source, description)
+        .await
+        .unwrap();
+    source
+        .authorize_build(
+            build_id.clone(),
+            replacement.clone(),
+            BuildConfiguration::Current,
+        )
+        .await
+        .unwrap();
+    let coordinator = {
+        let source = source.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::execute_build_with_copy(
+                &source,
+                ReplicaInformation::new(build_id, replacement, "drop-target".into()),
+                std::future::pending,
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "primary.build_replica")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shared coordinator must start the returned public build");
+    coordinator.abort();
+    assert!(coordinator.await.unwrap_err().is_cancelled());
+    assert!(matches!(
+        timeout(Duration::from_secs(1), facade)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+    assert!(
+        source
+            .snapshot()
+            .await
+            .builds
+            .iter()
+            .all(|build| !build.completed),
+        "dropping the coordinator must leave the exact acceptance gate closed"
+    );
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "primary.build_replica")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn managed_copy_failure_cancels_the_concurrent_public_build() {
+    let primary = identity(1, "copy-failure-primary");
+    let replacement = identity(2, "copy-failure-replacement");
+    let source_app = Arc::new(TestApplication::default());
+    let events = source_app.events.clone();
+    *source_app.factory.lock().unwrap() = Some(Arc::new(CountingFactory {
+        storage: Arc::downgrade(&source_app),
+        opened: Arc::new(AtomicUsize::new(0)),
+        role_changes: Arc::new(AtomicUsize::new(0)),
+        epoch_updates: Arc::new(AtomicUsize::new(0)),
+        events: events.clone(),
+        fail_change_role: Arc::new(AtomicBool::new(false)),
+        fail_close: Arc::new(AtomicBool::new(false)),
+        build_return_gate: None,
+        catchup_return_gate: None,
+    }));
+    let source = open_primary_with_session(source_app, vec![primary], "managed-copy-failure").await;
+    events.lock().unwrap().clear();
+    let build_id = OperationId::new("managed-copy-failure");
+    let facade = {
+        let primary = source.primary_replicator().await.unwrap();
+        let build_id = build_id.clone();
+        let replacement = replacement.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    replacement,
+                    "copy-failure-target".into(),
+                ))
+                .await
+        })
+    };
+    let endpoint = match source.data_plane().next_outbound().await {
+        Some(OutboundReplication::Build(endpoint)) => endpoint,
+        other => panic!("expected common hosted Build, got {other:?}"),
+    };
+    let mut description = ReplicaInformation::new(
+        endpoint.build_id.clone(),
+        replacement.clone(),
+        endpoint.replication_address,
+    );
+    description.process_session_id = ProcessSessionId::new("copy-failure-target-session");
+    kuberic_agent::testing::describe_peer(&source, description)
+        .await
+        .unwrap();
+    source
+        .authorize_build(
+            build_id.clone(),
+            replacement.clone(),
+            BuildConfiguration::Current,
+        )
+        .await
+        .unwrap();
+    let mut prepared = source
+        .data_plane()
+        .prepare_copy(PrepareCopyRequest {
+            build_id: build_id.clone(),
+            target: replacement.clone(),
+            configuration: BuildConfiguration::Current,
+            copy_context: empty_copy_context(),
+        })
+        .await
+        .unwrap();
+    let unavailable_target = PodRuntime::new(
+        replacement.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let result = kuberic_agent::testing::execute_build_with_copy(
+        &source,
+        ReplicaInformation::new(build_id, replacement, "copy-failure-target".into()),
+        || async {
+            loop {
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "primary.build_replica")
+                {
+                    let item = next_copy_item(&mut prepared).await;
+                    return unavailable_target
+                        .data_plane()
+                        .receive_copy_item(item)
+                        .await
+                        .map(|_| ());
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(matches!(
+        timeout(Duration::from_secs(1), facade)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+    assert!(
+        source
+            .snapshot()
+            .await
+            .builds
+            .iter()
+            .all(|build| !build.completed)
+    );
+}
+
+#[tokio::test]
+async fn stale_build_cleanup_does_not_cancel_same_id_retry_attempt() {
+    let runtime = open_primary_with_session(
+        Arc::new(TestApplication::default()),
+        vec![identity(1, "retry-primary")],
+        "same-id-retry",
+    )
+    .await;
+    let build_id = OperationId::new("same-id-retry");
+    let target = identity(2, "same-id-target");
+    let first = {
+        let primary = runtime.primary_replicator().await.unwrap();
+        let build_id = build_id.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    target,
+                    "same-id-target".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        runtime.data_plane().next_outbound().await,
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    let first_generation = kuberic_agent::testing::build_generation(&runtime, &build_id)
+        .await
+        .unwrap();
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(first.await.unwrap().is_err());
+    let retry = {
+        let primary = runtime.primary_replicator().await.unwrap();
+        let build_id = build_id.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    target,
+                    "same-id-target".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        runtime.data_plane().next_outbound().await,
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    let retry_generation = kuberic_agent::testing::build_generation(&runtime, &build_id)
+        .await
+        .unwrap();
+    assert!(retry_generation > first_generation);
+    kuberic_agent::testing::cancel_build_attempt(&runtime, &build_id, first_generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        kuberic_agent::testing::build_generation(&runtime, &build_id)
+            .await
+            .unwrap(),
+        retry_generation,
+        "late cleanup from the old coordinator must not invalidate its replacement"
+    );
+    assert!(!retry.is_finished());
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(retry.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn hosted_custom_build_cancellation_clears_pending_retry_admission() {
+    let (runtime, _, _, peer) = blocked_lifecycle_fixture("custom-build-retry").await;
+    let build_id = OperationId::new("custom-hosted-retry");
+    runtime
+        .authorize_build(build_id.clone(), peer.clone(), BuildConfiguration::Current)
+        .await
+        .unwrap();
+    let primary = runtime.primary_replicator().await.unwrap();
+    let first = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-hosted-retry".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(first.await.unwrap().is_err());
+
+    let retry = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-hosted-retry".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(retry.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn claimed_custom_cleanup_blocks_retry_and_cannot_remove_its_successor() {
+    let (runtime, control, _, peer) = blocked_lifecycle_fixture("custom-cleanup-claim").await;
+    let build_id = OperationId::new("custom-cleanup-claim");
+    runtime
+        .authorize_build(build_id.clone(), peer.clone(), BuildConfiguration::Current)
+        .await
+        .unwrap();
+    let primary = runtime.primary_replicator().await.unwrap();
+    let first = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-cleanup-claim".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    let old_generation = kuberic_agent::testing::build_generation(&runtime, &build_id)
+        .await
+        .unwrap();
+
+    control.block_configuration.store(true, Ordering::SeqCst);
+    let cancellation = {
+        let runtime = runtime.clone();
+        let build_id = build_id.clone();
+        tokio::spawn(async move { runtime.cancel_outbound_build(&build_id).await })
+    };
+    timeout(
+        Duration::from_secs(1),
+        control.configuration_entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        primary
+            .build_replica(ReplicaInformation::new(
+                build_id.clone(),
+                peer.clone(),
+                "custom-cleanup-claim".into(),
+            ))
+            .await,
+        Err(RuntimeError::ReconfigurationPending)
+    ));
+    control.configuration_released.notify_one();
+    cancellation.await.unwrap().unwrap();
+    assert!(first.await.unwrap().is_err());
+
+    let retry = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-cleanup-claim".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    let removes_before_stale_cleanup = control.remove_count.load(Ordering::SeqCst);
+    kuberic_agent::testing::cancel_build_attempt(&runtime, &build_id, old_generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        control.remove_count.load(Ordering::SeqCst),
+        removes_before_stale_cleanup,
+        "an old cleanup owner must not remove a successor attempt"
+    );
+
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(retry.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn session_fenced_custom_cleanup_releases_same_id_retry_admission() {
+    let (runtime, control, _, peer) = blocked_lifecycle_fixture("custom-cleanup-session").await;
+    let build_id = OperationId::new("custom-cleanup-session");
+    runtime
+        .authorize_build(build_id.clone(), peer.clone(), BuildConfiguration::Current)
+        .await
+        .unwrap();
+    let primary = runtime.primary_replicator().await.unwrap();
+    let first = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-cleanup-session".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+
+    control.block_configuration.store(true, Ordering::SeqCst);
+    let cancellation = {
+        let runtime = runtime.clone();
+        let build_id = build_id.clone();
+        tokio::spawn(async move { runtime.cancel_outbound_build(&build_id).await })
+    };
+    timeout(
+        Duration::from_secs(1),
+        control.configuration_entered.notified(),
+    )
+    .await
+    .unwrap();
+    let mut replacement = ReplicaInformation::new(
+        OperationId::default(),
+        peer.clone(),
+        "custom-cleanup-session-replacement".into(),
+    );
+    replacement.process_session_id = ProcessSessionId::new("custom-cleanup-session-replacement");
+    kuberic_agent::testing::describe_peer(&runtime, replacement)
+        .await
+        .unwrap();
+    control.configuration_released.notify_one();
+    assert!(cancellation.await.unwrap().is_err());
+    assert!(first.await.unwrap().is_err());
+
+    let retry = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-cleanup-session-replacement".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(retry.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn aborted_post_claim_cleanup_keeps_the_explicit_cancellation_owner() {
+    let (runtime, control, _, peer) = blocked_lifecycle_fixture("cancel-claim-retry").await;
+    let authority = runtime
+        .authorize_build(
+            OperationId::new("cancel-claim-retry"),
+            peer.clone(),
+            BuildConfiguration::Current,
+        )
+        .await
+        .unwrap();
+    let waiter = {
+        let primary = runtime.primary_replicator().await.unwrap();
+        let build_id = authority.build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "cancel-claim-target".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        runtime.data_plane().next_outbound().await,
+        Some(OutboundReplication::Build(endpoint))
+            if endpoint.build_id == authority.build_id
+    ));
+    let generation = kuberic_agent::testing::build_generation(&runtime, &authority.build_id)
+        .await
+        .unwrap();
+    let dispatch_lock = Arc::new(TokioMutex::new(()));
+    control.block_remove.store(true, Ordering::SeqCst);
+    let first_cleanup = {
+        let runtime = runtime.clone();
+        let build_id = authority.build_id.clone();
+        let dispatch_lock = dispatch_lock.clone();
+        tokio::spawn(async move {
+            kuberic_agent::transport::testing_cancel_build_dispatch(
+                runtime,
+                build_id,
+                generation,
+                dispatch_lock,
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.remove_entered.notified())
+        .await
+        .expect("cancellation must claim the attempt before native cleanup");
+    first_cleanup.abort();
+    assert!(first_cleanup.await.unwrap_err().is_cancelled());
+    assert!(
+        dispatch_lock.try_lock().is_err(),
+        "the explicit cleanup transaction must retain the production per-build lock"
+    );
+    control.remove_released.notify_one();
+    let _released = timeout(Duration::from_secs(1), dispatch_lock.lock())
+        .await
+        .expect("the production lock must release after cleanup completes");
+    assert!(matches!(
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+}
+
+#[tokio::test]
+async fn managed_catch_up_rejects_public_completion_after_host_invalidation() {
+    let local = identity(1, "stale-catchup-primary");
+    let application = Arc::new(TestApplication::default());
+    let events = application.events.clone();
+    let catchup_gate = BuildReturnGate {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        fail: Arc::new(AtomicBool::new(false)),
+    };
+    *application.factory.lock().unwrap() = Some(Arc::new(CountingFactory {
+        storage: Arc::downgrade(&application),
+        opened: Arc::new(AtomicUsize::new(0)),
+        role_changes: Arc::new(AtomicUsize::new(0)),
+        epoch_updates: Arc::new(AtomicUsize::new(0)),
+        events: events.clone(),
+        fail_change_role: Arc::new(AtomicBool::new(false)),
+        fail_close: Arc::new(AtomicBool::new(false)),
+        build_return_gate: None,
+        catchup_return_gate: Some(catchup_gate.clone()),
+    }));
+    let runtime =
+        open_primary_with_session(application, vec![local], "stale-catchup-completion").await;
+    events.lock().unwrap().clear();
+    let catchup = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), catchup_gate.entered.notified())
+        .await
+        .expect("public catch-up wrapper must pause after native proof");
+    runtime.abort();
+    catchup_gate.release.notify_one();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), catchup)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RuntimeError::Closed | RuntimeError::OperationCancelled)
+    ));
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "primary.wait_for_catch_up_quorum")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -7953,136 +10042,83 @@ async fn cancelled_factory_creation_aborts_pending_managed_replicator() {
 #[tokio::test]
 async fn replicator_creation_failure_matrix_releases_all_state() {
     let runtime = PodRuntime::new(
-        identity(1, "managed-pre-reservation"),
-        Arc::new(TestApplication::default()),
-        Arc::new(MemoryAuthorityStore::default()),
-    );
-    let registration = runtime.testing_replicator_registration();
-    let capability = Arc::new(TrackingManagedCapability::default());
-    let reservation = ReplicatorCreationReservation(1);
-    assert!(
-        registration
-            .register_managed_lifecycle(capability.clone(), reservation)
-            .await
-            .is_err()
-    );
-    assert!(
-        registration
-            .register_managed_data_plane(capability, reservation)
-            .await
-            .is_err()
-    );
-
-    let runtime = PodRuntime::new(
-        identity(1, "managed-duplicates"),
+        identity(1, "managed-coherent-attachment"),
         Arc::new(TestApplication::default()),
         Arc::new(MemoryAuthorityStore::default()),
     );
     let registration = runtime.testing_replicator_registration();
     let reservation = registration.reserve_replicator_creation().unwrap();
     let capability = Arc::new(TrackingManagedCapability::default());
+    let interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        reservation.identity(RuntimeHostToken::new()),
+        capability.clone(),
+        None,
+        capability.clone(),
+    );
+    let attachment = interfaces
+        .testing_prepare_attachment(RuntimeHostToken::new(), reservation)
+        .unwrap();
     registration
-        .register_managed_lifecycle(capability.clone(), reservation)
+        .register_interfaces(&attachment, None, reservation)
         .await
         .unwrap();
-    assert!(
-        registration
-            .register_managed_lifecycle(capability.clone(), reservation)
-            .await
-            .is_err()
-    );
-    registration
-        .register_managed_data_plane(capability.clone(), reservation)
-        .await
-        .unwrap();
-    assert!(
-        registration
-            .register_managed_data_plane(capability.clone(), reservation)
-            .await
-            .is_err()
-    );
-    registration.cancel_replicator_creation(reservation);
-    assert_eq!(capability.aborts.load(Ordering::SeqCst), 2);
-    assert!(
-        registration
-            .register_managed_lifecycle(capability.clone(), reservation)
-            .await
-            .is_err()
-    );
-    let retry = registration.reserve_replicator_creation().unwrap();
-    registration.cancel_replicator_creation(retry);
+    attachment.testing_disarm(RuntimeHostToken::new());
+    assert_eq!(runtime.testing_lifecycle_registration(), (Some(true), true));
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 0);
 
-    for lifecycle_only in [true, false] {
-        let runtime = PodRuntime::new(
-            identity(
-                1,
-                if lifecycle_only {
-                    "managed-lifecycle-only"
-                } else {
-                    "managed-data-plane-only"
-                },
-            ),
-            Arc::new(TestApplication::default()),
-            Arc::new(MemoryAuthorityStore::default()),
-        );
-        let registration = runtime.testing_replicator_registration();
-        let reservation = registration.reserve_replicator_creation().unwrap();
-        let capability = Arc::new(TrackingManagedCapability::default());
-        if lifecycle_only {
-            registration
-                .register_managed_lifecycle(capability.clone(), reservation)
-                .await
-                .unwrap();
-        } else {
-            registration
-                .register_managed_data_plane(capability.clone(), reservation)
-                .await
-                .unwrap();
-        }
-        let interfaces = ReplicatorInterfaces::primary(capability.clone(), None);
-        assert!(
-            registration
-                .register_interfaces(&interfaces, None, reservation)
-                .await
-                .is_err()
-        );
-        registration.cancel_replicator_creation(reservation);
-        assert_eq!(capability.aborts.load(Ordering::SeqCst), 1);
-    }
-
-    let runtime = PodRuntime::new(
-        identity(1, "managed-late-registration"),
+    let source_runtime = PodRuntime::new(
+        identity(1, "managed-source-identity"),
         Arc::new(TestApplication::default()),
         Arc::new(MemoryAuthorityStore::default()),
     );
-    let registration = runtime.testing_replicator_registration();
-    let reservation = registration.reserve_replicator_creation().unwrap();
+    let source_registration = source_runtime.testing_replicator_registration();
+    let source_reservation = source_registration.reserve_replicator_creation().unwrap();
+    let target_runtime = PodRuntime::new(
+        identity(1, "managed-target-identity"),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let target_registration = target_runtime.testing_replicator_registration();
+    let target_reservation = target_registration.reserve_replicator_creation().unwrap();
+    let mismatched = Arc::new(TrackingManagedCapability::default());
+    let mismatched_interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        source_reservation.identity(RuntimeHostToken::new()),
+        mismatched.clone(),
+        None,
+        mismatched.clone(),
+    );
+    assert!(
+        mismatched_interfaces
+            .testing_prepare_attachment(RuntimeHostToken::new(), target_reservation)
+            .is_err()
+    );
+    drop(mismatched_interfaces);
+    assert_eq!(mismatched.aborts.load(Ordering::SeqCst), 3);
+    source_registration.cancel_replicator_creation(source_reservation);
+    target_registration.cancel_replicator_creation(target_reservation);
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn reconstructing_a_managed_bundle_abandons_its_original_creation() {
+    let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
     let capability = Arc::new(TrackingManagedCapability::default());
-    registration
-        .register_managed_lifecycle(capability.clone(), reservation)
-        .await
-        .unwrap();
-    registration
-        .register_managed_data_plane(capability.clone(), reservation)
-        .await
-        .unwrap();
-    let interfaces = ReplicatorInterfaces::primary(capability.clone(), None);
-    registration
-        .register_interfaces(&interfaces, None, reservation)
-        .await
-        .unwrap();
-    assert!(
-        registration
-            .register_managed_lifecycle(capability.clone(), reservation)
-            .await
-            .is_err()
+    let original = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        reservation.identity(RuntimeHostToken::new()),
+        capability.clone(),
+        None,
+        capability.clone(),
     );
-    assert!(
-        registration
-            .register_managed_data_plane(capability, reservation)
-            .await
-            .is_err()
-    );
+    let replacement = ReplicatorInterfaces::primary(capability.clone(), None);
+
+    drop(original);
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 3);
+
+    drop(replacement);
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 4);
 }
 
 #[cfg(feature = "testing")]
@@ -8101,21 +10137,24 @@ async fn cancelled_interface_attachment_aborts_all_managed_capabilities() {
         attach_entered: Some(attach_entered.clone()),
         attach_resume: Some(Arc::new(Notify::new())),
     });
-    registration
-        .register_managed_lifecycle(capability.clone(), reservation)
-        .await
+    let interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        reservation.identity(RuntimeHostToken::new()),
+        capability.clone(),
+        None,
+        capability.clone(),
+    );
+    let attachment = interfaces
+        .testing_prepare_attachment(RuntimeHostToken::new(), reservation)
         .unwrap();
-    registration
-        .register_managed_data_plane(capability.clone(), reservation)
-        .await
-        .unwrap();
-    let interfaces = ReplicatorInterfaces::primary(capability.clone(), None);
     let registering = {
         let registration = registration.clone();
         tokio::spawn(async move {
-            registration
-                .register_interfaces(&interfaces, None, reservation)
-                .await
+            let result = registration
+                .register_interfaces(&attachment, None, reservation)
+                .await;
+            drop(interfaces);
+            result
         })
     };
     attach_entered.notified().await;
@@ -8124,10 +10163,79 @@ async fn cancelled_interface_attachment_aborts_all_managed_capabilities() {
         registering.await,
         Err(error) if error.is_cancelled()
     ));
-    assert_eq!(capability.aborts.load(Ordering::SeqCst), 2);
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 3);
+    assert_eq!(runtime.testing_lifecycle_registration(), (None, false));
     registration.cancel_replicator_creation(reservation);
     let retry = registration.reserve_replicator_creation().unwrap();
     registration.cancel_replicator_creation(retry);
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn stale_attachment_cannot_consume_a_retry_reservation() {
+    let runtime = PodRuntime::new(
+        identity(1, "stale-interface-attachment"),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let registration = runtime.testing_replicator_registration();
+    let reservation = registration.reserve_replicator_creation().unwrap();
+    let attach_entered = Arc::new(Notify::new());
+    let attach_resume = Arc::new(Notify::new());
+    let capability = Arc::new(TrackingManagedCapability {
+        aborts: AtomicUsize::new(0),
+        attach_entered: Some(attach_entered.clone()),
+        attach_resume: Some(attach_resume.clone()),
+    });
+    let interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        reservation.identity(RuntimeHostToken::new()),
+        capability.clone(),
+        None,
+        capability.clone(),
+    );
+    let attachment = interfaces
+        .testing_prepare_attachment(RuntimeHostToken::new(), reservation)
+        .unwrap();
+    let stale_registration = {
+        let registration = registration.clone();
+        tokio::spawn(async move {
+            let result = registration
+                .register_interfaces(&attachment, None, reservation)
+                .await;
+            drop(interfaces);
+            result
+        })
+    };
+    attach_entered.notified().await;
+
+    registration.cancel_replicator_creation(reservation);
+    let retry = registration.reserve_replicator_creation().unwrap();
+    attach_resume.notify_one();
+    assert!(matches!(
+        stale_registration.await.unwrap(),
+        Err(RuntimeError::Application(_))
+    ));
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 3);
+    assert_eq!(runtime.testing_lifecycle_registration(), (None, false));
+
+    let replacement = Arc::new(TrackingManagedCapability::default());
+    let replacement_interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        retry.identity(RuntimeHostToken::new()),
+        replacement.clone(),
+        None,
+        replacement,
+    );
+    let replacement_attachment = replacement_interfaces
+        .testing_prepare_attachment(RuntimeHostToken::new(), retry)
+        .unwrap();
+    registration
+        .register_interfaces(&replacement_attachment, None, retry)
+        .await
+        .unwrap();
+    replacement_attachment.testing_disarm(RuntimeHostToken::new());
+    assert_eq!(runtime.testing_lifecycle_registration(), (Some(true), true));
 }
 
 #[cfg(feature = "testing")]
@@ -8215,6 +10323,8 @@ async fn lifecycle_orders_role_changes_and_close_like_service_fabric() {
         events: events.clone(),
         fail_change_role: Arc::new(AtomicBool::new(false)),
         fail_close: Arc::new(AtomicBool::new(false)),
+        build_return_gate: None,
+        catchup_return_gate: None,
     }));
     let runtime = open_primary(app.clone(), vec![identity(1, "primary")]).await;
     events.lock().unwrap().clear();
@@ -8272,6 +10382,8 @@ async fn primary_promotion_retries_epoch_stage_before_application_role() {
             events: events.clone(),
             fail_change_role: Arc::new(AtomicBool::new(false)),
             fail_close: Arc::new(AtomicBool::new(false)),
+            build_return_gate: None,
+            catchup_return_gate: None,
         },
     )
     .unwrap();
@@ -8443,6 +10555,8 @@ async fn explicit_abort_stops_replicator_before_application() {
             events: events.clone(),
             fail_change_role: Arc::new(AtomicBool::new(false)),
             fail_close: Arc::new(AtomicBool::new(false)),
+            build_return_gate: None,
+            catchup_return_gate: None,
         },
     )
     .unwrap();
@@ -8527,9 +10641,10 @@ async fn ambiguous_primary_authority_admission_fences_pending_writes_and_old_ack
 
 #[tokio::test]
 async fn removing_a_replica_terminates_its_pending_build_wait() {
-    let runtime = open_primary(
+    let runtime = open_primary_with_session(
         Arc::new(TestApplication::default()),
         vec![identity(1, "primary")],
+        "removed-build",
     )
     .await;
     let control = runtime.primary_replicator().await.unwrap();
@@ -8547,17 +10662,48 @@ async fn removing_a_replica_terminates_its_pending_build_wait() {
                 .await
         })
     };
-    assert!(matches!(
-        runtime.data_plane().next_outbound().await,
-        Some(OutboundReplication::Build(_))
-    ));
+    let endpoint = match runtime.data_plane().next_outbound().await {
+        Some(OutboundReplication::Build(endpoint)) => endpoint,
+        other => panic!("expected common hosted Build, got {other:?}"),
+    };
+    let mut description = ReplicaInformation::new(
+        endpoint.build_id.clone(),
+        target.clone(),
+        endpoint.replication_address,
+    );
+    description.process_session_id = ProcessSessionId::new("removed-target-session");
+    kuberic_agent::testing::describe_peer(&runtime, description)
+        .await
+        .unwrap();
+    runtime
+        .authorize_build(
+            endpoint.build_id.clone(),
+            target.clone(),
+            BuildConfiguration::Current,
+        )
+        .await
+        .unwrap();
+    let coordinator = {
+        let runtime = runtime.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::execute_build_with_copy(
+                &runtime,
+                ReplicaInformation::new(OperationId::new("removed-build"), target, "target".into()),
+                std::future::pending,
+            )
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
     control.remove_replica(target.replica_id).await.unwrap();
+    assert!(coordinator.await.unwrap().is_err());
     assert!(matches!(
         timeout(Duration::from_secs(1), wait)
             .await
             .unwrap()
             .unwrap(),
-        Err(RuntimeError::ReplicaRemoved(2))
+        Err(RuntimeError::OperationCancelled | RuntimeError::ReplicaRemoved(2))
     ));
 }
 
@@ -8607,7 +10753,7 @@ async fn default_build_effect_dispatches_without_waiting_for_copy_completion() {
     .await;
     let build_id = OperationId::new("async-default-build");
     let target = identity(2, "target");
-    timeout(
+    let dispatched = timeout(
         Duration::from_secs(1),
         runtime.apply_effect(effect(
             5,
@@ -8621,6 +10767,23 @@ async fn default_build_effect_dispatches_without_waiting_for_copy_completion() {
     .await
     .expect("build effect dispatch must be non-blocking")
     .unwrap();
+    assert!(
+        dispatched
+            .postcondition
+            .builds
+            .iter()
+            .all(|build| !build.completed),
+        "durable effect completion must remain pending before public/native acceptance"
+    );
+    assert!(
+        runtime
+            .snapshot()
+            .await
+            .builds
+            .iter()
+            .all(|build| !build.completed),
+        "report-visible host completion must remain pending before acceptance"
+    );
     assert!(matches!(
         timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
             .await
@@ -8666,6 +10829,180 @@ async fn bounded_outbound_build_queue_is_cancelled_by_abort() {
 }
 
 #[tokio::test]
+async fn cancelled_queue_blocked_build_can_retry_after_capacity_returns() {
+    let runtime = open_primary(
+        Arc::new(TestApplication::default()),
+        vec![identity(1, "queue-retry-primary")],
+    )
+    .await;
+    let control = runtime.primary_replicator().await.unwrap();
+    let mut queued = Vec::new();
+    for id in 2..=17 {
+        let control = control.clone();
+        queued.push(tokio::spawn(async move {
+            control
+                .build_replica(ReplicaInformation::new(
+                    OperationId::new(format!("queue-fill-{id}")),
+                    identity(id, &format!("queue-fill-target-{id}")),
+                    format!("queue-fill-target-{id}"),
+                ))
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let retry_id = OperationId::new("queue-blocked-retry");
+    let retry_target = identity(99, "queue-blocked-target");
+    let blocked = {
+        let control = control.clone();
+        let retry_id = retry_id.clone();
+        let retry_target = retry_target.clone();
+        tokio::spawn(async move {
+            control
+                .build_replica(ReplicaInformation::new(
+                    retry_id,
+                    retry_target,
+                    "queue-blocked-target".into(),
+                ))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!blocked.is_finished());
+    blocked.abort();
+    assert!(blocked.await.unwrap_err().is_cancelled());
+
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(_))
+    ));
+    let retry = {
+        let control = control.clone();
+        let retry_id = retry_id.clone();
+        let retry_target = retry_target.clone();
+        tokio::spawn(async move {
+            control
+                .build_replica(ReplicaInformation::new(
+                    retry_id,
+                    retry_target,
+                    "queue-blocked-target".into(),
+                ))
+                .await
+        })
+    };
+    let mut observed_retry = false;
+    for _ in 0..16 {
+        if matches!(
+            timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+                .await
+                .unwrap(),
+            Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == retry_id
+        ) {
+            observed_retry = true;
+        }
+    }
+    assert!(
+        observed_retry,
+        "the cancelled queue reservation must be retryable"
+    );
+
+    control.abort();
+    for task in queued {
+        assert!(task.await.unwrap().is_err());
+    }
+    assert!(retry.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn explicitly_cancelled_queue_blocked_build_never_dispatches_and_can_retry() {
+    let runtime = open_primary(
+        Arc::new(TestApplication::default()),
+        vec![identity(1, "queue-explicit-primary")],
+    )
+    .await;
+    let control = runtime.primary_replicator().await.unwrap();
+    let mut queued = Vec::new();
+    for id in 2..=17 {
+        let control = control.clone();
+        queued.push(tokio::spawn(async move {
+            control
+                .build_replica(ReplicaInformation::new(
+                    OperationId::new(format!("queue-explicit-fill-{id}")),
+                    identity(id, &format!("queue-explicit-target-{id}")),
+                    format!("queue-explicit-target-{id}"),
+                ))
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let build_id = OperationId::new("queue-explicit-cancel");
+    let target = identity(99, "queue-explicit-cancel-target");
+    let blocked = {
+        let control = control.clone();
+        let build_id = build_id.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            control
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    target,
+                    "queue-explicit-cancel-target".into(),
+                ))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!blocked.is_finished());
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(
+        timeout(Duration::from_secs(1), blocked)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+
+    for _ in 0..16 {
+        assert!(!matches!(
+            timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+                .await
+                .unwrap(),
+            Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+        ));
+    }
+
+    let retry = {
+        let control = control.clone();
+        let build_id = build_id.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            control
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    target,
+                    "queue-explicit-cancel-target".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+
+    control.abort();
+    for task in queued {
+        assert!(task.await.unwrap().is_err());
+    }
+    assert!(retry.await.unwrap().is_err());
+}
+
+#[tokio::test]
 async fn dropping_runtime_always_aborts_application_and_selected_control() {
     let application = Arc::new(TestApplication::default());
     let events = application.events.clone();
@@ -8681,6 +11018,8 @@ async fn dropping_runtime_always_aborts_application_and_selected_control() {
             events: events.clone(),
             fail_change_role: Arc::new(AtomicBool::new(false)),
             fail_close: Arc::new(AtomicBool::new(false)),
+            build_return_gate: None,
+            catchup_return_gate: None,
         },
     )
     .unwrap();
@@ -9997,6 +12336,8 @@ async fn runtime_accepts_custom_primary_replicator_and_exposes_state_replicator_
             events: events.clone(),
             fail_change_role: Arc::new(AtomicBool::new(false)),
             fail_close: Arc::new(AtomicBool::new(false)),
+            build_return_gate: None,
+            catchup_return_gate: None,
         },
     )
     .unwrap();
@@ -10074,6 +12415,8 @@ async fn secondary_authority_dispatches_replicator_and_provider_epoch_before_rol
             events: events.clone(),
             fail_change_role: Arc::new(AtomicBool::new(false)),
             fail_close: Arc::new(AtomicBool::new(false)),
+            build_return_gate: None,
+            catchup_return_gate: None,
         },
     )
     .unwrap();
@@ -11361,6 +13704,8 @@ async fn injected_replicator_failures_cannot_leave_pending_writes_live() {
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_change_role: fail_change_role.clone(),
                 fail_close: fail_close_flag.clone(),
+                build_return_gate: None,
+                catchup_return_gate: None,
             },
         )
         .unwrap();
