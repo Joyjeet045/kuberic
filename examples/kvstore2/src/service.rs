@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use kuberic_protocol::types::ReplicaRole;
 use kuberic_runtime::application::{OpenContext, RoleChange, StatefulServiceReplica};
+use kuberic_runtime::protocol::types::ReplicaRole;
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
@@ -65,8 +65,8 @@ impl KvService {
     }
 }
 
-fn require_read_access(status: kuberic_protocol::types::AccessStatus) -> Result<()> {
-    if status == kuberic_protocol::types::AccessStatus::Granted {
+fn require_read_access(status: kuberic_runtime::protocol::types::AccessStatus) -> Result<()> {
+    if status == kuberic_runtime::protocol::types::AccessStatus::Granted {
         Ok(())
     } else {
         Err(RuntimeError::ReadClosed(status))

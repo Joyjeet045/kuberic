@@ -1,4 +1,4 @@
-use kuberic_protocol::types::AccessStatus;
+use crate::protocol::types::AccessStatus;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -45,21 +45,27 @@ pub enum RuntimeError {
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
-impl From<kuberic_runtime_internal::ContractError> for RuntimeError {
-    fn from(error: kuberic_runtime_internal::ContractError) -> Self {
+#[derive(Debug, Error)]
+pub(crate) enum ContractError {
+    #[error("authority mismatch: {0}")]
+    AuthorityMismatch(String),
+    #[error("persistence error: {0}")]
+    Persistence(String),
+}
+
+pub(crate) type ContractResult<T> = std::result::Result<T, ContractError>;
+
+impl From<ContractError> for RuntimeError {
+    fn from(error: ContractError) -> Self {
         match error {
-            kuberic_runtime_internal::ContractError::AuthorityMismatch(message) => {
-                Self::AuthorityMismatch(message)
-            }
-            kuberic_runtime_internal::ContractError::Persistence(message) => {
-                Self::Application(message)
-            }
+            ContractError::AuthorityMismatch(message) => Self::AuthorityMismatch(message),
+            ContractError::Persistence(message) => Self::Application(message),
         }
     }
 }
 
-impl From<kuberic_protocol::validation::ValidationError> for RuntimeError {
-    fn from(error: kuberic_protocol::validation::ValidationError) -> Self {
+impl From<crate::protocol::validation::ValidationError> for RuntimeError {
+    fn from(error: crate::protocol::validation::ValidationError) -> Self {
         Self::AuthorityMismatch(error.to_string())
     }
 }

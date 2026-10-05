@@ -5,9 +5,9 @@
 
 use std::pin::Pin;
 
+use crate::protocol::types::OperationId;
 use async_trait::async_trait;
 use futures::Stream;
-use kuberic_protocol::types::OperationId;
 
 use crate::Result;
 use crate::application::{

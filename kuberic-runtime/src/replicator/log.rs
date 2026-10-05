@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
+use crate::protocol::types::{Epoch, OperationId, ReplicaIdentity, ReplicaRole};
+use crate::transport::{ReplicationAck, ReplicationItem};
 use bytes::Bytes;
-use kuberic_protocol::types::{Epoch, OperationId, ReplicaIdentity, ReplicaRole};
-use kuberic_runtime_internal::transport::{ReplicationAck, ReplicationItem};
 use tokio::sync::oneshot;
 
 use crate::application::{ClientWrite, Lsn, Operation};
@@ -14,9 +14,9 @@ use super::quorum::QuorumTracker;
 
 #[derive(Debug)]
 pub(crate) struct PreparedWrite {
-    pub lsn: Lsn,
-    pub items: Vec<ReplicationItem>,
-    pub completion: oneshot::Receiver<Result<Lsn>>,
+    pub(crate) lsn: Lsn,
+    pub(crate) items: Vec<ReplicationItem>,
+    pub(crate) completion: oneshot::Receiver<Result<Lsn>>,
 }
 
 #[derive(Debug)]
@@ -40,7 +40,7 @@ struct PendingLocalWrite {
 }
 
 impl ReplicationLog {
-    pub fn new(local_identity: ReplicaIdentity) -> Self {
+    pub(crate) fn new(local_identity: ReplicaIdentity) -> Self {
         Self {
             local_identity,
             authority: None,
@@ -452,7 +452,7 @@ impl ReplicationLog {
     pub(crate) fn register_peer_session(
         &mut self,
         identity: ReplicaIdentity,
-        session: kuberic_protocol::types::ProcessSessionId,
+        session: crate::protocol::types::ProcessSessionId,
     ) -> Result<()> {
         self.quorum.register_peer_session(identity, session)
     }
@@ -463,22 +463,22 @@ impl ReplicationLog {
 
     pub(crate) fn observe_secondary_removal(
         &mut self,
-        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
+        witness: &crate::protocol::types::SecondaryRemovalWitness,
     ) -> Result<()> {
         self.quorum.observe_secondary_removal(witness)
     }
 
     pub(crate) fn observe_committed_secondary_removal(
         &mut self,
-        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
+        witness: &crate::protocol::types::SecondaryRemovalWitness,
     ) -> Result<()> {
         self.quorum.observe_committed_secondary_removal(witness)
     }
 
     pub(crate) fn observe_secondary_removal_progress(
         &mut self,
-        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
-        committed: &kuberic_protocol::types::SecondaryScaleDownCleanup,
+        witness: &crate::protocol::types::SecondaryRemovalWitness,
+        committed: &crate::protocol::types::SecondaryScaleDownCleanup,
     ) -> Result<()> {
         self.quorum
             .observe_secondary_removal_progress(witness, committed)
@@ -486,14 +486,14 @@ impl ReplicationLog {
 
     pub(crate) fn validate_secondary_removal_commit(
         &self,
-        committed: &kuberic_protocol::types::SecondaryScaleDownCleanup,
+        committed: &crate::protocol::types::SecondaryScaleDownCleanup,
     ) -> Result<()> {
         self.quorum.validate_secondary_removal_commit(committed)
     }
 
     pub(crate) fn restore_committed_secondary_removal(
         &mut self,
-        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
+        witness: &crate::protocol::types::SecondaryRemovalWitness,
     ) -> Result<()> {
         self.quorum.restore_committed_secondary_removal(witness)
     }
@@ -501,7 +501,7 @@ impl ReplicationLog {
     pub(crate) fn acknowledge_in_session(
         &mut self,
         ack: &ReplicationAck,
-        session: &kuberic_protocol::types::ProcessSessionId,
+        session: &crate::protocol::types::ProcessSessionId,
     ) -> Result<()> {
         if ack.epoch != self.epoch {
             return Err(RuntimeError::AuthorityMismatch(

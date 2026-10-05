@@ -1,4 +1,4 @@
-use kuberic_protocol::types::{AccessStatus, ReplicaRole};
+use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
 use sqlite_replicated::proto;
 use sqlite_replicated::proto::sqlite_store_server::SqliteStore as _;
 use sqlite_replicated::testing::*;

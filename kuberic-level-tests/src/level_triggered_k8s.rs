@@ -2878,7 +2878,12 @@ impl ControlForward {
 // after EVERY effect; successful replies are deliberately discarded, not forged.
 struct LiveAgents {
     endpoints: std::collections::BTreeMap<String, ControlForward>,
-    last_command: std::sync::Mutex<Option<(String, kuberic_wire::proto::ExecuteCommandRequest)>>,
+    last_command: std::sync::Mutex<
+        Option<(
+            String,
+            kuberic_runtime::control::proto::ExecuteCommandRequest,
+        )>,
+    >,
 }
 
 #[async_trait::async_trait]
@@ -2887,9 +2892,9 @@ impl kuberic_controller::cluster_api::AgentApi for LiveAgents {
         &self,
         endpoint: &str,
         token: &str,
-        request: kuberic_wire::proto::GetAgentStatusRequest,
+        request: kuberic_runtime::control::proto::GetAgentStatusRequest,
     ) -> std::result::Result<
-        kuberic_wire::proto::AgentStatusReport,
+        kuberic_runtime::control::proto::AgentStatusReport,
         kuberic_controller::cluster_api::AgentRpcError,
     > {
         use kuberic_controller::cluster_api::{AgentRpcError, GrpcAgentApi};
@@ -2906,9 +2911,9 @@ impl kuberic_controller::cluster_api::AgentApi for LiveAgents {
         &self,
         endpoint: &str,
         token: &str,
-        request: kuberic_wire::proto::ExecuteCommandRequest,
+        request: kuberic_runtime::control::proto::ExecuteCommandRequest,
     ) -> std::result::Result<
-        kuberic_wire::proto::ExecuteCommandResponse,
+        kuberic_runtime::control::proto::ExecuteCommandResponse,
         kuberic_controller::cluster_api::AgentRpcError,
     > {
         use kuberic_controller::cluster_api::{AgentRpcError, GrpcAgentApi};
@@ -2927,8 +2932,11 @@ impl kuberic_controller::cluster_api::AgentApi for LiveAgents {
 }
 
 struct LiveStep {
-    plan: kuberic_protocol::plan::Plan,
-    command: Option<(String, kuberic_wire::proto::ExecuteCommandRequest)>,
+    plan: kuberic_controller::plan::Plan,
+    command: Option<(
+        String,
+        kuberic_runtime::control::proto::ExecuteCommandRequest,
+    )>,
 }
 
 struct LiveStepper {
@@ -2984,7 +2992,7 @@ impl LiveStepper {
             let raw = api.observe("default", "kvstore2").await?;
             let snapshot =
                 kuberic_controller::normalize::normalize(raw.clone(), Default::default())?;
-            let plan = kuberic_protocol::evaluator::evaluate(
+            let plan = kuberic_controller::evaluator::evaluate(
                 &snapshot,
                 &kuberic_controller::production_evaluation_config(30, 5, 30),
             );
@@ -3012,7 +3020,7 @@ impl LiveStepper {
     fn observe_snapshot(
         &self,
         cluster: &SwitchoverCluster,
-    ) -> Result<kuberic_protocol::observation::ObservationSnapshot> {
+    ) -> Result<kuberic_runtime::protocol::observation::ObservationSnapshot> {
         use kuberic_controller::cluster_api::{ClusterApi, KubeClusterApi};
         self.runtime.block_on(async {
             let options = kube::config::KubeConfigOptions {
@@ -3040,7 +3048,7 @@ impl LiveStepper {
     fn reject_stale(
         &self,
         endpoint: &str,
-        request: kuberic_wire::proto::ExecuteCommandRequest,
+        request: kuberic_runtime::control::proto::ExecuteCommandRequest,
     ) -> Result<()> {
         self.runtime.block_on(async {
             let forward = self
@@ -3049,7 +3057,7 @@ impl LiveStepper {
                 .get(endpoint)
                 .context("stale-command exact endpoint")?;
             let mut client =
-                kuberic_wire::proto::agent_control_client::AgentControlClient::connect(
+                kuberic_runtime::control::proto::agent_control_client::AgentControlClient::connect(
                     forward.endpoint.clone(),
                 )
                 .await?;
@@ -3071,11 +3079,9 @@ impl LiveStepper {
     }
 }
 
-fn removal_stage(plan: &kuberic_protocol::plan::Plan) -> Option<String> {
-    use kuberic_protocol::{
-        command::{KubernetesChange, ProtocolCommand},
-        plan::Plan,
-    };
+fn removal_stage(plan: &kuberic_controller::plan::Plan) -> Option<String> {
+    use kuberic_controller::plan::Plan;
+    use kuberic_runtime::protocol::command::{KubernetesChange, ProtocolCommand};
     match plan {
         Plan::Execute { command } => match command {
             ProtocolCommand::PrepareSecondaryRemoval(_) => Some("prepare".into()),
@@ -3147,7 +3153,8 @@ fn restart_scale_process(case: &mut ScaleCase<'_>, member: &Value) -> Result<()>
 #[ignore = "requires an explicitly owned isolated KinD cluster"]
 fn scale_down_adversarial() -> Result<()> {
     run_switchover(|cluster| {
-        use kuberic_protocol::{command::ProtocolCommand, plan::Plan};
+        use kuberic_controller::plan::Plan;
+        use kuberic_runtime::protocol::command::ProtocolCommand;
         scale_down_historical_member_return(cluster)?;
         // Reachable-target retirement and every command/status/cleanup lost-reply
         // boundary, with a fresh controller state after each production effect.
@@ -3491,7 +3498,8 @@ fn scale_down_adversarial() -> Result<()> {
 }
 
 fn scale_down_historical_member_return(cluster: &SwitchoverCluster) -> Result<()> {
-    use kuberic_protocol::{command::ProtocolCommand, plan::Plan};
+    use kuberic_controller::plan::Plan;
+    use kuberic_runtime::protocol::command::ProtocolCommand;
     reset_scale_set(cluster, 6)?;
     let mut case = ScaleCase::new(cluster, 6)?;
     let late = case.accepted["members"]
@@ -3860,7 +3868,7 @@ fn active_scale_up_copy_checkpoint(
     expected_source_session: &str,
     expected_candidate_session: &str,
 ) -> Result<ActiveScaleUpCopyCheckpoint> {
-    use kuberic_protocol::types::{ProvisioningIntent, ReplicaRole, ResourceUid};
+    use kuberic_runtime::protocol::types::{ProvisioningIntent, ReplicaRole, ResourceUid};
 
     let provisioning: ProvisioningIntent =
         serde_json::from_value(status["status"]["provisioning"].clone())
@@ -4016,8 +4024,8 @@ fn active_copy_observed_sessions(
     cluster: &SwitchoverCluster,
     status: &Value,
 ) -> Result<(String, String)> {
-    use kuberic_protocol::observation::AgentObservation;
-    use kuberic_protocol::types::{ProvisioningIntent, ReplicaRole, ResourceUid};
+    use kuberic_runtime::protocol::observation::AgentObservation;
+    use kuberic_runtime::protocol::types::{ProvisioningIntent, ReplicaRole, ResourceUid};
 
     let provisioning: ProvisioningIntent =
         serde_json::from_value(status["status"]["provisioning"].clone())?;
@@ -4056,8 +4064,10 @@ fn active_copy_reconstruction_checkpoint(
     cluster: &SwitchoverCluster,
     status: &Value,
 ) -> Result<ActiveScaleUpCopyCheckpoint> {
-    use kuberic_protocol::observation::AgentObservation;
-    use kuberic_protocol::types::{OperationId, ProvisioningIntent, ReplicaRole, ResourceUid};
+    use kuberic_runtime::protocol::observation::AgentObservation;
+    use kuberic_runtime::protocol::types::{
+        OperationId, ProvisioningIntent, ReplicaRole, ResourceUid,
+    };
 
     let provisioning: ProvisioningIntent =
         serde_json::from_value(status["status"]["provisioning"].clone())?;
@@ -4876,16 +4886,18 @@ impl<'a> ScaleUpCase<'a> {
                 && status["status"]["scaleUpAdmissionStarted"] == intent["operationId"]
                 && status["status"]["topology"]["configurationId"]
                     == intent["previousConfiguration"]["configurationId"]
-                && let Ok(intent) =
-                    serde_json::from_value::<kuberic_protocol::types::ScaleUpIntent>(intent.clone())
-                && let Ok(current) =
-                    serde_json::from_value::<kuberic_protocol::types::ConfigurationDescriptor>(
-                        status["status"]["transition"]["currentConfiguration"].clone(),
-                    )
+                && let Ok(intent) = serde_json::from_value::<
+                    kuberic_runtime::protocol::types::ScaleUpIntent,
+                >(intent.clone())
+                && let Ok(current) = serde_json::from_value::<
+                    kuberic_runtime::protocol::types::ConfigurationDescriptor,
+                >(
+                    status["status"]["transition"]["currentConfiguration"].clone(),
+                )
                 && let Ok(snapshot) = LiveStepper::new(self.cluster)
                     .and_then(|stepper| stepper.observe_snapshot(self.cluster))
             {
-                use kuberic_protocol::observation::AgentObservation;
+                use kuberic_runtime::protocol::observation::AgentObservation;
                 let reports =
                     snapshot
                         .replicas
@@ -4900,7 +4912,7 @@ impl<'a> ScaleUpCase<'a> {
                 let candidate = reports
                     .clone()
                     .find(|report| report.identity == intent.target);
-                let exact_pc_cc = |report: &kuberic_protocol::observation::AgentReport| {
+                let exact_pc_cc = |report: &kuberic_runtime::protocol::observation::AgentReport| {
                     report.previous_configuration.as_ref() == Some(&intent.previous_configuration)
                         && report.current_configuration.as_ref() == Some(&current)
                         && report.scale_up_intent.as_deref() == Some(&intent)
@@ -4909,11 +4921,12 @@ impl<'a> ScaleUpCase<'a> {
                 if source.is_some_and(|report| {
                     exact_pc_cc(report)
                         && report.identity == intent.primary
-                        && report.role == kuberic_protocol::types::ReplicaRole::Primary
+                        && report.role == kuberic_runtime::protocol::types::ReplicaRole::Primary
                 }) && candidate.is_some_and(|report| {
                     exact_pc_cc(report)
                         && report.identity == intent.target
-                        && report.role == kuberic_protocol::types::ReplicaRole::ActiveSecondary
+                        && report.role
+                            == kuberic_runtime::protocol::types::ReplicaRole::ActiveSecondary
                 }) {
                     let write_lsn = self.write(&format!("admission-target-{target}"))?;
                     let boundary_lsn = intent.catch_up_boundary_lsn;
@@ -5392,7 +5405,7 @@ fn scale_up_candidate_delivery_requires_exact_incarnation_session_and_build() {
 
 #[test]
 fn scale_up_active_copy_oracle_requires_exact_unadmitted_inflight_build() {
-    use kuberic_protocol::types::{
+    use kuberic_runtime::protocol::types::{
         AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
         OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId,
         ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpProvisioning,
@@ -5633,11 +5646,9 @@ fn scale_up_retry_classifiers_propagate_unknown_failures() {
     );
 }
 
-fn scale_up_stage(plan: &kuberic_protocol::plan::Plan) -> Option<String> {
-    use kuberic_protocol::{
-        command::{KubernetesChange, ProtocolCommand},
-        plan::Plan,
-    };
+fn scale_up_stage(plan: &kuberic_controller::plan::Plan) -> Option<String> {
+    use kuberic_controller::plan::Plan;
+    use kuberic_runtime::protocol::command::{KubernetesChange, ProtocolCommand};
     match plan {
         Plan::Execute { command } => match command {
             ProtocolCommand::InitializeAgentStore(command)
@@ -6513,17 +6524,17 @@ fn scale_up_post_admission_recovery_and_replacement(
         let intent_value = &status["status"]["transition"]["scaleUp"];
         if intent_value.is_object()
             && status["status"]["scaleUpAdmissionStarted"].is_string()
-            && let Ok(intent) = serde_json::from_value::<kuberic_protocol::types::ScaleUpIntent>(
-                intent_value.clone(),
-            )
+            && let Ok(intent) = serde_json::from_value::<
+                kuberic_runtime::protocol::types::ScaleUpIntent,
+            >(intent_value.clone())
             && let Ok(expanded) =
-                serde_json::from_value::<kuberic_protocol::types::ConfigurationDescriptor>(
+                serde_json::from_value::<kuberic_runtime::protocol::types::ConfigurationDescriptor>(
                     status["status"]["transition"]["currentConfiguration"].clone(),
                 )
             && let Ok(snapshot) =
                 LiveStepper::new(cluster).and_then(|stepper| stepper.observe_snapshot(cluster))
         {
-            use kuberic_protocol::observation::AgentObservation;
+            use kuberic_runtime::protocol::observation::AgentObservation;
             let reports = snapshot
                 .replicas
                 .values()
@@ -6651,9 +6662,11 @@ fn scale_up_post_admission_recovery_and_replacement(
         "post-PC/CC failover did not retain its exact elected primary"
     );
     let accepted_status =
-        serde_json::from_value::<kuberic_protocol::types::AcceptedStatus>(stable["status"].clone())
-            .context("deserialize stable carried-failover status")?;
-    kuberic_protocol::validation::validate_status(&accepted_status)
+        serde_json::from_value::<kuberic_runtime::protocol::types::AcceptedStatus>(
+            stable["status"].clone(),
+        )
+        .context("deserialize stable carried-failover status")?;
+    kuberic_runtime::protocol::validation::validate_status(&accepted_status)
         .context("validate stable carried-failover status")?;
     let receipt = accepted_status
         .last_scale_up

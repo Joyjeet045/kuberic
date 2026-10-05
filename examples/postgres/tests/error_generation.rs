@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kuberic_protocol::types::{AccessStatus, FaultType};
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::{AccessStatus, FaultType};
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use postgres_replicated::access::PgAccessController;
 use postgres_replicated::testing::{
     PgPod, ProcessProbe, TestDataDir, find_pg_bin, native_identity, wrapped_pg_bin,

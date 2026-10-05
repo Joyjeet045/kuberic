@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use kuberic_protocol::types::{
+use kuberic_runtime::protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, ProcessSessionId,
     ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
 };
@@ -227,11 +227,11 @@ async fn stalled_control_data_fence_is_bounded_reaped_and_retryable() {
                 assert!(error.is_timeout(), "{error}");
                 assert_eq!(
                     error.fault_type(),
-                    kuberic_protocol::types::FaultType::Transient
+                    kuberic_runtime::protocol::types::FaultType::Transient
                 );
                 assert_eq!(
                     reported.recv().await,
-                    Some(kuberic_protocol::types::FaultType::Transient)
+                    Some(kuberic_runtime::protocol::types::FaultType::Transient)
                 );
             }
             (helper, children)
@@ -609,7 +609,10 @@ async fn unexpected_process_exit_reports_v2_permanent_fault() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fault, kuberic_protocol::types::FaultType::Permanent);
+    assert_eq!(
+        fault,
+        kuberic_runtime::protocol::types::FaultType::Permanent
+    );
     instance.stop().await.unwrap();
 }
 
@@ -671,7 +674,7 @@ async fn failed_start_reports_fault_cleans_child_and_allows_retry() {
             .await
             .unwrap()
             .unwrap(),
-        kuberic_protocol::types::FaultType::Permanent
+        kuberic_runtime::protocol::types::FaultType::Permanent
     );
     instance.init_db().await.unwrap();
     instance.start_native(fault_tx).await.unwrap();
@@ -775,7 +778,7 @@ async fn spawn_failure_reports_permanent_fault_and_faulted_state() {
             .await
             .unwrap()
             .unwrap(),
-        kuberic_protocol::types::FaultType::Permanent
+        kuberic_runtime::protocol::types::FaultType::Permanent
     );
 }
 
@@ -846,14 +849,14 @@ fn postgres_errors_have_explicit_fault_classification() {
 
     assert_eq!(
         PgError::Connection("temporary".into()).fault_type(),
-        kuberic_protocol::types::FaultType::Transient
+        kuberic_runtime::protocol::types::FaultType::Transient
     );
     assert_eq!(
         PgError::Query("temporary".into()).fault_type(),
-        kuberic_protocol::types::FaultType::Transient
+        kuberic_runtime::protocol::types::FaultType::Transient
     );
     assert_eq!(
         PgError::Configuration("unsafe".into()).fault_type(),
-        kuberic_protocol::types::FaultType::Permanent
+        kuberic_runtime::protocol::types::FaultType::Permanent
     );
 }

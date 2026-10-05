@@ -4,8 +4,8 @@ use kube::Resource;
 use kuberic_controller::cluster_api::{GrpcAgentApi, KubeClusterApi};
 use kuberic_controller::crd::{INSTANCE_LABEL, SCALE_UP_ALLOCATION_ANNOTATION};
 use kuberic_controller::executor::execute_plan;
-use kuberic_protocol::command::{KubernetesChange, SafetyChange, ScaleDownResource};
-use kuberic_protocol::types::{
+use kuberic_runtime::protocol::command::{KubernetesChange, SafetyChange, ScaleDownResource};
+use kuberic_runtime::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, TransitionKind,
 };
 use std::collections::BTreeSet;
@@ -161,7 +161,7 @@ async fn observe_fresh_candidate(api: &InMemoryClusterApi) {
         raw.agents.insert(
             key.clone(),
             RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
-                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                 resource_uid: UID.to_string(),
                 process_session_id: format!("fresh-session-{}", key.replica_id),
                 report_sequence: 1,
@@ -216,7 +216,7 @@ async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
             raw.agents.insert(
                 key,
                 RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
-                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                     resource_uid: UID.to_string(),
                     identity: Some(target.into()),
                     process_session_id: format!("initialized-session-{}", command.local_replica_id),
@@ -452,7 +452,7 @@ async fn finish_switchover(api: &Arc<InMemoryClusterApi>, primary_id: i64) {
             _ => None,
         })
         .collect::<Vec<_>>();
-    let validation = kuberic_protocol::validation::validate_snapshot(&snapshot);
+    let validation = kuberic_runtime::protocol::validation::validate_snapshot(&snapshot);
     let plan = evaluate(&snapshot, &enabled());
     panic!(
         "switchover did not converge: invalid={invalid:?} validation={validation:?} \
@@ -597,7 +597,7 @@ async fn canonical_candidate_is_created_pvc_before_pod_and_lost_create_replays()
 
 async fn authorized_allocation_without_candidate(
     api: &Arc<InMemoryClusterApi>,
-) -> kuberic_protocol::types::ScaleUpAllocation {
+) -> kuberic_runtime::protocol::types::ScaleUpAllocation {
     for _ in 0..20 {
         tick(api).await;
         let raw = api.observation().await;
@@ -1081,7 +1081,7 @@ async fn scale_up_replays_pending_current_only_before_and_after_installation() {
         panic!("current-only target report")
     };
     report.pending_operation_id = current_only.operation_id.to_string();
-    report.pending_configuration = Some(kuberic_wire::configuration_command_to_proto(
+    report.pending_configuration = Some(kuberic_runtime::control::configuration_command_to_proto(
         (*current_only).clone(),
     ));
     report.report_sequence += 1;
@@ -1108,7 +1108,7 @@ async fn scale_up_replays_pending_current_only_before_and_after_installation() {
     );
     assert!(report.previous_configuration.is_none());
     report.pending_operation_id = current_only.operation_id.to_string();
-    report.pending_configuration = Some(kuberic_wire::configuration_command_to_proto(
+    report.pending_configuration = Some(kuberic_runtime::control::configuration_command_to_proto(
         (*current_only).clone(),
     ));
     report.report_sequence += 1;
@@ -1420,7 +1420,7 @@ async fn scale_up_carried_failover_repairs_returning_original_current_only_prima
     report.pending_operation_id.clear();
     report.retained_operation_id = intent
         .command_operation_id(
-            kuberic_protocol::types::ScaleUpStage::CurrentOnly,
+            kuberic_runtime::protocol::types::ScaleUpStage::CurrentOnly,
             &intent.primary,
             &intent.current_configuration,
         )
@@ -1629,7 +1629,7 @@ async fn scale_up_accepted_member_correction_replays_exact_pending_and_fences_un
     };
     report.current_progress += 1;
     report.pending_operation_id = correction.operation_id.to_string();
-    report.pending_configuration = Some(kuberic_wire::configuration_command_to_proto(
+    report.pending_configuration = Some(kuberic_runtime::control::configuration_command_to_proto(
         (*correction).clone(),
     ));
     report.report_sequence += 1;
@@ -1662,7 +1662,7 @@ async fn scale_up_accepted_member_correction_replays_exact_pending_and_fences_un
         unreachable!()
     };
     report.pending_operation_id = current_only.operation_id.to_string();
-    report.pending_configuration = Some(kuberic_wire::configuration_command_to_proto(
+    report.pending_configuration = Some(kuberic_runtime::control::configuration_command_to_proto(
         (*current_only).clone(),
     ));
     report.current_progress += 1;
@@ -2090,9 +2090,9 @@ async fn stable_scale_up_then_planned_switchover_converges_with_receipt() {
     for step in 0..200 {
         let snapshot = normalize(api.observation().await, BTreeMap::new()).unwrap();
         assert!(
-            kuberic_protocol::validation::validate_snapshot(&snapshot).is_ok(),
+            kuberic_runtime::protocol::validation::validate_snapshot(&snapshot).is_ok(),
             "post-scale-up switchover snapshot invalid at step {step}: {:?}",
-            kuberic_protocol::validation::validate_snapshot(&snapshot)
+            kuberic_runtime::protocol::validation::validate_snapshot(&snapshot)
         );
         let invalid = snapshot
             .replicas
@@ -2492,8 +2492,10 @@ async fn cleanup_preserves_same_name_replacements_and_waits_on_lookup_failure() 
         .unwrap()
         .clone();
     let endpoint_name = match &cleanup.resources.endpoint {
-        kuberic_protocol::types::CleanupResourceIdentity::Present { name, .. }
-        | kuberic_protocol::types::CleanupResourceIdentity::Absent { name } => name.clone(),
+        kuberic_runtime::protocol::types::CleanupResourceIdentity::Present { name, .. }
+        | kuberic_runtime::protocol::types::CleanupResourceIdentity::Absent { name } => {
+            name.clone()
+        }
     };
     api.fail_exact_lookup(
         format!("Service/{endpoint_name}"),
@@ -2708,8 +2710,8 @@ async fn pending_candidate_cleanup_allows_primary_failover_but_blocks_retry() {
         .unwrap()
         .clone();
     let endpoint_name = match cleanup.resources.endpoint {
-        kuberic_protocol::types::CleanupResourceIdentity::Present { name, .. }
-        | kuberic_protocol::types::CleanupResourceIdentity::Absent { name } => name,
+        kuberic_runtime::protocol::types::CleanupResourceIdentity::Present { name, .. }
+        | kuberic_runtime::protocol::types::CleanupResourceIdentity::Absent { name } => name,
     };
     api.fail_exact_lookup(
         format!("Service/{endpoint_name}"),
@@ -3534,7 +3536,7 @@ async fn cancellation_after_pod_create_cleans_endpoint_pod_pvc_without_unrelated
 
 async fn active_pvc_only_allocation(
     api: &Arc<InMemoryClusterApi>,
-) -> kuberic_protocol::types::ScaleUpAllocation {
+) -> kuberic_runtime::protocol::types::ScaleUpAllocation {
     for _ in 0..20 {
         tick(api).await;
         let raw = api.observation().await;
@@ -3793,7 +3795,7 @@ async fn residual_pvc_replace_after_live_get_is_candidate_local() {
         raced.agents.insert(
             raced_key.clone(),
             RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
-                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                 resource_uid: UID.to_string(),
                 process_session_id: "agent-started-before-controller-recovery".into(),
                 report_sequence: 1,

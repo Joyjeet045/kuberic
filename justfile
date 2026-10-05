@@ -13,8 +13,12 @@ default: level-triggered-build
 install-nextest:
     scripts/install_nextest.sh
 
-# Build one reusable all-features test archive.
-nextest-archive: install-nextest
+# Verify guards that need the build environment rather than an archive-only runner.
+nextest-build-only:
+    scripts/check_runtime_public_api.sh
+
+# Verify build-only guards and build one reusable all-features test archive.
+nextest-archive: install-nextest nextest-build-only
     mkdir -p "$(dirname "{{ nextest_archive }}")"
     cargo nextest archive --workspace --all-features --profile ci \
         --archive-file "{{ nextest_archive }}"
@@ -28,7 +32,7 @@ nextest-validate-archive: install-nextest
     python3 scripts/validate_nextest_partitions.py \
         --archive-file "{{ nextest_archive }}"
 
-# List one semantic repository tier: all, ordinary, postgres, kind, dex-live, helper, or external.
+# List one semantic repository tier: all, ordinary, build-only, postgres, kind, dex-live, helper, or external.
 nextest-list tier="all": install-nextest
     #!/usr/bin/env bash
     set -euo pipefail
@@ -36,6 +40,7 @@ nextest-list tier="all": install-nextest
     case "{{ tier }}" in
       all) profile=ci ;;
       ordinary) profile=ordinary ;;
+      build-only) profile=build-only; ignored_args=(--run-ignored only) ;;
       postgres) profile=postgres ;;
       kind) profile=kind; ignored_args=(--run-ignored only) ;;
       dex-live) profile=dex-live ;;

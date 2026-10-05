@@ -1,5 +1,5 @@
 use kube::CustomResource;
-use kuberic_protocol::types::AcceptedStatus;
+use kuberic_runtime::protocol::types::AcceptedStatus;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

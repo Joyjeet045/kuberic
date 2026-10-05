@@ -4,25 +4,23 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use bytes::Bytes;
-use futures::StreamExt;
-use kuberic_protocol::types::{
+use crate::authority::RetiredAuthority;
+use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, OperationId, ProcessSessionId, ReplicaId,
     ReplicaIdentity, ReplicaRole, SecondaryRemovalPreparation, SecondaryRemovalStage,
     SecondaryRemovalWitness, SecondaryScaleDownCleanup,
 };
-use kuberic_protocol::validation::{
+use crate::protocol::validation::{
     validate_secondary_removal_preparation, validate_secondary_scale_down_cleanup,
 };
-use kuberic_runtime_internal::authority::RetiredAuthority;
-use kuberic_runtime_internal::receipts::{
+use crate::receipts::{
     AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
     NativeTopologyStatus, RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt,
     TopologyReceipt,
 };
-use kuberic_runtime_internal::transport::{
-    CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem,
-};
+use crate::transport::{CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem};
+use bytes::Bytes;
+use futures::StreamExt;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot, watch};
 
 use crate::application::{
@@ -47,9 +45,6 @@ use crate::replicator::{
 };
 use crate::{Result, RuntimeError};
 
-#[doc(hidden)]
-pub use crate::replicator::quorum::QuorumTracker;
-
 #[derive(Debug)]
 struct RuntimeState {
     open: bool,
@@ -59,7 +54,7 @@ struct RuntimeState {
     write_status: AccessStatus,
     authority: Option<AdmittedAuthority>,
     prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
-    removal_in_progress: Option<kuberic_protocol::types::SecondaryScaleDownIntent>,
+    removal_in_progress: Option<crate::protocol::types::SecondaryScaleDownIntent>,
     retired_authority: Option<RetiredAuthority>,
     retiring_authority: Option<RetiredAuthority>,
     accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
@@ -130,27 +125,28 @@ struct EmittedBuildItem {
     snapshot_chunk: bool,
 }
 
-pub struct PendingWrite {
-    pub lsn: i64,
-    pub replication_items: Vec<ReplicationItem>,
-    pub build_items: Vec<CopyItem>,
+pub(crate) struct PendingWrite {
+    pub(crate) lsn: i64,
+    pub(crate) replication_items: Vec<ReplicationItem>,
+    pub(crate) build_items: Vec<CopyItem>,
     completion: oneshot::Receiver<Result<i64>>,
     aborted: watch::Receiver<bool>,
 }
 
-pub struct PendingReplication {
-    pub received: ReplicationAck,
+pub(crate) struct PendingReplication {
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+    pub(crate) received: ReplicationAck,
     applied: Pin<Box<dyn Future<Output = Result<ReplicationAck>> + Send>>,
 }
 
 impl PendingReplication {
-    pub async fn applied(self) -> Result<ReplicationAck> {
+    pub(crate) async fn applied(self) -> Result<ReplicationAck> {
         self.applied.await
     }
 }
 
 impl PendingWrite {
-    pub async fn committed(self) -> Result<WriteReceipt> {
+    pub(crate) async fn committed(self) -> Result<WriteReceipt> {
         let mut aborted = self.aborted;
         if *aborted.borrow() {
             return Err(RuntimeError::Closed);
@@ -849,7 +845,7 @@ impl DefaultReplicatorInner {
         }
     }
 
-    pub async fn restore_authority(&self) -> Result<()> {
+    pub(crate) async fn restore_authority(&self) -> Result<()> {
         let _guard = self.effect_lock.lock().await;
         if self
             .replica_authority_store
@@ -941,7 +937,7 @@ impl DefaultReplicatorInner {
         Ok(())
     }
 
-    pub async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
+    pub(crate) async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
         let _guard = self.effect_lock.lock().await;
         self.begin_write_locked(write, false).await
     }
@@ -1195,7 +1191,10 @@ impl DefaultReplicatorInner {
         })
     }
 
-    pub async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()> {
+    pub(crate) async fn accept_acknowledgement(
+        &self,
+        acknowledgement: ReplicationAck,
+    ) -> Result<()> {
         let _guard = self.effect_lock.lock().await;
         self.check_aborted()?;
         let durable_authority = self.replica_authority_store.load().await?;
@@ -1210,7 +1209,7 @@ impl DefaultReplicatorInner {
         Ok(())
     }
 
-    pub async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
+    pub(crate) async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
         let _prepare = self.copy_prepare_lock.lock().await;
         let PrepareCopyRequest {
             build_id,
@@ -1237,7 +1236,7 @@ impl DefaultReplicatorInner {
                     return Err(RuntimeError::NotPrimary);
                 }
                 let kind = if authority.transition_kind
-                    == Some(kuberic_protocol::types::TransitionKind::Failover)
+                    == Some(crate::protocol::types::TransitionKind::Failover)
                 {
                     BuildAuthorityKind::Failover
                 } else {
@@ -1245,6 +1244,7 @@ impl DefaultReplicatorInner {
                 };
                 (kind, authority.current_configuration)
             }
+            #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
             BuildConfiguration::Bootstrap(configuration) => {
                 if state.write_status == AccessStatus::Granted {
                     return Err(RuntimeError::WriteClosed(AccessStatus::Granted));
@@ -1418,6 +1418,7 @@ impl DefaultReplicatorInner {
         });
         let items = Box::pin(CopyItemStream::new(stream_rx, copy_cancel_tx));
         Ok(PreparedCopy {
+            #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
             authority: build_authority,
             items,
         })
@@ -1728,7 +1729,7 @@ impl DefaultReplicatorInner {
         send_copy_item(sender, item, cancellation).await
     }
 
-    pub async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()> {
+    pub(crate) async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()> {
         let _delivery = self.delivery_lock.lock().await;
         let delivery_generation = self.fence_generation.load(Ordering::Acquire);
         let state = self.state.read().await;
@@ -1830,7 +1831,7 @@ impl DefaultReplicatorInner {
         Ok(())
     }
 
-    pub async fn receive_copy_item(&self, envelope: CopyItem) -> Result<CopyAck> {
+    pub(crate) async fn receive_copy_item(&self, envelope: CopyItem) -> Result<CopyAck> {
         let _delivery = self.delivery_lock.lock().await;
         let delivery_generation = self.fence_generation.load(Ordering::Acquire);
         self.check_aborted()?;
@@ -1870,7 +1871,7 @@ impl DefaultReplicatorInner {
             ));
         }
         authority.validate()?;
-        kuberic_runtime_internal::authority::validate_build_envelope(&authority, &envelope)?;
+        crate::authority::validate_build_envelope(&authority, &envelope)?;
         let replicator_epoch = self.replicator.lock().await.epoch();
         if replicator_epoch != Epoch::default() && replicator_epoch != envelope.epoch {
             return Err(RuntimeError::AuthorityMismatch(
@@ -2099,7 +2100,7 @@ impl DefaultReplicatorInner {
         })
     }
 
-    pub async fn receive_replication(
+    pub(crate) async fn receive_replication(
         self: Arc<Self>,
         envelope: ReplicationItem,
     ) -> Result<PendingReplication> {
@@ -2187,18 +2188,21 @@ impl DefaultReplicatorInner {
                     .await?,
             )
         };
-        let received_applied_lsn = replication_progress
-            .verified_lsn
-            .min(application_progress.applied_lsn);
-        let received = ReplicationAck {
-            sender: envelope.sender.clone(),
-            receiver: self.identity.clone(),
-            epoch: envelope.epoch,
-            previous_configuration_id: envelope.previous_configuration_id.clone(),
-            current_configuration_id: envelope.current_configuration_id.clone(),
-            received_lsn: envelope.lsn.max(received_applied_lsn),
-            applied_lsn: received_applied_lsn,
-            committed_lsn: application_progress.committed_lsn.min(received_applied_lsn),
+        #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+        let received = {
+            let received_applied_lsn = replication_progress
+                .verified_lsn
+                .min(application_progress.applied_lsn);
+            ReplicationAck {
+                sender: envelope.sender.clone(),
+                receiver: self.identity.clone(),
+                epoch: envelope.epoch,
+                previous_configuration_id: envelope.previous_configuration_id.clone(),
+                current_configuration_id: envelope.current_configuration_id.clone(),
+                received_lsn: envelope.lsn.max(received_applied_lsn),
+                applied_lsn: received_applied_lsn,
+                committed_lsn: application_progress.committed_lsn.min(received_applied_lsn),
+            }
         };
         let engine = self.clone();
         let applied = Box::pin(async move {
@@ -2215,7 +2219,11 @@ impl DefaultReplicatorInner {
                 )
                 .await
         });
-        Ok(PendingReplication { received, applied })
+        Ok(PendingReplication {
+            #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+            received,
+            applied,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2293,7 +2301,7 @@ impl DefaultReplicatorInner {
         })
     }
 
-    pub async fn snapshot(&self) -> RuntimeSnapshot {
+    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {
         let _guard = self.effect_lock.lock().await;
         let state = self.state.read().await;
         let snapshot = (
@@ -2468,7 +2476,7 @@ impl DefaultReplicatorInner {
                 let existing_authority = self.state.read().await.authority.clone();
                 if matches!(
                     authority.scale_up.as_deref(),
-                    Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover { .. })
+                    Some(crate::protocol::types::ScaleUpConfigurationEvidence::Failover { .. })
                 ) && existing_authority.is_none()
                 {
                     return Err(RuntimeError::AuthorityNotAdmitted);
@@ -3065,7 +3073,7 @@ impl DefaultReplicatorInner {
                 self.finalize_ready_commit().await?;
             }
             RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
-                kuberic_protocol::validation::validate_accept_secondary_removal_commit(&command)
+                crate::protocol::validation::validate_accept_secondary_removal_commit(&command)
                     .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
                 let committed = &command.committed;
                 let state = self.state.read().await;
@@ -3553,7 +3561,7 @@ impl DefaultReplicatorInner {
             RuntimeEffectAction::AdmitAuthority(authority)
                 if matches!(
                     authority.scale_up.as_deref(),
-                    Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
+                    Some(crate::protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
                 )
         );
         let generation = self.fence_generation.load(Ordering::Acquire);
@@ -4142,14 +4150,11 @@ impl ManagedReplicatorDataPlane for DefaultReplicatorInner {
         None
     }
 
-    async fn recover_pending_writes(&self) -> Result<()> {
-        self.recover_pending_local_writes().await
-    }
-
     async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()> {
         self.repair_peer_from_history(identity, progress).await
     }
 
+    #[cfg(all(test, kuberic_workspace_tests))]
     async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
         self.begin_write(write).await
     }
@@ -4320,7 +4325,7 @@ fn build_handoff_matches(build: &BuildAuthority, authority: &AdmittedAuthority) 
     }
     match build.kind {
         BuildAuthorityKind::Bootstrap => {
-            authority.transition_kind == Some(kuberic_protocol::types::TransitionKind::Bootstrap)
+            authority.transition_kind == Some(crate::protocol::types::TransitionKind::Bootstrap)
                 && authority.previous_configuration.is_none()
                 && authority.current_configuration.configuration_id
                     == build.current_configuration.configuration_id
@@ -4349,7 +4354,7 @@ fn build_handoff_matches(build: &BuildAuthority, authority: &AdmittedAuthority) 
         }
 
         BuildAuthorityKind::Failover => {
-            authority.transition_kind == Some(kuberic_protocol::types::TransitionKind::Failover)
+            authority.transition_kind == Some(crate::protocol::types::TransitionKind::Failover)
                 && authority.previous_configuration.is_some()
                 && authority.current_configuration.configuration_id
                     == build.current_configuration.configuration_id
@@ -4386,7 +4391,7 @@ fn preserves_same_primary_scale_up_access(
 ) -> bool {
     matches!(
         next.scale_up.as_deref(),
-        Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
+        Some(crate::protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
     ) && existing.primary_identity() == next.primary_identity()
         && next.local_identity == *next.primary_identity()
         && existing.local_identity == next.local_identity
@@ -4395,7 +4400,7 @@ fn preserves_same_primary_scale_up_access(
 fn restores_same_primary_scale_up_access(authority: &AdmittedAuthority) -> bool {
     matches!(
         authority.scale_up.as_deref(),
-        Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission { intent })
+        Some(crate::protocol::types::ScaleUpConfigurationEvidence::Admission { intent })
             if intent.primary == authority.local_identity
                 && authority.primary_identity() == &authority.local_identity
                 && intent.previous_configuration.primary_id

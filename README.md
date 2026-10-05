@@ -12,21 +12,26 @@ sequential scale-up, secondary scale-down, and epoch/session fencing.
 ## Repository
 
 ```text
-kuberic-protocol/          Authority, topology and command model
-kuberic-wire/              Generated control and replication wire contracts
-kuberic-runtime/           Stateful application and replicator interfaces
-kuberic-runtime-internal/  Durable authority/effect implementation
-kuberic-agent/             Replica-local authority and process hosting
-kuberic-controller/        operator.kuberic.io/v1alpha1 controller
-kuberic-level-tests/       Isolated KinD scenario harness
-kuberic-dex/               Durable execution and checkpoint kernel
+kuberic-runtime/           Application/replicator API, host, protocol, control
+kuberic-controller/        CRDs, reconciliation policy and Kubernetes controller
+kuberic-level-tests/       Unpublished isolated KinD scenario harness
+kuberic-dex/               Unpublished durable execution and checkpoint kernel
 
 examples/kvstore2/         Level-triggered conformance application
 examples/sqlite/           SQLite v2 application
 examples/postgres/         PostgreSQL-native v2 custom replicator
 examples/sqlserver/        Independent SQL Server observer
-sqlite-commit-barrier/     SQLite durability helper
 ```
+
+There are exactly two public production crates: `kuberic-runtime` and
+`kuberic-controller`. DEX, every example (including the SQL Server observer),
+and level tests remain separate, unpublished workspace packages (`publish = false`).
+Applications depend only on `kuberic-runtime`; its default `host` feature supplies
+`host::ReplicaHost`. Shared contracts are under `protocol` and `control`.
+The `testing` feature provides isolated conformance fixtures without exporting
+production capabilities. The SQLite example owns its application-specific WAL
+commit-barrier implementation as a private module; it is not a runtime API.
+The controller disables runtime default features and owns pure evaluation/plan APIs.
 
 The former `kuberic-core`, `kuberic-operator`, classic KVStore and classic
 integration-test packages were removed because they had no active users.

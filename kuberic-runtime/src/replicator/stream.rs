@@ -1,5 +1,5 @@
+use crate::protocol::types::OperationId;
 use bytes::Bytes;
-use kuberic_protocol::types::OperationId;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use crate::application::{DurableApplicationProgress, Lsn, Operation};

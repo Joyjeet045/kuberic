@@ -2,10 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::time::Duration;
 
-use kuberic_agent::store::AgentStore;
-use kuberic_protocol::types::*;
-use kuberic_runtime_internal::authority::{AdmittedAuthority, BuildAuthority, RetiredAuthority};
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::*;
+use kuberic_runtime::testing::authority::{AdmittedAuthority, BuildAuthority, RetiredAuthority};
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use tokio_postgres::{Client, NoTls, error::SqlState};
 
 use super::{PgPod, ProcessProbe, TestDataDir, native_configuration, native_identity};
@@ -861,7 +860,7 @@ impl PgGroup {
             primary.runtime.partition_report().await.write_status,
             AccessStatus::Granted
         );
-        kuberic_agent::runtime_adapter::RuntimeAdapter::new(
+        kuberic_runtime::testing::runtime_adapter::RuntimeAdapter::new(
             primary.store.clone(),
             primary.runtime.clone(),
         )
@@ -874,8 +873,10 @@ impl PgGroup {
         let pod = self.pods.get_mut(&id).unwrap();
         let before = pod.store.load_state().await.unwrap();
         pod.store = std::sync::Arc::new(
-            kuberic_agent::sqlite_store::SqliteStore::open_existing(
-                kuberic_agent::sqlite_store::SqliteStore::metadata_database_path(&pod.root),
+            kuberic_runtime::testing::sqlite_store::SqliteStore::open_existing(
+                kuberic_runtime::testing::sqlite_store::SqliteStore::metadata_database_path(
+                    &pod.root,
+                ),
                 Some(&before.identity),
             )
             .unwrap(),

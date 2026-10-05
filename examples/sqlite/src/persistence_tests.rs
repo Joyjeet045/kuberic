@@ -2,9 +2,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 
 use futures::TryStreamExt;
-use kuberic_protocol::types::OperationId;
 use kuberic_runtime::application::{CopyChunk, DurableApplicationProgress, Operation};
 use kuberic_runtime::engine::DurableState;
+use kuberic_runtime::protocol::types::OperationId;
 use rusqlite::Connection;
 use tempfile::TempDir;
 

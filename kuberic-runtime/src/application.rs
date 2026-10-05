@@ -1,14 +1,20 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::protocol::types::{Epoch, OperationId, ReplicaIdentity, ReplicaRole};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
-use kuberic_protocol::types::{Epoch, OperationId, ReplicaIdentity, ReplicaRole};
+use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::replicator::{Replicator, StatefulServicePartition};
-pub use kuberic_runtime_internal::effects::OpenMode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenMode {
+    New,
+    Existing,
+}
 
 pub type Lsn = i64;
 pub type OperationData = Bytes;

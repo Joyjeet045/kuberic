@@ -91,7 +91,7 @@ async fn manager(
     root: &Path,
 ) -> (
     Arc<PgInstanceManager>,
-    tokio::sync::mpsc::Sender<kuberic_protocol::types::FaultType>,
+    tokio::sync::mpsc::Sender<kuberic_runtime::protocol::types::FaultType>,
 ) {
     let instance = Arc::new(PgInstanceManager::new(
         root.join("pgdata"),

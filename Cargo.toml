@@ -6,14 +6,9 @@ members = [
   "examples/postgres",
   "examples/sqlserver",
   "examples/sqlite",
-  "kuberic-protocol",
   "kuberic-runtime",
-  "kuberic-runtime-internal",
-  "kuberic-agent",
   "kuberic-controller",
-  "kuberic-wire",
   "kuberic-level-tests",
-  "sqlite-commit-barrier",
 ]
 
 [workspace.package]

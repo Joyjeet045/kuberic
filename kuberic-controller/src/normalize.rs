@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Service};
 use kube::ResourceExt;
-use kuberic_protocol::observation::{
+use kuberic_runtime::protocol::observation::{
     AgentObservation, DesiredState, KubernetesReplicaObservation, ObservationFailure,
     ObservationSnapshot, ReplicaObservation, ReplicaObservationKey, ReportWatermark,
     RoutingObservation,
 };
-use kuberic_protocol::types::{
+use kuberic_runtime::protocol::types::{
     AcceptedStatus, PlannedSwitchoverRequest, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
     ReplicaInstanceId, ResourceUid, SwitchoverRequestId, derive_agent_generation,
     derive_initialization_id, derive_replica_endpoint_name,
@@ -48,7 +48,7 @@ pub fn normalize(
         .map(|status| status.authority.clone())
         .unwrap_or_default();
     let switchover_active = status.transition.as_ref().is_some_and(|transition| {
-        transition.kind == kuberic_protocol::types::TransitionKind::PlannedSwitchover
+        transition.kind == kuberic_runtime::protocol::types::TransitionKind::PlannedSwitchover
     });
     let mut failures = raw
         .failures
@@ -354,7 +354,7 @@ fn normalize_agent(
             uninitialized_report: None,
         },
         RawAgentObservation::Report(report) => {
-            match kuberic_wire::normalize_agent_status_report(*report) {
+            match kuberic_runtime::control::normalize_agent_status_report(*report) {
                 Ok(observation) => observation,
                 Err(error) => {
                     return AgentObservation::Invalid {

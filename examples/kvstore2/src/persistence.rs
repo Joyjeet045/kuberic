@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, stream};
-use kuberic_protocol::types::{Epoch, OperationId};
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationAck, DurableApplicationProgress, Operation,
 };
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
+use kuberic_runtime::protocol::types::{Epoch, OperationId};
 use kuberic_runtime::{Result, RuntimeError};
 use serde::{Deserialize, Serialize};
 

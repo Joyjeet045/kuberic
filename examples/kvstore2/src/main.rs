@@ -14,11 +14,11 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, put};
 use clap::Parser;
-use kuberic_agent::process::{
+use kuberic_runtime::host::KubernetesDnsResolver;
+use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaDiagnostics, ReplicaHandle, ReplicaHost, ReplicaProcessConfig,
 };
-use kuberic_agent::transport::KubernetesDnsResolver;
-use kuberic_protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
+use kuberic_runtime::protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
 use tokio::sync::watch;
 
 use crate::persistence::KvPersistence;

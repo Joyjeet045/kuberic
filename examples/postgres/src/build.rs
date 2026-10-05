@@ -1,7 +1,7 @@
 use crate::native::PgReplicationEvidence;
 use std::path::Path;
 
-use kuberic_protocol::types::{BuildAuthority, ProcessSessionId, ResourceUid};
+use kuberic_runtime::protocol::types::{BuildAuthority, ProcessSessionId, ResourceUid};
 use serde::{Deserialize, Serialize};
 
 use crate::instance::PgError;

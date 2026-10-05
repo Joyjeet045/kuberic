@@ -8,9 +8,9 @@ use std::sync::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use kuberic_protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
 use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
 use kuberic_runtime::engine::DurableState;
+use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,

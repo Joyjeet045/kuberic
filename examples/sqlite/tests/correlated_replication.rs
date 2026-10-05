@@ -1,8 +1,10 @@
 use futures::TryStreamExt;
-use kuberic_agent::testing::{InProcessTransport, TransportError, TransportEvent};
-use kuberic_protocol::types::{AccessStatus, ReplicaRole, SwitchoverRequestId, TransitionKind};
 use kuberic_runtime::engine::DurableState;
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::{
+    AccessStatus, ReplicaRole, SwitchoverRequestId, TransitionKind,
+};
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
+use kuberic_runtime::testing::{InProcessTransport, TransportError, TransportEvent};
 use sqlite_replicated::state::PersistenceFault;
 use sqlite_replicated::testing::{
     SqlitePod, authority, bootstrap, configuration, route, scratch, wait_applied,
@@ -333,7 +335,7 @@ async fn failover_and_planned_handoff_materialize_last_acknowledged_write_before
                 })
                 .await
                 .unwrap();
-            use kuberic_agent::store::AgentStore;
+
             Some(
                 first
                     .store

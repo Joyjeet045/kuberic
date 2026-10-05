@@ -15,7 +15,7 @@ mod tests {
     use super::*;
     use crate::durable::{PgDurableIdentity, StorageMode};
     use crate::testing::{TestDataDir, native_identity};
-    use kuberic_protocol::types::ResourceUid;
+    use kuberic_runtime::protocol::types::ResourceUid;
 
     fn identity() -> PgDurableIdentity {
         PgDurableIdentity {

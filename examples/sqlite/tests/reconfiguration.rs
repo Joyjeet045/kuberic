@@ -1,7 +1,7 @@
 use futures::TryStreamExt;
-use kuberic_protocol::types::*;
 use kuberic_runtime::engine::DurableState;
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::*;
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use sqlite_replicated::state::PersistenceFault;
 use sqlite_replicated::testing::*;
 

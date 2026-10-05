@@ -15,11 +15,11 @@ cargo test --doc --workspace --all-features
 just nextest-test
 ```
 
-The `ordinary` profile is cluster-free and excludes PostgreSQL plus DEX's real
-Kubernetes target. It runs with four global slots; the SQLite group has one
-slot, and each agent process-boundary test reserves all four slots so its
-subprocess recovery deadlines are not competing with another test. CI divides
-the 920 current ordinary tests into four 230-test slices.
+The `ordinary` profile is cluster-free and excludes PostgreSQL, DEX's real
+Kubernetes target and build-only guards. It runs with four global slots; the
+SQLite group has one slot, and each runtime host process-boundary test reserves
+all four slots so its subprocess recovery deadlines are not competing with
+another test. CI divides the current ordinary inventory into four slices.
 
 The all-features archive includes every test binary, including resource-backed
 tiers. Validate its exact-one disposition and partition union before relying on
@@ -30,9 +30,18 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The validator accounts for 1,125 current tests: 920 ordinary, 170 directly
-runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test, 18
-parent-driven subprocess helpers and four external SQL Server fixtures.
+The consolidated validator accounts for 1,216 tests: 976 ordinary, one build-only,
+203 directly runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test,
+19 mapped parent-driven subprocess helpers and four external SQL Server fixtures.
+Use its generated counts as the inventory evolves.
+
+The ignored runtime `public_api_privacy` binary belongs only to the `build-only`
+tier (`just nextest-list build-only`). It invokes Cargo and needs dependency
+caches and workspace sources, so CI runs `scripts/check_runtime_public_api.sh`
+in the build-artifact job before archiving, never on archive-only runners.
+`just nextest-build-only` runs the same guard, and `just nextest-archive`
+includes it as a prerequisite. Archive inventory validation still accounts for
+the ignored test exactly once.
 
 ## Level-Triggered Unit and Durable Validation
 
@@ -41,17 +50,17 @@ debugging, nextest accepts Cargo package/target selectors in addition to the
 repository profile:
 
 ```bash
-cargo nextest run --profile ordinary -p kuberic-agent --features testing
-cargo nextest run --profile ordinary -p kuberic-protocol
+cargo nextest run --profile ordinary -p kuberic-runtime --all-features
 cargo nextest run --profile ordinary -p kuberic-controller
 ```
 
-The agent crash suite's parent tests execute their ignored child helpers and
+The runtime `host::tests::crash_boundaries` and `host::tests::recovery` parent
+tests execute their ignored child helpers and
 reopen durable stores. Top-level ignored process entries are not omitted
 coverage.
 
 Controller library tests verify that the checked-in CRD equals the generated
-schema. Protocol tests guard representative status growth and reject quadratic
+schema. Runtime protocol tests guard representative status growth and reject quadratic
 evidence expansion.
 
 ## Level-Triggered Live Validation
@@ -97,13 +106,14 @@ agent/application stores and in-process transport. It requires no Kubernetes
 API, container runtime or external database process.
 
 ```bash
-cargo test -p sqlite-commit-barrier -p sqlite-replicated \
+cargo test -p sqlite-replicated \
   --all-features -- --test-threads=1
-cargo clippy -p kuberic-agent -p sqlite-replicated \
+cargo clippy -p kuberic-runtime -p sqlite-replicated \
   --all-targets --all-features -- -D warnings
 ```
 
-The ordinary nextest tier includes both SQLite packages under one serial
+The ordinary nextest tier includes the SQLite example and its private barrier
+module's tests under one serial
 `sqlite` group, so `just nextest-test` preserves the same resource boundary.
 
 Coverage includes bootstrap, replacement, failover, planned switchover,
@@ -134,7 +144,7 @@ validation.
 The matrix covers physical build/rewind, fencing, failover, switchover,
 replacement, scaling, quorum restoration, read-only secondaries and
 application/agent restart. The profile has one execution slot. Its complete
-172-test inventory is 170 directly partitioned tests plus two ignored
+205-test inventory is 203 directly partitioned tests plus two ignored
 subprocess helpers executed by mapped parent tests. PostgreSQL has no
 application-specific KinD test.
 

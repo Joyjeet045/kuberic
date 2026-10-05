@@ -56,6 +56,9 @@ jobs:
       - name: Test workspace documentation
         run: cargo test --doc --workspace --all-features
 
+      - name: Verify runtime public API (build-only)
+        run: scripts/check_runtime_public_api.sh
+
       - name: Build reusable test archive
         run: |
           mkdir -p "$(dirname "$NEXTEST_ARCHIVE")"

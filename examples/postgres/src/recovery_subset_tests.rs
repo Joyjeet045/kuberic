@@ -1,8 +1,8 @@
 use super::*;
 use crate::testing::{PgGroup, native_configuration, run_pg_test};
-use kuberic_protocol::types::{AccessStatus, TransitionKind};
-use kuberic_runtime_internal::authority::AdmittedAuthority;
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::{AccessStatus, TransitionKind};
+use kuberic_runtime::testing::authority::AdmittedAuthority;
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 
 async fn group() -> PgGroup {
     let mut group = PgGroup::singleton().await;

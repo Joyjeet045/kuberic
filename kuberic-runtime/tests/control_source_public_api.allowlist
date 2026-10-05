@@ -1,0 +1,770 @@
+private-path documented fn crate::protocol::validation::scale_down::fn validate_accept_secondary_removal_commit (command : & crate :: protocol :: command :: AcceptSecondaryRemovalCommit ,) -> Result
+private-path documented fn crate::protocol::validation::scale_down::fn validate_replica_retirement (report : & ReplicaRetirementReport) -> Result
+private-path documented fn crate::protocol::validation::scale_down::fn validate_secondary_removal_configuration (command : & EnsureConfiguration) -> Result
+private-path documented fn crate::protocol::validation::scale_down::fn validate_secondary_removal_evidence (evidence : & SecondaryRemovalEvidence , require_reduced : bool ,) -> Result
+private-path documented fn crate::protocol::validation::scale_down::fn validate_secondary_removal_preparation (preparation : & SecondaryRemovalPreparation) -> Result
+private-path documented fn crate::protocol::validation::scale_down::fn validate_secondary_removal_report (report : & AgentReport) -> Result
+private-path documented fn crate::protocol::validation::scale_down::fn validate_secondary_scale_down (intent : & SecondaryScaleDownIntent) -> Result
+private-path documented fn crate::protocol::validation::scale_down::fn validate_secondary_scale_down_cleanup (cleanup : & SecondaryScaleDownCleanup) -> Result
+private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up (intent : & ScaleUpIntent) -> Result
+private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up_allocation (allocation : & ScaleUpAllocation) -> Result
+private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up_cleanup (cleanup : & ScaleUpCleanup) -> Result
+private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up_configuration (command : & EnsureConfiguration) -> Result
+private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up_failover_evidence (evidence : & ScaleUpFailoverEvidence) -> Result
+private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up_failover_transition (evidence : & ScaleUpFailoverEvidence , current : & ConfigurationDescriptor , policy : & EffectivePolicy ,) -> Result
+private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up_provisioning (intent : & ProvisioningIntent) -> Result
+private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up_provisioning_request (scale_up : & ScaleUpProvisioning) -> Result
+private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up_receipt (receipt : & ScaleUpReceipt) -> Result
+public-path documented const crate::protocol::PROTOCOL_VERSION: u32
+public-path documented enum crate::control::convert::WireError
+public-path documented enum crate::protocol::command::EffectClass
+public-path documented enum crate::protocol::command::KubernetesChange
+public-path documented enum crate::protocol::command::ProtocolCommand
+public-path documented enum crate::protocol::command::SafetyChange
+public-path documented enum crate::protocol::command::ScaleDownResource
+public-path documented enum crate::protocol::observation::AgentObservation
+public-path documented enum crate::protocol::observation::ExactResourceObservation
+public-path documented enum crate::protocol::types::AccessStatus
+public-path documented enum crate::protocol::types::BuildAuthorityKind
+public-path documented enum crate::protocol::types::CleanupResourceIdentity
+public-path documented enum crate::protocol::types::ConditionStatus
+public-path documented enum crate::protocol::types::FaultType
+public-path documented enum crate::protocol::types::PlannedSwitchoverOutcome
+public-path documented enum crate::protocol::types::PlannedSwitchoverResolution
+public-path documented enum crate::protocol::types::ProvisioningKind
+public-path documented enum crate::protocol::types::ReplicaRole
+public-path documented enum crate::protocol::types::ScaleUpConfigurationEvidence
+public-path documented enum crate::protocol::types::ScaleUpStage
+public-path documented enum crate::protocol::types::SecondaryRemovalStage
+public-path documented enum crate::protocol::types::TransitionKind
+public-path documented enum crate::protocol::validation::ValidationError
+public-path documented field crate::control::convert::CopyAcknowledgement::build_id: OperationId
+public-path documented field crate::control::convert::CopyAcknowledgement::catch_up_boundary_lsn: Option < i64 >
+public-path documented field crate::control::convert::CopyAcknowledgement::current_configuration_id: ConfigurationId
+public-path documented field crate::control::convert::CopyAcknowledgement::durable_lsn: i64
+public-path documented field crate::control::convert::CopyAcknowledgement::epoch: Epoch
+public-path documented field crate::control::convert::CopyAcknowledgement::final_item: bool
+public-path documented field crate::control::convert::CopyAcknowledgement::receiver: ReplicaIdentity
+public-path documented field crate::control::convert::CopyAcknowledgement::replication_boundary_lsn: i64
+public-path documented field crate::control::convert::CopyAcknowledgement::sender: ReplicaIdentity
+public-path documented field crate::control::convert::CopyAcknowledgement::sequence: u64
+public-path documented field crate::control::convert::CopyAcknowledgement::snapshot_chunk: bool
+public-path documented field crate::control::convert::CopyEnvelope::build_id: OperationId
+public-path documented field crate::control::convert::CopyEnvelope::catch_up_boundary_lsn: Option < i64 >
+public-path documented field crate::control::convert::CopyEnvelope::committed_lsn: i64
+public-path documented field crate::control::convert::CopyEnvelope::current_configuration_id: ConfigurationId
+public-path documented field crate::control::convert::CopyEnvelope::data: Vec < u8 >
+public-path documented field crate::control::convert::CopyEnvelope::epoch: Epoch
+public-path documented field crate::control::convert::CopyEnvelope::final_item: bool
+public-path documented field crate::control::convert::CopyEnvelope::lsn: i64
+public-path documented field crate::control::convert::CopyEnvelope::receiver: ReplicaIdentity
+public-path documented field crate::control::convert::CopyEnvelope::replication_boundary_lsn: i64
+public-path documented field crate::control::convert::CopyEnvelope::sender: ReplicaIdentity
+public-path documented field crate::control::convert::CopyEnvelope::sequence: u64
+public-path documented field crate::control::convert::CopyEnvelope::snapshot_chunk: bool
+public-path documented field crate::control::convert::ExecuteEnvelope::command: ProtocolCommand
+public-path documented field crate::control::convert::ExecuteEnvelope::expected_process_session_id: ProcessSessionId
+public-path documented field crate::control::convert::ExecuteEnvelope::resource_uid: ResourceUid
+public-path documented field crate::control::convert::ExecuteEnvelope::target: ReplicaIdentity
+public-path documented field crate::control::convert::ReplicationAcknowledgement::applied_lsn: i64
+public-path documented field crate::control::convert::ReplicationAcknowledgement::committed_lsn: i64
+public-path documented field crate::control::convert::ReplicationAcknowledgement::current_configuration_id: ConfigurationId
+public-path documented field crate::control::convert::ReplicationAcknowledgement::epoch: Epoch
+public-path documented field crate::control::convert::ReplicationAcknowledgement::previous_configuration_id: Option < ConfigurationId >
+public-path documented field crate::control::convert::ReplicationAcknowledgement::received_lsn: i64
+public-path documented field crate::control::convert::ReplicationAcknowledgement::receiver: ReplicaIdentity
+public-path documented field crate::control::convert::ReplicationAcknowledgement::sender: ReplicaIdentity
+public-path documented field crate::control::convert::ReplicationEnvelope::committed_lsn: i64
+public-path documented field crate::control::convert::ReplicationEnvelope::current_configuration_id: ConfigurationId
+public-path documented field crate::control::convert::ReplicationEnvelope::data: Vec < u8 >
+public-path documented field crate::control::convert::ReplicationEnvelope::epoch: Epoch
+public-path documented field crate::control::convert::ReplicationEnvelope::lsn: i64
+public-path documented field crate::control::convert::ReplicationEnvelope::previous_configuration_id: Option < ConfigurationId >
+public-path documented field crate::control::convert::ReplicationEnvelope::receiver: ReplicaIdentity
+public-path documented field crate::control::convert::ReplicationEnvelope::sender: ReplicaIdentity
+public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::committed: crate :: protocol :: types :: SecondaryScaleDownCleanup
+public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::local_recovery: bool
+public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::operation_id: OperationId
+public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::target: ReplicaIdentity
+public-path documented field crate::protocol::command::EnsureConfiguration::current_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::command::EnsureConfiguration::current_epoch: Epoch
+public-path documented field crate::protocol::command::EnsureConfiguration::current_only: bool
+public-path documented field crate::protocol::command::EnsureConfiguration::effective_policy: EffectivePolicy
+public-path documented field crate::protocol::command::EnsureConfiguration::expected_agent_generation: AgentGeneration
+public-path documented field crate::protocol::command::EnsureConfiguration::expected_instance_id: ReplicaInstanceId
+public-path documented field crate::protocol::command::EnsureConfiguration::failover_safe_lsn: Option < i64 >
+public-path documented field crate::protocol::command::EnsureConfiguration::local_replica_id: ReplicaId
+public-path documented field crate::protocol::command::EnsureConfiguration::operation_id: OperationId
+public-path documented field crate::protocol::command::EnsureConfiguration::previous_configuration: Option < ConfigurationDescriptor >
+public-path documented field crate::protocol::command::EnsureConfiguration::previous_epoch: Option < Epoch >
+public-path documented field crate::protocol::command::EnsureConfiguration::previous_policy: Option < EffectivePolicy >
+public-path documented field crate::protocol::command::EnsureConfiguration::primary_write_status: crate :: protocol :: types :: AccessStatus
+public-path documented field crate::protocol::command::EnsureConfiguration::retire_build_ids: Vec < OperationId >
+public-path documented field crate::protocol::command::EnsureConfiguration::retire_switchover_preparation_ids: Vec < SwitchoverPreparationId >
+public-path documented field crate::protocol::command::EnsureConfiguration::scale_up_evidence: Option < Box < crate :: protocol :: types :: ScaleUpConfigurationEvidence > >
+public-path documented field crate::protocol::command::EnsureConfiguration::secondary_removal_evidence: Option < crate :: protocol :: types :: SecondaryRemovalEvidence >
+public-path documented field crate::protocol::command::EnsureConfiguration::switchover_handoff: Option < SwitchoverHandoff >
+public-path documented field crate::protocol::command::EnsureConfiguration::transition_kind: crate :: protocol :: types :: TransitionKind
+public-path documented field crate::protocol::command::EnsureReplicaBuild::authority: Option < BuildAuthority >
+public-path documented field crate::protocol::command::EnsureReplicaBuild::expected_agent_generation: AgentGeneration
+public-path documented field crate::protocol::command::EnsureReplicaBuild::expected_instance_id: ReplicaInstanceId
+public-path documented field crate::protocol::command::EnsureReplicaBuild::local_replica_id: ReplicaId
+public-path documented field crate::protocol::command::EnsureReplicaBuild::operation_id: OperationId
+public-path documented field crate::protocol::command::EnsureReplicaBuild::retire: bool
+public-path documented field crate::protocol::command::EnsureReplicaBuild::source_session_id: Option < crate :: protocol :: types :: ProcessSessionId >
+public-path documented field crate::protocol::command::EnsureReplicaBuild::target: ReplicaIdentity
+public-path documented field crate::protocol::command::InitializeAgentStore::assigned_agent_generation: AgentGeneration
+public-path documented field crate::protocol::command::InitializeAgentStore::bootstrap_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::command::InitializeAgentStore::effective_policy: EffectivePolicy
+public-path documented field crate::protocol::command::InitializeAgentStore::expected_instance_id: ReplicaInstanceId
+public-path documented field crate::protocol::command::InitializeAgentStore::expected_pod_uid: PodUid
+public-path documented field crate::protocol::command::InitializeAgentStore::expected_pvc_uid: PvcUid
+public-path documented field crate::protocol::command::InitializeAgentStore::initialization_id: InitializationId
+public-path documented field crate::protocol::command::InitializeAgentStore::local_replica_id: ReplicaId
+public-path documented field crate::protocol::command::InitializeAgentStore::provisioning: Option < ProvisioningIntent >
+public-path documented field crate::protocol::command::InitializeAgentStore::resource_uid: ResourceUid
+public-path documented field crate::protocol::command::PrepareSecondaryRemoval::expected_agent_generation: AgentGeneration
+public-path documented field crate::protocol::command::PrepareSecondaryRemoval::expected_instance_id: ReplicaInstanceId
+public-path documented field crate::protocol::command::PrepareSecondaryRemoval::intent: crate :: protocol :: types :: SecondaryScaleDownIntent
+public-path documented field crate::protocol::command::PrepareSecondaryRemoval::local_replica_id: ReplicaId
+public-path documented field crate::protocol::command::PrepareSecondaryRemoval::operation_id: OperationId
+public-path documented field crate::protocol::command::PrepareSwitchover::current_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::command::PrepareSwitchover::expected_agent_generation: AgentGeneration
+public-path documented field crate::protocol::command::PrepareSwitchover::expected_instance_id: ReplicaInstanceId
+public-path documented field crate::protocol::command::PrepareSwitchover::local_replica_id: ReplicaId
+public-path documented field crate::protocol::command::PrepareSwitchover::operation_id: OperationId
+public-path documented field crate::protocol::command::PrepareSwitchover::preparation_generation: u64
+public-path documented field crate::protocol::command::PrepareSwitchover::request_id: SwitchoverRequestId
+public-path documented field crate::protocol::command::PrepareSwitchover::source: ReplicaIdentity
+public-path documented field crate::protocol::command::PrepareSwitchover::target: ReplicaIdentity
+public-path documented field crate::protocol::command::RetireReplica::committed: crate :: protocol :: types :: SecondaryScaleDownCleanup
+public-path documented field crate::protocol::command::RetireReplica::expected_agent_generation: AgentGeneration
+public-path documented field crate::protocol::command::RetireReplica::expected_instance_id: ReplicaInstanceId
+public-path documented field crate::protocol::command::RetireReplica::local_replica_id: ReplicaId
+public-path documented field crate::protocol::command::RetireReplica::operation_id: OperationId
+public-path documented field crate::protocol::observation::AgentBuildReport::build_id: OperationId
+public-path documented field crate::protocol::observation::AgentBuildReport::catch_up_boundary_lsn: Option < i64 >
+public-path documented field crate::protocol::observation::AgentBuildReport::completed: bool
+public-path documented field crate::protocol::observation::AgentBuildReport::durable_lsn: i64
+public-path documented field crate::protocol::observation::AgentBuildReport::last_sequence: u64
+public-path documented field crate::protocol::observation::AgentBuildReport::replication_boundary_lsn: i64
+public-path documented field crate::protocol::observation::AgentBuildReport::target: ReplicaIdentity
+public-path documented field crate::protocol::observation::AgentReport::accepted_secondary_removal: Option < crate :: protocol :: types :: SecondaryScaleDownCleanup >
+public-path documented field crate::protocol::observation::AgentReport::builds: Vec < AgentBuildReport >
+public-path documented field crate::protocol::observation::AgentReport::catch_up_boundary: Option < i64 >
+public-path documented field crate::protocol::observation::AgentReport::catch_up_capability: Option < i64 >
+public-path documented field crate::protocol::observation::AgentReport::catch_up_complete: bool
+public-path documented field crate::protocol::observation::AgentReport::committed_lsn: i64
+public-path documented field crate::protocol::observation::AgentReport::current_configuration: Option < ConfigurationDescriptor >
+public-path documented field crate::protocol::observation::AgentReport::current_configuration_quorum_progress: i64
+public-path documented field crate::protocol::observation::AgentReport::current_progress: i64
+public-path documented field crate::protocol::observation::AgentReport::deactivated_lsn: Option < i64 >
+public-path documented field crate::protocol::observation::AgentReport::deactivation_epoch: Option < Epoch >
+public-path documented field crate::protocol::observation::AgentReport::epoch: Epoch
+public-path documented field crate::protocol::observation::AgentReport::healthy: bool
+public-path documented field crate::protocol::observation::AgentReport::identity: ReplicaIdentity
+public-path documented field crate::protocol::observation::AgentReport::load_metrics: Vec < LoadMetric >
+public-path documented field crate::protocol::observation::AgentReport::pending_configuration: Option < Box < crate :: protocol :: command :: EnsureConfiguration > >
+public-path documented field crate::protocol::observation::AgentReport::pending_operation_id: Option < OperationId >
+public-path documented field crate::protocol::observation::AgentReport::prepared_secondary_removal: Option < crate :: protocol :: types :: SecondaryRemovalPreparation >
+public-path documented field crate::protocol::observation::AgentReport::prepared_switchover: Option < SwitchoverHandoff >
+public-path documented field crate::protocol::observation::AgentReport::previous_configuration: Option < ConfigurationDescriptor >
+public-path documented field crate::protocol::observation::AgentReport::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::observation::AgentReport::protocol_version: u32
+public-path documented field crate::protocol::observation::AgentReport::read_status: AccessStatus
+public-path documented field crate::protocol::observation::AgentReport::report_sequence: u64
+public-path documented field crate::protocol::observation::AgentReport::reported_fault: Option < FaultType >
+public-path documented field crate::protocol::observation::AgentReport::resource_uid: ResourceUid
+public-path documented field crate::protocol::observation::AgentReport::retained_operation_id: Option < OperationId >
+public-path documented field crate::protocol::observation::AgentReport::retired_replica: Option < crate :: protocol :: types :: ReplicaRetirementReport >
+public-path documented field crate::protocol::observation::AgentReport::role: ReplicaRole
+public-path documented field crate::protocol::observation::AgentReport::scale_up_intent: Option < Box < crate :: protocol :: types :: ScaleUpIntent > >
+public-path documented field crate::protocol::observation::AgentReport::secondary_removal_evidence: Option < crate :: protocol :: types :: SecondaryRemovalEvidence >
+public-path documented field crate::protocol::observation::AgentReport::verified_replication_lsn: Option < i64 >
+public-path documented field crate::protocol::observation::AgentReport::write_status: AccessStatus
+public-path documented field crate::protocol::observation::DesiredState::failover_delay_seconds: u64
+public-path documented field crate::protocol::observation::DesiredState::generation: u64
+public-path documented field crate::protocol::observation::DesiredState::image: String
+public-path documented field crate::protocol::observation::DesiredState::replicas: u32
+public-path documented field crate::protocol::observation::DesiredState::switchover: Option < PlannedSwitchoverRequest >
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::image: Option < String >
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::peer_endpoint_ready: bool
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::pod_name: String
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::pod_ready: bool
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::pod_uid: Option < PodUid >
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::pvc_name: String
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::pvc_uid: Option < PvcUid >
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::replica_id: ReplicaId
+public-path documented field crate::protocol::observation::ObservationFailure::message: String
+public-path documented field crate::protocol::observation::ObservationFailure::source: String
+public-path documented field crate::protocol::observation::ObservationSnapshot::desired: DesiredState
+public-path documented field crate::protocol::observation::ObservationSnapshot::durable_storage_evidence: bool
+public-path documented field crate::protocol::observation::ObservationSnapshot::now_unix_seconds: i64
+public-path documented field crate::protocol::observation::ObservationSnapshot::observation_failures: Vec < ObservationFailure >
+public-path documented field crate::protocol::observation::ObservationSnapshot::previous_report_watermarks: BTreeMap < ReplicaObservationKey , ReportWatermark >
+public-path documented field crate::protocol::observation::ObservationSnapshot::replicas: BTreeMap < ReplicaObservationKey , ReplicaObservation >
+public-path documented field crate::protocol::observation::ObservationSnapshot::resource_uid: ResourceUid
+public-path documented field crate::protocol::observation::ObservationSnapshot::resource_version: String
+public-path documented field crate::protocol::observation::ObservationSnapshot::routing: RoutingObservation
+public-path documented field crate::protocol::observation::ObservationSnapshot::secondary_scale_down_resources: Vec < SecondaryScaleDownResourceObservation >
+public-path documented field crate::protocol::observation::ObservationSnapshot::status: AcceptedStatus
+public-path documented field crate::protocol::observation::ObservationSnapshot::supporting_resources_ready: bool
+public-path documented field crate::protocol::observation::ReplicaObservation::agent: AgentObservation
+public-path documented field crate::protocol::observation::ReplicaObservation::kubernetes: Option < KubernetesReplicaObservation >
+public-path documented field crate::protocol::observation::ReplicaObservationKey::instance_id: ReplicaInstanceId
+public-path documented field crate::protocol::observation::ReplicaObservationKey::replica_id: ReplicaId
+public-path documented field crate::protocol::observation::ReportWatermark::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::observation::ReportWatermark::report_sequence: u64
+public-path documented field crate::protocol::observation::RoutingObservation::service_present: bool
+public-path documented field crate::protocol::observation::RoutingObservation::unresolved_write_target: bool
+public-path documented field crate::protocol::observation::RoutingObservation::write_target: Option < ReplicaIdentity >
+public-path documented field crate::protocol::observation::SecondaryScaleDownResourceObservation::endpoint: ExactResourceObservation
+public-path documented field crate::protocol::observation::SecondaryScaleDownResourceObservation::identity: crate :: protocol :: types :: ReplicaCleanupIdentity
+public-path documented field crate::protocol::observation::SecondaryScaleDownResourceObservation::pod: ExactResourceObservation
+public-path documented field crate::protocol::observation::SecondaryScaleDownResourceObservation::pod_allocation_operation_id: Option < OperationId >
+public-path documented field crate::protocol::observation::SecondaryScaleDownResourceObservation::pod_matches_allocation_metadata: bool
+public-path documented field crate::protocol::observation::SecondaryScaleDownResourceObservation::pvc: ExactResourceObservation
+public-path documented field crate::protocol::observation::SecondaryScaleDownResourceObservation::pvc_allocation_operation_id: Option < OperationId >
+public-path documented field crate::protocol::observation::SecondaryScaleDownResourceObservation::resource_uid: ResourceUid
+public-path documented field crate::protocol::observation::SecondaryScaleDownResourceObservation::target: ReplicaIdentity
+public-path documented field crate::protocol::observation::UninitializedAgentObservation::pod_uid: PodUid
+public-path documented field crate::protocol::observation::UninitializedAgentObservation::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::observation::UninitializedAgentObservation::protocol_version: u32
+public-path documented field crate::protocol::observation::UninitializedAgentObservation::pvc_uid: PvcUid
+public-path documented field crate::protocol::observation::UninitializedAgentObservation::replica_id: ReplicaId
+public-path documented field crate::protocol::observation::UninitializedAgentObservation::report_sequence: u64
+public-path documented field crate::protocol::observation::UninitializedAgentObservation::resource_uid: ResourceUid
+public-path documented field crate::protocol::types::AcceptedStatus::conditions: Vec < StatusCondition >
+public-path documented field crate::protocol::types::AcceptedStatus::effective_policy: Option < EffectivePolicy >
+public-path documented field crate::protocol::types::AcceptedStatus::initialized: bool
+public-path documented field crate::protocol::types::AcceptedStatus::last_replacement: Option < ReplacementCleanup >
+public-path documented field crate::protocol::types::AcceptedStatus::last_scale_up: Option < Box < ScaleUpReceipt > >
+public-path documented field crate::protocol::types::AcceptedStatus::last_secondary_removal: Option < SecondaryRemovalReceipt >
+public-path documented field crate::protocol::types::AcceptedStatus::last_switchover: Option < PlannedSwitchoverReceipt >
+public-path documented field crate::protocol::types::AcceptedStatus::observed_generation: u64
+public-path documented field crate::protocol::types::AcceptedStatus::pending_replacement_cleanup: Option < ReplacementCleanup >
+public-path documented field crate::protocol::types::AcceptedStatus::primary_failure: Option < PrimaryFailureObservation >
+public-path documented field crate::protocol::types::AcceptedStatus::provisioning: Option < ProvisioningIntent >
+public-path documented field crate::protocol::types::AcceptedStatus::quorum_loss: Option < QuorumLossObservation >
+public-path documented field crate::protocol::types::AcceptedStatus::scale_up_admission_started: Option < OperationId >
+public-path documented field crate::protocol::types::AcceptedStatus::scale_up_allocation: Option < ScaleUpAllocation >
+public-path documented field crate::protocol::types::AcceptedStatus::scale_up_cleanup: Option < Box < ScaleUpCleanup > >
+public-path documented field crate::protocol::types::AcceptedStatus::secondary_scale_down_cleanup: Option < SecondaryScaleDownCleanup >
+public-path documented field crate::protocol::types::AcceptedStatus::topology: Option < AcceptedTopology >
+public-path documented field crate::protocol::types::AcceptedStatus::transition: Option < TransitionIntent >
+public-path documented field crate::protocol::types::AcceptedTopology::configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::BuildAuthority::build_id: OperationId
+public-path documented field crate::protocol::types::BuildAuthority::current_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::BuildAuthority::kind: BuildAuthorityKind
+public-path documented field crate::protocol::types::BuildAuthority::replication_boundary_lsn: i64
+public-path documented field crate::protocol::types::BuildAuthority::source: ReplicaIdentity
+public-path documented field crate::protocol::types::BuildAuthority::target: ReplicaIdentity
+public-path documented field crate::protocol::types::ConfigurationDescriptor::configuration_id: ConfigurationId
+public-path documented field crate::protocol::types::ConfigurationDescriptor::epoch: Epoch
+public-path documented field crate::protocol::types::ConfigurationDescriptor::members: Vec < ConfigurationMember >
+public-path documented field crate::protocol::types::ConfigurationDescriptor::primary_id: ReplicaId
+public-path documented field crate::protocol::types::ConfigurationDescriptor::write_quorum: u32
+public-path documented field crate::protocol::types::ConfigurationMember::identity: ReplicaIdentity
+public-path documented field crate::protocol::types::ConfigurationMember::role: ReplicaRole
+public-path documented field crate::protocol::types::EffectivePolicy::failover_delay_seconds: u64
+public-path documented field crate::protocol::types::EffectivePolicy::read_quorum: u32
+public-path documented field crate::protocol::types::EffectivePolicy::replica_set_size: u32
+public-path documented field crate::protocol::types::EffectivePolicy::write_quorum: u32
+public-path documented field crate::protocol::types::Epoch::configuration_number: i64
+public-path documented field crate::protocol::types::Epoch::data_loss_number: i64
+public-path documented field crate::protocol::types::LoadMetric::name: String
+public-path documented field crate::protocol::types::LoadMetric::value: i64
+public-path documented field crate::protocol::types::PartitionInformation::partition_id: PartitionId
+public-path documented field crate::protocol::types::PlannedSwitchoverIntent::handoff: Option < SwitchoverHandoff >
+public-path documented field crate::protocol::types::PlannedSwitchoverIntent::preparation_generation: u64
+public-path documented field crate::protocol::types::PlannedSwitchoverIntent::request_id: SwitchoverRequestId
+public-path documented field crate::protocol::types::PlannedSwitchoverIntent::requested_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::PlannedSwitchoverIntent::resolution: PlannedSwitchoverResolution
+public-path documented field crate::protocol::types::PlannedSwitchoverIntent::source: ReplicaIdentity
+public-path documented field crate::protocol::types::PlannedSwitchoverIntent::target: ReplicaIdentity
+public-path documented field crate::protocol::types::PlannedSwitchoverReceipt::accepted_target: Option < ReplicaIdentity >
+public-path documented field crate::protocol::types::PlannedSwitchoverReceipt::outcome: PlannedSwitchoverOutcome
+public-path documented field crate::protocol::types::PlannedSwitchoverReceipt::request_id: SwitchoverRequestId
+public-path documented field crate::protocol::types::PlannedSwitchoverReceipt::requested_target_replica_id: ReplicaId
+public-path documented field crate::protocol::types::PlannedSwitchoverReceipt::resulting_primary: Option < ReplicaIdentity >
+public-path documented field crate::protocol::types::PlannedSwitchoverRequest::request_id: SwitchoverRequestId
+public-path documented field crate::protocol::types::PlannedSwitchoverRequest::target_replica_id: ReplicaId
+public-path documented field crate::protocol::types::PrimaryFailureObservation::primary: ReplicaIdentity
+public-path documented field crate::protocol::types::PrimaryFailureObservation::started_at_unix_seconds: i64
+public-path documented field crate::protocol::types::ProvisioningIntent::operation_id: OperationId
+public-path documented field crate::protocol::types::ProvisioningIntent::pod_uid: PodUid
+public-path documented field crate::protocol::types::ProvisioningIntent::purpose: ProvisioningPurpose
+public-path documented field crate::protocol::types::ProvisioningIntent::pvc_uid: PvcUid
+public-path documented field crate::protocol::types::ProvisioningPurpose::kind: ProvisioningKind
+public-path documented field crate::protocol::types::ProvisioningPurpose::replaces: Option < ReplicaIdentity >
+public-path documented field crate::protocol::types::ProvisioningPurpose::scale_up: Option < ScaleUpProvisioning >
+public-path documented field crate::protocol::types::QuorumLossObservation::configuration_id: ConfigurationId
+public-path documented field crate::protocol::types::ReplacementCleanup::resource_uid: ResourceUid
+public-path documented field crate::protocol::types::ReplacementCleanup::resources: ReplicaCleanupIdentity
+public-path documented field crate::protocol::types::ReplacementCleanup::target: ReplicaIdentity
+public-path documented field crate::protocol::types::ReplicaCleanupIdentity::endpoint: CleanupResourceIdentity
+public-path documented field crate::protocol::types::ReplicaCleanupIdentity::pod: CleanupResourceIdentity
+public-path documented field crate::protocol::types::ReplicaCleanupIdentity::pvc: CleanupResourceIdentity
+public-path documented field crate::protocol::types::ReplicaIdentity::agent_generation: AgentGeneration
+public-path documented field crate::protocol::types::ReplicaIdentity::instance_id: ReplicaInstanceId
+public-path documented field crate::protocol::types::ReplicaIdentity::replica_id: ReplicaId
+public-path documented field crate::protocol::types::ReplicaRepairIntent::operation_id: OperationId
+public-path documented field crate::protocol::types::ReplicaRepairIntent::target: ReplicaIdentity
+public-path documented field crate::protocol::types::ReplicaRetirementReport::application_closed: bool
+public-path documented field crate::protocol::types::ReplicaRetirementReport::epoch: Epoch
+public-path documented field crate::protocol::types::ReplicaRetirementReport::intent: SecondaryScaleDownIntent
+public-path documented field crate::protocol::types::ReplicaRetirementReport::operation_id: OperationId
+public-path documented field crate::protocol::types::ReplicaRetirementReport::peers_fenced: bool
+public-path documented field crate::protocol::types::ReplicaRetirementReport::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::types::ReplicaRetirementReport::read_status: AccessStatus
+public-path documented field crate::protocol::types::ReplicaRetirementReport::report_sequence: u64
+public-path documented field crate::protocol::types::ReplicaRetirementReport::role: ReplicaRole
+public-path documented field crate::protocol::types::ReplicaRetirementReport::write_status: AccessStatus
+public-path documented field crate::protocol::types::ScaleUpAllocation::accepted_configuration_id: ConfigurationId
+public-path documented field crate::protocol::types::ScaleUpAllocation::cancellation_started: bool
+public-path documented field crate::protocol::types::ScaleUpAllocation::desired_replicas: u32
+public-path documented field crate::protocol::types::ScaleUpAllocation::operation_id: OperationId
+public-path documented field crate::protocol::types::ScaleUpAllocation::pod_uid: Option < PodUid >
+public-path documented field crate::protocol::types::ScaleUpAllocation::previous_configuration_id: ConfigurationId
+public-path documented field crate::protocol::types::ScaleUpAllocation::previous_operation_id: Option < OperationId >
+public-path documented field crate::protocol::types::ScaleUpAllocation::pvc_uid: Option < PvcUid >
+public-path documented field crate::protocol::types::ScaleUpAllocation::resource_uid: ResourceUid
+public-path documented field crate::protocol::types::ScaleUpAllocation::scaffolding_requested: bool
+public-path documented field crate::protocol::types::ScaleUpAllocation::spec_generation: u64
+public-path documented field crate::protocol::types::ScaleUpAllocation::target_replica_id: ReplicaId
+public-path documented field crate::protocol::types::ScaleUpCleanup::provisioning: ProvisioningIntent
+public-path documented field crate::protocol::types::ScaleUpCleanup::resources: ReplicaCleanupIdentity
+public-path documented field crate::protocol::types::ScaleUpCleanup::target: ReplicaIdentity
+public-path documented field crate::protocol::types::ScaleUpFailoverEvidence::current_read_quorum: Vec < ScaleUpWitness >
+public-path documented field crate::protocol::types::ScaleUpFailoverEvidence::final_election: Option < Box < ScaleUpFinalElectionEvidence > >
+public-path documented field crate::protocol::types::ScaleUpFailoverEvidence::intent: ScaleUpIntent
+public-path documented field crate::protocol::types::ScaleUpFailoverEvidence::previous_read_quorum: Vec < ScaleUpWitness >
+public-path documented field crate::protocol::types::ScaleUpFailoverEvidence::provisional_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::ScaleUpFailoverReceiptEvidence::current_read_quorum: Vec < ScaleUpWitness >
+public-path documented field crate::protocol::types::ScaleUpFailoverReceiptEvidence::final_election: Box < ScaleUpFinalElectionEvidence >
+public-path documented field crate::protocol::types::ScaleUpFailoverReceiptEvidence::previous_read_quorum: Vec < ScaleUpWitness >
+public-path documented field crate::protocol::types::ScaleUpFailoverReceiptEvidence::provisional_primary_replica_id: ReplicaId
+public-path documented field crate::protocol::types::ScaleUpFinalElectionEvidence::current_read_quorum: Vec < ReplicaId >
+public-path documented field crate::protocol::types::ScaleUpFinalElectionEvidence::previous_read_quorum: Vec < ReplicaId >
+public-path documented field crate::protocol::types::ScaleUpFinalElectionEvidence::selected_primary_replica_id: ReplicaId
+public-path documented field crate::protocol::types::ScaleUpFinalElectionEvidence::witnesses: Vec < ScaleUpFinalWitness >
+public-path documented field crate::protocol::types::ScaleUpFinalWitness::committed_lsn: i64
+public-path documented field crate::protocol::types::ScaleUpFinalWitness::current_progress: i64
+public-path documented field crate::protocol::types::ScaleUpFinalWitness::deactivated_lsn: i64
+public-path documented field crate::protocol::types::ScaleUpFinalWitness::fence_operation_id: OperationId
+public-path documented field crate::protocol::types::ScaleUpFinalWitness::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::types::ScaleUpFinalWitness::replica_id: ReplicaId
+public-path documented field crate::protocol::types::ScaleUpFinalWitness::report_sequence: u64
+public-path documented field crate::protocol::types::ScaleUpIntent::build_id: OperationId
+public-path documented field crate::protocol::types::ScaleUpIntent::catch_up_boundary_lsn: i64
+public-path documented field crate::protocol::types::ScaleUpIntent::current_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::ScaleUpIntent::current_policy: EffectivePolicy
+public-path documented field crate::protocol::types::ScaleUpIntent::desired_replicas: u32
+public-path documented field crate::protocol::types::ScaleUpIntent::operation_id: OperationId
+public-path documented field crate::protocol::types::ScaleUpIntent::previous_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::ScaleUpIntent::previous_policy: EffectivePolicy
+public-path documented field crate::protocol::types::ScaleUpIntent::primary: ReplicaIdentity
+public-path documented field crate::protocol::types::ScaleUpIntent::resource_uid: ResourceUid
+public-path documented field crate::protocol::types::ScaleUpIntent::snapshot_boundary_lsn: i64
+public-path documented field crate::protocol::types::ScaleUpIntent::spec_generation: u64
+public-path documented field crate::protocol::types::ScaleUpIntent::target: ReplicaIdentity
+public-path documented field crate::protocol::types::ScaleUpProvisioning::current_policy: EffectivePolicy
+public-path documented field crate::protocol::types::ScaleUpProvisioning::desired_replicas: u32
+public-path documented field crate::protocol::types::ScaleUpProvisioning::previous_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::ScaleUpProvisioning::previous_policy: EffectivePolicy
+public-path documented field crate::protocol::types::ScaleUpProvisioning::resource_uid: ResourceUid
+public-path documented field crate::protocol::types::ScaleUpProvisioning::spec_generation: u64
+public-path documented field crate::protocol::types::ScaleUpProvisioning::target_replica_id: ReplicaId
+public-path documented field crate::protocol::types::ScaleUpReceipt::accepted_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::ScaleUpReceipt::current_only_write_quorum: Vec < ScaleUpWitness >
+public-path documented field crate::protocol::types::ScaleUpReceipt::failover_evidence: Option < ScaleUpFailoverReceiptEvidence >
+public-path documented field crate::protocol::types::ScaleUpReceipt::failover_safe_lsn: Option < i64 >
+public-path documented field crate::protocol::types::ScaleUpReceipt::intent: ScaleUpIntent
+public-path documented field crate::protocol::types::ScaleUpWitness::current_configuration_id: ConfigurationId
+public-path documented field crate::protocol::types::ScaleUpWitness::epoch: Epoch
+public-path documented field crate::protocol::types::ScaleUpWitness::identity: ReplicaIdentity
+public-path documented field crate::protocol::types::ScaleUpWitness::pending_operation_id: Option < OperationId >
+public-path documented field crate::protocol::types::ScaleUpWitness::previous_configuration_id: Option < ConfigurationId >
+public-path documented field crate::protocol::types::ScaleUpWitness::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::types::ScaleUpWitness::report_sequence: u64
+public-path documented field crate::protocol::types::ScaleUpWitness::resource_uid: ResourceUid
+public-path documented field crate::protocol::types::ScaleUpWitness::retained_operation_id: Option < OperationId >
+public-path documented field crate::protocol::types::ScaleUpWitness::role: ReplicaRole
+public-path documented field crate::protocol::types::ScaleUpWitness::verified_replication_lsn: i64
+public-path documented field crate::protocol::types::ScaleUpWitness::write_status: AccessStatus
+public-path documented field crate::protocol::types::SecondaryRemovalEvidence::preparation: SecondaryRemovalPreparation
+public-path documented field crate::protocol::types::SecondaryRemovalEvidence::previous_read_quorum: Vec < SecondaryRemovalWitness >
+public-path documented field crate::protocol::types::SecondaryRemovalEvidence::reduced_write_quorum: Vec < SecondaryRemovalWitness >
+public-path documented field crate::protocol::types::SecondaryRemovalPreparation::boundary_lsn: i64
+public-path documented field crate::protocol::types::SecondaryRemovalPreparation::intent: SecondaryScaleDownIntent
+public-path documented field crate::protocol::types::SecondaryRemovalPreparation::operation_id: OperationId
+public-path documented field crate::protocol::types::SecondaryRemovalPreparation::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::types::SecondaryRemovalPreparation::report_sequence: u64
+public-path documented field crate::protocol::types::SecondaryRemovalReceipt::current_only_write_quorum: Vec < SecondaryRemovalWitness >
+public-path documented field crate::protocol::types::SecondaryRemovalReceipt::evidence: SecondaryRemovalEvidence
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::current_configuration_id: ConfigurationId
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::epoch: Epoch
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::identity: ReplicaIdentity
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::pending_operation_id: Option < OperationId >
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::previous_configuration_id: Option < ConfigurationId >
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::report_sequence: u64
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::resource_uid: ResourceUid
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::retained_operation_id: Option < OperationId >
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::role: ReplicaRole
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::verified_replication_lsn: i64
+public-path documented field crate::protocol::types::SecondaryRemovalWitness::write_status: AccessStatus
+public-path documented field crate::protocol::types::SecondaryScaleDownCleanup::current_only_write_quorum: Vec < SecondaryRemovalWitness >
+public-path documented field crate::protocol::types::SecondaryScaleDownCleanup::evidence: SecondaryRemovalEvidence
+public-path documented field crate::protocol::types::SecondaryScaleDownCleanup::retirement: Option < ReplicaRetirementReport >
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::cleanup: ReplicaCleanupIdentity
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::current_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::current_policy: EffectivePolicy
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::desired_replicas: u32
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::operation_id: OperationId
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::previous_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::previous_policy: EffectivePolicy
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::primary: ReplicaIdentity
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::resource_uid: ResourceUid
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::spec_generation: u64
+public-path documented field crate::protocol::types::SecondaryScaleDownIntent::target: ReplicaIdentity
+public-path documented field crate::protocol::types::StatusCondition::message: String
+public-path documented field crate::protocol::types::StatusCondition::reason: String
+public-path documented field crate::protocol::types::StatusCondition::status: ConditionStatus
+public-path documented field crate::protocol::types::StatusCondition::type_: String
+public-path documented field crate::protocol::types::SwitchoverHandoff::handoff_lsn: i64
+public-path documented field crate::protocol::types::SwitchoverHandoff::preparation_generation: u64
+public-path documented field crate::protocol::types::SwitchoverHandoff::preparation_operation_id: OperationId
+public-path documented field crate::protocol::types::SwitchoverHandoff::request_id: SwitchoverRequestId
+public-path documented field crate::protocol::types::SwitchoverHandoff::source: ReplicaIdentity
+public-path documented field crate::protocol::types::SwitchoverHandoff::starting_configuration_id: ConfigurationId
+public-path documented field crate::protocol::types::SwitchoverHandoff::starting_epoch: Epoch
+public-path documented field crate::protocol::types::SwitchoverHandoff::target: ReplicaIdentity
+public-path documented field crate::protocol::types::SwitchoverPreparationId::generation: u64
+public-path documented field crate::protocol::types::SwitchoverPreparationId::operation_id: OperationId
+public-path documented field crate::protocol::types::TransitionIntent::build_id: Option < OperationId >
+public-path documented field crate::protocol::types::TransitionIntent::current_configuration: ConfigurationDescriptor
+public-path documented field crate::protocol::types::TransitionIntent::effective_policy: EffectivePolicy
+public-path documented field crate::protocol::types::TransitionIntent::election_lsn: Option < i64 >
+public-path documented field crate::protocol::types::TransitionIntent::kind: TransitionKind
+public-path documented field crate::protocol::types::TransitionIntent::previous_configuration_id: Option < ConfigurationId >
+public-path documented field crate::protocol::types::TransitionIntent::repair: Option < ReplicaRepairIntent >
+public-path documented field crate::protocol::types::TransitionIntent::scale_up: Option < Box < ScaleUpIntent > >
+public-path documented field crate::protocol::types::TransitionIntent::scale_up_failover: Option < Box < ScaleUpFailoverEvidence > >
+public-path documented field crate::protocol::types::TransitionIntent::secondary_removal_evidence: Option < SecondaryRemovalEvidence >
+public-path documented field crate::protocol::types::TransitionIntent::secondary_scale_down: Option < SecondaryScaleDownIntent >
+public-path documented field crate::protocol::types::TransitionIntent::spec_generation: u64
+public-path documented field crate::protocol::types::TransitionIntent::switchover: Option < PlannedSwitchoverIntent >
+public-path documented field crate::protocol::types::TransitionIntent::transition_id: TransitionId
+public-path documented fn crate::control::convert::fn configuration_command_to_proto (command : EnsureConfiguration ,) -> proto :: EnsureConfigurationCommand
+public-path documented fn crate::control::convert::fn ensure_supported_version (observed : u32) -> Result < () , WireError >
+public-path documented fn crate::control::convert::fn normalize_agent_status_report (report : proto :: AgentStatusReport ,) -> Result < AgentObservation , WireError >
+public-path documented fn crate::control::convert::fn normalize_copy_ack (ack : proto :: CopyAck) -> Result < CopyAcknowledgement , WireError >
+public-path documented fn crate::control::convert::fn normalize_copy_item (item : proto :: CopyItem) -> Result < CopyEnvelope , WireError >
+public-path documented fn crate::control::convert::fn normalize_execute_request (request : proto :: ExecuteCommandRequest ,) -> Result < ExecuteEnvelope , WireError >
+public-path documented fn crate::control::convert::fn normalize_replication_ack (ack : proto :: ReplicationAck ,) -> Result < ReplicationAcknowledgement , WireError >
+public-path documented fn crate::control::convert::fn normalize_replication_item (item : proto :: ReplicationItem ,) -> Result < ReplicationEnvelope , WireError >
+public-path documented fn crate::control::convert::fn validate_agent_status_report (report : & proto :: AgentStatusReport) -> Result < () , WireError >
+public-path documented fn crate::control::convert::fn validate_copy_ack (ack : & proto :: CopyAck) -> Result < () , WireError >
+public-path documented fn crate::control::convert::fn validate_copy_item (item : & proto :: CopyItem) -> Result < () , WireError >
+public-path documented fn crate::control::convert::fn validate_execute_request (request : & proto :: ExecuteCommandRequest) -> Result < () , WireError >
+public-path documented fn crate::control::convert::fn validate_replication_ack (ack : & proto :: ReplicationAck) -> Result < () , WireError >
+public-path documented fn crate::control::convert::fn validate_replication_item (item : & proto :: ReplicationItem) -> Result < () , WireError >
+public-path documented fn crate::protocol::types::fn derive_agent_generation (initialization_id : & InitializationId) -> AgentGeneration
+public-path documented fn crate::protocol::types::fn derive_failover_repair_operation_id (resource_uid : & ResourceUid , transition_id : & TransitionId , target : & ReplicaIdentity ,) -> OperationId
+public-path documented fn crate::protocol::types::fn derive_initialization_id (resource_uid : & ResourceUid , replica_id : ReplicaId , pod_uid : & PodUid , pvc_uid : & PvcUid ,) -> InitializationId
+public-path documented fn crate::protocol::types::fn derive_replacement_operation_id (resource_uid : & ResourceUid , replacing : & ReplicaIdentity , pod_uid : & PodUid , pvc_uid : & PvcUid ,) -> OperationId
+public-path documented fn crate::protocol::types::fn derive_replacement_resource_name (resource_uid : & ResourceUid , replacing : & ReplicaIdentity ,) -> String
+public-path documented fn crate::protocol::types::fn derive_replica_endpoint_name (resource_uid : & ResourceUid , identity : & ReplicaIdentity ,) -> String
+public-path documented fn crate::protocol::types::fn derive_switchover_preparation_operation_id (resource_uid : & ResourceUid , request_id : & SwitchoverRequestId , generation : u64 , starting_configuration_id : & ConfigurationId , source : & ReplicaIdentity , target : & ReplicaIdentity ,) -> OperationId
+public-path documented fn crate::protocol::types::fn derive_transition_id (resource_uid : & ResourceUid , kind : TransitionKind , configuration_id : & ConfigurationId ,) -> TransitionId
+public-path documented fn crate::protocol::types::fn duplicate_replica_ids (members : & [ConfigurationMember]) -> BTreeSet < ReplicaId >
+public-path documented fn crate::protocol::validation::fn validate_configuration (configuration : & ConfigurationDescriptor , policy : Option < & EffectivePolicy > ,) -> Result < () , ValidationError >
+public-path documented fn crate::protocol::validation::fn validate_replacement_cleanup (cleanup : & crate :: protocol :: types :: ReplacementCleanup ,) -> Result < () , ValidationError >
+public-path documented fn crate::protocol::validation::fn validate_report_internal (report : & crate :: protocol :: observation :: AgentReport ,) -> Result < () , ValidationError >
+public-path documented fn crate::protocol::validation::fn validate_snapshot (snapshot : & ObservationSnapshot) -> Result < () , ValidationError >
+public-path documented fn crate::protocol::validation::fn validate_status (status : & AcceptedStatus) -> Result < () , ValidationError >
+public-path documented fn crate::protocol::validation::fn validate_transition_relationship (kind : TransitionKind , previous : Option < & ConfigurationDescriptor > , current : & ConfigurationDescriptor , policy : & EffectivePolicy ,) -> Result < () , ValidationError >
+public-path documented impl crate::protocol::command::EnsureConfiguration::fn is_switchover_restoration (& self) -> bool
+public-path documented impl crate::protocol::command::ProtocolCommand::fn effect_class (& self) -> EffectClass
+public-path documented impl crate::protocol::observation::KubernetesReplicaObservation::fn has_exact_scaffolding (& self) -> bool
+public-path documented impl crate::protocol::observation::ObservationSnapshot::fn has_complete_scaffolding (& self) -> bool
+public-path documented impl crate::protocol::observation::ObservationSnapshot::fn intended_replica_ids (& self) -> Vec < ReplicaId >
+public-path documented impl crate::protocol::observation::ObservationSnapshot::fn observation_for_identity (& self , identity : & ReplicaIdentity ,) -> Option < & ReplicaObservation >
+public-path documented impl crate::protocol::observation::ObservationSnapshot::fn scaffolding_for (& self , replica_id : ReplicaId) -> Option < & KubernetesReplicaObservation >
+public-path documented impl crate::protocol::observation::ObservationSnapshot::fn scaffolding_observation_for (& self , replica_id : ReplicaId ,) -> Option < & ReplicaObservation >
+public-path documented impl crate::protocol::observation::ReplicaObservationKey::fn new (replica_id : ReplicaId , instance_id : ReplicaInstanceId) -> Self
+public-path documented impl crate::protocol::types::AcceptedStatus::fn with_condition (mut self , condition : StatusCondition) -> Self
+public-path documented impl crate::protocol::types::AcceptedStatus::fn without_condition (mut self , type_ : & str) -> Self
+public-path documented impl crate::protocol::types::BuildAuthority::fn validate (& self) -> Result < () , crate :: protocol :: validation :: ValidationError >
+public-path documented impl crate::protocol::types::CleanupResourceIdentity::fn name (& self) -> & str
+public-path documented impl crate::protocol::types::ConfigurationDescriptor::fn expected_id (& self) -> ConfigurationId
+public-path documented impl crate::protocol::types::ConfigurationDescriptor::fn new (epoch : Epoch , primary_id : ReplicaId , mut members : Vec < ConfigurationMember > , write_quorum : u32 ,) -> Self
+public-path documented impl crate::protocol::types::EffectivePolicy::fn fixed (replica_set_size : u32 , failover_delay_seconds : u64) -> Option < Self >
+public-path documented impl crate::protocol::types::Epoch::const fn new (data_loss_number : i64 , configuration_number : i64) -> Self
+public-path documented impl crate::protocol::types::ProvisioningIntent::fn assigned_agent_generation (& self , resource_uid : & ResourceUid) -> AgentGeneration
+public-path documented impl crate::protocol::types::ProvisioningIntent::fn expected_operation_id (& self) -> OperationId
+public-path documented impl crate::protocol::types::ProvisioningIntent::fn initialization_id (& self , resource_uid : & ResourceUid) -> InitializationId
+public-path documented impl crate::protocol::types::ProvisioningIntent::fn instance_id (& self) -> ReplicaInstanceId
+public-path documented impl crate::protocol::types::ProvisioningIntent::fn replacement (& self) -> Option < & ReplicaIdentity >
+public-path documented impl crate::protocol::types::ProvisioningIntent::fn replica_id (& self) -> ReplicaId
+public-path documented impl crate::protocol::types::ProvisioningIntent::fn scale_up (& self) -> Option < & ScaleUpProvisioning >
+public-path documented impl crate::protocol::types::ProvisioningIntent::fn scale_up_build_id (& self , resource_uid : & ResourceUid) -> Option < OperationId >
+public-path documented impl crate::protocol::types::ProvisioningIntent::fn target_identity (& self , resource_uid : & ResourceUid) -> ReplicaIdentity
+public-path documented impl crate::protocol::types::ProvisioningPurpose::fn replacement (replaces : ReplicaIdentity) -> Self
+public-path documented impl crate::protocol::types::ProvisioningPurpose::fn scale_up (scale_up : ScaleUpProvisioning) -> Self
+public-path documented impl crate::protocol::types::ReplacementCleanup::fn provisioning_operation_id (& self , pod_uid : & PodUid , pvc_uid : & PvcUid) -> OperationId
+public-path documented impl crate::protocol::types::ReplacementCleanup::fn transition_id (& self , kind : TransitionKind , configuration_id : & ConfigurationId ,) -> TransitionId
+public-path documented impl crate::protocol::types::ReplicaId::const fn new (value : i64) -> Self
+public-path documented impl crate::protocol::types::ReplicaId::const fn value (self) -> i64
+public-path documented impl crate::protocol::types::ScaleUpAllocation::fn expected_operation_id (& self) -> OperationId
+public-path documented impl crate::protocol::types::ScaleUpAllocation::fn observation_target (& self) -> ReplicaIdentity
+public-path documented impl crate::protocol::types::ScaleUpConfigurationEvidence::fn intent (& self) -> & ScaleUpIntent
+public-path documented impl crate::protocol::types::ScaleUpFailoverEvidence::fn same_provisional_authority (& self , other : & Self) -> bool
+public-path documented impl crate::protocol::types::ScaleUpFailoverReceiptEvidence::fn expand (& self , intent : & ScaleUpIntent) -> Option < ScaleUpFailoverEvidence >
+public-path documented impl crate::protocol::types::ScaleUpFailoverReceiptEvidence::fn from_evidence (evidence : & ScaleUpFailoverEvidence) -> Option < Self >
+public-path documented impl crate::protocol::types::ScaleUpFinalElectionEvidence::fn final_configuration (& self , provisional : & ConfigurationDescriptor ,) -> Option < ConfigurationDescriptor >
+public-path documented impl crate::protocol::types::ScaleUpFinalElectionEvidence::fn safe_lsn (& self) -> Option < i64 >
+public-path documented impl crate::protocol::types::ScaleUpFinalElectionEvidence::fn selected_primary < 'a > (& self , provisional : & 'a ConfigurationDescriptor ,) -> Option < & 'a ReplicaIdentity >
+public-path documented impl crate::protocol::types::ScaleUpFinalElectionEvidence::fn witness (& self , replica_id : ReplicaId) -> Option < & ScaleUpFinalWitness >
+public-path documented impl crate::protocol::types::ScaleUpIntent::fn command_operation_id (& self , stage : ScaleUpStage , target : & ReplicaIdentity , authority : & ConfigurationDescriptor ,) -> OperationId
+public-path documented impl crate::protocol::types::ScaleUpIntent::fn expected_operation_id (& self) -> OperationId
+public-path documented impl crate::protocol::types::ScaleUpIntent::fn transition_id (& self , kind : TransitionKind , authority : & ConfigurationDescriptor ,) -> TransitionId
+public-path documented impl crate::protocol::types::ScaleUpProvisioning::fn next_configuration_epoch (& self) -> Option < Epoch >
+public-path documented impl crate::protocol::types::ScaleUpReceipt::fn expanded_failover_evidence (& self) -> Option < ScaleUpFailoverEvidence >
+public-path documented impl crate::protocol::types::SecondaryRemovalReceipt::fn committed (& self) -> SecondaryScaleDownCleanup
+public-path documented impl crate::protocol::types::SecondaryScaleDownIntent::fn command_operation_id (& self , stage : SecondaryRemovalStage , target : & ReplicaIdentity ,) -> OperationId
+public-path documented impl crate::protocol::types::SecondaryScaleDownIntent::fn expected_operation_id (& self) -> OperationId
+public-path documented impl crate::protocol::types::SwitchoverHandoff::fn preparation (& self) -> SwitchoverPreparationId
+public-path documented impl crate::protocol::types::TransitionKind::const fn as_tag (self) -> & 'static str
+public-path documented module crate::control
+public-path documented module crate::control::convert
+public-path documented module crate::control::proto
+public-path documented module crate::protocol
+public-path documented module crate::protocol::command
+public-path documented module crate::protocol::observation
+public-path documented module crate::protocol::types
+public-path documented module crate::protocol::validation
+public-path documented struct crate::control::convert::CopyAcknowledgement
+public-path documented struct crate::control::convert::CopyEnvelope
+public-path documented struct crate::control::convert::ExecuteEnvelope
+public-path documented struct crate::control::convert::ReplicationAcknowledgement
+public-path documented struct crate::control::convert::ReplicationEnvelope
+public-path documented struct crate::protocol::command::AcceptSecondaryRemovalCommit
+public-path documented struct crate::protocol::command::EnsureConfiguration
+public-path documented struct crate::protocol::command::EnsureReplicaBuild
+public-path documented struct crate::protocol::command::InitializeAgentStore
+public-path documented struct crate::protocol::command::PrepareSecondaryRemoval
+public-path documented struct crate::protocol::command::PrepareSwitchover
+public-path documented struct crate::protocol::command::RetireReplica
+public-path documented struct crate::protocol::observation::AgentBuildReport
+public-path documented struct crate::protocol::observation::AgentReport
+public-path documented struct crate::protocol::observation::DesiredState
+public-path documented struct crate::protocol::observation::KubernetesReplicaObservation
+public-path documented struct crate::protocol::observation::ObservationFailure
+public-path documented struct crate::protocol::observation::ObservationSnapshot
+public-path documented struct crate::protocol::observation::ReplicaObservation
+public-path documented struct crate::protocol::observation::ReplicaObservationKey
+public-path documented struct crate::protocol::observation::ReportWatermark
+public-path documented struct crate::protocol::observation::RoutingObservation
+public-path documented struct crate::protocol::observation::SecondaryScaleDownResourceObservation
+public-path documented struct crate::protocol::observation::UninitializedAgentObservation
+public-path documented struct crate::protocol::types::AcceptedStatus
+public-path documented struct crate::protocol::types::AcceptedTopology
+public-path documented struct crate::protocol::types::BuildAuthority
+public-path documented struct crate::protocol::types::ConfigurationDescriptor
+public-path documented struct crate::protocol::types::ConfigurationMember
+public-path documented struct crate::protocol::types::EffectivePolicy
+public-path documented struct crate::protocol::types::Epoch
+public-path documented struct crate::protocol::types::LoadMetric
+public-path documented struct crate::protocol::types::PartitionInformation
+public-path documented struct crate::protocol::types::PlannedSwitchoverIntent
+public-path documented struct crate::protocol::types::PlannedSwitchoverReceipt
+public-path documented struct crate::protocol::types::PlannedSwitchoverRequest
+public-path documented struct crate::protocol::types::PrimaryFailureObservation
+public-path documented struct crate::protocol::types::ProvisioningIntent
+public-path documented struct crate::protocol::types::ProvisioningPurpose
+public-path documented struct crate::protocol::types::QuorumLossObservation
+public-path documented struct crate::protocol::types::ReplacementCleanup
+public-path documented struct crate::protocol::types::ReplicaCleanupIdentity
+public-path documented struct crate::protocol::types::ReplicaId
+public-path documented struct crate::protocol::types::ReplicaIdentity
+public-path documented struct crate::protocol::types::ReplicaRepairIntent
+public-path documented struct crate::protocol::types::ReplicaRetirementReport
+public-path documented struct crate::protocol::types::ScaleUpAllocation
+public-path documented struct crate::protocol::types::ScaleUpCleanup
+public-path documented struct crate::protocol::types::ScaleUpFailoverEvidence
+public-path documented struct crate::protocol::types::ScaleUpFailoverReceiptEvidence
+public-path documented struct crate::protocol::types::ScaleUpFinalElectionEvidence
+public-path documented struct crate::protocol::types::ScaleUpFinalWitness
+public-path documented struct crate::protocol::types::ScaleUpIntent
+public-path documented struct crate::protocol::types::ScaleUpProvisioning
+public-path documented struct crate::protocol::types::ScaleUpReceipt
+public-path documented struct crate::protocol::types::ScaleUpWitness
+public-path documented struct crate::protocol::types::SecondaryRemovalEvidence
+public-path documented struct crate::protocol::types::SecondaryRemovalPreparation
+public-path documented struct crate::protocol::types::SecondaryRemovalReceipt
+public-path documented struct crate::protocol::types::SecondaryRemovalWitness
+public-path documented struct crate::protocol::types::SecondaryScaleDownCleanup
+public-path documented struct crate::protocol::types::SecondaryScaleDownIntent
+public-path documented struct crate::protocol::types::StatusCondition
+public-path documented struct crate::protocol::types::SwitchoverHandoff
+public-path documented struct crate::protocol::types::SwitchoverPreparationId
+public-path documented struct crate::protocol::types::TransitionIntent
+public-path documented use crate::control::convert :: { CopyAcknowledgement , CopyEnvelope , ExecuteEnvelope , ReplicationAcknowledgement , ReplicationEnvelope , WireError , configuration_command_to_proto , ensure_supported_version , normalize_agent_status_report , normalize_copy_ack , normalize_copy_item , normalize_execute_request , normalize_replication_ack , normalize_replication_item , validate_agent_status_report , validate_copy_ack , validate_copy_item , validate_execute_request , validate_replication_ack , validate_replication_item , }
+public-path documented use crate::protocol::validation::scale_down :: *
+public-path documented use crate::protocol::validation::scale_up :: *
+public-path documented variant crate::control::convert::WireError::InvalidAuthority((String))
+public-path documented variant crate::control::convert::WireError::InvalidEnum { { field : & 'static str , value : i32 } }
+public-path documented variant crate::control::convert::WireError::MissingField((& 'static str))
+public-path documented variant crate::control::convert::WireError::UnsupportedProtocolVersion { { expected : u32 , observed : u32 } }
+public-path documented variant crate::protocol::command::EffectClass::ConvergentEnsure
+public-path documented variant crate::protocol::command::EffectClass::ReconfigurationAction
+public-path documented variant crate::protocol::command::EffectClass::Unsupported
+public-path documented variant crate::protocol::command::KubernetesChange::DeleteExactPod { { pod_name : String , pod_uid : PodUid , } }
+public-path documented variant crate::protocol::command::KubernetesChange::DeleteReplicaEndpoint { { identity : ReplicaIdentity , } }
+public-path documented variant crate::protocol::command::KubernetesChange::DeleteReplicaScaffolding { { pod_name : Option < String > , pod_uid : Option < PodUid > , pvc_name : Option < String > , pvc_uid : Option < PvcUid > , } }
+public-path documented variant crate::protocol::command::KubernetesChange::DeleteScaleDownResource { { resource : ScaleDownResource , name : String , uid : String , resource_version : String , } }
+public-path documented variant crate::protocol::command::KubernetesChange::EnsureReplacementScaffolding { { replica_id : ReplicaId , replacing : ReplicaIdentity , } }
+public-path documented variant crate::protocol::command::KubernetesChange::EnsureReplicaScaffolding { { replica_ids : Vec < ReplicaId > , } }
+public-path documented variant crate::protocol::command::KubernetesChange::EnsureReplicaSupport
+public-path documented variant crate::protocol::command::KubernetesChange::EnsureWriteRoutingService
+public-path documented variant crate::protocol::command::KubernetesChange::PersistStatus { { status : Box < crate :: protocol :: types :: AcceptedStatus > , } }
+public-path documented variant crate::protocol::command::KubernetesChange::PublishWriteRouting { { primary : crate :: protocol :: types :: ReplicaIdentity , } }
+public-path documented variant crate::protocol::command::KubernetesChange::RemoveWriteRouting
+public-path documented variant crate::protocol::command::ProtocolCommand::AcceptSecondaryRemovalCommit((Box < AcceptSecondaryRemovalCommit >))
+public-path documented variant crate::protocol::command::ProtocolCommand::EnsureConfiguration((Box < EnsureConfiguration >))
+public-path documented variant crate::protocol::command::ProtocolCommand::EnsureReplicaBuild((Box < EnsureReplicaBuild >))
+public-path documented variant crate::protocol::command::ProtocolCommand::InitializeAgentStore((Box < InitializeAgentStore >))
+public-path documented variant crate::protocol::command::ProtocolCommand::PrepareSecondaryRemoval((Box < PrepareSecondaryRemoval >))
+public-path documented variant crate::protocol::command::ProtocolCommand::PrepareSwitchover((Box < PrepareSwitchover >))
+public-path documented variant crate::protocol::command::ProtocolCommand::RetireReplica((Box < RetireReplica >))
+public-path documented variant crate::protocol::command::SafetyChange::RemoveWriteRouting
+public-path documented variant crate::protocol::command::ScaleDownResource::Endpoint
+public-path documented variant crate::protocol::command::ScaleDownResource::Pod
+public-path documented variant crate::protocol::command::ScaleDownResource::Pvc
+public-path documented variant crate::protocol::observation::AgentObservation::Absent
+public-path documented variant crate::protocol::observation::AgentObservation::Invalid { { message : String , # [serde (default , skip_serializing_if = "Option::is_none")] uninitialized_report : Option < Box < UninitializedAgentObservation > > , } }
+public-path documented variant crate::protocol::observation::AgentObservation::Report((Box < AgentReport >))
+public-path documented variant crate::protocol::observation::AgentObservation::Uninitialized((UninitializedAgentObservation))
+public-path documented variant crate::protocol::observation::AgentObservation::Unreachable { { message : String , } }
+public-path documented variant crate::protocol::observation::ExactResourceObservation::FrozenUidPresent { { resource_version : String , } }
+public-path documented variant crate::protocol::observation::ExactResourceObservation::LookupFailed { { message : String , } }
+public-path documented variant crate::protocol::observation::ExactResourceObservation::NotFound
+public-path documented variant crate::protocol::observation::ExactResourceObservation::ReplacementPresent { { uid : String , resource_version : String , } }
+public-path documented variant crate::protocol::types::AccessStatus::Granted
+public-path documented variant crate::protocol::types::AccessStatus::NoWriteQuorum
+public-path documented variant crate::protocol::types::AccessStatus::NotPrimary
+public-path documented variant crate::protocol::types::AccessStatus::ReconfigurationPending
+public-path documented variant crate::protocol::types::BuildAuthorityKind::Bootstrap
+public-path documented variant crate::protocol::types::BuildAuthorityKind::Failover
+public-path documented variant crate::protocol::types::BuildAuthorityKind::Provisioning
+public-path documented variant crate::protocol::types::CleanupResourceIdentity::Absent { { # [schemars (length (min = 1))] name : String , } }
+public-path documented variant crate::protocol::types::CleanupResourceIdentity::Present { { # [schemars (length (min = 1))] name : String , # [schemars (length (min = 1))] uid : String , } }
+public-path documented variant crate::protocol::types::ConditionStatus::False
+public-path documented variant crate::protocol::types::ConditionStatus::True
+public-path documented variant crate::protocol::types::ConditionStatus::Unknown
+public-path documented variant crate::protocol::types::FaultType::Permanent
+public-path documented variant crate::protocol::types::FaultType::Transient
+public-path documented variant crate::protocol::types::PlannedSwitchoverOutcome::OldPrimaryCompensated
+public-path documented variant crate::protocol::types::PlannedSwitchoverOutcome::OldPrimaryRestored
+public-path documented variant crate::protocol::types::PlannedSwitchoverOutcome::Rejected
+public-path documented variant crate::protocol::types::PlannedSwitchoverOutcome::RequestedTargetCompleted
+public-path documented variant crate::protocol::types::PlannedSwitchoverOutcome::Unsafe
+public-path documented variant crate::protocol::types::PlannedSwitchoverResolution::CompensatingOldPrimary
+public-path documented variant crate::protocol::types::PlannedSwitchoverResolution::RequestedTarget
+public-path documented variant crate::protocol::types::PlannedSwitchoverResolution::RestoringOldPrimary
+public-path documented variant crate::protocol::types::PlannedSwitchoverResolution::Unsafe
+public-path documented variant crate::protocol::types::ProvisioningKind::Replacement
+public-path documented variant crate::protocol::types::ProvisioningKind::ScaleUp
+public-path documented variant crate::protocol::types::ReplicaRole::ActiveSecondary
+public-path documented variant crate::protocol::types::ReplicaRole::IdleSecondary
+public-path documented variant crate::protocol::types::ReplicaRole::None
+public-path documented variant crate::protocol::types::ReplicaRole::Primary
+public-path documented variant crate::protocol::types::ScaleUpConfigurationEvidence::Admission { { intent : ScaleUpIntent } }
+public-path documented variant crate::protocol::types::ScaleUpConfigurationEvidence::Failover { { evidence : ScaleUpFailoverEvidence } }
+public-path documented variant crate::protocol::types::ScaleUpStage::AcceptCommit
+public-path documented variant crate::protocol::types::ScaleUpStage::CurrentOnly
+public-path documented variant crate::protocol::types::ScaleUpStage::PreviousCurrent
+public-path documented variant crate::protocol::types::SecondaryRemovalStage::AcceptCommit
+public-path documented variant crate::protocol::types::SecondaryRemovalStage::CurrentOnly
+public-path documented variant crate::protocol::types::SecondaryRemovalStage::Prepare
+public-path documented variant crate::protocol::types::SecondaryRemovalStage::PreviousCurrent
+public-path documented variant crate::protocol::types::SecondaryRemovalStage::Retire
+public-path documented variant crate::protocol::types::TransitionKind::Bootstrap
+public-path documented variant crate::protocol::types::TransitionKind::Failover
+public-path documented variant crate::protocol::types::TransitionKind::PlannedSwitchover
+public-path documented variant crate::protocol::types::TransitionKind::Replacement
+public-path documented variant crate::protocol::types::TransitionKind::ScaleUp
+public-path documented variant crate::protocol::types::TransitionKind::SecondaryScaleDown
+public-path documented variant crate::protocol::validation::ValidationError::BootstrapHasPreviousConfiguration
+public-path documented variant crate::protocol::validation::ValidationError::BootstrapHasTopology
+public-path documented variant crate::protocol::validation::ValidationError::BootstrapHasUnrelatedAuthority
+public-path documented variant crate::protocol::validation::ValidationError::BootstrapReportHasPreviousConfiguration((i64))
+public-path documented variant crate::protocol::validation::ValidationError::BootstrapRoleConflict((i64))
+public-path documented variant crate::protocol::validation::ValidationError::BootstrapWriteGranted((i64))
+public-path documented variant crate::protocol::validation::ValidationError::BuildSourceNotPrimary
+public-path documented variant crate::protocol::validation::ValidationError::ConfigurationIdMismatch { { actual : String , expected : String } }
+public-path documented variant crate::protocol::validation::ValidationError::ConflictingPrimaryClaims((Vec < i64 >))
+public-path documented variant crate::protocol::validation::ValidationError::ConflictingReplicaConfiguration { { replica_id : i64 , epoch : crate :: protocol :: types :: Epoch , } }
+public-path documented variant crate::protocol::validation::ValidationError::ConflictingReplicaIdentity { { replica_id : i64 } }
+public-path documented variant crate::protocol::validation::ValidationError::DesiredReplicasZero
+public-path documented variant crate::protocol::validation::ValidationError::DuplicateReplicaIdentity((String))
+public-path documented variant crate::protocol::validation::ValidationError::DuplicateReplicaIds((Vec < i64 >))
+public-path documented variant crate::protocol::validation::ValidationError::EmptyConfiguration
+public-path documented variant crate::protocol::validation::ValidationError::EstablishedStoreMissing((i64))
+public-path documented variant crate::protocol::validation::ValidationError::FailoverMembershipChanged
+public-path documented variant crate::protocol::validation::ValidationError::FailoverReplacementWithoutBuild
+public-path documented variant crate::protocol::validation::ValidationError::InitializedWithoutPolicy
+public-path documented variant crate::protocol::validation::ValidationError::InitializedWithoutTopology
+public-path documented variant crate::protocol::validation::ValidationError::InvalidBootstrapBuildTarget
+public-path documented variant crate::protocol::validation::ValidationError::InvalidConfigurationEpoch
+public-path documented variant crate::protocol::validation::ValidationError::InvalidEffectivePolicy((u32))
+public-path documented variant crate::protocol::validation::ValidationError::InvalidFailoverElectionLsn
+public-path documented variant crate::protocol::validation::ValidationError::InvalidFailoverRepairTarget
+public-path documented variant crate::protocol::validation::ValidationError::InvalidPrimaryCount((usize))
+public-path documented variant crate::protocol::validation::ValidationError::InvalidProvisioningReplacement
+public-path documented variant crate::protocol::validation::ValidationError::InvalidReplacementCleanup
+public-path documented variant crate::protocol::validation::ValidationError::InvalidReplacementMembership
+public-path documented variant crate::protocol::validation::ValidationError::InvalidReplicaId((i64))
+public-path documented variant crate::protocol::validation::ValidationError::InvalidReplicaReportAuthority((i64))
+public-path documented variant crate::protocol::validation::ValidationError::InvalidScaleUp((& 'static str))
+public-path documented variant crate::protocol::validation::ValidationError::InvalidSecondaryScaleDown((& 'static str))
+public-path documented variant crate::protocol::validation::ValidationError::InvalidSwitchoverEvidence
+public-path documented variant crate::protocol::validation::ValidationError::InvalidSwitchoverHandoff
+public-path documented variant crate::protocol::validation::ValidationError::InvalidSwitchoverReceipt
+public-path documented variant crate::protocol::validation::ValidationError::InvalidSwitchoverResolution
+public-path documented variant crate::protocol::validation::ValidationError::InvalidSwitchoverSource
+public-path documented variant crate::protocol::validation::ValidationError::InvalidSwitchoverTarget
+public-path documented variant crate::protocol::validation::ValidationError::KubernetesObservationKeyMismatch
+public-path documented variant crate::protocol::validation::ValidationError::MissingPrimary((i64))
+public-path documented variant crate::protocol::validation::ValidationError::MissingSwitchoverIntent
+public-path documented variant crate::protocol::validation::ValidationError::NegativeBuildBoundary
+public-path documented variant crate::protocol::validation::ValidationError::PolicyBeforeInitialization
+public-path documented variant crate::protocol::validation::ValidationError::PreviousConfigurationMismatch { { actual : Option < String > , expected : String , } }
+public-path documented variant crate::protocol::validation::ValidationError::PrimaryFailureMismatch
+public-path documented variant crate::protocol::validation::ValidationError::ProvisioningAndTransition
+public-path documented variant crate::protocol::validation::ValidationError::ProvisioningBuildTargetInAuthority
+public-path documented variant crate::protocol::validation::ValidationError::ProvisioningClaimsAuthority((i64))
+public-path documented variant crate::protocol::validation::ValidationError::ProvisioningReusesAcceptedIncarnation
+public-path documented variant crate::protocol::validation::ValidationError::ProvisioningWithoutTopology
+public-path documented variant crate::protocol::validation::ValidationError::QuorumLossMismatch
+public-path documented variant crate::protocol::validation::ValidationError::ReplacementPrimaryChanged
+public-path documented variant crate::protocol::validation::ValidationError::ReplicaObservationKeyMismatch { { key : String , reported : String } }
+public-path documented variant crate::protocol::validation::ValidationError::ReplicaResourceMismatch((i64))
+public-path documented variant crate::protocol::validation::ValidationError::ReplicaSetSizeMismatch { { actual : u32 , expected : u32 } }
+public-path documented variant crate::protocol::validation::ValidationError::ReportedPreviousConfigurationMismatch((i64))
+public-path documented variant crate::protocol::validation::ValidationError::StaleReplicaEpoch { { replica_id : i64 , observed : crate :: protocol :: types :: Epoch , accepted : crate :: protocol :: types :: Epoch , } }
+public-path documented variant crate::protocol::validation::ValidationError::StaleReportSequence { { replica_id : i64 , observed : u64 , previous : u64 , } }
+public-path documented variant crate::protocol::validation::ValidationError::TopologyBeforeInitialization
+public-path documented variant crate::protocol::validation::ValidationError::TransitionDataLossChanged
+public-path documented variant crate::protocol::validation::ValidationError::TransitionEpochNotNewer
+public-path documented variant crate::protocol::validation::ValidationError::TransitionLogicalMembershipChanged
+public-path documented variant crate::protocol::validation::ValidationError::TransitionPolicyMismatch
+public-path documented variant crate::protocol::validation::ValidationError::TransitionWithoutTopology
+public-path documented variant crate::protocol::validation::ValidationError::UnauthorizedReplicaEpoch { { replica_id : i64 , observed : Epoch , authorized : Epoch , } }
+public-path documented variant crate::protocol::validation::ValidationError::UnexpectedSwitchoverIntent
+public-path documented variant crate::protocol::validation::ValidationError::UninitializedProvisioningMismatch
+public-path documented variant crate::protocol::validation::ValidationError::UninitializedScaffoldingMismatch
+public-path documented variant crate::protocol::validation::ValidationError::UnrelatedReplicaClaimsAuthority((i64))
+public-path documented variant crate::protocol::validation::ValidationError::WriteQuorumMismatch { { actual : u32 , expected : u32 } }

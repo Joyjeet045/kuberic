@@ -13,18 +13,18 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client, Resource, ResourceExt};
-use kuberic_protocol::command::{
+use kuberic_runtime::control::proto;
+use kuberic_runtime::protocol::command::{
     EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
     ProtocolCommand, ScaleDownResource,
 };
-use kuberic_protocol::observation::ReplicaObservationKey;
-use kuberic_protocol::types::{
+use kuberic_runtime::protocol::observation::ReplicaObservationKey;
+use kuberic_runtime::protocol::types::{
     AcceptedStatus, EffectivePolicy, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
     derive_agent_generation, derive_initialization_id, derive_replacement_resource_name,
     derive_replica_endpoint_name,
 };
-use kuberic_wire::proto;
 use tokio::sync::Mutex;
 use tonic::Code;
 
@@ -942,7 +942,7 @@ where
             )
             .await
             .map_err(map_agent_effect_error)?;
-        if response.protocol_version != kuberic_protocol::PROTOCOL_VERSION {
+        if response.protocol_version != kuberic_runtime::protocol::PROTOCOL_VERSION {
             return Err(ControllerError::InvalidAgentEvidence(
                 "Execute response uses an unsupported protocol version".to_string(),
             ));
@@ -952,7 +952,7 @@ where
                 "Execute response omitted its resulting observation".to_string(),
             )
         })?;
-        kuberic_wire::validate_agent_status_report(&report)
+        kuberic_runtime::control::validate_agent_status_report(&report)
             .map_err(|error| ControllerError::InvalidAgentEvidence(error.to_string()))
     }
 }
@@ -992,7 +992,7 @@ where
             };
         };
         let request = proto::GetAgentStatusRequest {
-            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
             resource_uid: resource_uid.to_string(),
             replica_id: replica_id.value(),
             expected_instance_id: instance_id,
@@ -1987,7 +1987,7 @@ fn command_request(
         }
     };
     Ok(proto::ExecuteCommandRequest {
-        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         resource_uid,
         target: Some(target.into()),
         expected_process_session_id,
@@ -2025,21 +2025,24 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
         expected_instance_id: command.expected_instance_id.to_string(),
         expected_agent_generation: command.expected_agent_generation.to_string(),
         transition_kind: transition_kind(command.transition_kind) as i32,
-        grant_write: command.primary_write_status == kuberic_protocol::types::AccessStatus::Granted,
+        grant_write: command.primary_write_status
+            == kuberic_runtime::protocol::types::AccessStatus::Granted,
         current_only: command.current_only,
         retire_build_id: command
             .retire_build_ids
             .first()
             .map_or_else(String::new, ToString::to_string),
         primary_write_status: match command.primary_write_status {
-            kuberic_protocol::types::AccessStatus::Granted => proto::AccessStatus::Granted as i32,
-            kuberic_protocol::types::AccessStatus::ReconfigurationPending => {
+            kuberic_runtime::protocol::types::AccessStatus::Granted => {
+                proto::AccessStatus::Granted as i32
+            }
+            kuberic_runtime::protocol::types::AccessStatus::ReconfigurationPending => {
                 proto::AccessStatus::ReconfigurationPending as i32
             }
-            kuberic_protocol::types::AccessStatus::NotPrimary => {
+            kuberic_runtime::protocol::types::AccessStatus::NotPrimary => {
                 proto::AccessStatus::NotPrimary as i32
             }
-            kuberic_protocol::types::AccessStatus::NoWriteQuorum => {
+            kuberic_runtime::protocol::types::AccessStatus::NoWriteQuorum => {
                 proto::AccessStatus::NoWriteQuorum as i32
             }
         },
@@ -2091,14 +2094,14 @@ fn provisioning(provisioning: ProvisioningIntent) -> proto::ProvisioningIntent {
     use proto::provisioning_intent::Purpose;
     proto::ProvisioningIntent {
         purpose: Some(match provisioning.purpose.kind {
-            kuberic_protocol::types::ProvisioningKind::Replacement => Purpose::Replaces(
+            kuberic_runtime::protocol::types::ProvisioningKind::Replacement => Purpose::Replaces(
                 provisioning
                     .purpose
                     .replaces
                     .expect("validated replacement provisioning")
                     .into(),
             ),
-            kuberic_protocol::types::ProvisioningKind::ScaleUp => Purpose::ScaleUp(
+            kuberic_runtime::protocol::types::ProvisioningKind::ScaleUp => Purpose::ScaleUp(
                 provisioning
                     .purpose
                     .scale_up
@@ -2990,7 +2993,7 @@ impl ClusterApi for InMemoryClusterApi {
         if observed_process_session(&state.observation, replica_id, &target)? != session {
             return Err(ControllerError::ObservationStale);
         }
-        kuberic_wire::validate_execute_request(&command_request(
+        kuberic_runtime::control::validate_execute_request(&command_request(
             observation
                 .set
                 .uid()
@@ -3104,22 +3107,21 @@ fn scale_down_delete_params(
     // Re-evaluate the immutable observation at the effect boundary. Only the
     // active accepted cleanup receipt can authorize this exact single deletion.
     let snapshot = crate::normalize::normalize(observation.clone(), BTreeMap::new())?;
-    let plan = kuberic_protocol::evaluator::evaluate(
+    let plan = crate::evaluator::evaluate(
         &snapshot,
-        &kuberic_protocol::evaluator::EvaluationConfig {
+        &crate::evaluator::EvaluationConfig {
             enable_secondary_scale_down: true,
             allow_scale_up: true,
             ..Default::default()
         },
     );
-    let expected = kuberic_protocol::command::KubernetesChange::DeleteScaleDownResource {
+    let expected = kuberic_runtime::protocol::command::KubernetesChange::DeleteScaleDownResource {
         resource,
         name: name.into(),
         uid: uid.into(),
         resource_version: resource_version.into(),
     };
-    if !matches!(plan, kuberic_protocol::plan::Plan::Apply { changes } if changes == vec![expected])
-    {
+    if !matches!(plan, crate::plan::Plan::Apply { changes } if changes == vec![expected]) {
         return Err(ControllerError::ObservationStale);
     }
     Ok(DeleteParams {
@@ -3223,17 +3225,17 @@ fn role_label(role: ReplicaRole) -> &'static str {
 
 #[cfg(test)]
 #[allow(dead_code)]
-#[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+#[path = "../tests/protocol_support/secondary_scale_down.rs"]
 mod scale_down_fixture;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crd::KubericSetSpec;
-    use kuberic_protocol::command::{
+    use kuberic_runtime::protocol::command::{
         EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
     };
-    use kuberic_protocol::types::{
+    use kuberic_runtime::protocol::types::{
         AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember,
         EffectivePolicy, Epoch, InitializationId, OperationId, PodUid, PvcUid, SwitchoverRequestId,
     };
@@ -3403,7 +3405,7 @@ mod tests {
                 command.clone(),
             )
             .unwrap();
-            let normalized = kuberic_wire::normalize_execute_request(request).unwrap();
+            let normalized = kuberic_runtime::control::normalize_execute_request(request).unwrap();
             assert_eq!(normalized.command, command);
             assert_eq!(normalized.target, target);
             assert_eq!(
@@ -3417,9 +3419,9 @@ mod tests {
     fn secondary_removal_commit_publication_round_trips() {
         let intent = scale_down_fixture::intent(&[1, 2], 1);
         let command = ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
-            kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+            kuberic_runtime::protocol::command::AcceptSecondaryRemovalCommit {
                 operation_id: intent.command_operation_id(
-                    kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+                    kuberic_runtime::protocol::types::SecondaryRemovalStage::AcceptCommit,
                     &intent.primary,
                 ),
                 target: intent.primary.clone(),
@@ -3435,7 +3437,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            kuberic_wire::normalize_execute_request(request)
+            kuberic_runtime::control::normalize_execute_request(request)
                 .unwrap()
                 .command,
             command

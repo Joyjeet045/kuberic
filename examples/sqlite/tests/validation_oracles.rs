@@ -1,5 +1,5 @@
-use kuberic_protocol::types::AccessStatus;
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::AccessStatus;
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use sqlite_replicated::proto;
 use sqlite_replicated::testing::*;
 

@@ -5,10 +5,15 @@ Kuberic stack.
 
 The controller watches `operator.kuberic.io/v1alpha1` `KubericSet` resources
 and their owned Pods, PVCs, Services, and Secrets. Each reconcile observes and
-normalizes the complete state, calls the pure evaluator in
-`kuberic-protocol`, applies independent resource convergence, and dispatches
+normalizes the complete state, calls its pure `evaluator` API, applies
+independent resource convergence, and dispatches
 at most one fenced authority-changing command. Stable, waiting, and unsafe
 states all use bounded re-observation.
+
+`kuberic-controller` and `kuberic-runtime` are the two publishable production
+crates. The controller depends on runtime shared `protocol` and `control`
+contracts with `default-features = false`; replica host implementation features
+are not needed by the control plane.
 
 The controller owns configuration selection, failure timing, routing fences,
 replacement provisioning, status projection, and optimistic-concurrency

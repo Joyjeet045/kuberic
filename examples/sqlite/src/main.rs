@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use kuberic_agent::process::{ApplicationStorageState, ReplicaHost, ReplicaProcessConfig};
-use kuberic_agent::transport::KubernetesDnsResolver;
-use kuberic_protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
+use kuberic_runtime::host::KubernetesDnsResolver;
+use kuberic_runtime::host::{ApplicationStorageState, ReplicaHost, ReplicaProcessConfig};
+use kuberic_runtime::protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
 use sqlite_replicated::{SqlitePersistence, proto, server::SqliteServer, service::SqliteService};
 
 #[derive(Parser)]

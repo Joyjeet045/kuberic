@@ -1,6 +1,6 @@
 use super::*;
 use crate::testing::{PgGroup, ProcessProbe, native_configuration, native_identity, run_pg_test};
-use kuberic_agent::store::AgentStore;
+
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
@@ -44,7 +44,7 @@ async fn inject(group: &PgGroup, mismatch: Mismatch) {
                 Mismatch::OrphanAcceptedBuild => {
                     state.accepted_build = Some(BuildAuthority {
                         build_id: OperationId::new("orphan"),
-                        kind: kuberic_protocol::types::BuildAuthorityKind::Failover,
+                        kind: kuberic_runtime::protocol::types::BuildAuthorityKind::Failover,
                         source: native_identity(2, "source"),
                         target: pod.identity.clone(),
                         current_configuration: native_configuration(

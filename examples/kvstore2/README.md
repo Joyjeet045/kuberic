@@ -3,7 +3,8 @@
 `kvstore2` is the conformance application for the independent level-triggered
 Kuberic stack. It implements `StatefulServiceReplica`, `StateProvider`, and
 the durable default-engine storage adapter, then delegates replica-process
-assembly to `kuberic-agent::ReplicaHost`.
+assembly to `kuberic_runtime::host::ReplicaHost`. Its only direct Kuberic
+production dependency is `kuberic-runtime`; this example is unpublished.
 The agent's common lifecycle owner handles authority, access, builds, removal,
 retirement and restart; the default engine remains the separately registered
 replication/copy data plane. This example is the live conformance path for that

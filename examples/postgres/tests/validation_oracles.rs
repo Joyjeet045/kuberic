@@ -32,8 +32,8 @@ fn stale_probe_oracle_rejects_unrelated_sql_failures_and_checks_secondary_reads(
 }
 
 async fn failure_case(failure: &str) {
-    use kuberic_protocol::types::{AccessStatus, FaultType};
-    use kuberic_runtime_internal::effects::RuntimeEffectAction;
+    use kuberic_runtime::protocol::types::{AccessStatus, FaultType};
+    use kuberic_runtime::testing::effects::RuntimeEffectAction;
     use postgres_replicated::testing::ProcessProbe;
     let mut group = PgGroup::singleton().await;
     group.add(2).await;

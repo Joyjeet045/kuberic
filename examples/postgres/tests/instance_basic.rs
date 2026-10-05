@@ -389,7 +389,7 @@ async fn monitor_observes_postmaster_exit_even_with_live_launcher() {
         tokio::time::timeout(Duration::from_secs(2), received.recv())
             .await
             .unwrap(),
-        Some(kuberic_protocol::types::FaultType::Permanent)
+        Some(kuberic_runtime::protocol::types::FaultType::Permanent)
     );
     assert!(std::path::Path::new(&format!("/proc/{launcher_pid}")).exists());
     assert!(!instance.is_running().await);

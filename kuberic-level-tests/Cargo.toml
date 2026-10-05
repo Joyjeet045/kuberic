@@ -17,7 +17,6 @@ tokio.workspace = true
 tempfile = "3"
 async-trait.workspace = true
 kube.workspace = true
-kuberic-controller = { path = "../kuberic-controller" }
-kuberic-protocol = { path = "../kuberic-protocol" }
-kuberic-wire = { path = "../kuberic-wire" }
+kuberic-controller = { version = "0.1.0", path = "../kuberic-controller" }
+kuberic-runtime = { version = "0.1.0", path = "../kuberic-runtime", default-features = false }
 tonic.workspace = true

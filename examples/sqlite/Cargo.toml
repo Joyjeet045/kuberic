@@ -5,22 +5,18 @@ edition.workspace = true
 publish = false
 
 [features]
-testing = ["kuberic-agent/testing", "dep:kuberic-runtime-internal", "dep:kuberic-wire", "dep:tempfile"]
+testing = ["kuberic-runtime/testing", "dep:tempfile"]
 
 [[bin]]
 name = "sqlite-replicated"
 path = "src/main.rs"
 
 [dependencies]
-kuberic-agent = { path = "../../kuberic-agent" }
-kuberic-protocol = { path = "../../kuberic-protocol" }
-kuberic-runtime = { path = "../../kuberic-runtime" }
-kuberic-runtime-internal = { path = "../../kuberic-runtime-internal", optional = true }
-kuberic-wire = { path = "../../kuberic-wire", optional = true }
+kuberic-runtime = { version = "0.1.0", path = "../../kuberic-runtime", features = ["host"] }
+libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 tempfile = { version = "3", optional = true }
 async-trait.workspace = true
 futures.workspace = true
-sqlite-commit-barrier = { path = "../../sqlite-commit-barrier" }
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-stream.workspace = true

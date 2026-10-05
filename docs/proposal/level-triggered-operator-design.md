@@ -631,10 +631,9 @@ Runtime-effect recovery follows an explicit ordering:
 5. atomically commit the resulting authority and terminal evidence;
 6. acknowledge command completion.
 
-Phase 3 implements this boundary in `kuberic-agent`. Process hosting and
-runtime effect sequencing live in the agent crate; unpublished
-`kuberic-runtime-internal` owns the narrow persistence and postcondition data
-contracts. `SqliteStore` is created only from validated bootstrap or
+This boundary is implemented in runtime's private host modules. Process hosting,
+runtime effect sequencing, and narrow persistence/postcondition contracts belong
+to `kuberic-runtime`. Its private `SqliteStore` is created only from validated bootstrap or
 replacement initialization authority, records exact storage identity, uses
 WAL with `synchronous=FULL`, and implements the narrow authority, replication,
 local-write, build-authorization, and build-progress capabilities. Reopen
@@ -777,9 +776,9 @@ the application partition. Load and fault reports are accepted by the hosting
 owner and included in agent observations. Primary promotion uses separate
 durable replicator-role, provider-epoch, and application-role effects.
 
-Runtime replication and copy messages are implementation-neutral contracts in
-`kuberic-runtime-internal`; protobuf validation and conversion belong to the
-agent. The runtime crates no longer depend on `kuberic-wire`. The agent binds
+Runtime replication and copy messages are private implementation-neutral
+contracts in `kuberic-runtime`; public protobuf validation and conversion belong
+to `kuberic_runtime::control`. The runtime host binds
 separate authenticated control/peer and replication listeners, opens the
 runtime only after both listeners bind, assigns a fresh process session,
 rejects retired sender or receiver sessions, and exposes bounded reliable send

@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use kuberic_agent::process::{ReplicaHost, ReplicaProcessConfig, RunningReplica};
-use kuberic_agent::transport::ReplicaEndpointResolver;
-use kuberic_protocol::types::{PodUid, PvcUid, ReplicaId, ReplicaIdentity, ResourceUid};
 use kuberic_runtime::StatefulServiceReplica;
+use kuberic_runtime::host::ReplicaEndpointResolver;
+use kuberic_runtime::host::{ReplicaHost, ReplicaProcessConfig, RunningReplica};
+use kuberic_runtime::protocol::types::{PodUid, PvcUid, ReplicaId, ReplicaIdentity, ResourceUid};
 use postgres_replicated::{PgService, PgServiceConfig, data_service::PgDataServiceImpl};
 
 type ProcessResult = Result<(), Box<dyn std::error::Error>>;
@@ -186,9 +186,11 @@ async fn run() -> ProcessResult {
     );
     let local_identity = ReplicaIdentity {
         replica_id: ReplicaId::new(config.replica_id),
-        instance_id: kuberic_protocol::types::ReplicaInstanceId::new(config.pod_uid.clone()),
-        agent_generation: kuberic_protocol::types::derive_agent_generation(
-            &kuberic_protocol::types::derive_initialization_id(
+        instance_id: kuberic_runtime::protocol::types::ReplicaInstanceId::new(
+            config.pod_uid.clone(),
+        ),
+        agent_generation: kuberic_runtime::protocol::types::derive_agent_generation(
+            &kuberic_runtime::protocol::types::derive_initialization_id(
                 &ResourceUid::new(&config.resource_uid),
                 ReplicaId::new(config.replica_id),
                 &PodUid::new(&config.pod_uid),
@@ -289,7 +291,7 @@ async fn run() -> ProcessResult {
 async fn finish_shutdown(
     mut replica: RunningReplica,
     application: &PgService,
-    completion: Option<kuberic_agent::Result<()>>,
+    completion: Option<kuberic_runtime::host::Result<()>>,
     coordination: Option<CoordinationTask>,
     trigger: ProcessResult,
 ) -> ProcessResult {

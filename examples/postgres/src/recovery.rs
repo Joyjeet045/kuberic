@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use kuberic_protocol::types::{
+use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ProcessSessionId, ReplicaIdentity, ReplicaRole, ResourceUid,
 };
 use kuberic_runtime::replicator::ReplicaSetConfiguration;
@@ -193,11 +193,11 @@ pub(crate) struct Recovery {
     pub source_fence: Option<SourceFence>,
     pub former_primary: bool,
     #[serde(default)]
-    pub receiver_epoch: Option<kuberic_protocol::types::Epoch>,
+    pub receiver_epoch: Option<kuberic_runtime::protocol::types::Epoch>,
     #[serde(default)]
-    followed: Option<(kuberic_protocol::types::Epoch, PgLineage)>,
+    followed: Option<(kuberic_runtime::protocol::types::Epoch, PgLineage)>,
     #[serde(default)]
-    preparation: Option<(kuberic_protocol::types::ConfigurationId, i64)>,
+    preparation: Option<(kuberic_runtime::protocol::types::ConfigurationId, i64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     connection: Option<Connection>,
 }
@@ -225,8 +225,11 @@ impl Recovery {
     }
 
     pub(crate) fn validate(&self, local: &ReplicaIdentity) -> std::result::Result<(), String> {
-        kuberic_protocol::validation::validate_configuration(&self.membership.configuration, None)
-            .map_err(|error| error.to_string())?;
+        kuberic_runtime::protocol::validation::validate_configuration(
+            &self.membership.configuration,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
         let identities = self
             .membership
             .peers
@@ -398,11 +401,11 @@ mod connection_validation_tests {
             }
             MalformedConnection::SourceInstance => {
                 connection.source.identity.instance_id =
-                    kuberic_protocol::types::ReplicaInstanceId::new("bad\ninstance")
+                    kuberic_runtime::protocol::types::ReplicaInstanceId::new("bad\ninstance")
             }
             MalformedConnection::SourceGeneration => {
                 connection.source.identity.agent_generation =
-                    kuberic_protocol::types::AgentGeneration::new("bad\ngeneration")
+                    kuberic_runtime::protocol::types::AgentGeneration::new("bad\ngeneration")
             }
         }
     }
@@ -437,8 +440,12 @@ mod connection_validation_tests {
             source_fence: None,
             former_primary: false,
             receiver_epoch: None,
-            followed: followed
-                .then(|| (kuberic_protocol::types::Epoch::new(0, 1), lineage.clone())),
+            followed: followed.then(|| {
+                (
+                    kuberic_runtime::protocol::types::Epoch::new(0, 1),
+                    lineage.clone(),
+                )
+            }),
             preparation: None,
             connection: Some(Connection {
                 source: Peer {
@@ -818,7 +825,10 @@ impl PgReplicator {
             ) => Err(error),
             Err(error @ RuntimeError::AuthorityMismatch(_)) => Err(self.permanent(error).await),
             Err(error) => Err(self
-                .report(kuberic_protocol::types::FaultType::Transient, error)
+                .report(
+                    kuberic_runtime::protocol::types::FaultType::Transient,
+                    error,
+                )
                 .await),
         }
     }
@@ -1431,7 +1441,10 @@ impl PgReplicator {
                 }
                 Err(error) => {
                     return Err(self
-                        .report(kuberic_protocol::types::FaultType::Transient, error)
+                        .report(
+                            kuberic_runtime::protocol::types::FaultType::Transient,
+                            error,
+                        )
                         .await);
                 }
             };
@@ -1814,7 +1827,7 @@ impl PgReplicator {
 
     pub(super) async fn record_handoff_preparation(
         &self,
-        configuration: kuberic_protocol::types::ConfigurationId,
+        configuration: kuberic_runtime::protocol::types::ConfigurationId,
         boundary: i64,
     ) -> Result<()> {
         self.durable
@@ -2288,7 +2301,7 @@ mod tests {
                 1 => bad.policy.configuration_generation += 1,
                 2 => {
                     bad.policy.configuration_id =
-                        kuberic_protocol::types::ConfigurationId::new("stale")
+                        kuberic_runtime::protocol::types::ConfigurationId::new("stale")
                 }
                 3 => {
                     bad.policy.eligible_standbys[0].process_session_id =

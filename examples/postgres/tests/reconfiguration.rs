@@ -3,9 +3,10 @@ use postgres_replicated::testing::{AdmissionCut, PgGroup, RestartPart, run_pg_te
 #[test_log::test]
 fn production_agent_restart_defers_persisted_grant_until_exact_discovery() {
     run_pg_test(|| async {
-        use kuberic_agent::store::AgentStore;
-        use kuberic_protocol::types::AccessStatus;
-        use kuberic_wire::proto::{self as wire, agent_control_client::AgentControlClient};
+        use kuberic_runtime::control::proto::{
+            self as wire, agent_control_client::AgentControlClient,
+        };
+        use kuberic_runtime::protocol::types::AccessStatus;
         use postgres_replicated::testing::ProcessProbe;
         use std::os::unix::fs::MetadataExt;
         use std::time::Duration;
@@ -47,7 +48,7 @@ fn production_agent_restart_defers_persisted_grant_until_exact_discovery() {
             .unwrap();
         let request = || {
             let mut request = tonic::Request::new(wire::GetAgentStatusRequest {
-                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                 resource_uid: "postgres-native-test".into(),
                 replica_id: 1,
                 expected_instance_id: group.pod(1).identity.instance_id.to_string(),
@@ -86,12 +87,12 @@ fn production_agent_restart_defers_persisted_grant_until_exact_discovery() {
                     continue;
                 }
                 let mut replica = kuberic_runtime::replicator::ReplicaInformation::new(
-                    kuberic_protocol::types::OperationId::default(),
+                    kuberic_runtime::protocol::types::OperationId::default(),
                     other.identity.clone(),
                     other.endpoint.clone(),
                 );
                 replica.process_session_id = other.session.clone();
-                kuberic_agent::testing::describe_peer(&pod.runtime, replica)
+                kuberic_runtime::testing::describe_peer(&pod.runtime, replica)
                     .await
                     .unwrap();
             }

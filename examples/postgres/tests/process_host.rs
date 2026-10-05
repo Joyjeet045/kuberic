@@ -6,18 +6,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use kuberic_agent::process::{ReplicaHost, ReplicaProcessConfig, RunningReplica};
-use kuberic_agent::transport::ReplicaEndpointResolver;
-use kuberic_agent::{sqlite_store::SqliteStore, store::AgentStore};
-use kuberic_protocol::types::{
+use kuberic_runtime::application::{OpenContext, RoleChange};
+use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
+use kuberic_runtime::host::ReplicaEndpointResolver;
+use kuberic_runtime::host::{ReplicaHost, ReplicaProcessConfig, RunningReplica};
+use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationMember, Epoch, FaultType, PodUid, PvcUid, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation,
     derive_initialization_id,
 };
-use kuberic_runtime::application::{OpenContext, RoleChange};
 use kuberic_runtime::replicator::ReplicaSetQuorumMode;
+use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::{PrimaryReplicator, Replicator, StatefulServiceReplica};
-use kuberic_wire::proto::{self as wire, agent_control_client::AgentControlClient};
 use postgres_replicated::data_service::PgDataServiceImpl;
 use postgres_replicated::durable::{PgDurableIdentity, PgDurableStore, StorageMode};
 use postgres_replicated::instance::PgInstanceManager;
@@ -95,7 +95,7 @@ fn execute(
     command: wire::execute_command_request::Command,
 ) -> Request<wire::ExecuteCommandRequest> {
     authorized(wire::ExecuteCommandRequest {
-        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         resource_uid: "postgres-test".into(),
         target: Some(identity().into()),
         expected_process_session_id: session.into(),
@@ -173,7 +173,7 @@ async fn status(address: SocketAddr) -> (AgentControlClient<Channel>, wire::Agen
             if let Ok(mut client) = AgentControlClient::connect(format!("http://{address}")).await {
                 let report = client
                     .get_status(authorized(wire::GetAgentStatusRequest {
-                        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                         resource_uid: "postgres-test".into(),
                         replica_id: 1,
                         expected_instance_id: "postgres-1".into(),
@@ -198,7 +198,7 @@ async fn status(address: SocketAddr) -> (AgentControlClient<Channel>, wire::Agen
 struct HostAttempt {
     address: SocketAddr,
     application: Arc<PgService>,
-    task: tokio::task::JoinHandle<kuberic_agent::Result<RunningReplica>>,
+    task: tokio::task::JoinHandle<kuberic_runtime::host::Result<RunningReplica>>,
 }
 
 struct OpenGate {
@@ -1233,7 +1233,7 @@ async fn previously_promoted_database_restarts_closed_until_authority_restoratio
 }
 
 async fn unsupported_native_callbacks_and_mutated_evidence_never_change_pgdata() {
-    use kuberic_protocol::types::{BuildAuthority, BuildAuthorityKind, OperationId};
+    use kuberic_runtime::protocol::types::{BuildAuthority, BuildAuthorityKind, OperationId};
     let root = TestDataDir::new("host-callbacks");
     let mut host = HostAttempt::start(root.path()).await;
     let mut running = host.bootstrap(root.path()).await;
@@ -1384,8 +1384,8 @@ async fn established_agent_and_postgres_lineage_mismatches_are_non_mutating() {
 }
 
 async fn unsafe_evidence_reports_permanent_fault_and_stops_granted_sql() {
-    use kuberic_agent::{sqlite_store::SqliteStore, store::AgentStore};
-    use kuberic_protocol::types::FaultType;
+    use kuberic_runtime::protocol::types::FaultType;
+    use kuberic_runtime::testing::sqlite_store::SqliteStore;
     let root = TestDataDir::new("host-unsafe");
     let mut host = HostAttempt::start(root.path()).await;
     let mut running = host.bootstrap(root.path()).await;
@@ -2370,7 +2370,7 @@ async fn executable_serves_initialization_and_singleton_sql_then_stops_its_child
         .unwrap();
     let report = client
         .get_status(authorized(wire::GetAgentStatusRequest {
-            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
             resource_uid: "postgres-test".into(),
             replica_id: 1,
             expected_instance_id: "postgres-1".into(),
@@ -2627,7 +2627,7 @@ async fn executable_launcher_exit_keeps_owned_postmaster_until_shutdown() {
             );
             let report = control
                 .get_status(authorized(wire::GetAgentStatusRequest {
-                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                     resource_uid: "postgres-test".into(),
                     replica_id: 1,
                     expected_instance_id: "postgres-1".into(),

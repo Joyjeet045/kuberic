@@ -15,10 +15,7 @@ axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
 futures.workspace = true
-kuberic-agent = { path = "../../kuberic-agent" }
-kuberic-protocol = { path = "../../kuberic-protocol" }
-kuberic-runtime = { path = "../../kuberic-runtime" }
-kuberic-runtime-internal = { path = "../../kuberic-runtime-internal" }
+kuberic-runtime = { version = "0.1.0", path = "../../kuberic-runtime", features = ["host"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio.workspace = true

@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use kuberic_agent::process::ApplicationStorageState;
-use kuberic_protocol::types::{FaultType, ReplicaRole, ResourceUid};
 use kuberic_runtime::application::{OpenContext, OpenMode, RoleChange, StateProvider};
+use kuberic_runtime::host::ApplicationStorageState;
+use kuberic_runtime::protocol::types::{FaultType, ReplicaRole, ResourceUid};
 use kuberic_runtime::replicator::{ReplicatorFactoryContext, ReplicatorSettings};
 use kuberic_runtime::{
     Replicator, ReplicatorFactory, ReplicatorInterfaces, Result, RuntimeError,

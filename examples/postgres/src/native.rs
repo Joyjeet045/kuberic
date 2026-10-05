@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kuberic_protocol::types::{
+use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationId, ProcessSessionId, ReplicaIdentity,
 };
 use serde::{Deserialize, Serialize};
@@ -941,7 +941,7 @@ fn requirement(
     if current
         && !configuration.members.iter().any(|member| {
             member.identity == *local
-                && member.role == kuberic_protocol::types::ReplicaRole::Primary
+                && member.role == kuberic_runtime::protocol::types::ReplicaRole::Primary
         })
     {
         return Err(PgError::Configuration(
@@ -1016,7 +1016,7 @@ async fn certify_primary_progress(
 
 #[cfg(test)]
 mod tests {
-    use kuberic_protocol::types::{
+    use kuberic_runtime::protocol::types::{
         AgentGeneration, ConfigurationMember, Epoch, ReplicaId, ReplicaInstanceId, ReplicaRole,
     };
 

@@ -1390,29 +1390,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kuberic-agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "kuberic-protocol",
- "kuberic-runtime",
- "kuberic-runtime-internal",
- "kuberic-wire",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "kuberic-controller"
 version = "0.1.0"
 dependencies = [
@@ -1421,8 +1398,7 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "kube",
- "kuberic-protocol",
- "kuberic-wire",
+ "kuberic-runtime",
  "schemars",
  "serde",
  "serde_json",
@@ -1460,23 +1436,11 @@ dependencies = [
  "async-trait",
  "kube",
  "kuberic-controller",
- "kuberic-protocol",
- "kuberic-wire",
+ "kuberic-runtime",
  "serde_json",
  "tempfile",
  "tokio",
  "tonic",
-]
-
-[[package]]
-name = "kuberic-protocol"
-version = "0.1.0"
-dependencies = [
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1486,37 +1450,24 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "kuberic-protocol",
- "kuberic-runtime-internal",
+ "kuberic-controller",
+ "prost",
  "quote",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
  "syn 3.0.0",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "uuid",
-]
-
-[[package]]
-name = "kuberic-runtime-internal"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "kuberic-protocol",
- "serde",
- "thiserror 2.0.21",
- "uuid",
-]
-
-[[package]]
-name = "kuberic-wire"
-version = "0.1.0"
-dependencies = [
- "kuberic-protocol",
- "prost",
- "thiserror 2.0.21",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1529,10 +1480,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "kuberic-agent",
- "kuberic-protocol",
  "kuberic-runtime",
- "kuberic-runtime-internal",
  "serde",
  "serde_json",
  "tempfile",
@@ -1913,11 +1861,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
- "kuberic-agent",
- "kuberic-protocol",
  "kuberic-runtime",
- "kuberic-runtime-internal",
- "kuberic-wire",
  "postgres-replicated",
  "prost",
  "rusqlite",
@@ -2670,16 +2614,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlite-commit-barrier"
-version = "0.1.0"
-dependencies = [
- "libsqlite3-sys",
- "rusqlite",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "sqlite-replicated"
 version = "0.1.0"
 dependencies = [
@@ -2688,16 +2622,12 @@ dependencies = [
  "clap",
  "crc32fast",
  "futures",
- "kuberic-agent",
- "kuberic-protocol",
  "kuberic-runtime",
- "kuberic-runtime-internal",
- "kuberic-wire",
+ "libsqlite3-sys",
  "prost",
  "rusqlite",
  "serde",
  "serde_json",
- "sqlite-commit-barrier",
  "sqlite-replicated",
  "tempfile",
  "tokio",

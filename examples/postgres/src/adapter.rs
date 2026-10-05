@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
-use kuberic_protocol::types::{
+use kuberic_runtime::protocol::types::{
     AccessStatus, BuildAuthority, ConfigurationDescriptor, Epoch, FaultType, OperationId,
     ReplicaId, ReplicaIdentity, ReplicaRole,
 };
@@ -38,7 +38,7 @@ pub(crate) fn application_error(error: impl std::fmt::Display) -> RuntimeError {
 
 fn evidence_configuration(
     snapshot: &crate::native::PgObservation,
-) -> Option<&kuberic_protocol::types::ConfigurationId> {
+) -> Option<&kuberic_runtime::protocol::types::ConfigurationId> {
     snapshot
         .evidence
         .as_ref()?
@@ -325,7 +325,7 @@ impl PgReplicator {
     async fn current_sessions(
         &self,
         configuration: &ConfigurationDescriptor,
-    ) -> Result<BTreeMap<ReplicaIdentity, kuberic_protocol::types::ProcessSessionId>> {
+    ) -> Result<BTreeMap<ReplicaIdentity, kuberic_runtime::protocol::types::ProcessSessionId>> {
         let local = self.durable.snapshot().await.identity.replica;
         let mut members = configuration.members.clone();
         if let Some(previous) = self
@@ -359,7 +359,7 @@ impl PgReplicator {
     async fn policy_sessions(
         &self,
         configuration: &ConfigurationDescriptor,
-    ) -> Result<BTreeMap<ReplicaIdentity, kuberic_protocol::types::ProcessSessionId>> {
+    ) -> Result<BTreeMap<ReplicaIdentity, kuberic_runtime::protocol::types::ProcessSessionId>> {
         let durable = self.durable.snapshot().await;
         let mut members = configuration.members.clone();
         if let Some(previous) = durable.recovery.as_ref().and_then(|r| r.previous.as_ref()) {
@@ -478,7 +478,7 @@ impl PgReplicator {
     async fn peer_session(
         &self,
         identity: &ReplicaIdentity,
-    ) -> Result<kuberic_protocol::types::ProcessSessionId> {
+    ) -> Result<kuberic_runtime::protocol::types::ProcessSessionId> {
         self.configuration
             .read()
             .await
@@ -1405,7 +1405,7 @@ impl PgReplicator {
         current: ReplicaSetConfiguration,
         previous: Option<ConfigurationDescriptor>,
     ) -> Result<()> {
-        kuberic_protocol::validation::validate_configuration(&current.configuration, None)
+        kuberic_runtime::protocol::validation::validate_configuration(&current.configuration, None)
             .map_err(application_error)?;
         let mut builds = BTreeMap::new();
         for replica in current.replicas.iter().filter(|r| !r.build_id.is_empty()) {
@@ -1834,9 +1834,9 @@ impl PgReplicator {
                     .iter()
                     .any(|m| m.identity == replica.identity)
                 {
-                    kuberic_protocol::types::BuildAuthorityKind::Failover
+                    kuberic_runtime::protocol::types::BuildAuthorityKind::Failover
                 } else {
-                    kuberic_protocol::types::BuildAuthorityKind::Provisioning
+                    kuberic_runtime::protocol::types::BuildAuthorityKind::Provisioning
                 },
                 source: durable.identity.replica.clone(),
                 target: replica.identity.clone(),

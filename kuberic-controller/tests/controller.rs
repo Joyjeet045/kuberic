@@ -13,19 +13,19 @@ use kuberic_controller::crd::{
     INSTANCE_LABEL, KubericSet, KubericSetSpec, KubericSetStatus, PlannedSwitchoverRequestSpec,
     REPLICA_ID_LABEL, SET_UID_LABEL,
 };
+use kuberic_controller::evaluator::{EvaluationConfig, evaluate};
 use kuberic_controller::normalize::normalize;
 use kuberic_controller::observation::{RawAgentObservation, RawObservation, RawObservationFailure};
+use kuberic_controller::plan::Plan;
 use kuberic_controller::reconciler::{ReconcileKind, Reconciler};
-use kuberic_protocol::command::ProtocolCommand;
-use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
-use kuberic_protocol::observation::{AgentObservation, ReplicaObservationKey};
-use kuberic_protocol::plan::Plan;
-use kuberic_protocol::types::{
+use kuberic_runtime::control::proto;
+use kuberic_runtime::protocol::command::ProtocolCommand;
+use kuberic_runtime::protocol::observation::{AgentObservation, ReplicaObservationKey};
+use kuberic_runtime::protocol::types::{
     AcceptedStatus, AcceptedTopology, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
     ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
     derive_replica_endpoint_name,
 };
-use kuberic_wire::proto;
 
 const UID: &str = "set-uid";
 const POD_UID: &str = "pod-uid-1";
@@ -40,7 +40,7 @@ fn config() -> EvaluationConfig {
     EvaluationConfig {
         enable_secondary_scale_down: false,
         allow_scale_up: false,
-        supported_protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        supported_protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         stable_resync_seconds: 11,
         wait_requeue_seconds: 3,
         unsafe_requeue_seconds: 7,
@@ -289,7 +289,9 @@ fn bootstrap_status(raw: &RawObservation) -> AcceptedStatus {
     changes
         .into_iter()
         .find_map(|change| match change {
-            kuberic_protocol::command::KubernetesChange::PersistStatus { status } => Some(*status),
+            kuberic_runtime::protocol::command::KubernetesChange::PersistStatus { status } => {
+                Some(*status)
+            }
             _ => None,
         })
         .unwrap()
@@ -297,7 +299,7 @@ fn bootstrap_status(raw: &RawObservation) -> AcceptedStatus {
 
 fn uninitialized_report() -> proto::AgentStatusReport {
     proto::AgentStatusReport {
-        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         resource_uid: UID.to_string(),
         process_session_id: "session-1".to_string(),
         report_sequence: 1,
@@ -310,11 +312,11 @@ fn uninitialized_report() -> proto::AgentStatusReport {
 }
 
 fn initialized_report(
-    identity: kuberic_protocol::types::ReplicaIdentity,
-    configuration: kuberic_protocol::types::ConfigurationDescriptor,
+    identity: kuberic_runtime::protocol::types::ReplicaIdentity,
+    configuration: kuberic_runtime::protocol::types::ConfigurationDescriptor,
 ) -> proto::AgentStatusReport {
     proto::AgentStatusReport {
-        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         resource_uid: UID.to_string(),
         identity: Some(identity.into()),
         process_session_id: "session-2".to_string(),
@@ -356,7 +358,9 @@ fn stable_observation() -> RawObservation {
         authority: AcceptedStatus {
             initialized: true,
             observed_generation: 1,
-            effective_policy: Some(kuberic_protocol::types::EffectivePolicy::fixed(1, 10).unwrap()),
+            effective_policy: Some(
+                kuberic_runtime::protocol::types::EffectivePolicy::fixed(1, 10).unwrap(),
+            ),
             topology: Some(AcceptedTopology {
                 configuration: configuration.clone(),
             }),
@@ -435,19 +439,19 @@ fn switchover_observation() -> RawObservation {
         endpoint.spec.as_mut().unwrap().selector =
             Some(BTreeMap::from([(INSTANCE_LABEL.to_string(), pod_uid)]));
         observation.services.push(endpoint);
-        members.push(kuberic_protocol::types::ConfigurationMember {
+        members.push(kuberic_runtime::protocol::types::ConfigurationMember {
             identity: local,
             role: ReplicaRole::ActiveSecondary,
         });
     }
-    let configuration = kuberic_protocol::types::ConfigurationDescriptor::new(
-        kuberic_protocol::types::Epoch::new(0, 1),
+    let configuration = kuberic_runtime::protocol::types::ConfigurationDescriptor::new(
+        kuberic_runtime::protocol::types::Epoch::new(0, 1),
         ReplicaId::new(1),
         members,
         2,
     );
     let status = &mut observation.set.status.as_mut().unwrap().authority;
-    status.effective_policy = kuberic_protocol::types::EffectivePolicy::fixed(3, 10);
+    status.effective_policy = kuberic_runtime::protocol::types::EffectivePolicy::fixed(3, 10);
     status.topology = Some(AcceptedTopology {
         configuration: configuration.clone(),
     });
@@ -518,7 +522,7 @@ async fn observe_switchover_result(api: &InMemoryClusterApi, command: &ProtocolC
         ProtocolCommand::PrepareSwitchover(command) => {
             report.write_status = proto::AccessStatus::ReconfigurationPending as i32;
             report.prepared_switchover = Some(
-                kuberic_protocol::types::SwitchoverHandoff {
+                kuberic_runtime::protocol::types::SwitchoverHandoff {
                     preparation_generation: command.preparation_generation,
                     preparation_operation_id: command.operation_id.clone(),
                     request_id: command.request_id.clone(),
@@ -545,7 +549,8 @@ async fn observe_switchover_result(api: &InMemoryClusterApi, command: &ProtocolC
                 proto::ReplicaRole::ActiveSecondary as i32
             };
             report.write_status = if primary
-                && command.primary_write_status == kuberic_protocol::types::AccessStatus::Granted
+                && command.primary_write_status
+                    == kuberic_runtime::protocol::types::AccessStatus::Granted
             {
                 proto::AccessStatus::Granted as i32
             } else if primary {
@@ -707,7 +712,7 @@ async fn switchover_request_mutations_at_every_boundary_heal_without_watch_event
                     }
                     assert!(
                         matches!(&now.observation_for_identity(routed).unwrap().agent,
-                        AgentObservation::Report(report) if report.write_status == kuberic_protocol::types::AccessStatus::Granted)
+                        AgentObservation::Report(report) if report.write_status == kuberic_runtime::protocol::types::AccessStatus::Granted)
                     );
                 }
             }
@@ -766,7 +771,7 @@ async fn switchover_request_mutations_at_every_boundary_heal_without_watch_event
 
 #[tokio::test]
 async fn switchover_recovery_reobserves_lost_effects_allocation_receipts_and_session_rollover() {
-    use kuberic_protocol::types::{PlannedSwitchoverOutcome, PlannedSwitchoverResolution};
+    use kuberic_runtime::protocol::types::{PlannedSwitchoverOutcome, PlannedSwitchoverResolution};
     for compensate in [false, true] {
         let api = Arc::new(InMemoryClusterApi::new(switchover_observation()));
         let mut injected = false;
@@ -806,9 +811,9 @@ async fn switchover_recovery_reobserves_lost_effects_allocation_receipts_and_ses
             let reconciler = Reconciler::new(api.clone(), config());
             if let Plan::Apply { changes } = &plan {
                 let recovery = changes.iter().find_map(|change| match change {
-                    kuberic_protocol::command::KubernetesChange::PersistStatus { status } => {
-                        Some(status)
-                    }
+                    kuberic_runtime::protocol::command::KubernetesChange::PersistStatus {
+                        status,
+                    } => Some(status),
                     _ => None,
                 });
                 if let Some(status) = recovery {
@@ -866,7 +871,7 @@ async fn switchover_recovery_reobserves_lost_effects_allocation_receipts_and_ses
             if let Plan::Execute { command } = &plan {
                 if let ProtocolCommand::EnsureConfiguration(command) = command {
                     if command.primary_write_status
-                        == kuberic_protocol::types::AccessStatus::Granted
+                        == kuberic_runtime::protocol::types::AccessStatus::Granted
                     {
                         assert!(snapshot.status.transition.is_none());
                         assert!(snapshot.status.last_switchover.is_some());
@@ -979,8 +984,8 @@ async fn exact_safety_deletion_is_uid_and_resource_version_fenced_and_preserves_
 
 #[tokio::test]
 async fn persistent_fault_compensation_deletes_exact_pod_without_waiting_for_its_commands() {
-    use kuberic_protocol::command::KubernetesChange;
-    use kuberic_protocol::types::PlannedSwitchoverOutcome;
+    use kuberic_runtime::protocol::command::KubernetesChange;
+    use kuberic_runtime::protocol::types::PlannedSwitchoverOutcome;
     let api = Arc::new(InMemoryClusterApi::new(switchover_observation()));
     let pvcs = api.observation().await.pvcs;
     let mut faulted = false;
@@ -1202,7 +1207,7 @@ async fn switchover_unsafe_receipt_requires_observed_closure_after_ambiguous_pod
             .last_switchover
             .unwrap()
             .outcome,
-        kuberic_protocol::types::PlannedSwitchoverOutcome::Unsafe
+        kuberic_runtime::protocol::types::PlannedSwitchoverOutcome::Unsafe
     );
 }
 
@@ -1265,7 +1270,7 @@ async fn switchover_reobserves_conflicts_ambiguous_replies_sessions_and_complete
         if let Plan::Apply { changes } = &plan
             && changes.iter().any(|change| {
                 matches!(change,
-                kuberic_protocol::command::KubernetesChange::PersistStatus { status }
+                kuberic_runtime::protocol::command::KubernetesChange::PersistStatus { status }
                     if status.last_switchover.is_some())
             })
             && snapshot.status.transition.is_some()
@@ -1305,7 +1310,7 @@ async fn switchover_reobserves_conflicts_ambiguous_replies_sessions_and_complete
             assert!(snapshot.status.last_switchover.is_some());
             assert!(
                 matches!(&snapshot.observation_for_identity(target).unwrap().agent,
-                AgentObservation::Report(report) if report.write_status == kuberic_protocol::types::AccessStatus::Granted)
+                AgentObservation::Report(report) if report.write_status == kuberic_runtime::protocol::types::AccessStatus::Granted)
             );
         }
     }

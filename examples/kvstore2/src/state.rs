@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::stream;
-use kuberic_protocol::types::Epoch;
 use kuberic_runtime::application::{OperationDataStream, StateProvider};
+use kuberic_runtime::protocol::types::Epoch;
 use kuberic_runtime::{Result, RuntimeError};
 
 use crate::persistence::{KvPersistence, snapshot_stream};

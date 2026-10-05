@@ -1,4 +1,6 @@
 [env]
+# Cross-crate policy proofs are enabled only inside this repository.
+KUBERIC_WORKSPACE_TESTS = { value = "1", force = false }
 # Durable all-feature integration tests and receipt-aware persistence validation
 # can exceed Rust's test-thread default while replaying large authority fixtures.
 RUST_MIN_STACK = { value = "8388608", force = false }

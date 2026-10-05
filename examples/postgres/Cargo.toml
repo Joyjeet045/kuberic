@@ -5,18 +5,14 @@ edition.workspace = true
 publish = false
 
 [features]
-testing = ["kuberic-agent/testing", "dep:kuberic-runtime-internal"]
+testing = ["kuberic-runtime/testing"]
 
 [[bin]]
 name = "postgres-replicated"
 path = "src/main.rs"
 
 [dependencies]
-kuberic-agent = { path = "../../kuberic-agent" }
-kuberic-wire = { path = "../../kuberic-wire" }
-kuberic-protocol = { path = "../../kuberic-protocol" }
-kuberic-runtime = { path = "../../kuberic-runtime" }
-kuberic-runtime-internal = { path = "../../kuberic-runtime-internal", optional = true }
+kuberic-runtime = { version = "0.1.0", path = "../../kuberic-runtime", features = ["host"] }
 async-trait.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true

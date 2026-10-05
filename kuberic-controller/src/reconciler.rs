@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
-use kuberic_protocol::observation::{ReplicaObservationKey, ReportWatermark};
+use crate::evaluator::{EvaluationConfig, evaluate};
+use kuberic_runtime::protocol::observation::{ReplicaObservationKey, ReportWatermark};
 use tokio::sync::Mutex;
 
 use crate::cluster_api::ClusterApi;
@@ -70,12 +70,12 @@ impl Reconciler {
                     .as_ref()
                     .is_some_and(|transition| {
                         transition.kind
-                            == kuberic_protocol::types::TransitionKind::PlannedSwitchover
+                            == kuberic_runtime::protocol::types::TransitionKind::PlannedSwitchover
                     })
                 {
-                    let status = snapshot.status.clone().with_condition(kuberic_protocol::types::StatusCondition {
+                    let status = snapshot.status.clone().with_condition(kuberic_runtime::protocol::types::StatusCondition {
                         type_: "Progressing".to_string(),
-                        status: kuberic_protocol::types::ConditionStatus::True,
+                        status: kuberic_runtime::protocol::types::ConditionStatus::True,
                         reason: "SwitchoverReobservationRequired".to_string(),
                         message: format!("Re-observe exact process-session authority; dispatch is not completion evidence: {message}"),
                     });

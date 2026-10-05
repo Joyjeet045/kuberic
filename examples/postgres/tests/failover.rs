@@ -20,10 +20,12 @@ macro_rules! host_test {
 }
 
 mod scenarios {
-    use kuberic_agent::store::AgentStore;
-    use kuberic_protocol::types::{AccessStatus, ReplicaRole, SwitchoverRequestId, TransitionKind};
-    use kuberic_runtime_internal::authority::AdmittedAuthority;
-    use kuberic_runtime_internal::effects::RuntimeEffectAction;
+
+    use kuberic_runtime::protocol::types::{
+        AccessStatus, ReplicaRole, SwitchoverRequestId, TransitionKind,
+    };
+    use kuberic_runtime::testing::authority::AdmittedAuthority;
+    use kuberic_runtime::testing::effects::RuntimeEffectAction;
     use postgres_replicated::testing::{
         PgPod, RecoveryStage, TestDataDir, definitive_fence_error, native_configuration,
         native_identity,
@@ -437,7 +439,7 @@ mod scenarios {
                 assert!(!source.application.instance().is_running().await);
                 assert_eq!(
                     source.runtime.partition_report().await.reported_fault,
-                    Some(kuberic_protocol::types::FaultType::Permanent)
+                    Some(kuberic_runtime::protocol::types::FaultType::Permanent)
                 );
                 write_rejected(&sql, "INSERT INTO recovered VALUES(99)").await;
                 disconnected(&sql).await;
@@ -626,15 +628,15 @@ mod scenarios {
                     .with_coordination_token("restart-test".into()),
                 );
                 let store = std::sync::Arc::new(
-                    kuberic_agent::sqlite_store::SqliteStore::open_existing(
-                        kuberic_agent::sqlite_store::SqliteStore::metadata_database_path(
+                    kuberic_runtime::testing::sqlite_store::SqliteStore::open_existing(
+                        kuberic_runtime::testing::sqlite_store::SqliteStore::metadata_database_path(
                             &root.path().join("t"),
                         ),
                         None,
                     )
                     .unwrap(),
                 );
-                let runtime = kuberic_agent::hosting::PodRuntime::new(
+                let runtime = kuberic_runtime::testing::hosting::PodRuntime::new(
                     saved.identity.replica.clone(),
                     service.clone(),
                     store.clone(),
@@ -642,7 +644,7 @@ mod scenarios {
                 runtime
                     .bind_replica_session(
                         saved.identity.resource_uid.clone(),
-                        kuberic_protocol::types::ProcessSessionId::new("reopened-session"),
+                        kuberic_runtime::protocol::types::ProcessSessionId::new("reopened-session"),
                     )
                     .unwrap();
                 let result = runtime
@@ -669,8 +671,8 @@ mod scenarios {
                 if result.is_ok() {
                     let sequence = store.load_state().await.unwrap().next_effect_sequence;
                     let grant = runtime
-                        .apply_effect(kuberic_runtime_internal::effects::RuntimeEffect {
-                            operation_id: kuberic_protocol::types::OperationId::new(
+                        .apply_effect(kuberic_runtime::testing::effects::RuntimeEffect {
+                            operation_id: kuberic_runtime::protocol::types::OperationId::new(
                                 "reopened-grant",
                             ),
                             sequence,
@@ -696,7 +698,9 @@ mod scenarios {
             target
                 .effect(RuntimeEffectAction::RegisterPeerSession {
                     identity: other.identity.clone(),
-                    session: kuberic_protocol::types::ProcessSessionId::new("replaced-responder"),
+                    session: kuberic_runtime::protocol::types::ProcessSessionId::new(
+                        "replaced-responder",
+                    ),
                 })
                 .await
                 .unwrap();
@@ -795,9 +799,9 @@ mod scenarios {
             );
             if let Some(failure) = failure {
                 let expected = match failure {
-                    Failure::Promotion => kuberic_protocol::types::FaultType::Permanent,
-                    Failure::Observation => kuberic_protocol::types::FaultType::Permanent,
-                    Failure::Shutdown => kuberic_protocol::types::FaultType::Permanent,
+                    Failure::Promotion => kuberic_runtime::protocol::types::FaultType::Permanent,
+                    Failure::Observation => kuberic_runtime::protocol::types::FaultType::Permanent,
+                    Failure::Shutdown => kuberic_runtime::protocol::types::FaultType::Permanent,
                 };
                 assert_eq!(
                     target.runtime.partition_report().await.reported_fault,
@@ -955,7 +959,7 @@ mod scenarios {
     }
 
     struct ReopenedHost {
-        runtime: std::sync::Arc<kuberic_agent::hosting::PodRuntime>,
+        runtime: std::sync::Arc<kuberic_runtime::testing::hosting::PodRuntime>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -967,11 +971,11 @@ mod scenarios {
     }
 
     async fn reopen_planned_host(pod: PgPod, survivor: &PgPod, point: PlannedRestart) {
-        use kuberic_agent::{
+        use kuberic_runtime::protocol::types::{FaultType, OperationId};
+        use kuberic_runtime::testing::effects::RuntimeEffect;
+        use kuberic_runtime::testing::{
             runtime_adapter::RuntimeAdapter, service::AgentService, sqlite_store::SqliteStore,
         };
-        use kuberic_protocol::types::{FaultType, OperationId};
-        use kuberic_runtime_internal::effects::RuntimeEffect;
         use postgres_replicated::testing::{ProcessProbe, allocate_port, find_pg_bin};
         use postgres_replicated::{PgService, PgServiceConfig, data_service::PgDataServiceImpl};
         use std::sync::Arc;
@@ -1124,7 +1128,7 @@ mod scenarios {
             })
             .with_coordination_token(token.into()),
         );
-        let runtime = Arc::new(kuberic_agent::hosting::PodRuntime::new(
+        let runtime = Arc::new(kuberic_runtime::testing::hosting::PodRuntime::new(
             metadata.identity.replica.clone(),
             application.clone(),
             store.clone(),

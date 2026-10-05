@@ -3,25 +3,24 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use crate::{PgService, PgServiceConfig};
-use kuberic_agent::{
+use kuberic_runtime::StatefulServiceReplica;
+use kuberic_runtime::application::OpenMode;
+use kuberic_runtime::protocol::types::{
+    AccessStatus, AgentGeneration, BuildAuthority, ConfigurationDescriptor, ConfigurationMember,
+    EffectivePolicy, Epoch, InitializationId, OperationId, PodUid, ProcessSessionId, PvcUid,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+};
+use kuberic_runtime::replicator::ReplicaInformation;
+use kuberic_runtime::testing::authority::AdmittedAuthority;
+use kuberic_runtime::testing::copy::BuildConfiguration;
+use kuberic_runtime::testing::effects::{RuntimeEffect, RuntimeEffectAction};
+use kuberic_runtime::testing::{
     hosting::PodRuntime,
     runtime_adapter::RuntimeAdapter,
     service::AgentService,
     sqlite_store::SqliteStore,
     state::{AgentState, SCHEMA_VERSION, StorageIdentity},
-    store::AgentStore,
 };
-use kuberic_protocol::types::{
-    AccessStatus, AgentGeneration, BuildAuthority, ConfigurationDescriptor, ConfigurationMember,
-    EffectivePolicy, Epoch, InitializationId, OperationId, PodUid, ProcessSessionId, PvcUid,
-    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
-};
-use kuberic_runtime::StatefulServiceReplica;
-use kuberic_runtime::application::OpenMode;
-use kuberic_runtime::replicator::ReplicaInformation;
-use kuberic_runtime::replicator::copy::BuildConfiguration;
-use kuberic_runtime_internal::authority::AdmittedAuthority;
-use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction};
 use std::sync::Arc;
 
 const NATIVE_TOKEN: &str = "host-local-native-build";
@@ -73,7 +72,7 @@ pub struct PgPod {
     pub identity: ReplicaIdentity,
     pub session: ProcessSessionId,
     agent: AgentService<SqliteStore, PodRuntime>,
-    control_server: Option<tokio::task::JoinHandle<kuberic_agent::Result<()>>>,
+    control_server: Option<tokio::task::JoinHandle<kuberic_runtime::host::Result<()>>>,
     pub root: PathBuf,
     pub endpoint: String,
     server: tokio::task::JoinHandle<()>,
@@ -218,24 +217,11 @@ impl PgPod {
     }
 
     pub async fn dispatch_native(&self, target: &Self, control: std::net::SocketAddr, id: &str) {
-        use kuberic_agent::transport::{
-            GrpcOutboundDispatcher, OutboundDispatcher, QueuedOutbound, ReliableTransport,
-        };
+        use kuberic_runtime::testing::transport::dispatch_build;
         let resolver = Arc::new(NativeRoute {
             identity: target.identity.clone(),
             control,
         });
-        let dispatcher = GrpcOutboundDispatcher::new(
-            self.runtime.clone(),
-            Arc::new(tokio::sync::Mutex::new(
-                ReliableTransport::new(self.session.clone(), 16).unwrap(),
-            )),
-            resolver,
-            "postgres-native-test",
-            NATIVE_TOKEN,
-            std::time::Duration::from_secs(10),
-        )
-        .unwrap();
         self.refresh().await;
         let build = self.effect(RuntimeEffectAction::BuildReplica {
             build_id: OperationId::new(id),
@@ -253,12 +239,21 @@ impl PgPod {
         .await
         .unwrap()
         .unwrap();
-        let kuberic_agent::hosting::OutboundReplication::Build(endpoint) = outbound else {
+        let kuberic_runtime::testing::hosting::OutboundReplication::Build(endpoint) = outbound
+        else {
             panic!("expected custom build");
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(70),
-            dispatcher.dispatch(QueuedOutbound::Build(endpoint)),
+            dispatch_build(
+                &self.runtime,
+                self.session.clone(),
+                resolver,
+                "postgres-native-test",
+                NATIVE_TOKEN,
+                std::time::Duration::from_secs(10),
+                endpoint,
+            ),
         )
         .await
         .unwrap()
@@ -266,7 +261,7 @@ impl PgPod {
         build.await.unwrap();
     }
 
-    pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_agent::Result<()> {
+    pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_runtime::host::Result<()> {
         let sequence = self.store.load_state().await?.next_effect_sequence;
         self.effect_as(
             OperationId::new(format!("native-effect-{sequence}")),
@@ -279,7 +274,7 @@ impl PgPod {
         &self,
         operation_id: OperationId,
         action: RuntimeEffectAction,
-    ) -> kuberic_agent::Result<()> {
+    ) -> kuberic_runtime::host::Result<()> {
         let sequence = self.store.load_state().await?.next_effect_sequence;
         RuntimeAdapter::new(self.store.clone(), self.runtime.clone())
             .execute(RuntimeEffect {
@@ -386,7 +381,7 @@ impl PgPod {
             other.endpoint.clone(),
         );
         description.process_session_id = other.session.clone();
-        kuberic_agent::testing::describe_peer(&self.runtime, description)
+        kuberic_runtime::testing::describe_peer(&self.runtime, description)
             .await
             .unwrap();
     }
@@ -412,7 +407,7 @@ impl PgPod {
         }
         target
             .store
-            .journal_build(&kuberic_protocol::command::EnsureReplicaBuild {
+            .journal_build(&kuberic_runtime::protocol::command::EnsureReplicaBuild {
                 operation_id: authority.build_id.clone(),
                 local_replica_id: target.identity.replica_id,
                 expected_instance_id: target.identity.instance_id.clone(),
@@ -440,7 +435,7 @@ impl PgPod {
     ) -> kuberic_runtime::Result<()> {
         tokio::time::timeout(
             std::time::Duration::from_secs(70),
-            kuberic_agent::testing::execute_build(
+            kuberic_runtime::testing::execute_build(
                 &self.runtime,
                 ReplicaInformation::new(
                     authority.build_id.clone(),
@@ -477,8 +472,10 @@ impl PgPod {
         (pod, address)
     }
 
-    pub async fn status(&self) -> kuberic_agent::Result<kuberic_wire::proto::AgentStatusReport> {
-        kuberic_agent::report::AgentReporter::new(self.store.clone())
+    pub async fn status(
+        &self,
+    ) -> kuberic_runtime::host::Result<kuberic_runtime::control::proto::AgentStatusReport> {
+        kuberic_runtime::testing::report::AgentReporter::new(self.store.clone())
             .report(&self.runtime)
             .await
     }
@@ -574,7 +571,7 @@ struct NativeRoute {
     control: std::net::SocketAddr,
 }
 
-impl kuberic_agent::transport::ReplicaEndpointResolver for NativeRoute {
+impl kuberic_runtime::host::ReplicaEndpointResolver for NativeRoute {
     fn control_endpoint(&self, identity: &ReplicaIdentity) -> String {
         if identity == &self.identity {
             format!("http://{}", self.control)

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use kuberic_protocol::types::AccessStatus;
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::AccessStatus;
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use postgres_replicated::{
     build::{PgBuildMethod, PgBuildStage, PgLineage, decode, encode},
     native::PgNativeObserver,
@@ -46,7 +46,7 @@ async fn former_primary_rejoins_by_rewind_or_explicit_fresh_fallback() {
             .await;
         successor
             .effect(RuntimeEffectAction::ChangeRole(
-                kuberic_protocol::types::ReplicaRole::Primary,
+                kuberic_runtime::protocol::types::ReplicaRole::Primary,
             ))
             .await
             .unwrap();
@@ -86,7 +86,7 @@ async fn agent_dispatch_admits_and_builds_through_exact_native_route() {
         .application
         .native_driver()
         .build_replica(kuberic_runtime::replicator::ReplicaInformation::new(
-            kuberic_protocol::types::OperationId::new("wire-native"),
+            kuberic_runtime::protocol::types::OperationId::new("wire-native"),
             target.identity.clone(),
             String::new(),
         ))
@@ -196,7 +196,7 @@ async fn delayed_completion_cannot_publish_after_target_session_replacement() {
     source
         .effect(RuntimeEffectAction::RegisterPeerSession {
             identity: target.identity.clone(),
-            session: kuberic_protocol::types::ProcessSessionId::new("replacement-process"),
+            session: kuberic_runtime::protocol::types::ProcessSessionId::new("replacement-process"),
         })
         .await
         .unwrap();
@@ -364,9 +364,9 @@ async fn real_receive_and_flush_without_replay_do_not_complete_frozen_boundary()
     let authority = source
         .runtime
         .authorize_build(
-            kuberic_protocol::types::OperationId::new("frozen"),
+            kuberic_runtime::protocol::types::OperationId::new("frozen"),
             target.identity.clone(),
-            kuberic_runtime::replicator::copy::BuildConfiguration::Current,
+            kuberic_runtime::testing::copy::BuildConfiguration::Current,
         )
         .await
         .unwrap();
@@ -514,7 +514,7 @@ async fn all_wait_cancellation_reconciles_committed_metadata_without_permanent_f
         source.refresh().await;
         assert_ne!(
             source.runtime.partition_report().await.reported_fault,
-            Some(kuberic_protocol::types::FaultType::Permanent)
+            Some(kuberic_runtime::protocol::types::FaultType::Permanent)
         );
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -528,7 +528,7 @@ async fn all_wait_cancellation_reconciles_committed_metadata_without_permanent_f
 
 #[tokio::test]
 async fn more_than_sixteen_terminal_builds_reclaim_capacity_and_slots_across_reopen() {
-    use kuberic_protocol::types::OperationId;
+    use kuberic_runtime::protocol::types::OperationId;
     use kuberic_runtime::replicator::ReplicaInformation;
     let root = TestDataDir::new("many-builds");
     let mut source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
@@ -553,7 +553,7 @@ async fn more_than_sixteen_terminal_builds_reclaim_capacity_and_slots_across_reo
                 );
             }
         } else {
-            let result = kuberic_agent::testing::execute_build(
+            let result = kuberic_runtime::testing::execute_build(
                 &source.runtime,
                 ReplicaInformation::new(
                     authority.build_id.clone(),
@@ -604,7 +604,7 @@ async fn more_than_sixteen_terminal_builds_reclaim_capacity_and_slots_across_reo
     assert!(state.suspended_builds.is_empty());
     assert_eq!(state.retired_builds.len(), 20);
     assert!(
-        kuberic_agent::testing::execute_build(
+        kuberic_runtime::testing::execute_build(
             &source.runtime,
             ReplicaInformation::new(
                 OperationId::new("bounded-0"),
@@ -686,7 +686,6 @@ async fn cancelled_attempt_cannot_publish_after_same_build_retry() {
 
 #[tokio::test]
 async fn completion_is_exact_to_the_selected_build_across_reopen() {
-    use kuberic_runtime_internal::authority::BuildAuthorityStore;
     let root = TestDataDir::new("exact-receipt");
     let source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
     let target = PgPod::new(root.path().join("t"), native_identity(2, "target")).await;
@@ -797,7 +796,7 @@ async fn overlapping_build_authority_cancels_and_rejects_the_old_completion() {
 
 #[tokio::test]
 async fn all_catch_up_requires_every_current_session_and_is_cancellable() {
-    use kuberic_protocol::types::ReplicaRole;
+    use kuberic_runtime::protocol::types::ReplicaRole;
     use kuberic_runtime::replicator::ReplicaSetQuorumMode;
     let root = TestDataDir::new("all-quorum");
     let source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
@@ -969,8 +968,8 @@ async fn all_catch_up_requires_every_current_session_and_is_cancellable() {
 
 #[tokio::test]
 async fn admitted_standby_restart_and_build_retirement_preserve_readable_data() {
-    use kuberic_protocol::types::ReplicaRole;
     use kuberic_runtime::application::OpenMode;
+    use kuberic_runtime::protocol::types::ReplicaRole;
     let root = TestDataDir::new("sf-restart");
     let source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
     let target = PgPod::new(root.path().join("t"), native_identity(2, "target")).await;
@@ -1157,7 +1156,7 @@ async fn fresh_native_build_requires_durable_replay_and_exact_lineage() {
     target.runtime.cancel_configuration_work().await.unwrap();
     target
         .effect(RuntimeEffectAction::ChangeRole(
-            kuberic_protocol::types::ReplicaRole::ActiveSecondary,
+            kuberic_runtime::protocol::types::ReplicaRole::ActiveSecondary,
         ))
         .await
         .unwrap();

@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use kuberic_protocol::types::{
+use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, OperationId, ProcessSessionId, ReplicaIdentity,
     ReplicaRole, SecondaryRemovalStage, SecondaryRemovalWitness, SecondaryScaleDownCleanup,
 };
-use kuberic_runtime_internal::transport::ReplicationAck;
+use crate::transport::ReplicationAck;
 use tokio::sync::oneshot;
 
 use crate::application::Lsn;
@@ -12,7 +12,7 @@ use crate::authority::AdmittedAuthority;
 use crate::{Result, RuntimeError};
 
 #[derive(Debug, Default)]
-pub struct QuorumTracker {
+pub(crate) struct QuorumTracker {
     authority: Option<AdmittedAuthority>,
     progress: BTreeMap<ReplicaIdentity, Lsn>,
     pending: BTreeMap<Lsn, Vec<oneshot::Sender<Result<Lsn>>>>,
@@ -28,7 +28,11 @@ pub struct QuorumTracker {
 }
 
 impl QuorumTracker {
-    pub fn configure(&mut self, authority: AdmittedAuthority, local_progress: Lsn) -> Result<()> {
+    pub(crate) fn configure(
+        &mut self,
+        authority: AdmittedAuthority,
+        local_progress: Lsn,
+    ) -> Result<()> {
         authority.validate()?;
         let same_fence = self.authority.as_ref() == Some(&authority);
         let current_only_completion = self.authority.as_ref().is_some_and(|existing| {
@@ -84,7 +88,7 @@ impl QuorumTracker {
         Ok(())
     }
 
-    pub fn register_peer_session(
+    pub(crate) fn register_peer_session(
         &mut self,
         identity: ReplicaIdentity,
         session: ProcessSessionId,
@@ -130,14 +134,17 @@ impl QuorumTracker {
         Ok(())
     }
 
-    pub fn record_verified_local_progress(&mut self, lsn: Lsn) {
+    pub(crate) fn record_verified_local_progress(&mut self, lsn: Lsn) {
         if let Some(authority) = &self.authority {
             self.verified
                 .insert(authority.local_identity.clone(), (0, lsn));
         }
     }
 
-    pub fn observe_secondary_removal(&mut self, witness: &SecondaryRemovalWitness) -> Result<()> {
+    pub(crate) fn observe_secondary_removal(
+        &mut self,
+        witness: &SecondaryRemovalWitness,
+    ) -> Result<()> {
         if self.witnesses.get(&witness.identity) == Some(witness)
             && !self.live_commits.contains_key(&witness.identity)
         {
@@ -171,7 +178,7 @@ impl QuorumTracker {
             || witness.report_sequence == 0
             || witness.verified_replication_lsn < evidence.preparation.boundary_lsn
             || witness.pending_operation_id.is_some()
-            || witness.write_status == kuberic_protocol::types::AccessStatus::Granted
+            || witness.write_status == crate::protocol::types::AccessStatus::Granted
             || witness.retained_operation_id.as_ref()
                 != Some(&intent.command_operation_id(stage, &witness.identity))
             || self
@@ -211,7 +218,7 @@ impl QuorumTracker {
         witness: &SecondaryRemovalWitness,
         committed: &SecondaryScaleDownCleanup,
     ) -> Result<()> {
-        kuberic_protocol::validation::validate_secondary_scale_down_cleanup(committed)
+        crate::protocol::validation::validate_secondary_scale_down_cleanup(committed)
             .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
         let authority = self
             .authority
@@ -358,7 +365,7 @@ impl QuorumTracker {
         self.observe_committed_secondary_removal(witness)
     }
 
-    pub fn register_write(&mut self, lsn: Lsn) -> Result<oneshot::Receiver<Result<Lsn>>> {
+    pub(crate) fn register_write(&mut self, lsn: Lsn) -> Result<oneshot::Receiver<Result<Lsn>>> {
         if self.authority.is_none() {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -368,7 +375,7 @@ impl QuorumTracker {
         Ok(receiver)
     }
 
-    pub fn record_local_progress(&mut self, lsn: Lsn) -> Result<()> {
+    pub(crate) fn record_local_progress(&mut self, lsn: Lsn) -> Result<()> {
         let authority = self
             .authority
             .as_ref()
@@ -381,7 +388,7 @@ impl QuorumTracker {
         Ok(())
     }
 
-    pub fn record_build_handoff_progress(
+    pub(crate) fn record_build_handoff_progress(
         &mut self,
         identity: ReplicaIdentity,
         lsn: Lsn,
@@ -403,7 +410,7 @@ impl QuorumTracker {
         Ok(())
     }
 
-    pub fn acknowledge(&mut self, acknowledgement: &ReplicationAck) -> Result<()> {
+    pub(crate) fn acknowledge(&mut self, acknowledgement: &ReplicationAck) -> Result<()> {
         let authority = self
             .authority
             .as_ref()
@@ -418,7 +425,7 @@ impl QuorumTracker {
         Ok(())
     }
 
-    pub fn acknowledge_in_session(
+    pub(crate) fn acknowledge_in_session(
         &mut self,
         acknowledgement: &ReplicationAck,
         session: &ProcessSessionId,
@@ -431,35 +438,35 @@ impl QuorumTracker {
         self.acknowledge(acknowledgement)
     }
 
-    pub fn current_configuration_quorum_progress(&self) -> Lsn {
+    pub(crate) fn current_configuration_quorum_progress(&self) -> Lsn {
         self.authority.as_ref().map_or(0, |authority| {
             quorum_progress(&authority.current_configuration, &self.progress)
         })
     }
 
-    pub fn committed_lsn(&self) -> Lsn {
+    pub(crate) fn committed_lsn(&self) -> Lsn {
         self.committed_lsn
     }
 
-    pub fn highest_lsn(&self) -> Lsn {
+    pub(crate) fn highest_lsn(&self) -> Lsn {
         self.highest_lsn
     }
 
-    pub fn catch_up_boundary(&self) -> Option<Lsn> {
+    pub(crate) fn catch_up_boundary(&self) -> Option<Lsn> {
         self.catch_up_boundary
     }
 
-    pub fn fail_pending(&mut self) {
+    pub(crate) fn fail_pending(&mut self) {
         for (_, senders) in std::mem::take(&mut self.pending) {
             for sender in senders {
                 let _ = sender.send(Err(RuntimeError::WriteClosed(
-                    kuberic_protocol::types::AccessStatus::ReconfigurationPending,
+                    crate::protocol::types::AccessStatus::ReconfigurationPending,
                 )));
             }
         }
     }
 
-    pub fn catch_up_complete(&self) -> bool {
+    pub(crate) fn catch_up_complete(&self) -> bool {
         if let Some(authority) = &self.authority
             && let Some(evidence) = &authority.secondary_removal
         {
@@ -502,7 +509,7 @@ impl QuorumTracker {
         })
     }
 
-    pub fn ready_commit_lsn(&self) -> Option<Lsn> {
+    pub(crate) fn ready_commit_lsn(&self) -> Option<Lsn> {
         let authority = self.authority.as_ref()?;
         self.pending
             .keys()
@@ -511,7 +518,7 @@ impl QuorumTracker {
             .max()
     }
 
-    pub fn finalize_commit(&mut self, committed_lsn: Lsn) -> Result<()> {
+    pub(crate) fn finalize_commit(&mut self, committed_lsn: Lsn) -> Result<()> {
         let ready = self.ready_commit_lsn().ok_or_else(|| {
             RuntimeError::Application("no quorum-ready write can be finalized".to_string())
         })?;
@@ -537,7 +544,7 @@ impl QuorumTracker {
         Ok(())
     }
 
-    pub fn restore_committed_lsn(&mut self, committed_lsn: Lsn) {
+    pub(crate) fn restore_committed_lsn(&mut self, committed_lsn: Lsn) {
         let completed = self
             .pending
             .keys()
@@ -555,7 +562,7 @@ impl QuorumTracker {
         self.committed_lsn = self.committed_lsn.max(committed_lsn);
     }
 
-    pub fn reset_progress_after_data_loss(
+    pub(crate) fn reset_progress_after_data_loss(
         &mut self,
         local_identity: ReplicaIdentity,
         current_progress: Lsn,
@@ -659,36 +666,37 @@ fn has_quorum(
         >= configuration.write_quorum as usize
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-#[path = "../../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
-mod removal_fixture;
+#[cfg(all(test, kuberic_workspace_tests))]
+#[path = "quorum_tests.rs"]
+mod scenario_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuberic_protocol::types::{
+    use crate::protocol::types::{
         EffectivePolicy, Epoch, ReplicaId, ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence,
         ScaleUpIntent, ScaleUpStage, ScaleUpWitness, TransitionKind,
     };
+    #[cfg(kuberic_workspace_tests)]
+    use crate::removal_fixture;
 
     fn scale_up_authority() -> (AdmittedAuthority, ReplicaIdentity) {
         let primary = ReplicaIdentity {
             replica_id: ReplicaId::new(1),
-            instance_id: kuberic_protocol::types::ReplicaInstanceId::new("primary"),
-            agent_generation: kuberic_protocol::types::AgentGeneration::new("primary-gen"),
+            instance_id: crate::protocol::types::ReplicaInstanceId::new("primary"),
+            agent_generation: crate::protocol::types::AgentGeneration::new("primary-gen"),
         };
         let target = ReplicaIdentity {
             replica_id: ReplicaId::new(2),
-            instance_id: kuberic_protocol::types::ReplicaInstanceId::new("target"),
-            agent_generation: kuberic_protocol::types::AgentGeneration::new("target-gen"),
+            instance_id: crate::protocol::types::ReplicaInstanceId::new("target"),
+            agent_generation: crate::protocol::types::AgentGeneration::new("target-gen"),
         };
         let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
         let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
         let previous = ConfigurationDescriptor::new(
             Epoch::new(0, 1),
             primary.replica_id,
-            vec![kuberic_protocol::types::ConfigurationMember {
+            vec![crate::protocol::types::ConfigurationMember {
                 identity: primary.clone(),
                 role: ReplicaRole::Primary,
             }],
@@ -698,11 +706,11 @@ mod tests {
             Epoch::new(0, 2),
             primary.replica_id,
             vec![
-                kuberic_protocol::types::ConfigurationMember {
+                crate::protocol::types::ConfigurationMember {
                     identity: primary.clone(),
                     role: ReplicaRole::Primary,
                 },
-                kuberic_protocol::types::ConfigurationMember {
+                crate::protocol::types::ConfigurationMember {
                     identity: target.clone(),
                     role: ReplicaRole::ActiveSecondary,
                 },
@@ -711,7 +719,7 @@ mod tests {
         );
         let mut intent = ScaleUpIntent {
             operation_id: OperationId::default(),
-            resource_uid: kuberic_protocol::types::ResourceUid::new("set"),
+            resource_uid: crate::protocol::types::ResourceUid::new("set"),
             spec_generation: 2,
             desired_replicas: 2,
             previous_configuration: previous.clone(),
@@ -771,10 +779,8 @@ mod tests {
         let identities = (1..=5)
             .map(|id| ReplicaIdentity {
                 replica_id: ReplicaId::new(id),
-                instance_id: kuberic_protocol::types::ReplicaInstanceId::new(format!("pod-{id}")),
-                agent_generation: kuberic_protocol::types::AgentGeneration::new(format!(
-                    "gen-{id}"
-                )),
+                instance_id: crate::protocol::types::ReplicaInstanceId::new(format!("pod-{id}")),
+                agent_generation: crate::protocol::types::AgentGeneration::new(format!("gen-{id}")),
             })
             .collect::<Vec<_>>();
         let previous_policy = EffectivePolicy::fixed(4, 30).unwrap();
@@ -786,7 +792,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(
-                    |(index, identity)| kuberic_protocol::types::ConfigurationMember {
+                    |(index, identity)| crate::protocol::types::ConfigurationMember {
                         identity: identity.clone(),
                         role: if index == 0 {
                             ReplicaRole::Primary
@@ -805,7 +811,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(
-                    |(index, identity)| kuberic_protocol::types::ConfigurationMember {
+                    |(index, identity)| crate::protocol::types::ConfigurationMember {
                         identity: identity.clone(),
                         role: if index == 0 {
                             ReplicaRole::Primary
@@ -819,7 +825,7 @@ mod tests {
         );
         let mut intent = ScaleUpIntent {
             operation_id: OperationId::default(),
-            resource_uid: kuberic_protocol::types::ResourceUid::new("set"),
+            resource_uid: crate::protocol::types::ResourceUid::new("set"),
             spec_generation: 2,
             desired_replicas: 5,
             previous_configuration: previous.clone(),
@@ -863,7 +869,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(
-                    |(index, identity)| kuberic_protocol::types::ConfigurationMember {
+                    |(index, identity)| crate::protocol::types::ConfigurationMember {
                         identity: identity.clone(),
                         role: if index == 1 {
                             ReplicaRole::Primary
@@ -917,6 +923,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(kuberic_workspace_tests)]
     fn late_member_uses_live_committed_primary_progress_not_a_transition_certificate() {
         let intent = removal_fixture::intent(&[1, 2, 3, 4], 1);
         let committed = removal_fixture::cleanup(&intent);
@@ -963,7 +970,7 @@ mod tests {
                         .process_session_id
                         .clone()
                 }
-                1 => invalid.resource_uid = kuberic_protocol::types::ResourceUid::new("other"),
+                1 => invalid.resource_uid = crate::protocol::types::ResourceUid::new("other"),
                 2 => invalid.identity = intent.target.clone(),
                 3 => invalid.epoch.configuration_number += 1,
                 4 => {
@@ -986,7 +993,7 @@ mod tests {
         }
         let mut joint = authority;
         joint.previous_configuration = Some(intent.previous_configuration.clone());
-        joint.transition_kind = Some(kuberic_protocol::types::TransitionKind::SecondaryScaleDown);
+        joint.transition_kind = Some(crate::protocol::types::TransitionKind::SecondaryScaleDown);
         let mut precommit = QuorumTracker::default();
         precommit.configure(joint, 10).unwrap();
         precommit
@@ -1032,6 +1039,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(kuberic_workspace_tests)]
     fn committed_witness_cannot_revive_obsolete_credit_after_session_change() {
         let intent = removal_fixture::intent(&[1, 2, 3], 1);
         let authority = AdmittedAuthority {
@@ -1080,18 +1088,18 @@ mod tests {
             match mutation {
                 0 => {
                     wrong.identity.agent_generation =
-                        kuberic_protocol::types::AgentGeneration::new("substitute")
+                        crate::protocol::types::AgentGeneration::new("substitute")
                 }
                 1 => {
                     wrong.current_configuration_id =
-                        kuberic_protocol::types::ConfigurationId::new("other")
+                        crate::protocol::types::ConfigurationId::new("other")
                 }
                 2 => {
                     wrong.previous_configuration_id =
                         Some(intent.previous_configuration.configuration_id.clone())
                 }
                 3 => wrong.verified_replication_lsn = 9,
-                4 => wrong.resource_uid = kuberic_protocol::types::ResourceUid::new("other"),
+                4 => wrong.resource_uid = crate::protocol::types::ResourceUid::new("other"),
                 _ => wrong.epoch.configuration_number += 1,
             }
             assert!(tracker.observe_secondary_removal(&wrong).is_err());

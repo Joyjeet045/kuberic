@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret, Service};
-use kuberic_protocol::observation::ReplicaObservationKey;
-use kuberic_protocol::types::{ReplicaCleanupIdentity, ReplicaIdentity};
-use kuberic_wire::proto;
+use kuberic_runtime::control::proto;
+use kuberic_runtime::protocol::observation::ReplicaObservationKey;
+use kuberic_runtime::protocol::types::{ReplicaCleanupIdentity, ReplicaIdentity};
 
 use crate::crd::KubericSet;
 

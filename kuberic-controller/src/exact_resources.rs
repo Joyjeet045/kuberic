@@ -1,9 +1,9 @@
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 use kube::{Resource, ResourceExt};
-use kuberic_protocol::observation::{
+use kuberic_runtime::protocol::observation::{
     ExactResourceObservation, ReplicaObservationKey, SecondaryScaleDownResourceObservation,
 };
-use kuberic_protocol::types::{
+use kuberic_runtime::protocol::types::{
     CleanupResourceIdentity, Epoch, OperationId, PodUid, PvcUid, ReplicaCleanupIdentity, ReplicaId,
     ReplicaIdentity, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
     derive_replica_endpoint_name,
@@ -148,7 +148,7 @@ fn push_request(
 }
 
 fn scale_up_transition_target(
-    transition: &kuberic_protocol::types::TransitionIntent,
+    transition: &kuberic_runtime::protocol::types::TransitionIntent,
 ) -> Option<&ReplicaIdentity> {
     transition
         .scale_up
@@ -195,7 +195,7 @@ fn scale_up_lifecycle_target(raw: &RawObservation, target: &ReplicaIdentity) -> 
 
 fn scale_up_allocation_identity(
     raw: &RawObservation,
-    allocation: &kuberic_protocol::types::ScaleUpAllocation,
+    allocation: &kuberic_runtime::protocol::types::ScaleUpAllocation,
 ) -> ReplicaCleanupIdentity {
     let pod_name = format!(
         "{}-{}",
@@ -257,7 +257,7 @@ fn scale_up_candidate_identity(
 }
 
 fn replacement_candidate(raw: &RawObservation, target: &ReplicaIdentity, epoch: Epoch) -> bool {
-    use kuberic_wire::proto;
+    use kuberic_runtime::control::proto;
     if !raw
         .pods
         .iter()

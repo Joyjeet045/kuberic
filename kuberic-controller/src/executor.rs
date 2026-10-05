@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use kuberic_protocol::command::{KubernetesChange, SafetyChange};
-use kuberic_protocol::observation::ObservationSnapshot;
-use kuberic_protocol::plan::Plan;
+use crate::plan::Plan;
+use kuberic_runtime::protocol::command::{KubernetesChange, SafetyChange};
+use kuberic_runtime::protocol::observation::ObservationSnapshot;
 
 use crate::Result;
 use crate::cluster_api::ClusterApi;
@@ -154,7 +154,7 @@ async fn persist_if_changed(
     api: &dyn ClusterApi,
     observation: &RawObservation,
     snapshot: &ObservationSnapshot,
-    status: &kuberic_protocol::types::AcceptedStatus,
+    status: &kuberic_runtime::protocol::types::AcceptedStatus,
 ) -> Result<()> {
     if &snapshot.status != status {
         api.replace_status(observation, status).await?;

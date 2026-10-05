@@ -24,12 +24,15 @@ The historical rationale and protocol design remain in the
 
 | Component | Responsibility |
 |---|---|
-| `kuberic-protocol` | Canonical identities, epochs, PC/CC configurations, validation, commands, normalized observations, and pure evaluation |
-| `kuberic-wire` | Exact-version protobuf and tonic contracts for controller, peer, copy, and replication traffic |
-| `kuberic-runtime` | Application interfaces plus hidden, separately registered default-engine lifecycle proofs and replication/copy data plane |
-| `kuberic-agent` | One lifecycle owner for every primary implementation: durable local authority, sessions, access, builds, removal, retirement, callback fencing, listeners, and restart reconstruction |
-| `kuberic-controller` | Kubernetes observation, normalization, pure-plan execution, routing fences, resource convergence, and bounded re-observation |
-| `kvstore2` | Small HTTP key-value conformance application for the independent stack |
+| `kuberic-runtime` | Application/replicator interfaces, shared `protocol`/`control` contracts, replica hosting, private durable authority/effects and lifecycle proofs, and replication/copy data plane |
+| `kuberic-controller` | CRDs, pure evaluator and plan APIs, Kubernetes observation/normalization, routing fences, resource convergence, command execution, and bounded re-observation |
+| `kvstore2` | Unpublished HTTP key-value conformance application |
+
+These are exactly two public production crates. DEX, all examples (including the
+SQL Server observer), and level tests are separate unpublished workspace packages.
+Runtime host support is enabled by default; the controller disables runtime
+default features. Isolated testing support is an opt-in runtime feature. The
+unpublished SQLite example owns its private WAL commit-barrier implementation.
 
 The controller is the Failover Manager-equivalent owner. The agent and its
 coordinator own Replica Agent-equivalent local reconfiguration. `ReplicaHost`
@@ -704,7 +707,8 @@ no rolling upgrade or existing-data migration is provided.
 
 Crash injection is test-only. `KUBERIC_CRASH_WRITER_PATH` and
 `KUBERIC_CRASH_BOUNDARY` are consumed only by the
-`kuberic-agent` crash-boundary test executable. Production binaries expose no
+`kuberic-runtime` unit-test executable's `host::tests::crash_boundaries` module.
+Production binaries expose no
 fault-injection switch.
 
 ## Local Deployment
@@ -993,7 +997,7 @@ Run the API inventory and the generated-schema/status regressions with Cargo:
 ```bash
 cargo test -p kuberic-runtime --test public_api_inventory
 cargo test -p kuberic-controller --lib
-cargo test -p kuberic-protocol --lib representative_scale_up_status_variants
+cargo test -p kuberic-runtime --lib representative_scale_up_status_variants
 ```
 
 Classic v1 source and operational guidance have been removed. SQLite and

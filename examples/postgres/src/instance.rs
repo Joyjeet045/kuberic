@@ -33,13 +33,13 @@ pub enum PgProcessState {
 
 #[derive(Clone)]
 struct StartParameters {
-    fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>,
+    fault_tx: mpsc::Sender<kuberic_runtime::protocol::types::FaultType>,
     cancellation: Option<(Weak<PgInstanceManager>, CancellationToken)>,
 }
 
 pub(crate) struct GenerationFault {
     generation: u64,
-    fault: kuberic_protocol::types::FaultType,
+    fault: kuberic_runtime::protocol::types::FaultType,
 }
 
 #[derive(Clone)]
@@ -476,7 +476,7 @@ impl PgInstanceManager {
         report: F,
     ) -> kuberic_runtime::RuntimeError
     where
-        F: Fn(kuberic_protocol::types::FaultType, PgError) -> Fut,
+        F: Fn(kuberic_runtime::protocol::types::FaultType, PgError) -> Fut,
         Fut: Future<Output = kuberic_runtime::RuntimeError>,
     {
         #[cfg(feature = "testing")]
@@ -642,7 +642,7 @@ impl PgInstanceManager {
 
     pub async fn start_native(
         &self,
-        fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>,
+        fault_tx: mpsc::Sender<kuberic_runtime::protocol::types::FaultType>,
     ) -> Result<(), PgError> {
         self.start_with_parameters(StartParameters {
             fault_tx,
@@ -653,7 +653,7 @@ impl PgInstanceManager {
 
     fn fault_reporter(
         &self,
-        fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>,
+        fault_tx: mpsc::Sender<kuberic_runtime::protocol::types::FaultType>,
         generation: &Arc<ProcessGeneration>,
     ) -> Arc<dyn Fn(PgProcessFault) + Send + Sync> {
         let current = Arc::downgrade(&self.current);
@@ -661,8 +661,8 @@ impl PgInstanceManager {
         let generation = Arc::downgrade(generation);
         Arc::new(move |fault| {
             let fault = match fault {
-                PgProcessFault::Transient => kuberic_protocol::types::FaultType::Transient,
-                PgProcessFault::Permanent => kuberic_protocol::types::FaultType::Permanent,
+                PgProcessFault::Transient => kuberic_runtime::protocol::types::FaultType::Transient,
+                PgProcessFault::Permanent => kuberic_runtime::protocol::types::FaultType::Permanent,
             };
             if let (Some(current), Some(generation)) = (current.upgrade(), generation.upgrade())
                 && Arc::ptr_eq(&current.lock().unwrap(), &generation)
@@ -702,7 +702,7 @@ impl PgInstanceManager {
 
     pub async fn start_native_with_cancellation(
         self: &Arc<Self>,
-        fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>,
+        fault_tx: mpsc::Sender<kuberic_runtime::protocol::types::FaultType>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<(), PgError> {
         self.start_with_parameters(StartParameters {
@@ -861,8 +861,8 @@ impl PgInstanceManager {
         .await;
         if let Err(error) = prepared {
             fault_reporter(match error.fault_type() {
-                kuberic_protocol::types::FaultType::Transient => PgProcessFault::Transient,
-                kuberic_protocol::types::FaultType::Permanent => PgProcessFault::Permanent,
+                kuberic_runtime::protocol::types::FaultType::Transient => PgProcessFault::Transient,
+                kuberic_runtime::protocol::types::FaultType::Permanent => PgProcessFault::Permanent,
             });
             *generation.state.lock().unwrap() = PgProcessState::Faulted;
             return Err(error.with_generation(generation.id));
@@ -1536,14 +1536,14 @@ impl PgError {
         }
     }
 
-    pub fn fault_type(&self) -> kuberic_protocol::types::FaultType {
+    pub fn fault_type(&self) -> kuberic_runtime::protocol::types::FaultType {
         match self {
             Self::Generation { source, .. } => source.fault_type(),
             Self::Connection(_) | Self::Query(_) | Self::Timeout(_) => {
-                kuberic_protocol::types::FaultType::Transient
+                kuberic_runtime::protocol::types::FaultType::Transient
             }
             Self::Process(_) | Self::Configuration(_) | Self::GenerationExhausted(_) => {
-                kuberic_protocol::types::FaultType::Permanent
+                kuberic_runtime::protocol::types::FaultType::Permanent
             }
         }
     }

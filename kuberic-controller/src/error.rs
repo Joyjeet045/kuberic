@@ -1,0 +1,19 @@
+use thiserror::Error;
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ControllerError {
+    #[error("observation failed: {0}")]
+    Observation(String),
+    #[error("transient observation failed: {0}")]
+    TransientObservation(String),
+    #[error("observed Kubernetes object changed; a fresh observation is required")]
+    ObservationStale,
+    #[error("agent is unavailable: {0}")]
+    AgentUnavailable(String),
+    #[error("agent returned invalid evidence: {0}")]
+    InvalidAgentEvidence(String),
+    #[error("effect failed: {0}")]
+    Effect(String),
+}
+
+pub type Result<T> = std::result::Result<T, ControllerError>;

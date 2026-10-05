@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use quote::ToTokens;
 use syn::{Attribute, Fields, ImplItem, Item, ItemMod, Meta, TraitItem, Visibility, parse_file};
 
-const ALLOWLIST: &str = include_str!("../../scripts/runtime_source_public_api.allowlist");
+const ALLOWLIST: &str = include_str!("source_public_api.allowlist");
+const CONTROL_ALLOWLIST: &str = include_str!("control_source_public_api.allowlist");
 
 #[test]
 fn application_replication_api_has_no_parallel_driver_or_admission_surface() {
@@ -40,21 +41,127 @@ fn source_public_api_matches_reviewed_inventory() {
     inventory.dedup();
     let actual = format!("{}\n", inventory.join("\n"));
 
-    let allowlist_path = manifest_dir
-        .parent()
-        .expect("workspace root")
-        .join("scripts/runtime_source_public_api.allowlist");
-    if std::env::var_os("UPDATE_RUNTIME_SOURCE_API").is_some() {
-        fs::write(&allowlist_path, &actual).expect("write source API allowlist");
+    let control_allowlist_path = manifest_dir.join("tests/control_source_public_api.allowlist");
+    if std::env::var_os("UPDATE_RUNTIME_CONTROL_SOURCE_API").is_some() {
+        let control_inventory = inventory
+            .iter()
+            .filter(|entry| is_control_api_entry(entry))
+            .cloned()
+            .collect::<Vec<_>>();
+        fs::write(
+            &control_allowlist_path,
+            format!("{}\n", control_inventory.join("\n")),
+        )
+        .expect("write control source API allowlist");
         return;
     }
 
+    let allowlist_path = manifest_dir.join("tests/source_public_api.allowlist");
+    if std::env::var_os("UPDATE_RUNTIME_SOURCE_API").is_some() {
+        let application_inventory = inventory
+            .iter()
+            .filter(|entry| !is_control_api_entry(entry))
+            .cloned()
+            .collect::<Vec<_>>();
+        fs::write(
+            &allowlist_path,
+            format!("{}\n", application_inventory.join("\n")),
+        )
+        .expect("write source API allowlist");
+        return;
+    }
+
+    let mut expected = ALLOWLIST
+        .lines()
+        .chain(CONTROL_ALLOWLIST.lines())
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    expected.dedup();
+    let expected = format!("{}\n", expected.join("\n"));
+
     assert_eq!(
-        actual, ALLOWLIST,
+        actual, expected,
         "kuberic-runtime source-public API changed; review the diff and, if intentional, run \
          UPDATE_RUNTIME_SOURCE_API=1 cargo test -p kuberic-runtime \
-         --test public_api_inventory"
+         --test public_api_inventory (or UPDATE_RUNTIME_CONTROL_SOURCE_API=1 for \
+         the protocol and control modules)"
     );
+}
+
+fn is_control_api_entry(entry: &str) -> bool {
+    let owner = entry.split_whitespace().nth(3).expect("API entry owner");
+    owner == "crate::control"
+        || owner.starts_with("crate::control::")
+        || owner == "crate::protocol"
+        || owner.starts_with("crate::protocol::")
+}
+
+#[test]
+fn host_capabilities_are_not_source_public_even_when_doc_hidden() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let mut inventory = Vec::new();
+    inventory_file("crate", &source, true, false, &mut inventory);
+    for entry in inventory
+        .iter()
+        .filter(|entry| entry.starts_with("public-path"))
+    {
+        for forbidden in [
+            "crate::authority",
+            "crate::capabilities",
+            "crate::effects",
+            "crate::receipts",
+            "crate::runtime",
+            "crate::transport",
+            "crate::internal",
+            "crate::sqlite",
+            "crate::host::command",
+            "crate::host::coordinator",
+            "crate::host::hosting",
+            "crate::host::provisioning",
+            "crate::host::recovery",
+            "crate::host::report",
+            "crate::host::runtime_adapter",
+            "crate::host::service",
+            "crate::host::session",
+            "crate::host::sqlite_store",
+            "crate::host::state",
+            "crate::host::store",
+            "crate::host::testing",
+            "crate::replicator::copy",
+            "crate::replicator::quorum",
+            "crate::replicator::sender",
+            "RuntimeHostToken",
+            "ReplicatorCreationIdentity",
+            "ReplicatorCreationReservation",
+            "ReplicatorAttachment",
+            "DefaultReplicatorDependencies",
+            "ManagedReplicator",
+            "ManagedFenceGuard",
+            "PartitionAccessView",
+            "ReplicatorRegistration",
+            "crate::replicator::ReplicatorFactoryContext::fn new",
+            "crate::replicator::StatefulServicePartition::fn new",
+            "crate::replicator::ReplicatorInterfaces::fn testing_",
+        ] {
+            assert!(
+                !entry.contains(forbidden),
+                "host capability leaked: {entry}"
+            );
+        }
+    }
+}
+
+#[test]
+fn control_inventory_tracks_ownership_not_referenced_types() {
+    assert!(is_control_api_entry(
+        "public-path documented module crate::control",
+    ));
+    assert!(is_control_api_entry(
+        "public-path documented field crate::protocol::types::Epoch::data_loss_number: i64",
+    ));
+    assert!(!is_control_api_entry(
+        "public-path documented field crate::application::OpenContext::epoch: crate::protocol::types::Epoch",
+    ));
 }
 
 fn inventory_file(

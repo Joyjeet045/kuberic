@@ -1,7 +1,7 @@
-use kuberic_protocol::types::{AccessStatus, FaultType, OperationId, ReplicaRole};
 use kuberic_runtime::engine::DurableState;
-use kuberic_runtime_internal::authority::{LocalWriteJournal, LocalWritePhase};
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::{AccessStatus, FaultType, OperationId, ReplicaRole};
+use kuberic_runtime::testing::authority::LocalWritePhase;
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use sqlite_replicated::proto::sqlite_store_server::SqliteStore as _;
 use sqlite_replicated::state::PersistenceFault;
 use sqlite_replicated::testing::{SqlitePod, scratch};
@@ -65,7 +65,7 @@ async fn waiting_without_durable_quorum_cannot_publish_sqlite_commit_bytes() {
             .await
     });
     let item = first.runtime.data_plane().next_outbound().await.unwrap();
-    let kuberic_agent::hosting::OutboundReplication::Replication(item) = item else {
+    let kuberic_runtime::testing::hosting::OutboundReplication::Replication(item) = item else {
         panic!("expected WAL replication")
     };
     assert_eq!(item.lsn, 2);

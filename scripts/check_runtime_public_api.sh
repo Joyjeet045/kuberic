@@ -29,18 +29,21 @@ if cargo check --manifest-path "$fixture/Cargo.toml" --quiet >"$fixture_output" 
     exit 1
 fi
 
-if ! grep -q 'method `prepare_attachment` is private' "$fixture_output" ||
-    ! grep -q 'cannot construct `ReplicatorInterfaces` with struct literal syntax due to private fields' "$fixture_output" ||
-    ! grep -q 'cannot construct `kuberic_runtime::replicator::ReplicatorAttachment` with struct literal syntax due to private fields' "$fixture_output" ||
-    ! grep -q 'RuntimeHostToken: Default' "$fixture_output" ||
-    ! grep -q 'method `disarm` is private' "$fixture_output" ||
-    ! grep -q 'field `default_dependencies` of struct `ReplicatorFactoryContext` is private' "$fixture_output" ||
-    ! grep -q 'module `authority` is private' "$fixture_output"; then
-    cat "$fixture_output" >&2
-    echo "The external fixture failed for an unexpected reason." >&2
-    exit 1
-fi
+for expected in \
+    'struct `ReplicatorAttachment` is private' \
+    'struct `ReplicatorCreationReservation` is private' \
+    'trait `ReplicatorRegistration` is private' \
+    'module `authority` is private'; do
+    if ! grep -Fq "$expected" "$fixture_output"; then
+        cat "$fixture_output" >&2
+        echo "The external fixture failed for an unexpected reason: $expected" >&2
+        exit 1
+    fi
+done
 
-cargo test -p kuberic-runtime --test public_api_inventory --quiet
+cargo test -p kuberic-runtime --all-features \
+    --test public_api_inventory --quiet
+cargo test -p kuberic-runtime --all-features \
+    --test public_api_privacy --quiet -- --ignored
 
 echo "kuberic-runtime documented and source-public APIs match their allowlists; tested private-capability extraction, forging, attachment, guard, authority, and host-construction paths are unreachable from safe application code."

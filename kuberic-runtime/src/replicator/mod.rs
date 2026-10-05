@@ -1,27 +1,27 @@
-#[doc(hidden)]
-pub mod copy;
+pub(crate) mod copy;
 mod queue;
-#[doc(hidden)]
-pub mod quorum;
-#[doc(hidden)]
-pub mod sender;
+pub(crate) mod quorum;
+pub(crate) mod sender;
 pub mod stream;
 
 pub(crate) mod log;
 
+#[cfg(test)]
+mod capability_tests;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
-use async_trait::async_trait;
-use kuberic_protocol::types::{
+use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
+use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
     PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
 };
-use kuberic_runtime_internal::receipts::{
+use crate::receipts::{
     AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
     NativeTopologyStatus, TopologyReceipt,
 };
-use kuberic_runtime_internal::{ReplicatorCreationIdentity, RuntimeHostToken};
+use async_trait::async_trait;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
@@ -31,12 +31,12 @@ use crate::authority::{
 };
 use crate::effects::{RuntimeEffectAction, RuntimeSnapshot};
 use crate::engine::DurableState;
-use crate::internal::{DefaultReplicatorInner, PendingReplication, PendingWrite};
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
+#[cfg(all(test, kuberic_workspace_tests))]
+use crate::runtime::PendingWrite;
+use crate::runtime::{DefaultReplicatorInner, PendingReplication};
+use crate::transport::{CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem};
 use crate::{Result, RuntimeError};
-use kuberic_runtime_internal::transport::{
-    CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem,
-};
 use stream::{OperationStream, ServiceStreams};
 
 /// IFabricReplicator, with COM Begin/End pairs collapsed to async calls.
@@ -80,7 +80,7 @@ pub trait StateReplicator: Send + Sync {
 
 #[async_trait]
 #[doc(hidden)]
-pub trait ManagedReplicatorLifecycle: Send + Sync {
+pub(crate) trait ManagedReplicatorLifecycle: Send + Sync {
     async fn fence_writes(&self) -> Result<()>;
     async fn settle_primary_prefix(&self) -> Result<CertifiedPrefixReceipt>;
     async fn cancel_configuration_work(&self) -> Result<()>;
@@ -119,7 +119,7 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
 }
 
 #[doc(hidden)]
-pub struct ManagedFenceGuard {
+pub(crate) struct ManagedFenceGuard {
     _delivery: OwnedMutexGuard<()>,
     progress: NativeProgressStatus,
 }
@@ -132,17 +132,17 @@ impl ManagedFenceGuard {
         }
     }
 
-    pub fn progress(&self) -> &NativeProgressStatus {
+    pub(crate) fn progress(&self) -> &NativeProgressStatus {
         &self.progress
     }
 }
 
 #[async_trait]
 #[doc(hidden)]
-pub trait ManagedReplicatorDataPlane: Send + Sync {
+pub(crate) trait ManagedReplicatorDataPlane: Send + Sync {
     async fn next_outbound_item(&self) -> Option<OutboundOperation>;
-    async fn recover_pending_writes(&self) -> Result<()>;
     async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()>;
+    #[cfg(all(test, kuberic_workspace_tests))]
     async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite>;
     async fn observe_acknowledgement(
         &self,
@@ -299,7 +299,7 @@ impl Drop for ReplicatorCreation {
 }
 
 #[doc(hidden)]
-pub struct ReplicatorAttachment {
+pub(crate) struct ReplicatorAttachment {
     creation: Arc<ReplicatorCreation>,
     replicator: Arc<dyn Replicator>,
     primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
@@ -307,7 +307,7 @@ pub struct ReplicatorAttachment {
 
 #[doc(hidden)]
 impl ReplicatorAttachment {
-    pub fn identity(&self, _token: RuntimeHostToken) -> ReplicatorCreationIdentity {
+    pub(crate) fn identity(&self, _token: RuntimeHostToken) -> ReplicatorCreationIdentity {
         *self
             .creation
             .identity
@@ -315,7 +315,7 @@ impl ReplicatorAttachment {
             .expect("replicator attachment identity is bound")
     }
 
-    pub fn managed_lifecycle(
+    pub(crate) fn managed_lifecycle(
         &self,
         _token: RuntimeHostToken,
     ) -> Option<Arc<dyn ManagedReplicatorLifecycle>> {
@@ -325,7 +325,7 @@ impl ReplicatorAttachment {
             .map(|managed| managed.lifecycle.clone())
     }
 
-    pub fn managed_data_plane(
+    pub(crate) fn managed_data_plane(
         &self,
         _token: RuntimeHostToken,
     ) -> Option<Arc<dyn ManagedReplicatorDataPlane>> {
@@ -335,11 +335,11 @@ impl ReplicatorAttachment {
             .map(|managed| managed.data_plane.clone())
     }
 
-    pub fn replicator(&self, _token: RuntimeHostToken) -> Arc<dyn Replicator> {
+    pub(crate) fn replicator(&self, _token: RuntimeHostToken) -> Arc<dyn Replicator> {
         self.replicator.clone()
     }
 
-    pub fn primary_replicator(
+    pub(crate) fn primary_replicator(
         &self,
         _token: RuntimeHostToken,
     ) -> Option<Arc<dyn PrimaryReplicator>> {
@@ -350,8 +350,8 @@ impl ReplicatorAttachment {
         self.creation.armed.store(false, Ordering::Release);
     }
 
-    #[cfg(feature = "testing")]
-    pub fn testing_disarm(&self, _token: RuntimeHostToken) {
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn testing_disarm(&self, _token: RuntimeHostToken) {
         self.disarm();
     }
 }
@@ -418,9 +418,9 @@ impl ReplicatorInterfaces {
         }
     }
 
-    #[cfg(feature = "testing")]
+    #[cfg(all(test, feature = "testing"))]
     #[doc(hidden)]
-    pub fn testing_managed_primary<T, M>(
+    pub(crate) fn testing_managed_primary<T, M>(
         _token: RuntimeHostToken,
         identity: ReplicatorCreationIdentity,
         primary_replicator: Arc<T>,
@@ -480,9 +480,9 @@ impl ReplicatorInterfaces {
         })
     }
 
-    #[cfg(feature = "testing")]
+    #[cfg(all(test, feature = "testing"))]
     #[doc(hidden)]
-    pub fn testing_prepare_attachment(
+    pub(crate) fn testing_prepare_attachment(
         &self,
         _token: RuntimeHostToken,
         reservation: ReplicatorCreationReservation,
@@ -501,7 +501,7 @@ pub struct ReplicatorFactoryContext {
 
 impl ReplicatorFactoryContext {
     #[doc(hidden)]
-    pub fn new(
+    pub(crate) fn new(
         _token: RuntimeHostToken,
         identity: ReplicaIdentity,
         access: Arc<dyn PartitionAccessView>,
@@ -554,7 +554,7 @@ impl ReplicatorFactoryContext {
 
 #[async_trait]
 #[doc(hidden)]
-pub trait PartitionAccessView: Send + Sync {
+pub(crate) trait PartitionAccessView: Send + Sync {
     fn partition_information(&self) -> PartitionInformation;
     async fn read_status(&self) -> Result<AccessStatus>;
 
@@ -567,32 +567,32 @@ pub trait PartitionAccessView: Send + Sync {
 
 #[doc(hidden)]
 #[derive(Clone)]
-pub struct DefaultReplicatorDependencies {
-    pub replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
-    pub replication_progress_store: Arc<dyn ReplicationProgressStore>,
-    pub local_write_journal: Arc<dyn LocalWriteJournal>,
-    pub build_authority_store: Arc<dyn BuildAuthorityStore>,
-    pub build_progress_store: Arc<dyn BuildProgressStore>,
+pub(crate) struct DefaultReplicatorDependencies {
+    pub(crate) replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
+    pub(crate) replication_progress_store: Arc<dyn ReplicationProgressStore>,
+    pub(crate) local_write_journal: Arc<dyn LocalWriteJournal>,
+    pub(crate) build_authority_store: Arc<dyn BuildAuthorityStore>,
+    pub(crate) build_progress_store: Arc<dyn BuildProgressStore>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
-pub struct ReplicatorCreationReservation(ReplicatorCreationIdentity);
+pub(crate) struct ReplicatorCreationReservation(ReplicatorCreationIdentity);
 
 #[doc(hidden)]
 impl ReplicatorCreationReservation {
-    pub fn new(_token: RuntimeHostToken) -> Self {
+    pub(crate) fn new(_token: RuntimeHostToken) -> Self {
         Self(ReplicatorCreationIdentity::new(RuntimeHostToken::new()))
     }
 
-    pub fn identity(&self, _token: RuntimeHostToken) -> ReplicatorCreationIdentity {
+    pub(crate) fn identity(&self, _token: RuntimeHostToken) -> ReplicatorCreationIdentity {
         self.0
     }
 }
 
 #[async_trait]
 #[doc(hidden)]
-pub trait ReplicatorRegistration: Send + Sync {
+pub(crate) trait ReplicatorRegistration: Send + Sync {
     fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation>;
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation);
@@ -624,7 +624,7 @@ pub struct StatefulServicePartition {
 
 impl StatefulServicePartition {
     #[doc(hidden)]
-    pub fn new(
+    pub(crate) fn new(
         _token: RuntimeHostToken,
         registration: Arc<dyn ReplicatorRegistration>,
         context: ReplicatorFactoryContext,

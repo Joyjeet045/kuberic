@@ -2,6 +2,31 @@
 
 Application and replication runtime for the level-triggered Kuberic stack.
 
+Together with `kuberic-controller`, this is one of exactly two public
+production crates. DEX, all examples, the SQL Server observer and level tests
+are separate unpublished workspace packages. Applications need only this crate:
+
+```toml
+kuberic-runtime = "0.1.0"
+```
+
+The default `host` feature enables `host::ReplicaHost`, process recovery,
+durable metadata and authenticated listeners. Shared identities, commands and
+observations live in `protocol`; protobuf contracts and conversion live in
+`control`. Enable `testing` for isolated fixture hosts/stores and deterministic
+transport. Application-specific SQLite WAL commit barriers live privately in
+the unpublished SQLite example, not in runtime.
+Application and replication callbacks return `RuntimeError`; process hosting,
+durable metadata, RPC and transport orchestration return `host::HostError`.
+Controller-only consumers use `default-features = false` for the contracts-only
+`protocol` and `control` modules; application and runtime implementation APIs
+require `host`. Pure evaluation and plans belong to `kuberic-controller`.
+
+Repository commands enable cross-crate policy proofs through
+`KUBERIC_WORKSPACE_TESTS` in the workspace's `.cargo/config.toml`. That
+configuration is not packaged: default tests of the published runtime run
+without the workspace-only controller dev dependency.
+
 ## Service Fabric V1 interfaces and ownership
 
 The implemented public traits preserve the **V1 COM divisions**, rather than
@@ -38,7 +63,7 @@ the control interface and optional state-replicator capability; the optional pri
 the explicit Rust counterpart of querying `IFabricPrimaryReplicator`.
 
 ```text
-kuberic-agent::PodRuntime ── Open(partition) ──► StatefulServiceReplica
+runtime host (private PodRuntime) ── Open(partition) ──► StatefulServiceReplica
                                                 │
                                                 ├─ CreateReplicator(StateProvider, settings)
                                                 ├─ retains StateReplicator
@@ -67,7 +92,7 @@ independent public bundle without the original native provenance.
 hosting registrar, application lifetime, Open registration, effect ordering,
 and exact returned-interface identity; it does not preconstruct unused default
 replication state for a custom factory. `PodRuntime` and that hosting registrar
-now live in `kuberic-agent`, not this application-facing crate.
+are private runtime host implementation details; applications use `host::ReplicaHost`.
 There is no `PodRuntime::new_with_replicator` ownership shortcut.
 Services can observe `partition.get_write_status()`; custom factories receive
 the same access gate through `ReplicatorFactoryContext::write_status`.
@@ -253,11 +278,12 @@ retains write identity across failures and cancellation. Agent transport uses
 a separate `RuntimeDataPlane` handle; `PodRuntime` remains the hosting and
 lifecycle owner.
 
-The runtime emits implementation-neutral domain messages. `kuberic-agent`
-owns protobuf conversion, separate control and replication listeners, process
+The replication engine emits implementation-neutral domain messages. Runtime
+`control` owns protobuf conversion; the `host` feature supplies separate control
+and replication listeners, process
 session fencing, reliable resend windows, reconnect, cancellation, and
-full-copy fallback signaling. The runtime has no dependency on
-`kuberic-wire` and does not start a network server.
+full-copy fallback signaling. Disabling `host` leaves the shared contracts and
+application interfaces available without the replica process implementation.
 
 Role changes drive the replicator before the service callback. Primary
 promotion additionally invokes replicator/state-provider `UpdateEpoch`
@@ -273,20 +299,18 @@ failure. Abort also stops the returned control before application teardown.
 Failed or cancelled Open aborts created interfaces;
 lifecycle/epoch failures never reopen writes.
 
-Hosting, effect, authority-store, and snapshot types are absent from the
-runtime root and generated user documentation. Process hosting and durable
-effect execution are owned by `kuberic-agent`; shared persistence and
-postcondition data live in unpublished `kuberic-runtime-internal`.
+Internal effect, authority-store, and snapshot types remain crate-private.
+Process hosting and durable effect execution are owned by runtime's private
+host modules; only the supported `host::ReplicaHost` process API is public.
 Runtime role and write access remain separate: startup is write-closed,
 becoming Primary does not grant writes, and direct client writes require an
 explicit granted `WriteStatus`.
 
-The runtime does not create an operator, replica agent, or control-plane
-server. It consumes narrow `ReplicaAuthorityStore`,
+The runtime does not create a Kubernetes operator. Its host consumes private
+`ReplicaAuthorityStore`,
 `ReplicationProgressStore`, `LocalWriteJournal`, `BuildAuthorityStore`, and
-`BuildProgressStore` capabilities from the unpublished contract crate.
-`kuberic-agent::SqliteStore` implements all capabilities while callers receive
-only the mutation authority they require.
+`BuildProgressStore` capabilities. The private host `SqliteStore` implements
+them while internal callers receive only the mutation authority they require.
 
 Replica builds use separate exact-target authority outside quorum membership.
 The agent admits immutable build authority before source copy execution; the
@@ -302,10 +326,26 @@ generation-scoped build.
 ## Public API boundary
 
 The intended application surface is the documented service, state-provider,
-partition, replicator-factory, replicator, and operation-stream API. Some
-cross-crate host signatures are `pub` and `#[doc(hidden)]` because
-`kuberic-agent` is a separate crate; hidden documentation is not treated as
-access control.
+partition, replicator-factory, replicator, operation-stream and process-host
+API. Host registration, attachment, durable authority/effect and native
+capability constructors remain private even with all features enabled; hidden
+documentation is not treated as access control.
+
+The opt-in `testing` API provides opaque, independently constructed fixture
+hosts/stores and detached serializable records. It cannot extract a host from
+`RunningReplica`, turn fixture records into production authority capabilities,
+or obtain attachment/registration/native lifecycle capabilities. Application
+tests can drive real durable effects and transport without widening production
+admission APIs.
+
+Private lifecycle mutation, attachment introspection, acceptance pause gates,
+and control-plane drivers are compiled only for runtime's own unit tests.
+Enabling the downstream `testing` feature does not enable those private hooks.
+
+Repository-only unit tests also exercise the controller's actual evaluator
+against private host admission. Their unversioned controller dev-dependency is
+omitted by Cargo when packaging runtime, preserving the one-way production
+dependency and allowing runtime to be published before controller.
 
 `scripts/check_runtime_public_api.sh` reviews both generated rustdoc and an
 exhaustive source-level inventory of public signatures. Compile-fail fixtures

@@ -1,19 +1,54 @@
 //! Independent application and replication runtime for the level-triggered stack.
 
+#[cfg(feature = "host")]
 pub mod application;
+#[cfg(feature = "host")]
 mod authority;
+#[cfg(feature = "host")]
+mod capabilities;
+pub mod control;
+#[cfg(feature = "host")]
 mod effects;
+#[cfg(feature = "host")]
 #[doc(hidden)]
 pub mod engine;
-#[doc(hidden)]
-#[path = "runtime.rs"]
-pub mod internal;
+#[cfg(feature = "host")]
+/// Replica process hosting and peer transport, enabled by the `host` feature.
+pub mod host;
+pub mod protocol;
+#[cfg(feature = "host")]
+mod receipts;
+#[cfg(feature = "host")]
 pub mod replicator;
+#[cfg(feature = "host")]
+mod runtime;
+#[cfg(feature = "host")]
+mod transport;
 
+#[cfg(feature = "testing")]
+/// Isolated host fixtures and deterministic transports; no production capabilities.
+pub mod testing;
+
+#[cfg(feature = "host")]
 mod error;
 
+#[cfg(all(test, feature = "host"))]
+#[allow(dead_code)]
+#[path = "test_support/secondary_scale_down.rs"]
+mod removal_fixture;
+
+#[cfg(all(test, feature = "host"))]
+mod durable_contract_tests;
+
+#[cfg(all(test, feature = "host", kuberic_workspace_tests))]
+#[path = "test_support/controller.rs"]
+mod test_controller;
+
+#[cfg(feature = "host")]
 pub use application::{StateProvider, StatefulServiceReplica};
+#[cfg(feature = "host")]
 pub use error::{Result, RuntimeError};
+#[cfg(feature = "host")]
 pub use replicator::{
     DefaultReplicator, DefaultReplicatorFactory, PrimaryReplicator, Replicator, ReplicatorFactory,
     ReplicatorInterfaces, StateReplicator, StatefulServicePartition,

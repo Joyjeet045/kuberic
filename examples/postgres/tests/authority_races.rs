@@ -1,5 +1,5 @@
-use kuberic_protocol::types::AccessStatus;
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::AccessStatus;
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use postgres_replicated::testing::{PgGroup, run_pg_test};
 
 #[test_log::test]
@@ -58,8 +58,8 @@ fn same_ordinal_replacement_rejects_old_work_without_mutating_the_replacement() 
 #[test_log::test]
 fn raw_postgres_progress_cannot_admit_an_unbuilt_candidate() {
     run_pg_test(|| async {
-        use kuberic_protocol::types::*;
-        use kuberic_runtime_internal::authority::AdmittedAuthority;
+        use kuberic_runtime::protocol::types::*;
+        use kuberic_runtime::testing::authority::AdmittedAuthority;
         let mut group = PgGroup::singleton().await;
         let mut candidate = group.candidate(2).await;
         let source = group.pod(1);

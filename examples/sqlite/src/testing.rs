@@ -5,22 +5,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use kuberic_agent::hosting::PodRuntime;
-use kuberic_agent::hosting::PreparedCopy;
-use kuberic_agent::runtime_adapter::RuntimeAdapter;
-use kuberic_agent::session::ProcessSession;
-use kuberic_agent::sqlite_store::SqliteStore;
-use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
-use kuberic_agent::store::AgentStore;
-use kuberic_agent::testing::{InProcessTransport, Message, TransportError, TransportEvent};
-use kuberic_protocol::types::*;
+use kuberic_runtime::testing::hosting::PodRuntime;
+use kuberic_runtime::testing::hosting::PreparedCopy;
+use kuberic_runtime::testing::runtime_adapter::RuntimeAdapter;
+use kuberic_runtime::testing::session::ProcessSession;
+use kuberic_runtime::testing::sqlite_store::SqliteStore;
+use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+
 use kuberic_runtime::application::OpenMode;
-use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest};
-use kuberic_runtime_internal::authority::AdmittedAuthority;
-use kuberic_runtime_internal::authority::{
-    BuildAuthority, BuildAuthorityStore, BuildProgressStore,
-};
-use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction};
+use kuberic_runtime::protocol::types::*;
+use kuberic_runtime::testing::authority::AdmittedAuthority;
+use kuberic_runtime::testing::authority::BuildAuthority;
+use kuberic_runtime::testing::copy::{BuildConfiguration, PrepareCopyRequest};
+use kuberic_runtime::testing::effects::{RuntimeEffect, RuntimeEffectAction};
+use kuberic_runtime::testing::{InProcessTransport, Message, TransportError, TransportEvent};
 use tonic::{Request, Status};
 
 use crate::proto::sqlite_store_server::SqliteStore as _;
@@ -176,7 +174,7 @@ impl SqlitePod {
         }
     }
 
-    pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_agent::Result<()> {
+    pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_runtime::host::Result<()> {
         let sequence = self.store.load_state().await?.next_effect_sequence;
         self.effect_as(
             OperationId::new(format!("sqlite-effect-{sequence}")),
@@ -189,7 +187,7 @@ impl SqlitePod {
         &self,
         operation_id: OperationId,
         action: RuntimeEffectAction,
-    ) -> kuberic_agent::Result<()> {
+    ) -> kuberic_runtime::host::Result<()> {
         let sequence = self.store.load_state().await?.next_effect_sequence;
         RuntimeAdapter::new(self.store.clone(), self.runtime.clone())
             .execute(RuntimeEffect {
@@ -710,7 +708,7 @@ pub fn assert_durable_receipts(replica: &SqlitePod, receipts: &[SqlReceipt]) {
 
 fn local_journal(
     replica: &SqlitePod,
-) -> Vec<kuberic_runtime_internal::authority::DurableLocalWrite> {
+) -> Vec<kuberic_runtime::testing::authority::DurableLocalWrite> {
     // Include committed entries too; load_local_writes deliberately omits them.
     let database = rusqlite::Connection::open_with_flags(
         replica.store.path(),
@@ -871,8 +869,8 @@ pub async fn copy_transport(source: &SqlitePod, target: &SqlitePod) -> InProcess
 
 pub async fn deliver_copy(
     transport: &mut InProcessTransport,
-    item: kuberic_wire::proto::CopyItem,
-) -> Result<kuberic_wire::proto::CopyAck, TransportError> {
+    item: kuberic_runtime::control::proto::CopyItem,
+) -> Result<kuberic_runtime::control::proto::CopyAck, TransportError> {
     let message = transport.bind(Message::Copy(item))?;
     let id = transport.enqueue(message)?;
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -914,7 +912,7 @@ pub async fn authorize_copy(
         .unwrap();
     target
         .store
-        .journal_build(&kuberic_protocol::command::EnsureReplicaBuild {
+        .journal_build(&kuberic_runtime::protocol::command::EnsureReplicaBuild {
             operation_id: id.clone(),
             local_replica_id: target.identity.replica_id,
             expected_instance_id: target.identity.instance_id.clone(),
@@ -957,7 +955,7 @@ pub async fn prepare_copy(
 pub async fn copy_items(
     copy: &mut PreparedCopy,
     through: i64,
-) -> Vec<kuberic_wire::proto::CopyItem> {
+) -> Vec<kuberic_runtime::control::proto::CopyItem> {
     let mut items = Vec::new();
     loop {
         let item = tokio::time::timeout(Duration::from_secs(5), copy.items.next())
@@ -1020,7 +1018,7 @@ pub fn scale_up_intent(
         catch_up_boundary_lsn: catch_up,
     };
     intent.operation_id = intent.expected_operation_id();
-    kuberic_protocol::validation::validate_scale_up(&intent).unwrap();
+    kuberic_runtime::protocol::validation::validate_scale_up(&intent).unwrap();
     intent
 }
 
@@ -1061,7 +1059,7 @@ pub async fn admit_expansion(pods: &[&SqlitePod], intent: &ScaleUpIntent) {
 pub async fn copy_progress(
     pod: &SqlitePod,
     id: &OperationId,
-) -> kuberic_runtime_internal::authority::DurableBuildProgress {
+) -> kuberic_runtime::testing::authority::DurableBuildProgress {
     pod.store.load_build_progress(id).await.unwrap().unwrap()
 }
 
@@ -1369,7 +1367,7 @@ pub async fn removal_intent(
         },
     };
     intent.operation_id = intent.expected_operation_id();
-    kuberic_protocol::validation::validate_secondary_scale_down(&intent).unwrap();
+    kuberic_runtime::protocol::validation::validate_secondary_scale_down(&intent).unwrap();
     intent
 }
 
@@ -1449,7 +1447,8 @@ pub async fn scale_down(
         previous_read_quorum: old,
         reduced_write_quorum: Vec::new(),
     };
-    kuberic_protocol::validation::validate_secondary_removal_evidence(&evidence, false).unwrap();
+    kuberic_runtime::protocol::validation::validate_secondary_removal_evidence(&evidence, false)
+        .unwrap();
     for pod in pods {
         let mut admitted = authority(pod.identity.clone(), intent.current_configuration.clone());
         admitted.previous_configuration = Some(previous.clone());
@@ -1489,7 +1488,8 @@ pub async fn scale_down(
         current_only_write_quorum: current,
         retirement: None,
     };
-    kuberic_protocol::validation::validate_secondary_scale_down_cleanup(&committed).unwrap();
+    kuberic_runtime::protocol::validation::validate_secondary_scale_down_cleanup(&committed)
+        .unwrap();
     for pod in pods {
         pod.effect_as(
             intent.command_operation_id(SecondaryRemovalStage::AcceptCommit, &pod.identity),
@@ -1514,7 +1514,7 @@ pub async fn scale_down(
         .effect_as(
             report.operation_id.clone(),
             RuntimeEffectAction::RetireReplica(Box::new(
-                kuberic_runtime_internal::authority::RetiredAuthority {
+                kuberic_runtime::testing::authority::RetiredAuthority {
                     committed: committed.clone(),
                     report,
                 },

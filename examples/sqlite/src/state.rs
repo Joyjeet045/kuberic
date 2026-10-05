@@ -3,11 +3,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use kuberic_protocol::types::OperationId;
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationAck, DurableApplicationProgress, Operation,
 };
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
+use kuberic_runtime::protocol::types::OperationId;
 
 pub use crate::framelog::durable::RecoveryState;
 use crate::framelog::durable::{DurableFrameLog, replace, sync_directory};

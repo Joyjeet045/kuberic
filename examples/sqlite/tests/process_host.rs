@@ -4,17 +4,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kuberic_agent::process::{
+use kuberic_runtime::control::proto as agent_proto;
+use kuberic_runtime::control::proto::agent_control_client::AgentControlClient;
+use kuberic_runtime::host::ReplicaEndpointResolver;
+use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaHost, ReplicaProcessConfig, RunningReplica,
 };
-use kuberic_agent::sqlite_store::SqliteStore;
-use kuberic_agent::transport::ReplicaEndpointResolver;
-use kuberic_protocol::types::{
+use kuberic_runtime::protocol::types::{
     PodUid, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ResourceUid,
     derive_agent_generation, derive_initialization_id,
 };
-use kuberic_wire::proto as agent_proto;
-use kuberic_wire::proto::agent_control_client::AgentControlClient;
+use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use sqlite_replicated::proto::sqlite_store_server::SqliteStore as _;
 use sqlite_replicated::server::SqliteServer;
 use sqlite_replicated::service::SqliteService;
@@ -63,7 +63,7 @@ fn start_host(
 ) -> (
     SocketAddr,
     Arc<SqliteService>,
-    tokio::task::JoinHandle<kuberic_agent::Result<RunningReplica>>,
+    tokio::task::JoinHandle<kuberic_runtime::host::Result<RunningReplica>>,
 ) {
     let address = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -100,7 +100,7 @@ async fn initialization_status(
         };
         let status = client
             .get_status(authorized(agent_proto::GetAgentStatusRequest {
-                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                 resource_uid: "sqlite-test".into(),
                 replica_id: 1,
                 expected_instance_id: "sqlite-1".into(),
@@ -127,7 +127,7 @@ fn initialize(session: String) -> Request<agent_proto::ExecuteCommandRequest> {
         agent_generation: derive_agent_generation(&initialization),
     };
     authorized(agent_proto::ExecuteCommandRequest {
-        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         resource_uid: "sqlite-test".into(),
         target: Some(identity.clone().into()),
         expected_process_session_id: session,

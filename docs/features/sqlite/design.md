@@ -5,6 +5,12 @@ in place to the level-triggered v2 stack. There is no second SQLite application
 and no classic runtime/operator dependency. The primary serves SQL over gRPC;
 secondaries retain durable WAL-frame history but do not serve client SQL.
 
+This unpublished example depends directly only on `kuberic-runtime` among
+production Kuberic crates. It enables runtime `host` support; the application-
+specific commit-barrier implementation is its private `commit_barrier` module
+under `examples/sqlite/src/commit_barrier`. Its opt-in
+`testing` feature uses runtime's isolated fixture API, not private capabilities.
+
 This is an experimental source/runtime migration, not a deployed-data upgrade.
 Use fresh v2 storage with protocol 9 / agent schema 5. There is no v1 data,
 authority, or metadata import path. SQLite-specific images, manifests, published
@@ -198,18 +204,18 @@ target accepts new writes, separately from delayed old committed responses.
 From the repository root, with the pinned Rust toolchain and `protoc` available:
 
 ```bash
-cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
-cargo clippy -p kuberic-agent -p sqlite-replicated --all-targets --all-features -- -D warnings
-cargo test -p kuberic-runtime -p kuberic-runtime-internal -p kuberic-wire
+cargo test -p sqlite-replicated --lib commit_barrier:: -- --test-threads=1
+cargo test -p sqlite-replicated --all-features -- --test-threads=1
+cargo clippy -p kuberic-runtime -p sqlite-replicated --all-targets --all-features -- -D warnings
 ```
 
-These SQLite tests require no KinD, Kubernetes API, container runtime, or child
+These SQLite selections require no KinD, Kubernetes API, container runtime, or child
 process launched by a test. The separate `relative_root` target owns its temporary
-working directory so parallel library tests are unaffected. Agent/protocol
+working directory so parallel library tests are unaffected. Runtime host/protocol
 selections excluding their existing subprocess tests are documented in the
 [testing guide](../kuberic/testing.md#sqlite-v2-unit-and-in-process-validation).
 
-`kuberic-agent`'s opt-in `testing::InProcessTransport` binds full replica identities
+Runtime's opt-in `testing::InProcessTransport` binds full replica identities
 and sessions, separates received/applied ACKs, routes copy ACKs, and surfaces
 Build/Remove/Evict outputs without granting authority. Its `pump()` idle result
 means no ready or in-flight delivery, not cluster convergence. Pause/failure
@@ -246,8 +252,8 @@ control/replication/application listener settings. Listener defaults are
 ## References
 
 - [V2 runtime interfaces](../../../kuberic-runtime/README.md)
-- [Replica hosting and opt-in transport](../../../kuberic-agent/README.md)
-- [Commit-barrier VFS](../../../sqlite-commit-barrier/src/lib.rs)
+- [Replica hosting and opt-in transport](../../../kuberic-runtime/README.md)
+- [Example-owned commit-barrier VFS](../../../examples/sqlite/src/commit_barrier/mod.rs)
 - [SQLite WAL format](https://sqlite.org/walformat.html)
 - [SQLite VFS](https://sqlite.org/vfs.html)
 - [V1 removal record and deferred work](../../proposal/v1-retirement-plan.md)

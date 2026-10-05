@@ -115,8 +115,8 @@ The repository validates this boundary through:
 ```bash
 cargo test -p kuberic-runtime --test public_api_inventory
 scripts/check_runtime_public_api.sh
-cargo nextest run --profile ordinary -p kuberic-agent --features testing \
-  --test runtime --test store --test coordinator --test crash_boundaries
+cargo nextest run --profile ordinary -p kuberic-runtime --features testing --lib \
+  -E 'test(/^host::tests::(runtime|store|coordinator|crash_boundaries)::/)'
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 

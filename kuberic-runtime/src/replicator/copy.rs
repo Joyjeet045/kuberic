@@ -1,31 +1,37 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+use crate::protocol::types::ConfigurationDescriptor;
+use crate::protocol::types::{OperationId, ReplicaIdentity};
+use crate::transport::CopyItem;
 use futures::Stream;
-use kuberic_protocol::types::{ConfigurationDescriptor, OperationId, ReplicaIdentity};
-use kuberic_runtime_internal::transport::CopyItem;
 use tokio::sync::{mpsc, watch};
 
 use crate::Result;
 use crate::application::OperationDataStream;
-use crate::authority::{BuildAuthority, DurableBuildProgress};
+#[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+use crate::authority::BuildAuthority;
+use crate::authority::DurableBuildProgress;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BuildConfiguration {
+pub(crate) enum BuildConfiguration {
     Current,
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     Bootstrap(ConfigurationDescriptor),
 }
 
-pub struct PrepareCopyRequest {
-    pub build_id: OperationId,
-    pub target: ReplicaIdentity,
-    pub configuration: BuildConfiguration,
-    pub copy_context: OperationDataStream,
+pub(crate) struct PrepareCopyRequest {
+    pub(crate) build_id: OperationId,
+    pub(crate) target: ReplicaIdentity,
+    pub(crate) configuration: BuildConfiguration,
+    pub(crate) copy_context: OperationDataStream,
 }
 
-pub struct PreparedCopy {
-    pub authority: BuildAuthority,
-    pub items: Pin<Box<dyn Stream<Item = Result<CopyItem>> + Send>>,
+pub(crate) struct PreparedCopy {
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+    pub(crate) authority: BuildAuthority,
+    pub(crate) items: Pin<Box<dyn Stream<Item = Result<CopyItem>> + Send>>,
 }
 
 pub(crate) struct CopyItemStream {
@@ -59,4 +65,4 @@ impl Drop for CopyItemStream {
     }
 }
 
-pub type BuildProgress = DurableBuildProgress;
+pub(crate) type BuildProgress = DurableBuildProgress;

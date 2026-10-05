@@ -1,8 +1,8 @@
 use futures::FutureExt;
-use kuberic_agent::store::AgentStore;
-use kuberic_protocol::types::{AccessStatus, ReplicaRole};
-use kuberic_runtime_internal::authority::LocalWriteJournal;
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+
+use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
+
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use sqlite_replicated::proto::sqlite_store_server::SqliteStore as _;
 use sqlite_replicated::testing::*;
 use sqlite_replicated::{RecoveryState, proto};

@@ -1,9 +1,9 @@
 use super::*;
 use crate::testing::{PgGroup, ProcessProbe, native_configuration, run_pg_test};
-use kuberic_agent::{report::AgentReporter, store::AgentStore};
-use kuberic_protocol::types::{AccessStatus, FaultType, TransitionKind};
+use kuberic_runtime::protocol::types::{AccessStatus, FaultType, TransitionKind};
 use kuberic_runtime::replicator::Replicator;
-use kuberic_runtime_internal::{authority::AdmittedAuthority, effects::RuntimeEffectAction};
+use kuberic_runtime::testing::report::AgentReporter;
+use kuberic_runtime::testing::{authority::AdmittedAuthority, effects::RuntimeEffectAction};
 use std::future::{Future, poll_fn};
 use std::task::Poll;
 

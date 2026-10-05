@@ -13,7 +13,12 @@ retries = 0
 
 [profile.ordinary]
 inherits = "ci"
-default-filter = 'not package(=postgres-replicated) and not binary(=kubernetes_checkpoint_real)'
+default-filter = 'not package(=postgres-replicated) and not binary(=kubernetes_checkpoint_real) and not binary_id(=kuberic-runtime::public_api_privacy)'
+
+[profile.build-only]
+inherits = "ci"
+default-filter = 'binary_id(=kuberic-runtime::public_api_privacy)'
+test-threads = 1
 
 [profile.postgres]
 inherits = "ci"
@@ -32,7 +37,7 @@ test-threads = 1
 
 [profile.helper]
 inherits = "ci"
-default-filter = 'binary_id(=kuberic-agent::crash_boundaries) or binary_id(=kuberic-protocol::model) or binary_id(=postgres-replicated::native_durable) or binary_id(=postgres-replicated::validation_oracles)'
+default-filter = '(binary_id(=kuberic-runtime) and test(/^host::tests::(crash_boundaries|recovery)::/)) or binary_id(=kuberic-controller::model) or binary_id(=postgres-replicated::native_durable) or binary_id(=postgres-replicated::validation_oracles)'
 test-threads = 1
 
 [profile.external]
@@ -51,11 +56,11 @@ filter = 'package(=postgres-replicated)'
 test-group = 'postgres'
 
 [[profile.default.overrides]]
-filter = 'package(=sqlite-replicated) or package(=sqlite-commit-barrier)'
+filter = 'package(=sqlite-replicated)'
 test-group = 'sqlite'
 
 [[profile.default.overrides]]
-filter = 'binary_id(=kuberic-agent::crash_boundaries)'
+filter = 'binary_id(=kuberic-runtime) and test(/^host::tests::(crash_boundaries|recovery)::/)'
 test-group = 'process-boundaries'
 threads-required = 4
 

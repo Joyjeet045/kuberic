@@ -4,10 +4,10 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
 };
 
+use crate::commit_barrier::{BarrierError, CommitBarrier, Transaction};
 use bytes::Bytes;
-use kuberic_protocol::types::{AccessStatus, FaultType};
+use kuberic_runtime::protocol::types::{AccessStatus, FaultType};
 use kuberic_runtime::replicator::{StateReplicator, StatefulServicePartition};
-use sqlite_commit_barrier::{BarrierError, CommitBarrier, Transaction};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -75,7 +75,7 @@ impl ReplicationBarrier {
             #[cfg(any(test, feature = "testing"))]
             after_quorum: crate::testing::PauseGate::default(),
         });
-        sqlite_commit_barrier::register(&name, barrier.clone()).map_err(std::io::Error::other)?;
+        crate::commit_barrier::register(&name, barrier.clone()).map_err(std::io::Error::other)?;
         Ok((barrier, name))
     }
 

@@ -6,7 +6,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Level-triggered Kubernetes controller for Kuberic"
-publish = false
+readme = "README.md"
+
+[features]
+runtime-test-bridge = []
 
 [[bin]]
 name = "kuberic-controller"
@@ -18,8 +21,7 @@ clap.workspace = true
 futures.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
-kuberic-protocol = { path = "../kuberic-protocol" }
-kuberic-wire = { path = "../kuberic-wire" }
+kuberic-runtime = { version = "0.1.0", path = "../kuberic-runtime", default-features = false }
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kuberic_protocol::types::{ConfigurationId, FaultType, OperationId, ResourceUid};
-use kuberic_runtime::replicator::{ReplicaInformation, copy::BuildConfiguration};
+use kuberic_runtime::protocol::types::{ConfigurationId, FaultType, OperationId, ResourceUid};
+use kuberic_runtime::replicator::ReplicaInformation;
+use kuberic_runtime::testing::copy::BuildConfiguration;
 use postgres_replicated::durable::{
     CommitStage, MAX_RETAINED_BUILD_IDS, PgDurableIdentity, PgDurableStore, StorageMode,
 };
@@ -25,7 +26,7 @@ fn identity() -> PgDurableIdentity {
 
 #[tokio::test]
 async fn ownership_pending_count_identifier_and_byte_bounds_are_enforced() {
-    use kuberic_protocol::types::{BuildAuthority, BuildAuthorityKind, ProcessSessionId};
+    use kuberic_runtime::protocol::types::{BuildAuthority, BuildAuthorityKind, ProcessSessionId};
     use postgres_replicated::build::{
         BUILD_PROTOCOL_VERSION, PgBuildMethod, PgBuildProgress, PgBuildRequest, PgBuildStage,
         PgLineage,
@@ -470,7 +471,7 @@ async fn bounded_history_exhaustion_requires_epoch_advance_and_rejects_old_work_
         .await
         .unwrap();
     assert!(
-        kuberic_agent::testing::execute_build(
+        kuberic_runtime::testing::execute_build(
             &source.runtime,
             ReplicaInformation::new(
                 authority.build_id.clone(),
@@ -541,10 +542,10 @@ async fn bounded_history_exhaustion_requires_epoch_advance_and_rejects_old_work_
     assert!(state.suspended_builds.is_empty());
     assert_eq!(
         state.retired_build_epoch,
-        Some(kuberic_protocol::types::Epoch::new(0, 1))
+        Some(kuberic_runtime::protocol::types::Epoch::new(0, 1))
     );
     assert!(
-        kuberic_agent::testing::execute_build(
+        kuberic_runtime::testing::execute_build(
             &source.runtime,
             ReplicaInformation::new(
                 OperationId::new("bounded-0000"),

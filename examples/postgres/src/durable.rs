@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use crate::native::AcknowledgementPolicy;
-use kuberic_protocol::types::{BuildAuthority, Epoch, OperationId, ReplicaIdentity, ResourceUid};
+use kuberic_runtime::protocol::types::{
+    BuildAuthority, Epoch, OperationId, ReplicaIdentity, ResourceUid,
+};
 use kuberic_runtime::replicator::ReplicaSetConfiguration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,7 +90,7 @@ pub struct PgDurableState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbound_builds: Vec<crate::build::PgBuildProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub catch_up: Option<(kuberic_protocol::types::ConfigurationId, i64)>,
+    pub catch_up: Option<(kuberic_runtime::protocol::types::ConfigurationId, i64)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspended_builds: Vec<crate::build::PgBuildProgress>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -936,7 +938,7 @@ pub enum PgDurableError {
 
 #[cfg(test)]
 mod tests {
-    use kuberic_protocol::types::{AgentGeneration, ReplicaId, ReplicaInstanceId};
+    use kuberic_runtime::protocol::types::{AgentGeneration, ReplicaId, ReplicaInstanceId};
 
     use super::*;
 

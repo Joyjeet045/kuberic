@@ -1,7 +1,7 @@
 use super::*;
-use kuberic_protocol::command::{KubernetesChange, ScaleDownResource};
-use kuberic_protocol::observation::ExactResourceObservation;
-use kuberic_protocol::types::*;
+use kuberic_runtime::protocol::command::{KubernetesChange, ScaleDownResource};
+use kuberic_runtime::protocol::observation::ExactResourceObservation;
+use kuberic_runtime::protocol::types::*;
 
 fn enabled() -> EvaluationConfig {
     EvaluationConfig {

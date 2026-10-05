@@ -17,8 +17,8 @@ KIND_PREFIX = "level_triggered_k8s::"
 DEX_LIVE_BINARY = "kuberic-dex::kubernetes_checkpoint_real"
 EXTERNAL_BINARY = "sqlserver-replicated::live_observation"
 HELPER_BINARIES = {
-    "kuberic-agent::crash_boundaries",
-    "kuberic-protocol::model",
+    "kuberic-runtime",
+    "kuberic-controller::model",
     "postgres-replicated::native_durable",
     "postgres-replicated::validation_oracles",
 }
@@ -39,157 +39,175 @@ class ListedTest:
     matches: bool
 
 
+BUILD_ONLY_TESTS = {
+    TestId(
+        "kuberic-runtime",
+        "kuberic-runtime::public_api_privacy",
+        "external_applications_can_use_contracts_but_cannot_forge_host_capabilities",
+    )
+}
+
+
 def test_id(package: str, binary: str, name: str) -> TestId:
+    if package == "kuberic-runtime" and not name.startswith("host::"):
+        name = f"host::tests::crash_boundaries::{name}"
     return TestId(package, binary, name)
 
 
-AGENT_CRASH_BINARY = "kuberic-agent::crash_boundaries"
+RUNTIME_CRASH_BINARY = "kuberic-runtime"
 HELPER_PARENTS: dict[TestId, set[TestId]] = {
-    test_id("kuberic-agent", AGENT_CRASH_BINARY, "crash_boundary_writer_process"): {
+    test_id("kuberic-runtime", "kuberic-runtime", "host::tests::recovery::crash_writer"): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            "kuberic-runtime",
+            "host::tests::recovery::sqlite_completion_survives_process_exit_without_destructors",
+        )
+    },
+    test_id("kuberic-runtime", RUNTIME_CRASH_BINARY, "crash_boundary_writer_process"): {
+        test_id(
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "configuration_boundaries_survive_process_termination_without_destructors",
         )
     },
-    test_id("kuberic-agent", AGENT_CRASH_BINARY, "crash_writer_process"): {
+    test_id("kuberic-runtime", RUNTIME_CRASH_BINARY, "crash_writer_process"): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "sqlite_commits_survive_process_termination_without_destructors",
         )
     },
-    test_id("kuberic-agent", AGENT_CRASH_BINARY, "local_write_recovery_writer_process"): {
+    test_id("kuberic-runtime", RUNTIME_CRASH_BINARY, "local_write_recovery_writer_process"): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "local_write_recovery_boundaries_commit_fresh_writes_after_process_termination",
         ),
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "repeated_preparation_retirement_fences_every_delayed_command_after_process_termination",
         ),
     },
     test_id(
-        "kuberic-agent", AGENT_CRASH_BINARY, "real_handoff_configuration_writer_process"
+        "kuberic-runtime", RUNTIME_CRASH_BINARY, "real_handoff_configuration_writer_process"
     ): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "real_handoff_configuration_boundaries_survive_process_termination",
         )
     },
-    test_id("kuberic-agent", AGENT_CRASH_BINARY, "real_runtime_effect_writer_process"): {
+    test_id("kuberic-runtime", RUNTIME_CRASH_BINARY, "real_runtime_effect_writer_process"): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "real_runtime_effect_recovers_and_completes_after_process_termination",
         )
     },
     test_id(
-        "kuberic-agent",
-        AGENT_CRASH_BINARY,
+        "kuberic-runtime",
+        RUNTIME_CRASH_BINARY,
         "real_switchover_preparation_writer_process",
     ): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "real_runtime_switchover_preparation_recovers_after_process_termination",
         )
     },
     test_id(
-        "kuberic-agent",
-        AGENT_CRASH_BINARY,
+        "kuberic-runtime",
+        RUNTIME_CRASH_BINARY,
         "removal_crashes::quorum_crashes::history::pending_acceptance_writer",
     ): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "removal_crashes::quorum_crashes::history::historical_local_acceptance_survives_sqlite_service_restart_and_newer_authority",
         ),
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "removal_crashes::quorum_crashes::history::pending_ordinary_acceptance_recovers_after_cleanup_and_newer_authority",
         ),
     },
     test_id(
-        "kuberic-agent",
-        AGENT_CRASH_BINARY,
+        "kuberic-runtime",
+        RUNTIME_CRASH_BINARY,
         "removal_crashes::quorum_crashes::writer",
     ): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "removal_crashes::quorum_crashes::real_three_to_two_quorum_crashes_preserve_sessions_and_successful_writes",
         )
     },
-    test_id("kuberic-agent", AGENT_CRASH_BINARY, "removal_crashes::writer"): {
+    test_id("kuberic-runtime", RUNTIME_CRASH_BINARY, "removal_crashes::writer"): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "removal_crashes::real_process_removal_boundaries_preserve_exact_authority_and_values",
         )
     },
     test_id(
-        "kuberic-agent", AGENT_CRASH_BINARY, "scale_up_active_secondary_cut_writer_process"
+        "kuberic-runtime", RUNTIME_CRASH_BINARY, "scale_up_active_secondary_cut_writer_process"
     ): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "scale_up_exact_cut_matrix_survives_real_process_restart",
         )
     },
     test_id(
-        "kuberic-agent", AGENT_CRASH_BINARY, "scale_up_configuration_cut_writer_process"
+        "kuberic-runtime", RUNTIME_CRASH_BINARY, "scale_up_configuration_cut_writer_process"
     ): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "scale_up_exact_cut_matrix_survives_real_process_restart",
         )
     },
     test_id(
-        "kuberic-agent", AGENT_CRASH_BINARY, "scale_up_failover_crash_writer_process"
+        "kuberic-runtime", RUNTIME_CRASH_BINARY, "scale_up_failover_crash_writer_process"
     ): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "scale_up_failover_replays_after_authority_and_completion_process_boundaries",
         )
     },
-    test_id("kuberic-agent", AGENT_CRASH_BINARY, "scale_up_store_cut_writer_process"): {
+    test_id("kuberic-runtime", RUNTIME_CRASH_BINARY, "scale_up_store_cut_writer_process"): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "scale_up_exact_cut_matrix_survives_real_process_restart",
         )
     },
     test_id(
-        "kuberic-agent", AGENT_CRASH_BINARY, "switchover_preparation_writer_process"
+        "kuberic-runtime", RUNTIME_CRASH_BINARY, "switchover_preparation_writer_process"
     ): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "switchover_preparation_boundaries_survive_process_termination",
         )
     },
-    test_id("kuberic-agent", AGENT_CRASH_BINARY, "switchover_recovery_writer_process"): {
+    test_id("kuberic-runtime", RUNTIME_CRASH_BINARY, "switchover_recovery_writer_process"): {
         test_id(
-            "kuberic-agent",
-            AGENT_CRASH_BINARY,
+            "kuberic-runtime",
+            RUNTIME_CRASH_BINARY,
             "switchover_recovery_boundaries_survive_process_termination",
         )
     },
     test_id(
-        "kuberic-protocol",
-        "kuberic-protocol::model",
+        "kuberic-controller",
+        "kuberic-controller::model",
         "terminal_switchover_receipt_writer_process",
     ): {
         test_id(
-            "kuberic-protocol",
-            "kuberic-protocol::model",
+            "kuberic-controller",
+            "kuberic-controller::model",
             "terminal_switchover_receipts_survive_process_exit_and_do_not_allocate_again",
         )
     },
@@ -273,6 +291,8 @@ def listed_tests(document: dict) -> list[ListedTest]:
 
 def classify(test: ListedTest) -> str | None:
     test_id = test.test_id
+    if test_id in BUILD_ONLY_TESTS:
+        return "build-only" if test.ignored else None
     if test.ignored:
         if test_id.package == KIND_PACKAGE and test_id.name.startswith(KIND_PREFIX):
             return "kind-live"
@@ -367,6 +387,9 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
     if len(all_assigned) != len(inventory):
         raise ValueError("test inventory contains duplicate identifiers")
 
+    if assignments.get("build-only", set()) != BUILD_ONLY_TESTS:
+        raise ValueError("build-only inventory does not exactly match its configured guards")
+
     kind_live = assignments.get("kind-live", set())
     if len(kind_live) != EXPECTED_KIND_LIVE_COUNT:
         raise ValueError(
@@ -374,6 +397,11 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
             f"found {len(kind_live)}"
         )
     configured_profiles = {
+        "build-only": all_matching_ids(
+            nextest_json(
+                root, extracted, "--profile", "build-only", "--run-ignored", "only"
+            )
+        ),
         "ordinary": matching_ids(
             nextest_json(root, extracted, "--profile", "ordinary")
         ),
