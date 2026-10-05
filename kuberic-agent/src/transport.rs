@@ -667,41 +667,25 @@ pub async fn run_outbound<D: OutboundDispatcher + 'static>(
                     }
                     continue;
                 };
-                let receiver = domain_outbound_receiver(&outbound).cloned();
-                let queued = {
-                    let mut sender = transport.lock().await;
-                    sender.queue(outbound)
-                };
-                let queued = match queued {
-                    Ok(queued) => sender_outbound_to_queued(queued),
-                    Err(RuntimeError::QueueFull | RuntimeError::ReconfigurationPending) => {
-                        tracing::warn!(
-                            ?receiver,
-                            "outbound peer backlog unavailable; deferring to peer repair"
-                        );
-                        continue;
-                    }
-                    Err(error) => return Err(AgentError::Runtime(error)),
-                };
-                let key = queued_outbound_receiver(&queued).cloned();
+                let key = domain_outbound_receiver(&outbound).cloned();
                 let sender = workers.entry(key).or_insert_with(|| {
-                    spawn_delivery_worker(
+                    spawn_outbound_worker(
                         &mut worker_tasks,
-                        Some(runtime.clone()),
+                        runtime.clone(),
                         transport.clone(),
                         dispatcher.clone(),
                         shutdown.clone(),
                     )
                 });
-                if sender.send(queued.clone()).is_err() {
-                    let replacement = spawn_delivery_worker(
+                if sender.send(outbound.clone()).is_err() {
+                    let replacement = spawn_outbound_worker(
                         &mut worker_tasks,
-                        Some(runtime.clone()),
+                        runtime.clone(),
                         transport.clone(),
                         dispatcher.clone(),
                         shutdown.clone(),
                     );
-                    replacement.send(queued).map_err(|_| {
+                    replacement.send(outbound).map_err(|_| {
                         AgentError::Backpressure("outbound peer worker stopped".into())
                     })?;
                     *sender = replacement;
@@ -711,6 +695,36 @@ pub async fn run_outbound<D: OutboundDispatcher + 'static>(
     }
 }
 
+fn spawn_outbound_worker<D: OutboundDispatcher + 'static>(
+    tasks: &mut tokio::task::JoinSet<()>,
+    runtime: Arc<PodRuntime>,
+    transport: Arc<Mutex<ReliableTransport>>,
+    dispatcher: Arc<D>,
+    shutdown: watch::Receiver<bool>,
+) -> tokio::sync::mpsc::UnboundedSender<OutboundOperation> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    tasks.spawn(async move {
+        while let Some(outbound) = receiver.recv().await {
+            if let Err(error) = deliver_outbound_with_runtime(
+                Some(runtime.as_ref()),
+                transport.clone(),
+                dispatcher.clone(),
+                outbound,
+                shutdown.clone(),
+            )
+            .await
+            {
+                tracing::warn!(%error, "outbound delivery failed");
+                if matches!(error, AgentError::Runtime(RuntimeError::OperationCancelled)) {
+                    break;
+                }
+            }
+        }
+    });
+    sender
+}
+
+#[cfg(test)]
 fn spawn_delivery_worker<D: OutboundDispatcher + 'static>(
     tasks: &mut tokio::task::JoinSet<()>,
     runtime: Option<Arc<PodRuntime>>,
@@ -791,6 +805,16 @@ async fn deliver_outbound<D: OutboundDispatcher>(
     outbound: OutboundOperation,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    deliver_outbound_with_runtime(None, transport, dispatcher, outbound, shutdown).await
+}
+
+async fn deliver_outbound_with_runtime<D: OutboundDispatcher>(
+    runtime: Option<&PodRuntime>,
+    transport: Arc<Mutex<ReliableTransport>>,
+    dispatcher: Arc<D>,
+    outbound: OutboundOperation,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let queued = loop {
         let (queued, retry_delay) = {
             let mut sender = transport.lock().await;
@@ -818,7 +842,7 @@ async fn deliver_outbound<D: OutboundDispatcher>(
             Err(error) => return Err(AgentError::Runtime(error)),
         }
     };
-    dispatch_queued_with_retry(None, transport, dispatcher, queued, shutdown).await
+    dispatch_queued_with_retry(runtime, transport, dispatcher, queued, shutdown).await
 }
 
 async fn queued_matches_runtime_authority(runtime: &PodRuntime, queued: &QueuedOutbound) -> bool {
@@ -1069,7 +1093,8 @@ fn domain_outbound_receiver(outbound: &OutboundOperation) -> Option<&ReplicaIden
         OutboundOperation::Replication(item) => Some(&item.receiver),
         OutboundOperation::Copy(item) => Some(&item.receiver),
         OutboundOperation::Build(endpoint) => Some(&endpoint.identity),
-        OutboundOperation::Remove(_) | OutboundOperation::Evict(_) => None,
+        OutboundOperation::Evict(identity) => Some(identity),
+        OutboundOperation::Remove(_) => None,
     }
 }
 
@@ -1394,6 +1419,59 @@ mod tests {
         );
         available.await.unwrap().unwrap();
         unavailable.await.unwrap().unwrap();
+        assert_eq!(delivered_rx.recv().await, Some(ReplicaId::new(2)));
+    }
+
+    #[tokio::test]
+    async fn full_peer_window_does_not_drop_or_block_another_peer() {
+        let transport = Arc::new(Mutex::new(
+            ReliableTransport::new(ProcessSessionId::new("primary-session"), 1).unwrap(),
+        ));
+        for replica_id in [2, 3] {
+            transport
+                .lock()
+                .await
+                .admit_peer(
+                    identity(replica_id),
+                    ProcessSessionId::new(format!("session-{replica_id}")),
+                )
+                .unwrap();
+        }
+        transport.lock().await.queue(outbound(identity(2))).unwrap();
+
+        let (delivered, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dispatcher = Arc::new(FlakyDispatcher {
+            failed_peer_attempts: AtomicUsize::new(0),
+            failures_before_success: 0,
+            delivered,
+        });
+        let (_stop, shutdown) = watch::channel(false);
+        let blocked = tokio::spawn(deliver_outbound(
+            transport.clone(),
+            dispatcher.clone(),
+            outbound(identity(2)),
+            shutdown.clone(),
+        ));
+        let healthy = tokio::spawn(deliver_outbound(
+            transport.clone(),
+            dispatcher,
+            outbound(identity(3)),
+            shutdown,
+        ));
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), delivered_rx.recv())
+                .await
+                .unwrap(),
+            Some(ReplicaId::new(3))
+        );
+        healthy.await.unwrap().unwrap();
+        transport
+            .lock()
+            .await
+            .acknowledge_replication(&identity(2), 1)
+            .unwrap();
+        blocked.await.unwrap().unwrap();
         assert_eq!(delivered_rx.recv().await, Some(ReplicaId::new(2)));
     }
 

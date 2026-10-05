@@ -1618,12 +1618,21 @@ impl<'a> SwitchoverCase<'a> {
     fn acknowledge(&mut self, suffix: &str) -> Result<i64> {
         let key = format!("{}-{suffix}", self.request);
         let value = format!("acknowledged-{suffix}");
-        let (code, body) = self
-            .source_client
-            .request("PUT", &format!("/kv/{key}"), &value)?;
-        ensure!(code == 200, "source write failed: HTTP {code} {body}");
-        self.acknowledged.push((key, value));
-        Ok(body.parse()?)
+        loop {
+            let (code, body) = self
+                .source_client
+                .request("PUT", &format!("/kv/{key}"), &value)?;
+            match code {
+                200 => {
+                    self.acknowledged.push((key, value));
+                    return Ok(body.parse()?);
+                }
+                503 if body.contains("ReconfigurationPending") => {
+                    poll(self.deadline, "source write access before switchover")?;
+                }
+                _ => bail!("source write failed: HTTP {code} {body}"),
+            }
+        }
     }
 
     fn wait_replicated(&mut self) -> Result<()> {

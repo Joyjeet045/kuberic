@@ -80,15 +80,15 @@ impl<S: AgentStore> AgentReporter<S> {
             let confirmed_snapshot = runtime.snapshot().await;
             let confirmed_state = self.store.load_state().await?;
             if state != confirmed_state
-                || snapshot != confirmed_snapshot
-                || !snapshot_matches_state(&snapshot, &state)
+                || !same_report_fence(&snapshot, &confirmed_snapshot)
+                || !snapshot_matches_state(&confirmed_snapshot, &confirmed_state)
             {
                 continue;
             }
             return Ok(build_report(
                 &self.session,
-                state,
-                snapshot,
+                confirmed_state,
+                confirmed_snapshot,
                 catch_up_capability,
                 partition.reported_fault,
             ));
@@ -266,6 +266,24 @@ fn snapshot_matches_state(
         && snapshot.retired_authority == state.retired_authority
 }
 
+fn same_report_fence(
+    before: &kuberic_runtime_internal::effects::RuntimeSnapshot,
+    after: &kuberic_runtime_internal::effects::RuntimeSnapshot,
+) -> bool {
+    before.identity == after.identity
+        && before.open == after.open
+        && before.replication_address == after.replication_address
+        && before.role == after.role
+        && before.role_transition == after.role_transition
+        && before.read_status == after.read_status
+        && before.write_status == after.write_status
+        && before.authority == after.authority
+        && before.prepared_secondary_removal == after.prepared_secondary_removal
+        && before.retired_authority == after.retired_authority
+        && before.accepted_secondary_removal == after.accepted_secondary_removal
+        && before.live_builds_only == after.live_builds_only
+}
+
 fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
     match role {
         ReplicaRole::Primary => proto::ReplicaRole::Primary,
@@ -375,5 +393,33 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn report_fence_allows_progress_but_not_authority_changes() {
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("source"),
+            agent_generation: AgentGeneration::new("generation"),
+        };
+        let mut before = crate::hosting::empty_snapshot(identity);
+        before.current_progress = 10;
+        before.verified_replication_lsn = Some(10);
+        before.committed_lsn = 9;
+        before.current_configuration_quorum_progress = 8;
+        before.catch_up_boundary = Some(10);
+        before.catch_up_complete = false;
+
+        let mut after = before.clone();
+        after.current_progress = 11;
+        after.verified_replication_lsn = Some(11);
+        after.committed_lsn = 10;
+        after.current_configuration_quorum_progress = 10;
+        after.catch_up_boundary = Some(11);
+        after.catch_up_complete = true;
+        assert!(same_report_fence(&before, &after));
+
+        after.write_status = AccessStatus::Granted;
+        assert!(!same_report_fence(&before, &after));
     }
 }
