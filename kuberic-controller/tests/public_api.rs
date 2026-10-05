@@ -11,8 +11,21 @@ use kuberic_controller::protocol::command::KubernetesChange;
 use kuberic_controller::protocol::observation::ObservationSnapshot;
 use kuberic_controller::protocol::types::AcceptedStatus;
 use kuberic_controller::protocol::validation::validate_snapshot;
-use kuberic_controller::{EvaluationConfig, Plan, evaluate, production_evaluation_config};
+use kuberic_controller::{
+    EvaluationConfig, Plan, default_main, evaluate, production_evaluation_config,
+};
 use serde_json::json;
+
+#[test]
+fn controller_exports_default_main() {
+    fn assert_future<F>(_: F)
+    where
+        F: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+    {
+    }
+
+    assert_future(default_main());
+}
 
 #[test]
 fn controller_exports_observation_and_evaluation_contracts() {

@@ -4,10 +4,10 @@
 > production use. The classic v1 stack has been removed. Published v2 images
 > and a supported release installation are not available yet.
 
-Kuberic is a Service Fabric-inspired stateful replication framework for
-Kubernetes. The current level-triggered stack provides quorum replication,
-automatic failover, planned switchover, copy-based replica building,
-sequential scale-up, secondary scale-down, and epoch/session fencing.
+Kuberic is a stateful replication framework for Kubernetes. The current
+level-triggered stack provides quorum replication, automatic failover, planned
+switchover, copy-based replica building, sequential scale-up, secondary
+scale-down, and epoch/session fencing.
 
 ## Repository
 
@@ -113,7 +113,7 @@ classic data is imported. See the [SQLite design](docs/features/sqlite/design.md
 
 ### PostgreSQL
 
-`postgres-replicated` is an application-owned SF-style custom replicator.
+`postgres-replicated` is an application-owned custom replicator.
 PostgreSQL owns WAL streaming, physical recovery, synchronous policy and
 promotion while Kuberic owns generic authority and lifecycle choreography.
 Fresh protocol-9/schema-5 storage is required. See the
@@ -147,8 +147,8 @@ the isolated development/CI assets above.
 - [V1 removal record](docs/proposal/v1-retirement-plan.md)
 - [Archived classic architecture](docs/archive/v1/README.md)
 
-Service Fabric and other background material under `docs/background/` remains
-technology reference material rather than a Kuberic compatibility promise.
+Background material under `docs/background/` remains technology reference
+material rather than a Kuberic compatibility promise.
 
 ## License
 

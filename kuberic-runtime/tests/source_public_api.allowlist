@@ -158,6 +158,7 @@ public-path documented impl crate::replicator::stream::OperationStream::fn chann
 public-path documented impl crate::replicator::stream::StreamOperation::fn acknowledge (self , progress : DurableApplicationProgress) -> Result < () >
 public-path documented impl crate::replicator::stream::StreamOperation::fn reject (self , error : RuntimeError) -> Result < () >
 public-path documented module crate::application
+public-path documented module crate::engine
 public-path documented module crate::host
 public-path documented module crate::replicator
 public-path documented module crate::replicator::stream
@@ -190,6 +191,15 @@ public-path documented trait crate::application::StatefulServiceReplica::async f
 public-path documented trait crate::application::StatefulServiceReplica::async fn close (& self) -> Result < () >
 public-path documented trait crate::application::StatefulServiceReplica::async fn open (self : Arc < Self > , context : OpenContext) -> Result < Arc < dyn Replicator > >
 public-path documented trait crate::application::StatefulServiceReplica::fn abort (& self)
+public-path documented trait crate::engine::DurableState: Send + Sync
+public-path documented trait crate::engine::DurableState::async fn apply (& self , operation : Operation) -> Result < DurableApplicationAck >
+public-path documented trait crate::engine::DurableState::async fn apply_copy_chunk (& self , build_id : & OperationId , sequence : u64 , chunk : CopyChunk ,) -> Result < () >
+public-path documented trait crate::engine::DurableState::async fn commit (& self , committed_lsn : Lsn) -> Result < DurableApplicationProgress >
+public-path documented trait crate::engine::DurableState::async fn durable_progress (& self) -> Result < DurableApplicationProgress >
+public-path documented trait crate::engine::DurableState::async fn finish_copy (& self , build_id : & OperationId , up_to_lsn : Lsn , committed_lsn : Lsn ,) -> Result < DurableApplicationProgress >
+public-path documented trait crate::engine::DurableState::async fn get_replication_operations (& self , from_lsn : Lsn , to_lsn : Lsn ,) -> Result < RetainedOperationStream >
+public-path documented trait crate::engine::DurableState::async fn verify_applied (& self , operation : & Operation) -> Result < bool >
+public-path documented trait crate::engine::DurableState::async fn verify_copy_chunk (& self , build_id : & OperationId , sequence : u64 , chunk : & CopyChunk ,) -> Result < bool >
 public-path documented trait crate::replicator::PrimaryReplicator: Replicator
 public-path documented trait crate::replicator::PrimaryReplicator::async fn build_replica (& self , replica : ReplicaInformation) -> Result < () >
 public-path documented trait crate::replicator::PrimaryReplicator::async fn on_data_loss (& self) -> Result < bool >
@@ -216,6 +226,7 @@ public-path documented type crate::application::DurableApplicationAck = DurableA
 public-path documented type crate::application::Lsn = i64
 public-path documented type crate::application::OperationData = Bytes
 public-path documented type crate::application::OperationDataStream = Pin < Box < dyn Stream < Item = Result < OperationData > > + Send > >
+public-path documented type crate::engine::RetainedOperationStream = Pin < Box < dyn Stream < Item = Result < Operation > > + Send > >
 public-path documented use crate::application :: { StateProvider , StatefulServiceReplica }
 public-path documented use crate::error :: { Result , RuntimeError }
 public-path documented use crate::host::error :: { HostError , Result }
@@ -229,14 +240,3 @@ public-path documented variant crate::replicator::ReplicaSetQuorumMode::WriteQuo
 public-path documented variant crate::replicator::stream::OperationMetadata::Copy { { build_id : OperationId , sequence : u64 , } }
 public-path documented variant crate::replicator::stream::OperationMetadata::CopyComplete { { build_id : OperationId , up_to_lsn : Lsn , committed_lsn : Lsn , } }
 public-path documented variant crate::replicator::stream::OperationMetadata::Replication { { lsn : Lsn , committed_lsn : Lsn , } }
-public-path hidden module crate::engine
-public-path hidden trait crate::engine::DurableState: Send + Sync
-public-path hidden trait crate::engine::DurableState::async fn apply (& self , operation : Operation) -> Result < DurableApplicationAck >
-public-path hidden trait crate::engine::DurableState::async fn apply_copy_chunk (& self , build_id : & OperationId , sequence : u64 , chunk : CopyChunk ,) -> Result < () >
-public-path hidden trait crate::engine::DurableState::async fn commit (& self , committed_lsn : Lsn) -> Result < DurableApplicationProgress >
-public-path hidden trait crate::engine::DurableState::async fn durable_progress (& self) -> Result < DurableApplicationProgress >
-public-path hidden trait crate::engine::DurableState::async fn finish_copy (& self , build_id : & OperationId , up_to_lsn : Lsn , committed_lsn : Lsn ,) -> Result < DurableApplicationProgress >
-public-path hidden trait crate::engine::DurableState::async fn get_replication_operations (& self , from_lsn : Lsn , to_lsn : Lsn ,) -> Result < RetainedOperationStream >
-public-path hidden trait crate::engine::DurableState::async fn verify_applied (& self , operation : & Operation) -> Result < bool >
-public-path hidden trait crate::engine::DurableState::async fn verify_copy_chunk (& self , build_id : & OperationId , sequence : u64 , chunk : & CopyChunk ,) -> Result < bool >
-public-path hidden type crate::engine::RetainedOperationStream = Pin < Box < dyn Stream < Item = Result < Operation > > + Send > >

@@ -113,6 +113,9 @@ page:control/proto/struct.SecondaryScaleDownCleanup.html
 page:control/proto/struct.SecondaryScaleDownIntent.html
 page:control/proto/struct.SwitchoverHandoff.html
 page:control/proto/struct.SwitchoverPreparationId.html
+page:engine/index.html
+page:engine/trait.DurableState.html
+page:engine/type.RetainedOperationStream.html
 page:enum.RuntimeError.html
 page:error/enum.RuntimeError.html
 page:error/type.Result.html

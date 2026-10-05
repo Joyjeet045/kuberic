@@ -12,7 +12,7 @@ name = "sqlite-replicated"
 path = "src/main.rs"
 
 [dependencies]
-kuberic-runtime = { version = "0.1.0", path = "../../kuberic-runtime", features = ["host"] }
+kuberic-runtime = { workspace = true, features = ["host"] }
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 tempfile = { version = "3", optional = true }
 async-trait.workspace = true

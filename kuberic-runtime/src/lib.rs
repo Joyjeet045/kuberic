@@ -10,7 +10,6 @@ pub mod control;
 #[cfg(feature = "host")]
 mod effects;
 #[cfg(feature = "host")]
-#[doc(hidden)]
 pub mod engine;
 #[cfg(feature = "host")]
 /// Replica process hosting and peer transport, enabled by the `host` feature.

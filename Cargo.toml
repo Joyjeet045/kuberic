@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/youyuanwu/kuberic"
@@ -20,6 +20,8 @@ description = "Stateful replication framework for Kubernetes"
 rust-version = "1.85"
 
 [workspace.dependencies]
+kuberic-controller = { version = "0.0.1", path = "kuberic-controller" }
+kuberic-runtime = { version = "0.0.1", path = "kuberic-runtime", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tokio-stream = "0.1"

@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "kuberic-controller"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "kuberic-dex"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "kuberic-level-tests"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "kuberic-runtime"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "kvstore2"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "postgres-replicated"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2615,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite-replicated"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2654,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "sqlserver-replicated"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "clap",

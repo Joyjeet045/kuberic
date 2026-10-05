@@ -7,7 +7,7 @@ production crates. DEX, all examples, the SQL Server observer and level tests
 are separate unpublished workspace packages. Applications need only this crate:
 
 ```toml
-kuberic-runtime = "0.1.0"
+kuberic-runtime = "0.0.1"
 ```
 
 The default `host` feature enables `host::ReplicaHost`, process recovery,

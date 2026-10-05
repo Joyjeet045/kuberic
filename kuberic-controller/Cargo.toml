@@ -21,7 +21,7 @@ clap.workspace = true
 futures.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
-kuberic-runtime = { version = "0.1.0", path = "../kuberic-runtime", default-features = false }
+kuberic-runtime.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -12,7 +12,7 @@ name = "postgres-replicated"
 path = "src/main.rs"
 
 [dependencies]
-kuberic-runtime = { version = "0.1.0", path = "../../kuberic-runtime", features = ["host"] }
+kuberic-runtime = { workspace = true, features = ["host"] }
 async-trait.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true

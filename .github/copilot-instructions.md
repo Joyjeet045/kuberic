@@ -2,8 +2,9 @@
 
 ## What This Is
 
-A Service Fabric-inspired stateful replication system for Kubernetes.
-Provides quorum-based replication with automatic failover, switchover,
+A stateful Kubernetes system combining CloudNativePG (CNPG) and Service
+Fabric (SF) concepts. It uses a Kubernetes-native, level-triggered operator
+model with quorum-based replication, automatic failover, switchover,
 copy-based replica building, and epoch-based fencing.
 
 ## API stability
