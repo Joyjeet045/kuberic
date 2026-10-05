@@ -56,14 +56,29 @@ nextest-test partition="": install-nextest
     cargo nextest run --workspace --all-features --profile ordinary "${partition_args[@]}"
 
 # Run the PostgreSQL tier serially, optionally as hash shard N/M.
-nextest-postgres partition="": install-nextest
+nextest-postgres partition="":
     #!/usr/bin/env bash
     set -euo pipefail
+    scratch="${TMPDIR:-$PWD/target/paw-tmp}"
+    mkdir -p "$scratch"
+    TMPDIR="$scratch" scripts/install_nextest.sh
     partition_args=()
     if [[ -n "{{ partition }}" ]]; then
       partition_args=(--partition "hash:{{ partition }}")
     fi
-    cargo nextest run --workspace --all-features --profile postgres "${partition_args[@]}"
+    TMPDIR="$scratch" cargo nextest run \
+      --workspace --all-features --profile postgres "${partition_args[@]}"
+
+# Run a representative real-PostgreSQL smoke selection for routine local checks.
+nextest-postgres-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    scratch="${TMPDIR:-$PWD/target/paw-tmp}"
+    mkdir -p "$scratch"
+    TMPDIR="$scratch" scripts/install_nextest.sh
+    filter='test(/^(tests::singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_sql|fresh_native_build_requires_durable_replay_and_exact_lineage|acknowledged_row_is_replayed_before_candidate_primary_callback_completes|planned_switchover_requires_source_shutdown_before_target_writes|scaling_reopens_agent_after_built_boundary|storage_failure_is_explicit_and_keeps_clients_closed)$/)'
+    TMPDIR="$scratch" cargo nextest run \
+      --workspace --all-features --profile postgres -E "$filter"
 
 # Create the local Kind cluster and write its kubeconfig.
 create-kind-cluster:

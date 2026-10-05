@@ -458,36 +458,59 @@ async fn bounded_history_exhaustion_requires_epoch_advance_and_rejects_old_work_
     let mut source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
     let target = PgPod::new(root.path().join("t"), native_identity(2, "target")).await;
     source.singleton().await;
-    for index in 0..MAX_RETAINED_BUILD_IDS {
-        let authority = source
-            .authorize(&target, &format!("bounded-{index:04}"))
-            .await;
-        assert!(
-            kuberic_agent::testing::execute_build(
-                &source.runtime,
-                ReplicaInformation::new(
-                    authority.build_id.clone(),
-                    target.identity.clone(),
-                    "http://127.0.0.1:0".into()
-                ),
-            )
-            .await
-            .is_err()
-        );
-        source
-            .runtime
-            .cancel_outbound_build(&authority.build_id)
-            .await
-            .unwrap();
-        let state = source.application.native_driver().durable_state().await;
-        assert!(
-            state.retired_builds.len() + state.suspended_builds.len() <= MAX_RETAINED_BUILD_IDS
-        );
-        assert!(state.outbound_builds.is_empty());
-        if index == 31 {
-            source = source.reopen().await;
-        }
-    }
+    source.refresh().await;
+    source.peer(&target).await;
+    let authority = source
+        .runtime
+        .authorize_build(
+            OperationId::new("bounded-0000"),
+            target.identity.clone(),
+            BuildConfiguration::Current,
+        )
+        .await
+        .unwrap();
+    assert!(
+        kuberic_agent::testing::execute_build(
+            &source.runtime,
+            ReplicaInformation::new(
+                authority.build_id.clone(),
+                target.identity.clone(),
+                "http://127.0.0.1:0".into()
+            ),
+        )
+        .await
+        .is_err()
+    );
+    source
+        .runtime
+        .cancel_outbound_build(&authority.build_id)
+        .await
+        .unwrap();
+    let state = source.application.native_driver().durable_state().await;
+    assert_eq!(state.retired_builds.len() + state.suspended_builds.len(), 1);
+    assert!(state.outbound_builds.is_empty());
+    source
+        .application
+        .native_driver()
+        .fill_retired_build_history_for_test(MAX_RETAINED_BUILD_IDS / 2)
+        .await;
+    source = source.reopen().await;
+    let state = source.application.native_driver().durable_state().await;
+    assert_eq!(
+        state.retired_builds.len() + state.suspended_builds.len(),
+        MAX_RETAINED_BUILD_IDS / 2
+    );
+    source
+        .application
+        .native_driver()
+        .fill_retired_build_history_for_test(MAX_RETAINED_BUILD_IDS)
+        .await;
+    let state = source.application.native_driver().durable_state().await;
+    assert_eq!(
+        state.retired_builds.len() + state.suspended_builds.len(),
+        MAX_RETAINED_BUILD_IDS
+    );
+    source.peer(&target).await;
     let error = source
         .runtime
         .authorize_build(

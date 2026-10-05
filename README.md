@@ -51,10 +51,12 @@ PostgreSQL validation requires compatible host-local PostgreSQL binaries and an
 unprivileged Linux account:
 
 ```bash
-mkdir -p target/paw-tmp
-export TMPDIR="$PWD/target/paw-tmp"
+just nextest-postgres-smoke
 just nextest-postgres
 ```
+
+The smoke target runs a representative real-PostgreSQL lifecycle selection for
+routine local checks. The full target remains the complete pre-push validation.
 
 Build once and verify the exact ordinary/PostgreSQL partitions with:
 

@@ -292,8 +292,7 @@ Configuration is implementation-owned, not a general PostgreSQL tuning API.
 ## Local Validation
 
 ```sh
-mkdir -p target/paw-tmp
-export TMPDIR="$PWD/target/paw-tmp"
+just nextest-postgres-smoke
 just nextest-postgres
 # One deterministic shard, normally run on its own isolated CI runner:
 just nextest-postgres 1/4
@@ -302,6 +301,11 @@ cargo test -p postgres-replicated --all-features --test native_build --test fail
 cargo test -p postgres-replicated --all-features --test reconfiguration --test authority_races --test switchover_checkpoints --test validation_oracles -- --test-threads=1
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
+
+The smoke target is the routine local gate and exercises representative real
+PostgreSQL bootstrap/fencing, native build, failover, planned switchover,
+scaling and explicit failure handling. The full target remains the complete
+pre-push gate.
 
 Tests discover common PostgreSQL installation directories (16, 17, 15 in that
 order on Debian-style hosts), then `pg_config --bindir`. `--pg-bin` configures the

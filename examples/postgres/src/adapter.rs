@@ -932,6 +932,40 @@ impl PgReplicator {
     }
 
     #[cfg(feature = "testing")]
+    /// Seeds terminal IDs so boundary tests do not repeat external build cleanup.
+    pub async fn fill_retired_build_history_for_test(&self, total: usize) {
+        assert!(total <= crate::durable::MAX_RETAINED_BUILD_IDS);
+        let epoch = self
+            .configuration
+            .read()
+            .await
+            .as_ref()
+            .expect("installed test configuration")
+            .configuration
+            .epoch;
+        self.durable
+            .update(|state| {
+                state.build_epoch = Some(epoch);
+                let mut known = state.retired_builds.len()
+                    + state.suspended_builds.len()
+                    + state.outbound_builds.len();
+                for index in 0..crate::durable::MAX_RETAINED_BUILD_IDS {
+                    if known == total {
+                        break;
+                    }
+                    let id = OperationId::new(format!("fixture-retired-{index:04}"));
+                    if state.retired_builds.insert(id) {
+                        known += 1;
+                    }
+                }
+                assert_eq!(known, total);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "testing")]
     pub fn pause_catch_up_commit(
         &self,
         stage: crate::durable::CommitStage,

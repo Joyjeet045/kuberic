@@ -78,13 +78,17 @@ unprivileged Linux account with compatible server/client binaries, pidfds,
 subreapers and readable `/proc`. PostgreSQL 16 is the validated major.
 
 ```bash
-mkdir -p target/paw-tmp
-export TMPDIR="$PWD/target/paw-tmp"
+just nextest-postgres-smoke
 just nextest-postgres
 # Or run one deterministic isolated-runner shard:
 just nextest-postgres 1/4
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
+
+Use the smoke target for routine local checks. It covers real bootstrap and
+fencing, native build, failover, planned switchover, scale-up recovery and an
+explicit storage-failure oracle. Run the full target before pushing PostgreSQL
+changes.
 
 See the [PostgreSQL validation guide](features/kuberic/testing.md#postgresql-v2-host-local-validation)
 and [design](features/postgres/design.md).

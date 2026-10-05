@@ -120,13 +120,16 @@ subreapers, readable `/proc` and compatible PostgreSQL binaries. PostgreSQL 16
 is the validated host major. Missing prerequisites fail rather than skip.
 
 ```bash
-mkdir -p target/paw-tmp
-export TMPDIR="$PWD/target/paw-tmp"
+just nextest-postgres-smoke
 just nextest-postgres
 # Same deterministic four-way hash partition used by an isolated CI runner:
 just nextest-postgres 1/4
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
+
+The smoke target is intended for routine local checks and covers representative
+real lifecycle paths. The full target remains the complete pre-push and CI
+validation.
 
 The matrix covers physical build/rewind, fencing, failover, switchover,
 replacement, scaling, quorum restoration, read-only secondaries and
