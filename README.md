@@ -20,12 +20,11 @@ kuberic-dex/               Unpublished durable execution and checkpoint kernel
 examples/kvstore2/         Level-triggered conformance application
 examples/sqlite/           SQLite v2 application
 examples/postgres/         PostgreSQL-native v2 custom replicator
-examples/sqlserver/        Independent SQL Server observer
 ```
 
 There are exactly two public production crates: `kuberic-runtime` and
-`kuberic-controller`. DEX, every example (including the SQL Server observer),
-and level tests remain separate, unpublished workspace packages (`publish = false`).
+`kuberic-controller`. DEX, every example, and level tests remain separate,
+unpublished workspace packages (`publish = false`).
 Applications depend only on `kuberic-runtime`; its default `host` feature supplies
 `host::ReplicaHost`. Shared contracts are under `protocol` and `control`.
 The `testing` feature provides isolated conformance fixtures without exporting
@@ -70,8 +69,8 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The complete tier inventory, shard commands, SQL Server external fixtures and
-DEX Kubernetes-provider commands are documented in the
+The complete tier inventory, shard commands and DEX Kubernetes-provider
+commands are documented in the
 [test strategy](docs/features/kuberic/testing.md).
 
 ## Experimental Kubernetes Validation
@@ -119,12 +118,6 @@ promotion while Kuberic owns generic authority and lifecycle choreography.
 Fresh protocol-9/schema-5 storage is required. See the
 [PostgreSQL design](docs/features/postgres/design.md).
 
-### SQL Server
-
-`sqlserver-replicated` is an independent native availability-group observer. It
-does not deploy or mutate SQL Server. See the
-[SQL Server observation guide](docs/features/sqlserver/observation.md).
-
 ## Distribution Status
 
 Classic source and image publication have been removed. Existing external
@@ -142,13 +135,15 @@ the isolated development/CI assets above.
 - [Testing strategy](docs/features/kuberic/testing.md)
 - [SQLite design](docs/features/sqlite/design.md)
 - [PostgreSQL design](docs/features/postgres/design.md)
-- [SQL Server design](docs/features/sqlserver/design.md)
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md)
 - [V1 removal record](docs/proposal/v1-retirement-plan.md)
 - [Archived classic architecture](docs/archive/v1/README.md)
 
 Background material under `docs/background/` remains technology reference
 material rather than a Kuberic compatibility promise.
+
+The SQL Server observer is maintained separately in
+[kuberic-mssql](https://github.com/youyuanwu/kuberic-mssql).
 
 ## License
 

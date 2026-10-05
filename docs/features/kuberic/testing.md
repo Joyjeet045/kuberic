@@ -30,9 +30,9 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated validator accounts for 1,216 tests: 976 ordinary, one build-only,
-203 directly runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test,
-19 mapped parent-driven subprocess helpers and four external SQL Server fixtures.
+The consolidated validator accounts for 1,109 tests: 873 ordinary, one build-only,
+203 directly runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test
+and 19 mapped parent-driven subprocess helpers.
 Use its generated counts as the inventory evolves.
 
 The ignored runtime `public_api_privacy` binary belongs only to the `build-only`
@@ -149,22 +149,6 @@ subprocess helpers executed by mapped parent tests. PostgreSQL has no
 application-specific KinD test.
 
 See the [PostgreSQL design](../postgres/design.md).
-
-## SQL Server Validation
-
-The default SQL Server suite is server-free and uses local fake TDS fixtures:
-
-```bash
-cargo fmt -p sqlserver-replicated -- --check
-cargo clippy --locked -p sqlserver-replicated \
-  --all-targets --all-features -- -D warnings
-cargo test --locked -p sqlserver-replicated --all-features
-```
-
-The ignored live observation target requires an externally provisioned SQL
-Server and explicit image/EULA/TLS/credential configuration. It is independent
-of Kuberic controller deployment. `just nextest-list external` lists exactly
-those four manual fixtures; they are not silently run in hosted CI.
 
 ## DEX Validation
 

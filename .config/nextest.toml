@@ -40,11 +40,6 @@ inherits = "ci"
 default-filter = '(binary_id(=kuberic-runtime) and test(/^host::tests::(crash_boundaries|recovery)::/)) or binary_id(=kuberic-controller::model) or binary_id(=postgres-replicated::native_durable) or binary_id(=postgres-replicated::validation_oracles)'
 test-threads = 1
 
-[profile.external]
-inherits = "ci"
-default-filter = 'binary_id(=sqlserver-replicated::live_observation)'
-test-threads = 1
-
 [test-groups]
 postgres = { max-threads = 1 }
 sqlite = { max-threads = 1 }

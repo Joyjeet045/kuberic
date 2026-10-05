@@ -15,7 +15,6 @@ from pathlib import Path
 KIND_PACKAGE = "kuberic-level-tests"
 KIND_PREFIX = "level_triggered_k8s::"
 DEX_LIVE_BINARY = "kuberic-dex::kubernetes_checkpoint_real"
-EXTERNAL_BINARY = "sqlserver-replicated::live_observation"
 HELPER_BINARIES = {
     "kuberic-runtime",
     "kuberic-controller::model",
@@ -296,8 +295,6 @@ def classify(test: ListedTest) -> str | None:
     if test.ignored:
         if test_id.package == KIND_PACKAGE and test_id.name.startswith(KIND_PREFIX):
             return "kind-live"
-        if test_id.binary == EXTERNAL_BINARY:
-            return "external-manual"
         if test_id.binary in HELPER_BINARIES:
             return "helper-parent"
         return None
@@ -419,11 +416,6 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
         "helper-parent": all_matching_ids(
             nextest_json(
                 root, extracted, "--profile", "helper", "--run-ignored", "only"
-            )
-        ),
-        "external-manual": all_matching_ids(
-            nextest_json(
-                root, extracted, "--profile", "external", "--run-ignored", "only"
             )
         ),
     }

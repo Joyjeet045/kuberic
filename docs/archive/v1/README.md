@@ -22,7 +22,7 @@ See [Status & Roadmap](status.md) for historical source maps and the current
 | [Protocols](protocols.md) | Failover, switchover, create, scale-up/down, restart, access status, epoch fencing, quorum model |
 | [Operator](operator.md) | CRD spec/status, reconciler phases, healthy phase, gRPC tracking, scale-up/down, restart recovery |
 | [Status & Roadmap](status.md) | MVP simplifications, known gaps (SF + CNPG), degenerate configs, open questions, source code map |
-| [Current Testing](../../features/kuberic/testing.md) | Surviving v2, database, SQL Server and DEX validation |
+| [Current Testing](../../features/kuberic/testing.md) | Surviving v2, database and DEX validation |
 | [Design Gaps](design-gaps.md) | Historical protocol, resilience and implementation review |
 | [Failure Scenarios](operator-failure-scenarios.md) | 9 failure scenarios with detection + recovery design |
 

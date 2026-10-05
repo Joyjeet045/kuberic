@@ -25,7 +25,6 @@ just nextest-list postgres
 just nextest-list kind
 just nextest-list dex-live
 just nextest-list helper
-just nextest-list external
 ```
 
 The ordinary tier is bounded to four test processes and keeps the combined

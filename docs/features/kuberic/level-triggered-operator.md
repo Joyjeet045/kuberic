@@ -28,8 +28,8 @@ The historical rationale and protocol design remain in the
 | `kuberic-controller` | CRDs, pure evaluator and plan APIs, Kubernetes observation/normalization, routing fences, resource convergence, command execution, and bounded re-observation |
 | `kvstore2` | Unpublished HTTP key-value conformance application |
 
-These are exactly two public production crates. DEX, all examples (including the
-SQL Server observer), and level tests are separate unpublished workspace packages.
+These are exactly two public production crates. DEX, all examples, and level
+tests are separate unpublished workspace packages.
 Runtime host support is enabled by default; the controller disables runtime
 default features. Isolated testing support is an opt-in runtime feature. The
 unpublished SQLite example owns its private WAL commit-barrier implementation.
@@ -983,8 +983,8 @@ production identity or key-rotation design.
 
 ## API and Source Boundaries
 
-The Cargo workspace contains only the current level-triggered, application,
-SQL Server and DEX packages. Package manifests and the compiled dependency
+The Cargo workspace contains only the current level-triggered, application and
+DEX packages. Package manifests and the compiled dependency
 graph are the source of truth for their dependencies.
 
 The runtime Rust tests maintain a reviewed source-public API inventory:

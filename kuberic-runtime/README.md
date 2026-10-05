@@ -3,7 +3,7 @@
 Application and replication runtime for the level-triggered Kuberic stack.
 
 Together with `kuberic-controller`, this is one of exactly two public
-production crates. DEX, all examples, the SQL Server observer and level tests
+production crates. DEX, all examples and level tests
 are separate unpublished workspace packages. Applications need only this crate:
 
 ```toml
