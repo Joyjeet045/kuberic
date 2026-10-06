@@ -21,7 +21,11 @@ use futures::{StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::host::Result;
+#[cfg(all(test, feature = "testing"))]
 use crate::host::hosting::PodRuntime;
+use crate::host::hosting::{
+    BuildAttemptRuntime, BuildRuntime, OutboundRuntime, PeerDiscoveryRuntime,
+};
 use crate::host::service::SessionRegistry;
 use crate::host::store::AgentStore;
 use async_trait::async_trait;
@@ -96,7 +100,7 @@ impl ReplicaEndpointResolver for KubernetesDnsResolver {
 }
 
 pub(crate) struct GrpcOutboundDispatcher<R> {
-    runtime: Arc<PodRuntime>,
+    runtime: BuildRuntime,
     transport: Arc<Mutex<ReliableTransport>>,
     resolver: Arc<R>,
     resource_uid: Arc<str>,
@@ -106,6 +110,11 @@ pub(crate) struct GrpcOutboundDispatcher<R> {
     completed_builds: Mutex<BTreeSet<(crate::protocol::types::OperationId, ProcessSessionId)>>,
 }
 
+#[async_trait]
+pub(crate) trait PeerReporter: Send + Sync {
+    async fn peer_report(&self, receiver: &ReplicaIdentity) -> Result<AgentReport>;
+}
+
 struct BuildDispatchCancellation {
     decision: Option<tokio::sync::oneshot::Sender<bool>>,
     completion: tokio::task::JoinHandle<()>,
@@ -113,7 +122,7 @@ struct BuildDispatchCancellation {
 
 impl BuildDispatchCancellation {
     fn new(
-        runtime: Arc<PodRuntime>,
+        runtime: BuildAttemptRuntime,
         build_id: crate::protocol::types::OperationId,
         generation: u64,
         guard: OwnedMutexGuard<()>,
@@ -121,9 +130,7 @@ impl BuildDispatchCancellation {
         let (decision, completion) = tokio::sync::oneshot::channel();
         let completion = tokio::spawn(async move {
             if completion.await != Ok(true) {
-                let _ = runtime
-                    .cancel_outbound_build_attempt(&build_id, generation, true)
-                    .await;
+                let _ = runtime.cancel_attempt(&build_id, generation, true).await;
             }
             drop(guard);
         });
@@ -150,7 +157,7 @@ pub(crate) async fn testing_cancel_build_dispatch(
     lock: Arc<Mutex<()>>,
 ) {
     let guard = lock.lock_owned().await;
-    BuildDispatchCancellation::new(runtime, build_id, generation, guard)
+    BuildDispatchCancellation::new(runtime.build_attempt_runtime(), build_id, generation, guard)
         .finish(false)
         .await;
 }
@@ -160,7 +167,7 @@ where
     R: ReplicaEndpointResolver,
 {
     pub(crate) fn new(
-        runtime: Arc<PodRuntime>,
+        runtime: BuildRuntime,
         transport: Arc<Mutex<ReliableTransport>>,
         resolver: Arc<R>,
         resource_uid: impl Into<Arc<str>>,
@@ -173,6 +180,7 @@ where
                 "agent bearer token must not be empty".into(),
             ));
         }
+
         Ok(Self {
             runtime,
             transport,
@@ -253,9 +261,13 @@ where
         };
         let build_id = endpoint.build_id.clone();
         let guard = build_lock.lock_owned().await;
-        let generation = self.runtime.build_generation(&build_id).await?;
-        let cancellation =
-            BuildDispatchCancellation::new(self.runtime.clone(), build_id, generation, guard);
+        let generation = self.runtime.generation(&build_id).await?;
+        let cancellation = BuildDispatchCancellation::new(
+            self.runtime.cancellation(),
+            build_id,
+            generation,
+            guard,
+        );
         let result = self.dispatch_build_locked(endpoint).await;
         cancellation.finish(result.is_ok()).await;
         result
@@ -349,7 +361,6 @@ where
                 || async {
                     let mut prepared = self
                         .runtime
-                        .data_plane()
                         .prepare_copy(PrepareCopyRequest {
                             build_id: build_id.clone(),
                             target: endpoint.identity.clone(),
@@ -430,7 +441,6 @@ where
         )?;
         let sequence = acknowledgement.sequence;
         self.runtime
-            .data_plane()
             .accept_copy_acknowledgement(acknowledgement)
             .await?;
         if retire_window {
@@ -441,6 +451,16 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<R> PeerReporter for GrpcOutboundDispatcher<R>
+where
+    R: ReplicaEndpointResolver,
+{
+    async fn peer_report(&self, receiver: &ReplicaIdentity) -> Result<AgentReport> {
+        GrpcOutboundDispatcher::peer_report(self, receiver).await
     }
 }
 
@@ -552,10 +572,7 @@ where
                         "replication ACK does not match the dispatched sessions".into(),
                     ));
                 }
-                self.runtime
-                    .data_plane()
-                    .accept_acknowledgement(acknowledgement)
-                    .await?;
+                self.runtime.accept_acknowledgement(acknowledgement).await?;
                 self.transport
                     .lock()
                     .await
@@ -661,7 +678,7 @@ mod build_request_tests {
 }
 
 pub(crate) async fn run_outbound<D: OutboundDispatcher + 'static>(
-    runtime: Arc<PodRuntime>,
+    runtime: Arc<OutboundRuntime>,
     transport: Arc<Mutex<ReliableTransport>>,
     dispatcher: Arc<D>,
     shutdown: watch::Receiver<bool>,
@@ -722,7 +739,7 @@ pub(crate) async fn run_outbound<D: OutboundDispatcher + 'static>(
 
 fn spawn_outbound_worker<D: OutboundDispatcher + 'static>(
     tasks: &mut tokio::task::JoinSet<()>,
-    runtime: Arc<PodRuntime>,
+    runtime: Arc<OutboundRuntime>,
     transport: Arc<Mutex<ReliableTransport>>,
     dispatcher: Arc<D>,
     shutdown: watch::Receiver<bool>,
@@ -755,7 +772,7 @@ fn spawn_outbound_worker<D: OutboundDispatcher + 'static>(
 #[cfg(test)]
 fn spawn_delivery_worker<D: OutboundDispatcher + 'static>(
     tasks: &mut tokio::task::JoinSet<()>,
-    runtime: Option<Arc<PodRuntime>>,
+    runtime: Option<Arc<OutboundRuntime>>,
     transport: Arc<Mutex<ReliableTransport>>,
     dispatcher: Arc<D>,
     shutdown: watch::Receiver<bool>,
@@ -786,7 +803,7 @@ fn spawn_delivery_worker<D: OutboundDispatcher + 'static>(
 }
 
 async fn dispatch_queued_with_retry<D: OutboundDispatcher>(
-    runtime: Option<&PodRuntime>,
+    runtime: Option<&OutboundRuntime>,
     transport: Arc<Mutex<ReliableTransport>>,
     dispatcher: Arc<D>,
     queued: QueuedOutbound,
@@ -845,7 +862,7 @@ async fn deliver_outbound<D: OutboundDispatcher>(
 }
 
 async fn deliver_outbound_with_runtime<D: OutboundDispatcher>(
-    runtime: Option<&PodRuntime>,
+    runtime: Option<&OutboundRuntime>,
     transport: Arc<Mutex<ReliableTransport>>,
     dispatcher: Arc<D>,
     outbound: OutboundOperation,
@@ -881,7 +898,10 @@ async fn deliver_outbound_with_runtime<D: OutboundDispatcher>(
     dispatch_queued_with_retry(runtime, transport, dispatcher, queued, shutdown).await
 }
 
-async fn queued_matches_runtime_authority(runtime: &PodRuntime, queued: &QueuedOutbound) -> bool {
+async fn queued_matches_runtime_authority(
+    runtime: &OutboundRuntime,
+    queued: &QueuedOutbound,
+) -> bool {
     let snapshot = runtime.snapshot().await;
     if !snapshot.open {
         return matches!(queued, QueuedOutbound::Remove(_) | QueuedOutbound::Evict(_));
@@ -907,18 +927,17 @@ async fn queued_matches_runtime_authority(runtime: &PodRuntime, queued: &QueuedO
     }
 }
 
-pub(crate) async fn run_peer_discovery<S, R>(
+pub(crate) async fn run_peer_discovery<S>(
     local: ReplicaIdentity,
-    runtime: Arc<PodRuntime>,
+    runtime: Arc<PeerDiscoveryRuntime>,
     store: Arc<S>,
     transport: Arc<Mutex<ReliableTransport>>,
-    dispatcher: Arc<GrpcOutboundDispatcher<R>>,
+    dispatcher: Arc<dyn PeerReporter>,
     sessions: Arc<SessionRegistry>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()>
 where
     S: AgentStore + 'static,
-    R: ReplicaEndpointResolver + 'static,
 {
     loop {
         if *shutdown.borrow_and_update() {
@@ -1038,7 +1057,6 @@ where
                             })
                         {
                             let _ = runtime
-                                .data_plane()
                                 .accept_acknowledgement(proto::ReplicationAck {
                                     receiver_session_id: report.process_session_id.to_string(),
                                     ..replication_ack_to_proto(ReplicationAck {

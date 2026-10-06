@@ -43,6 +43,18 @@ in the build-artifact job before archiving, never on archive-only runners.
 includes it as a prerequisite. Archive inventory validation still accounts for
 the ignored test exactly once.
 
+Internal lifecycle dependency isolation is a separate ordinary source test:
+
+```bash
+cargo test -p kuberic-runtime --test lifecycle_capability_boundaries
+```
+
+It inventories every capability contract, view, registration projection and
+production consumer signature, and rejects renamed facades, broad aliases,
+conversion escapes, host captures and nested capability brokers. This
+complements behavior suites and the external API/privacy guard; it does not
+replace either.
+
 ## Level-Triggered Unit and Durable Validation
 
 Use `just nextest-test` for the complete cluster-free tier. For focused

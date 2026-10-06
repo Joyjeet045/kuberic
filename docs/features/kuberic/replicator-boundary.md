@@ -46,9 +46,18 @@ agent-owned:
 - native copy progress alone is not host-accepted completion;
 - remove invokes the public primary before the common Remove dispatch.
 
-The private lifecycle contract contains local write fencing/access preparation,
-pending-write recovery, committed-prefix reconciliation, exact topology proof,
-and reporting/recovery observation rather than duplicate standard commands.
+Private lifecycle work is divided into consumer-specific process, authority,
+access, build, cancellation, topology, observation and outbound capabilities.
+Registration projects those capabilities from one shared managed or independent
+owner. Reporting, build dispatch, peer discovery, cleanup, topology effects and
+recovery receive opaque narrow views rather than a universal lifecycle facade.
+The split changes reachability, not synchronization: authority, sessions,
+generations, cleanup claims and the outbound queue remain shared.
+
+There is no all-capability supertrait, generic lifecycle action hook, backend
+enum, or getter that reconstructs the complete owner. Managed and custom
+implementations continue to use explicit common routing and their distinct
+proof mechanisms.
 
 ## Native topology receipts
 
@@ -105,10 +114,12 @@ validate. Existing
 JSON fields remain backward-readable through serde defaults; this refactor does
 not introduce a database schema migration.
 
-Reporting composes durable agent authority with current public/native
-observations. It preserves `live_builds_only`, so old-session build evidence is
-not resurrected. Catch-up composition retains an accepted boundary only while
-the native engine still reports catch-up complete.
+Reporting uses an opaque reconciliatory view rather than the complete hosting
+runtime. It composes durable agent authority with current public/native
+observations and can retry deferred access restoration. It preserves
+`live_builds_only`, so old-session build evidence is not resurrected. Catch-up
+composition retains an accepted boundary only while the native engine still
+reports catch-up complete.
 
 Recovery reconstructs authority and native stores, reissues or reobserves
 pending effects, and keeps access closed until public/native proof is accepted.
@@ -131,6 +142,7 @@ The repository validates this boundary through:
 
 ```bash
 cargo test -p kuberic-runtime --test public_api_inventory
+cargo test -p kuberic-runtime --test lifecycle_capability_boundaries
 scripts/check_runtime_public_api.sh
 cargo nextest run --profile ordinary -p kuberic-runtime --features testing --lib \
   -E 'test(/^host::tests::(runtime|store|coordinator|crash_boundaries)::/)'

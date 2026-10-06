@@ -827,7 +827,7 @@ fn run_removal_boundary_matrix() {
                             );
                         }
                         let reporter = crate::host::report::AgentReporter::new(store.clone());
-                        let report = reporter.report(&runtime).await.unwrap();
+                        let report = reporter.report(&runtime.report_runtime()).await.unwrap();
                         crate::control::normalize_agent_status_report(report).unwrap();
                         if boundary == "current:reply" {
                             let state = store.load_state().await.unwrap();
@@ -871,7 +871,7 @@ fn run_removal_boundary_matrix() {
                                 .unwrap();
                             let reporter = crate::host::report::AgentReporter::new(store.clone());
                             crate::control::normalize_agent_status_report(
-                                reporter.report(&runtime).await.unwrap(),
+                                reporter.report(&runtime.report_runtime()).await.unwrap(),
                             )
                             .unwrap();
                             runtime.abort();

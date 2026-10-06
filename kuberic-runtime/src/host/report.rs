@@ -7,7 +7,7 @@ use crate::control::proto;
 use crate::protocol::types::{AccessStatus, FaultType, ReplicaRole};
 
 use crate::host::Result;
-use crate::host::hosting::PodRuntime;
+use crate::host::hosting::ReportRuntime;
 use crate::host::session::ProcessSession;
 use crate::host::store::AgentStore;
 
@@ -28,7 +28,7 @@ impl<S: AgentStore> AgentReporter<S> {
         &self.session
     }
 
-    pub(crate) async fn report(&self, runtime: &PodRuntime) -> Result<proto::AgentStatusReport> {
+    pub(crate) async fn report(&self, runtime: &ReportRuntime) -> Result<proto::AgentStatusReport> {
         for attempt in 0..100 {
             match runtime.observe_progress().await {
                 Ok(()) | Err(crate::RuntimeError::ReconfigurationPending) => break,

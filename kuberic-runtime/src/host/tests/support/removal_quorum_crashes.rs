@@ -470,7 +470,7 @@ async fn late_member_recovery() {
     ));
     let dispatcher = Arc::new(
         GrpcOutboundDispatcher::new(
-            late.runtime.clone(),
+            late.runtime.build_runtime(),
             transport.clone(),
             Arc::new(Endpoints(endpoints)),
             intent.resource_uid.to_string(),
@@ -489,7 +489,7 @@ async fn late_member_recovery() {
     assert!(report.verified_replication_lsn.unwrap() >= 2);
     let discovery = tokio::spawn(run_peer_discovery(
         late.runtime.snapshot().await.identity,
-        late.runtime.clone(),
+        Arc::new(late.runtime.peer_discovery_runtime()),
         late.store.clone(),
         transport,
         dispatcher,

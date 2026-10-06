@@ -19,6 +19,6 @@ impl AgentReporter {
         &self,
         runtime: &PodRuntime,
     ) -> crate::host::Result<proto::AgentStatusReport> {
-        self.inner.report(&runtime.inner).await
+        self.inner.report(&runtime.inner.report_runtime()).await
     }
 }

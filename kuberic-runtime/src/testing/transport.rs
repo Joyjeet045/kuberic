@@ -26,7 +26,7 @@ pub async fn dispatch_build<R: crate::host::ReplicaEndpointResolver + 'static>(
         crate::host::transport::ReliableTransport::new(session, 16)?,
     ));
     let dispatcher = crate::host::transport::GrpcOutboundDispatcher::new(
-        runtime.inner.clone(),
+        runtime.inner.build_runtime(),
         transport,
         resolver,
         resource,

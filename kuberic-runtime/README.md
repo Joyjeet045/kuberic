@@ -206,9 +206,12 @@ and progress/catch-up boundary), including authorized idle replicas outside the
 voting set. Agent hosting installs these through configuration callbacks before
 dispatching `build_replica`. Configuration/epoch/session changes revoke old work;
 `remove_replica` retires idle build work without removing an admitted secondary.
-The private agent lifecycle host retains all durable authority/effect/store
-capabilities, fences delayed callback completion by exact authority and session,
-and publishes access only after implementation-specific proof. Standard
+The private host assembles consumer-specific process, authority, access, build,
+cancellation, topology, observation and outbound capabilities over one shared
+owner. Leaf workflows receive opaque narrow views rather than a universal
+lifecycle facade. The shared owner fences delayed callback completion by exact
+authority and session, and publishes access only after
+implementation-specific proof. Standard
 catch-up, build, and remove requests cross the returned public
 `PrimaryReplicator`; the private capability exposes only native proof,
 recovery, reconciliation, canonical topology receipts, and narrow observation.
@@ -220,8 +223,8 @@ required to construct topology receipts.
 An unmanaged custom factory without that hosting support remains rejected for
 managed admission.
 
-The common agent lifecycle host durably selects one build per logical target
-slot for custom implementations.
+The shared build capability durably selects one build per logical target slot
+for custom implementations.
 Descriptions for superseded builds are withdrawn, and callback receipts bind
 the full authority/generation to both process sessions and the local attempt.
 An idle custom replicator must withhold build-ready progress until its durable
@@ -275,8 +278,9 @@ Reservations, exact-authority admission and ACK validation, queue retention,
 quorum finalization, copy/build bookkeeping, and durable retry IDs live in the
 non-COM replication engine, not the SF traits. The default state interface
 retains write identity across failures and cancellation. Agent transport uses
-a separate `RuntimeDataPlane` handle; `PodRuntime` remains the hosting and
-lifecycle owner.
+a separate `RuntimeDataPlane` handle. `PodRuntime` remains the private
+composition/lifetime owner, while report, build, peer-discovery, outbound and
+recovery workers receive only their narrow runtime views.
 
 The replication engine emits implementation-neutral domain messages. Runtime
 `control` owns protobuf conversion; the `host` feature supplies separate control

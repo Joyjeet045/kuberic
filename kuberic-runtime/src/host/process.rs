@@ -321,8 +321,11 @@ where
             agent.sessions().local_session().clone(),
             self.config.transport_window_capacity,
         )?));
+        let build_runtime = runtime.build_runtime();
+        let outbound_runtime = Arc::new(runtime.outbound_runtime());
+        let peer_runtime = Arc::new(runtime.peer_discovery_runtime());
         let dispatcher = Arc::new(GrpcOutboundDispatcher::new(
-            runtime.clone(),
+            build_runtime,
             transport.clone(),
             self.resolver,
             self.config.resource_uid.to_string(),
@@ -338,14 +341,14 @@ where
             shutdown_rx.clone(),
         ));
         let mut outbound_task = tokio::spawn(run_outbound(
-            runtime.clone(),
+            outbound_runtime,
             transport.clone(),
             dispatcher.clone(),
             shutdown_rx.clone(),
         ));
         let mut peer_task = tokio::spawn(run_peer_discovery(
             identity.local_identity,
-            runtime.clone(),
+            peer_runtime,
             store.clone(),
             transport,
             dispatcher,

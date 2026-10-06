@@ -33,7 +33,8 @@ for expected in \
     'struct `ReplicatorAttachment` is private' \
     'struct `ReplicatorCreationReservation` is private' \
     'trait `ReplicatorRegistration` is private' \
-    'module `authority` is private'; do
+    'module `authority` is private' \
+    'module `hosting` is private'; do
     if ! grep -Fq "$expected" "$fixture_output"; then
         cat "$fixture_output" >&2
         echo "The external fixture failed for an unexpected reason: $expected" >&2

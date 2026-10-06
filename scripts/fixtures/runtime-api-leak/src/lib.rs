@@ -8,6 +8,13 @@ use kuberic_runtime::replicator::{
     StatefulServicePartition,
 };
 use kuberic_runtime::authority::AdmittedAuthority;
+use kuberic_runtime::host::hosting::{
+    BuildRuntime, OutboundRuntime, PeerDiscoveryRuntime, ReportRuntime,
+};
+use kuberic_runtime::host::hosting::lifecycle::{
+    LifecycleWiring, RecoveryRuntime, TopologyRuntime,
+};
+use kuberic_runtime::host::hosting::custom::ReplicatorLifecycleRegistration;
 
 pub fn extract_attachment(
     interfaces: &ReplicatorInterfaces,

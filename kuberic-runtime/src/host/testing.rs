@@ -610,7 +610,7 @@ pub(crate) async fn build_generation(
     runtime: &crate::host::hosting::PodRuntime,
     build_id: &crate::protocol::types::OperationId,
 ) -> crate::Result<u64> {
-    runtime.build_generation(build_id).await
+    runtime.build_runtime().generation(build_id).await
 }
 
 #[cfg(test)]
@@ -620,7 +620,8 @@ pub(crate) async fn cancel_build_attempt(
     generation: u64,
 ) -> crate::Result<()> {
     runtime
-        .cancel_outbound_build_attempt(build_id, generation, true)
+        .build_attempt_runtime()
+        .cancel_attempt(build_id, generation, true)
         .await
 }
 

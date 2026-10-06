@@ -1625,7 +1625,7 @@ async fn scale_up_transport_cancellation_reissues_exact_build_and_resumes_partia
     ));
     let dispatcher = Arc::new(
         GrpcOutboundDispatcher::new(
-            source_runtime.clone(),
+            source_runtime.build_runtime(),
             transport.clone(),
             resolver.clone(),
             "resource-1",
@@ -1636,7 +1636,7 @@ async fn scale_up_transport_cancellation_reissues_exact_build_and_resumes_partia
     );
     let (outbound_shutdown, outbound_shutdown_rx) = watch::channel(false);
     let outbound = tokio::spawn(run_outbound(
-        source_runtime.clone(),
+        Arc::new(source_runtime.outbound_runtime()),
         transport,
         dispatcher,
         outbound_shutdown_rx,

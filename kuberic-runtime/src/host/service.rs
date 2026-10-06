@@ -781,8 +781,9 @@ where
                 "status request targets another replica incarnation",
             ));
         }
+        let report_runtime = self.runtime.report_runtime();
         self.reporter
-            .report(&self.runtime)
+            .report(&report_runtime)
             .await
             .map_err(|error| match error {
                 crate::host::HostError::DurableEffectConflict(message) => {
@@ -891,9 +892,10 @@ where
                     .map_err(status_from_agent)?;
             }
         }
+        let report_runtime = self.runtime.report_runtime();
         let observation = self
             .reporter
-            .report(&self.runtime)
+            .report(&report_runtime)
             .await
             .map_err(status_from_agent)?;
         crate::control::validate_agent_status_report(&observation)

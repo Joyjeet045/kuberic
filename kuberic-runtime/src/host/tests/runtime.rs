@@ -5494,7 +5494,7 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
         }
         startup.unwrap();
         let reporter = crate::host::report::AgentReporter::new(store.clone());
-        let report = reporter.report(&runtime).await.unwrap();
+        let report = reporter.report(&runtime.report_runtime()).await.unwrap();
         assert_eq!(
             report.write_status,
             proto::AccessStatus::ReconfigurationPending as i32
@@ -5532,7 +5532,7 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
                 .await
                 .unwrap();
         }
-        let report = reporter.report(&runtime).await.unwrap();
+        let report = reporter.report(&runtime.report_runtime()).await.unwrap();
         assert_eq!(
             report.write_status,
             if supersede != 0 {
@@ -7403,7 +7403,8 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     let application = include_str!("../../application.rs");
     let library = include_str!("../../lib.rs");
     let hosting = include_str!("../hosting.rs");
-    let lifecycle = include_str!("../custom.rs");
+    let lifecycle = include_str!("../lifecycle.rs");
+    let custom = include_str!("../custom.rs");
     let report = include_str!("../report.rs");
     let service = include_str!("../service.rs");
     let testing = include_str!("../testing.rs");
@@ -7421,21 +7422,15 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         !include_str!("../transport.rs").contains(".record_durable_peer_progress("),
         "peer discovery may use reported progress for repair, never commit quorum credit"
     );
-    let backend_trait = lifecycle
-        .split_once("trait ReplicatorLifecycleBackend")
-        .unwrap()
-        .1
-        .split_once("\n}")
-        .unwrap()
-        .0;
     assert!(
         !replication.contains("async fn execute_action(&self, action: RuntimeEffectAction)")
-            && !lifecycle.contains("async fn execute_action")
-            && !lifecycle.contains(".legacy.execute_action(")
-            && !backend_trait.contains("fn owns_stream_session(&self) -> bool {"),
+            && !lifecycle.contains("execute_action")
+            && !custom.contains("async fn execute_action")
+            && !custom.contains(".legacy.execute_action(")
+            && !custom.contains("ReplicatorLifecycleBackend"),
         "ordinary lifecycle work must use explicit common routing and private proof hooks"
     );
-    for source in [hosting, lifecycle, report, service, transport] {
+    for source in [hosting, lifecycle, custom, report, service, transport] {
         for origin_name in [
             "refresh_custom_progress",
             "register_custom_peer_session",
@@ -7472,10 +7467,10 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         "only the optional built-in data plane may expose replication/copy outbound polling"
     );
     assert!(
-        !lifecycle.contains("install_engine_removal_proof"),
+        !custom.contains("install_engine_removal_proof"),
         "migrated topology completion must not restore a broad runtime snapshot"
     );
-    let removal_completion = lifecycle
+    let removal_completion = custom
         .split_once("async fn execute_removal_action")
         .unwrap()
         .1
@@ -7495,14 +7490,29 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     assert!(!replication.contains("fn managed_replicator("));
     assert!(!replication.contains("ReplicatorInterfaces::new"));
     assert!(
-        hosting.contains("lifecycle: Option<Arc<custom::ReplicatorLifecycleHost>>")
+        !hosting.contains("ReplicatorLifecycleHost")
+            && !custom.contains("ReplicatorLifecycleHost")
+            && hosting.contains("process_lifecycle: Option<lifecycle::ProcessRuntime>")
+            && hosting.contains("authority_lifecycle: Option<lifecycle::AuthorityRuntime>")
+            && hosting.contains("peer_lifecycle: Option<lifecycle::PeerRuntime>")
+            && hosting.contains("access_closure: Option<lifecycle::AccessClosure>")
+            && hosting.contains("topology_lifecycle: Option<lifecycle::TopologyRuntime>")
+            && hosting.contains("recovery_lifecycle: Option<lifecycle::RecoveryRuntime>")
             && !hosting.contains("enum HostedLifecycle")
             && !hosting.contains("custom: Option<Arc<custom::CustomReplicatorHost>>"),
-        "agent registration must retain one lifecycle facade rather than default/custom hosts"
+        "registration must retain only narrow lifecycle views"
     );
     assert!(
-        !include_str!("../custom.rs").contains("enum ReplicatorLifecycleBackend"),
-        "the lifecycle facade must use capability polymorphism rather than an origin enum"
+        !custom.contains("ReplicatorLifecycleBackend")
+            && lifecycle.contains("trait ProcessLifecycle")
+            && lifecycle.contains("trait AuthorityLifecycle")
+            && lifecycle.contains("trait AccessLifecycle")
+            && lifecycle.contains("trait BuildLifecycle")
+            && lifecycle.contains("trait BuildCancellation")
+            && lifecycle.contains("trait TopologyLifecycle")
+            && lifecycle.contains("trait LifecycleObservation")
+            && lifecycle.contains("trait OutboundLifecycle"),
+        "lifecycle routing must use explicit private capabilities rather than a universal backend"
     );
     for internal_module in ["authority", "effects", "runtime"] {
         assert!(
@@ -8707,6 +8717,95 @@ async fn peer_session_replacement_waits_for_the_durable_access_decision() {
         runtime.snapshot().await.write_status,
         AccessStatus::ReconfigurationPending
     );
+}
+
+enum ProductionAckView {
+    Build,
+    PeerDiscovery,
+}
+
+async fn assert_production_ack_view_rejects_obsolete_session(
+    view: ProductionAckView,
+    suffix: &str,
+) {
+    let local_instance = format!("{suffix}-primary");
+    let peer_instance = format!("{suffix}-peer");
+    let local = identity(1, &local_instance);
+    let peer = identity(2, &peer_instance);
+    let runtime = open_primary_with_session(
+        Arc::new(TestApplication::default()),
+        vec![local, peer.clone()],
+        suffix,
+    )
+    .await;
+    let first_session = ProcessSessionId::new(format!("{suffix}-session-a"));
+    crate::host::testing::register_lifecycle_peer_session(
+        &runtime,
+        peer.clone(),
+        first_session.clone(),
+    )
+    .await
+    .unwrap();
+    let pending = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new(format!("{suffix}-write")),
+            data: Bytes::from_static(b"session-fenced"),
+        })
+        .await
+        .unwrap();
+    let authority = runtime.snapshot().await.authority.unwrap();
+    let replacement = ProcessSessionId::new(format!("{suffix}-session-b"));
+    crate::host::testing::register_lifecycle_peer_session(
+        &runtime,
+        peer.clone(),
+        replacement.clone(),
+    )
+    .await
+    .unwrap();
+    let mut stale = acknowledgement(&authority, peer.clone(), pending.lsn);
+    stale.receiver_session_id = first_session.to_string();
+    let stale_result = match view {
+        ProductionAckView::Build => runtime.build_runtime().accept_acknowledgement(stale).await,
+        ProductionAckView::PeerDiscovery => {
+            runtime
+                .peer_discovery_runtime()
+                .accept_acknowledgement(stale)
+                .await
+        }
+    };
+    assert!(matches!(
+        stale_result,
+        Err(RuntimeError::AuthorityMismatch(message))
+            if message.contains("obsolete peer session")
+    ));
+
+    let mut current = acknowledgement(&authority, peer, pending.lsn);
+    current.receiver_session_id = replacement.to_string();
+    match view {
+        ProductionAckView::Build => runtime
+            .build_runtime()
+            .accept_acknowledgement(current)
+            .await
+            .unwrap(),
+        ProductionAckView::PeerDiscovery => runtime
+            .peer_discovery_runtime()
+            .accept_acknowledgement(current)
+            .await
+            .unwrap(),
+    }
+    pending.committed().await.unwrap();
+}
+
+#[tokio::test]
+async fn production_ack_views_preserve_current_peer_session_fencing() {
+    assert_production_ack_view_rejects_obsolete_session(ProductionAckView::Build, "build-view-ack")
+        .await;
+    assert_production_ack_view_rejects_obsolete_session(
+        ProductionAckView::PeerDiscovery,
+        "peer-view-ack",
+    )
+    .await;
 }
 
 #[tokio::test]

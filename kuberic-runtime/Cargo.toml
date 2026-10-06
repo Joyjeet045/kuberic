@@ -40,5 +40,5 @@ kuberic-controller = { path = "../kuberic-controller", features = ["runtime-test
 quote = "1"
 rusqlite.workspace = true
 serde_json.workspace = true
-syn = { version = "3", features = ["full"] }
+syn = { version = "3", features = ["full", "visit"] }
 tempfile = "3"
