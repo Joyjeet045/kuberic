@@ -2,61 +2,39 @@
 
 use std::sync::Arc;
 
-use crate::RuntimeError;
 use crate::effects::{RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::types::OperationId;
 use async_trait::async_trait;
-use tokio::sync::oneshot;
 
 use crate::host::Result;
-use crate::host::hosting::PodRuntime;
+use crate::host::hosting::{AcceptedAccessEffect, PodRuntime};
 use crate::host::store::{AgentStore, BeginEffect};
 
-#[doc(hidden)]
-pub(crate) struct RuntimeEffectCommit {
-    decision: Option<oneshot::Sender<bool>>,
-    completion: tokio::task::JoinHandle<Result<()>>,
-}
-
-impl RuntimeEffectCommit {
-    pub(crate) fn new(
-        decision: oneshot::Sender<bool>,
-        completion: tokio::task::JoinHandle<Result<()>>,
-    ) -> Self {
-        Self {
-            decision: Some(decision),
-            completion,
-        }
-    }
-
-    async fn finish(mut self, committed: bool) -> Result<()> {
-        if let Some(decision) = self.decision.take() {
-            let _ = decision.send(committed);
-        }
-        self.completion
-            .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
-    }
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RuntimeEffectObserverGate {
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 #[doc(hidden)]
 pub(crate) struct RuntimeEffectExecution {
     result: RuntimeEffectResult,
-    commit: Option<RuntimeEffectCommit>,
+    access: Option<AcceptedAccessEffect>,
 }
 
 impl RuntimeEffectExecution {
     pub(crate) fn completed(result: RuntimeEffectResult) -> Self {
         Self {
             result,
-            commit: None,
+            access: None,
         }
     }
 
-    pub(crate) fn prepared(result: RuntimeEffectResult, commit: RuntimeEffectCommit) -> Self {
+    pub(crate) fn prepared(result: RuntimeEffectResult, access: AcceptedAccessEffect) -> Self {
         Self {
             result,
-            commit: Some(commit),
+            access: Some(access),
         }
     }
 
@@ -64,16 +42,21 @@ impl RuntimeEffectExecution {
         &self.result
     }
 
+    #[cfg(test)]
+    pub(crate) fn testing_pause_after_decision(&mut self) -> Option<RuntimeEffectObserverGate> {
+        Some(self.access.as_mut()?.testing_pause_after_decision())
+    }
+
     pub(crate) async fn accept(mut self) -> Result<RuntimeEffectResult> {
-        if let Some(commit) = self.commit.take() {
-            commit.finish(true).await?;
+        if let Some(access) = self.access.take() {
+            access.accept().await?;
         }
         Ok(self.result)
     }
 
     pub(crate) async fn reject(mut self) -> Result<()> {
-        if let Some(commit) = self.commit.take() {
-            commit.finish(false).await?;
+        if let Some(access) = self.access.take() {
+            access.reject().await?;
         }
         Ok(())
     }

@@ -66,19 +66,36 @@ the native topology fence captured around the public call.
 
 Native access admission does not itself grant application access. The host
 reserves one common projection generation, validates public progress, publishes
-native access, and atomically updates the common and external projection. An
-explicit access transaction owns native fencing and projection cleanup while it
-waits for host-memory effect acceptance. If the caller is cancelled, the
-already-running transaction observes the closed decision channel and performs
-rollback; no `Drop` implementation starts asynchronous correctness work. The
-adapter then persists applied/completed stages through the existing intent-
-first protocol; startup remains write-closed and reissues or reobserves an
-interrupted persistence boundary.
+native access, and atomically updates the common and external projection. One
+already-running access task owns native/common fencing, final owner validation,
+host-memory completion, and projection cleanup. Its ready transaction is
+consumed exactly once to obtain an accepted transaction; that accepted owner is
+then committed or rejected exactly once. If the caller disappears before a
+decision, the task observes the closed channel and performs rollback. No
+`Drop` implementation starts asynchronous correctness work.
+
+Durable access effects persist applied and completed stages through the
+intent-first protocol before authorizing the accepted transaction. Direct
+lifecycle restoration, reconciliation, and Close use the same accepted owner
+without creating another effect journal entry. A positive durable decision
+transfers the exact applied effect to the access task, so cancellation of the
+waiting observer cannot suppress host-memory recording after successful final
+validation.
+
+Durable completion and runtime commit remain distinct. Abort or supersession
+can invalidate the owner after completion is retained but before final commit.
+That execution returns an explicit error, cleans only its own publication, and
+does not record host-memory success. The retained exact result remains
+replayable without publishing another access generation.
 
 Cancellation, publication failure, or configuration invalidation fences native
 writes and clears an unaccepted projection. Rollback is generation-scoped, so
 it cannot revoke a newer accepted grant. Final effect acceptance is serialized
-with projection invalidation.
+with projection invalidation. Common ownership validates authority,
+configuration, peer sessions, role, and access generations. The built-in engine
+also validates its native session, generation, progress, and fence. Independent
+custom implementations instead complete their public progress/revocation
+callback contract; they do not acquire managed-native receipts.
 
 ## Persistence, reporting, and recovery
 

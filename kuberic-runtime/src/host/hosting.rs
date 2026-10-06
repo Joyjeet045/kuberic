@@ -65,6 +65,7 @@ use crate::host::transport::{
 
 #[path = "custom.rs"]
 mod custom;
+pub(crate) use custom::AcceptedAccessEffect;
 
 #[async_trait]
 #[cfg(all(test, kuberic_workspace_tests))]
@@ -1669,9 +1670,12 @@ impl RuntimeHost {
                 gate.release.notified().await;
             }
         }
-        let access_progress = match access_commit.as_mut() {
-            Some(transaction) => transaction.accept().await?,
-            None => None,
+        let (access_progress, access_commit) = match access_commit {
+            Some(transaction) => {
+                let (progress, transaction) = transaction.accept().await?;
+                (progress, Some(transaction))
+            }
+            None => (None, None),
         };
         let lifecycle = self.lifecycle().ok();
         let topology_receipt = match lifecycle.as_ref() {
@@ -1696,7 +1700,7 @@ impl RuntimeHost {
             result: result.clone(),
         };
         if let Some(commit) = access_commit {
-            let commit = commit.into_runtime_commit(self.weak_self.clone(), applied);
+            let commit = commit.into_effect(self.weak_self.clone(), applied);
             return Ok(RuntimeEffectExecution::prepared(result, commit));
         }
         self.state

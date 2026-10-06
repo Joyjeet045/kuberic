@@ -25,8 +25,6 @@ use crate::{Result, RuntimeError};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 
-use crate::host::runtime_adapter::RuntimeEffectCommit;
-
 use super::{AppliedEffect, RuntimeHost, empty_snapshot};
 #[path = "custom_removal.rs"]
 mod removal;
@@ -65,11 +63,37 @@ struct AcceptedBuild {
     admission: BuildAdmission,
 }
 
-pub(super) struct AccessEffectTransaction {
-    accept: Option<oneshot::Sender<()>>,
-    accepted: Option<oneshot::Receiver<Option<NativeProgressStatus>>>,
-    decision: Option<oneshot::Sender<bool>>,
+pub(super) struct ReadyAccessTransaction {
+    accept: oneshot::Sender<()>,
+    accepted: oneshot::Receiver<Option<NativeProgressStatus>>,
+    decision: oneshot::Sender<AccessDecision>,
     completion: tokio::task::JoinHandle<Result<()>>,
+}
+
+pub(crate) struct AcceptedAccessTransaction {
+    decision: oneshot::Sender<AccessDecision>,
+    completion: tokio::task::JoinHandle<Result<()>>,
+}
+
+pub(crate) struct AcceptedAccessEffect {
+    transaction: AcceptedAccessTransaction,
+    host: Weak<RuntimeHost>,
+    applied: AppliedEffect,
+    #[cfg(test)]
+    observer_gate: Option<crate::host::runtime_adapter::RuntimeEffectObserverGate>,
+}
+
+enum AccessCommit {
+    Direct,
+    Durable {
+        host: Weak<RuntimeHost>,
+        applied: Box<AppliedEffect>,
+    },
+}
+
+enum AccessDecision {
+    Commit(AccessCommit),
+    Reject,
 }
 
 struct BuildQueueAdmission {
@@ -115,60 +139,114 @@ impl BuildQueueAdmission {
     }
 }
 
-impl AccessEffectTransaction {
-    pub(super) async fn accept(&mut self) -> Result<Option<NativeProgressStatus>> {
-        if let Some(accept) = self.accept.take() {
-            let _ = accept.send(());
+impl AccessCommit {
+    async fn record(self) {
+        if let Self::Durable { host, applied } = self
+            && let Some(host) = host.upgrade()
+        {
+            host.state
+                .write()
+                .await
+                .effects
+                .insert(applied.result.sequence, *applied);
         }
-        let Some(accepted) = self.accepted.take() else {
-            return Err(RuntimeError::OperationCancelled);
-        };
-        accepted.await.map_err(|_| RuntimeError::OperationCancelled)
     }
+}
 
-    pub(super) async fn commit(mut self) -> Result<()> {
-        if let Some(decision) = self.decision.take() {
-            let _ = decision.send(true);
-        }
+impl ReadyAccessTransaction {
+    pub(super) async fn accept(
+        self,
+    ) -> Result<(Option<NativeProgressStatus>, AcceptedAccessTransaction)> {
+        let Self {
+            accept,
+            accepted,
+            decision,
+            completion,
+        } = self;
+        let _ = accept.send(());
+        let progress = accepted
+            .await
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        Ok((
+            progress,
+            AcceptedAccessTransaction {
+                decision,
+                completion,
+            },
+        ))
+    }
+}
+
+impl AcceptedAccessTransaction {
+    async fn finish(self, decision: AccessDecision) -> Result<()> {
+        let _ = self.decision.send(decision);
         self.completion
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?
     }
 
-    pub(super) fn into_runtime_commit(
-        mut self,
+    pub(super) async fn commit(self) -> Result<()> {
+        self.finish(AccessDecision::Commit(AccessCommit::Direct))
+            .await
+    }
+
+    pub(super) fn into_effect(
+        self,
         host: Weak<RuntimeHost>,
         applied: AppliedEffect,
-    ) -> RuntimeEffectCommit {
-        let (decision, durable_decision) = oneshot::channel();
-        let completion = tokio::spawn(async move {
-            let committed = durable_decision.await.unwrap_or(false);
-            if let Some(inner) = self.decision.take() {
-                let _ = inner.send(committed);
-            }
-            let result = self
-                .completion
-                .await
-                .map_err(|error| RuntimeError::Application(error.to_string()))?;
-            if committed {
-                result?;
-                if let Some(host) = host.upgrade() {
-                    host.state
-                        .write()
-                        .await
-                        .effects
-                        .insert(applied.result.sequence, applied);
-                }
-                Ok(())
-            } else {
-                match result {
-                    Ok(()) | Err(RuntimeError::OperationCancelled) => Ok(()),
-                    Err(error) => Err(error),
-                }
-            }
-            .map_err(crate::host::HostError::from)
+    ) -> AcceptedAccessEffect {
+        AcceptedAccessEffect {
+            transaction: self,
+            host,
+            applied,
+            #[cfg(test)]
+            observer_gate: None,
+        }
+    }
+}
+
+impl AcceptedAccessEffect {
+    pub(crate) async fn accept(self) -> Result<()> {
+        let Self {
+            transaction,
+            host,
+            applied,
+            #[cfg(test)]
+            observer_gate,
+        } = self;
+        let decision = AccessDecision::Commit(AccessCommit::Durable {
+            host,
+            applied: Box::new(applied),
         });
-        RuntimeEffectCommit::new(decision, completion)
+        let _ = transaction.decision.send(decision);
+        #[cfg(test)]
+        if let Some(gate) = observer_gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        transaction
+            .completion
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?
+    }
+
+    pub(crate) async fn reject(self) -> Result<()> {
+        match self.transaction.finish(AccessDecision::Reject).await {
+            Ok(()) | Err(RuntimeError::OperationCancelled) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_pause_after_decision(
+        &mut self,
+    ) -> crate::host::runtime_adapter::RuntimeEffectObserverGate {
+        let gate = crate::host::runtime_adapter::RuntimeEffectObserverGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        self.observer_gate = Some(gate.clone());
+        gate
     }
 }
 
@@ -299,7 +377,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
         ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
         accepted: oneshot::Sender<Option<NativeProgressStatus>>,
-        decision: oneshot::Receiver<bool>,
+        decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()>;
     async fn wait_for_catch_up(&self) -> Result<()>;
     async fn authorize_failover_prefix(&self, boundary: i64) -> Result<()>;
@@ -521,7 +599,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
         accepted: oneshot::Sender<Option<NativeProgressStatus>>,
-        decision: oneshot::Receiver<bool>,
+        decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()> {
         self.execute_access_transaction(read, write, ready, accept, accepted, decision)
             .await
@@ -1282,7 +1360,7 @@ impl ManagedLifecycleBackend {
         mut ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
         accepted: oneshot::Sender<Option<NativeProgressStatus>>,
-        decision: oneshot::Receiver<bool>,
+        decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()> {
         let projection = self.common.reserve_access_projection(read, write).await?;
         let publication = {
@@ -1332,24 +1410,28 @@ impl ManagedLifecycleBackend {
             drop(common_guard);
             return Err(RuntimeError::OperationCancelled);
         }
-        let committed = decision.await.unwrap_or(false);
+        let decision = decision.await.unwrap_or(AccessDecision::Reject);
         drop(native_guard);
-        if committed
-            && self
-                .common
-                .validate_access_projection(&projection)
-                .await
-                .is_ok()
-        {
-            drop(common_guard);
-            Ok(())
-        } else {
-            let _ = self.legacy.fence_writes().await;
-            self.common
-                .rollback_common_access_projection_locked(&projection)
-                .await;
-            drop(common_guard);
-            Err(RuntimeError::OperationCancelled)
+        match decision {
+            AccessDecision::Commit(commit)
+                if self
+                    .common
+                    .validate_access_projection(&projection)
+                    .await
+                    .is_ok() =>
+            {
+                drop(common_guard);
+                commit.record().await;
+                Ok(())
+            }
+            AccessDecision::Commit(_) | AccessDecision::Reject => {
+                let _ = self.legacy.fence_writes().await;
+                self.common
+                    .rollback_common_access_projection_locked(&projection)
+                    .await;
+                drop(common_guard);
+                Err(RuntimeError::OperationCancelled)
+            }
         }
     }
 }
@@ -1469,8 +1551,8 @@ impl ReplicatorLifecycleHost {
         read: AccessStatus,
         write: AccessStatus,
     ) -> Result<()> {
-        let mut transaction = self.begin_access_effect(read, write).await?;
-        transaction.accept().await?;
+        let transaction = self.begin_access_effect(read, write).await?;
+        let (_, transaction) = transaction.accept().await?;
         transaction.commit().await
     }
 
@@ -1478,7 +1560,7 @@ impl ReplicatorLifecycleHost {
         &self,
         read: AccessStatus,
         write: AccessStatus,
-    ) -> Result<AccessEffectTransaction> {
+    ) -> Result<ReadyAccessTransaction> {
         let backend = self.backend.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (accept_tx, accept_rx) = oneshot::channel();
@@ -1490,10 +1572,10 @@ impl ReplicatorLifecycleHost {
                 .await
         });
         match ready_rx.await {
-            Ok(()) => Ok(AccessEffectTransaction {
-                accept: Some(accept_tx),
-                accepted: Some(accepted_rx),
-                decision: Some(decision_tx),
+            Ok(()) => Ok(ReadyAccessTransaction {
+                accept: accept_tx,
+                accepted: accepted_rx,
+                decision: decision_tx,
                 completion,
             }),
             Err(_) => completion
@@ -2418,7 +2500,7 @@ impl CustomReplicatorHost {
         mut ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
         accepted: oneshot::Sender<Option<NativeProgressStatus>>,
-        decision: oneshot::Receiver<bool>,
+        decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()> {
         let projection = self.reserve_access_projection(read, write).await?;
         let publication = {
@@ -2453,15 +2535,21 @@ impl CustomReplicatorHost {
             drop(guard);
             return Err(RuntimeError::OperationCancelled);
         }
-        let committed = decision.await.unwrap_or(false);
-        if committed && self.validate_access_projection(&projection).await.is_ok() {
-            drop(guard);
-            Ok(())
-        } else {
-            self.rollback_published_common_access_locked(&projection)
-                .await;
-            drop(guard);
-            Err(RuntimeError::OperationCancelled)
+        let decision = decision.await.unwrap_or(AccessDecision::Reject);
+        match decision {
+            AccessDecision::Commit(commit)
+                if self.validate_access_projection(&projection).await.is_ok() =>
+            {
+                drop(guard);
+                commit.record().await;
+                Ok(())
+            }
+            AccessDecision::Commit(_) | AccessDecision::Reject => {
+                self.rollback_published_common_access_locked(&projection)
+                    .await;
+                drop(guard);
+                Err(RuntimeError::OperationCancelled)
+            }
         }
     }
 
@@ -4153,7 +4241,7 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
         accepted: oneshot::Sender<Option<NativeProgressStatus>>,
-        decision: oneshot::Receiver<bool>,
+        decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()> {
         self.execute_common_access_transaction(read, write, ready, accept, accepted, decision)
             .await

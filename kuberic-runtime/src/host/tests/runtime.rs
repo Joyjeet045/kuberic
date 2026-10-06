@@ -25,12 +25,14 @@ use crate::engine::{DurableState, RetainedOperationStream};
 use crate::error::{ContractError, ContractResult};
 use crate::host::coordinator::Coordinator;
 use crate::host::hosting::{OutboundReplication, PodRuntime, PreparedCopy, RuntimeControlPlane};
-use crate::host::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
+use crate::host::runtime_adapter::{
+    RuntimeAdapter, RuntimeEffectExecution, RuntimeEffectExecutor, RuntimeEffectObserverGate,
+};
 use crate::host::service::AgentService;
 use crate::host::sqlite_store::SqliteStore;
 use crate::host::state::{
-    AgentState, CoordinatorStage, ReconfigurationRecord, RetainedCommandResult, RetainedResult,
-    SCHEMA_VERSION, StorageIdentity,
+    AgentState, CoordinatorStage, EffectStage, ReconfigurationRecord, RetainedCommandResult,
+    RetainedResult, SCHEMA_VERSION, StorageIdentity,
 };
 use crate::host::store::{AgentStore, BeginConfiguration, BeginEffect};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
@@ -4360,6 +4362,7 @@ struct CustomRoleGate {
     fail: AtomicBool,
     grant_error: AtomicUsize,
     block_progress: AtomicBool,
+    block_grant_progress: AtomicBool,
     progress_entered: Notify,
     progress_released: Notify,
     native_access_granted: AtomicBool,
@@ -4422,6 +4425,10 @@ impl Replicator for CustomRoleGate {
             Some(partition) => partition.get_write_status().await? == AccessStatus::Granted,
             None => false,
         };
+        if grant_attempt && self.block_grant_progress.swap(false, Ordering::SeqCst) {
+            self.progress_entered.notify_one();
+            self.progress_released.notified().await;
+        }
         if grant_attempt {
             match self.grant_error.load(Ordering::SeqCst) {
                 1 => return Err(RuntimeError::ReconfigurationPending),
@@ -8226,13 +8233,68 @@ enum EffectPersistenceFailure {
     MarkApplied = 1,
     Complete = 2,
     BlockComplete = 3,
+    BlockAfterBegin = 4,
+    BlockAfterApplied = 5,
+    BlockAfterComplete = 6,
 }
 
 struct FailingEffectStore {
     inner: Arc<SqliteStore>,
     failure: AtomicUsize,
-    complete_entered: Notify,
-    complete_release: Notify,
+    persistence_entered: Notify,
+    persistence_release: Notify,
+}
+
+struct ObserverGatedExecutor {
+    runtime: Arc<PodRuntime>,
+    gate: Mutex<Option<RuntimeEffectObserverGate>>,
+}
+
+impl ObserverGatedExecutor {
+    fn new(runtime: Arc<PodRuntime>) -> Self {
+        Self {
+            runtime,
+            gate: Mutex::new(None),
+        }
+    }
+
+    async fn gate(&self) -> RuntimeEffectObserverGate {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(gate) = self.gate.lock().unwrap().clone() {
+                    break gate;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+}
+
+#[async_trait]
+impl RuntimeEffectExecutor for ObserverGatedExecutor {
+    async fn apply_runtime_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> crate::host::Result<RuntimeEffectResult> {
+        <PodRuntime as RuntimeEffectExecutor>::apply_runtime_effect(self.runtime.as_ref(), effect)
+            .await
+    }
+
+    async fn prepare_runtime_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> crate::host::Result<RuntimeEffectExecution> {
+        let mut execution = <PodRuntime as RuntimeEffectExecutor>::prepare_runtime_effect(
+            self.runtime.as_ref(),
+            effect,
+        )
+        .await?;
+        let gate = execution.testing_pause_after_decision().unwrap();
+        *self.gate.lock().unwrap() = Some(gate);
+        Ok(execution)
+    }
 }
 
 impl FailingEffectStore {
@@ -8240,8 +8302,8 @@ impl FailingEffectStore {
         Self {
             inner,
             failure: AtomicUsize::new(failure as usize),
-            complete_entered: Notify::new(),
-            complete_release: Notify::new(),
+            persistence_entered: Notify::new(),
+            persistence_release: Notify::new(),
         }
     }
 
@@ -8275,12 +8337,40 @@ impl AgentStore for FailingEffectStore {
     }
 
     async fn begin_effect(&self, effect: &RuntimeEffect) -> crate::host::Result<BeginEffect> {
-        self.inner.begin_effect(effect).await
+        let result = self.inner.begin_effect(effect).await?;
+        if self
+            .failure
+            .compare_exchange(
+                EffectPersistenceFailure::BlockAfterBegin as usize,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.persistence_entered.notify_one();
+            self.persistence_release.notified().await;
+        }
+        Ok(result)
     }
 
     async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> crate::host::Result<()> {
         self.fail(EffectPersistenceFailure::MarkApplied)?;
-        self.inner.mark_effect_applied(effect).await
+        self.inner.mark_effect_applied(effect).await?;
+        if self
+            .failure
+            .compare_exchange(
+                EffectPersistenceFailure::BlockAfterApplied as usize,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.persistence_entered.notify_one();
+            self.persistence_release.notified().await;
+        }
+        Ok(())
     }
 
     async fn complete_effect(&self, result: &RuntimeEffectResult) -> crate::host::Result<()> {
@@ -8294,11 +8384,25 @@ impl AgentStore for FailingEffectStore {
             )
             .is_ok()
         {
-            self.complete_entered.notify_one();
-            self.complete_release.notified().await;
+            self.persistence_entered.notify_one();
+            self.persistence_release.notified().await;
         }
         self.fail(EffectPersistenceFailure::Complete)?;
-        self.inner.complete_effect(result).await
+        self.inner.complete_effect(result).await?;
+        if self
+            .failure
+            .compare_exchange(
+                EffectPersistenceFailure::BlockAfterComplete as usize,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.persistence_entered.notify_one();
+            self.persistence_release.notified().await;
+        }
+        Ok(())
     }
 
     async fn cancel_effect(&self, effect: &RuntimeEffect) -> crate::host::Result<()> {
@@ -8492,6 +8596,73 @@ async fn prepared_access_effect_holds_native_fence_until_durable_decision() {
         runtime.snapshot().await.write_status,
         AccessStatus::ReconfigurationPending
     );
+}
+
+#[tokio::test]
+async fn decided_access_effect_records_after_completion_observer_is_dropped() {
+    let primary = identity(1, "access-observer-loss-primary");
+    let runtime = open_primary_with_session(
+        Arc::new(TestApplication::default()),
+        vec![primary.clone()],
+        "access-observer-loss-session",
+    )
+    .await;
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+    let access = effect(
+        6,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    );
+    let mut state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: ResourceUid::new("access-observer-loss"),
+        pod_uid: PodUid::new(primary.instance_id.as_str()),
+        pvc_uid: PvcUid::new("access-observer-loss-pvc"),
+        initialization_id: InitializationId::new("access-observer-loss-initialization"),
+        local_identity: primary,
+        effective_policy: EffectivePolicy::fixed(1, 10).unwrap(),
+    });
+    state.next_effect_sequence = 6;
+    let directory = crate::host::tests::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    let executor = Arc::new(ObserverGatedExecutor::new(runtime.clone()));
+    let accepted = {
+        let store = store.clone();
+        let executor = executor.clone();
+        let access = access.clone();
+        tokio::spawn(async move { RuntimeAdapter::new(store, executor).execute(access).await })
+    };
+    let gate = executor.gate().await;
+    timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .unwrap();
+    let retained = store.load_state().await.unwrap().retained_result.unwrap();
+    assert_eq!(retained.effect, access);
+    accepted.abort();
+    assert!(accepted.await.unwrap_err().is_cancelled());
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime.testing_has_applied_effect(6).await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let replay = RuntimeAdapter::new(store, runtime.clone())
+        .execute(access)
+        .await
+        .unwrap();
+    assert_eq!(replay, retained.result);
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
 }
 
 #[tokio::test]
@@ -8697,7 +8868,7 @@ async fn cancelling_durable_access_completion_rolls_back_and_preserves_pending_r
         let access = access.clone();
         tokio::spawn(async move { RuntimeAdapter::new(store, runtime).execute(access).await })
     };
-    timeout(Duration::from_secs(1), store.complete_entered.notified())
+    timeout(Duration::from_secs(1), store.persistence_entered.notified())
         .await
         .unwrap();
     execution.abort();
@@ -8722,6 +8893,276 @@ async fn cancelling_durable_access_completion_rolls_back_and_preserves_pending_r
     assert!(runtime.testing_has_applied_effect(6).await);
     assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
     assert!(inner.load_state().await.unwrap().pending_effect.is_none());
+}
+
+#[tokio::test]
+async fn retained_access_completion_survives_caller_loss_and_final_validation_failure() {
+    for (suffix, invalidate_owner) in [("caller-loss", false), ("abort", true)] {
+        let primary = identity(1, &format!("retained-access-{suffix}"));
+        let runtime = open_primary_with_session(
+            Arc::new(TestApplication::default()),
+            vec![primary.clone()],
+            &format!("retained-access-{suffix}-session"),
+        )
+        .await;
+        runtime
+            .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+            .await
+            .unwrap();
+
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new(format!("retained-access-{suffix}")),
+            pod_uid: PodUid::new(primary.instance_id.as_str()),
+            pvc_uid: PvcUid::new(format!("retained-access-{suffix}-pvc")),
+            initialization_id: InitializationId::new(format!(
+                "retained-access-{suffix}-initialization"
+            )),
+            local_identity: primary,
+            effective_policy: EffectivePolicy::fixed(1, 10).unwrap(),
+        });
+        state.next_effect_sequence = 6;
+        let directory = crate::host::tests::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let inner = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        let store = Arc::new(FailingEffectStore::new(
+            inner.clone(),
+            EffectPersistenceFailure::BlockAfterComplete,
+        ));
+        let access = effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        );
+        let task = {
+            let store = store.clone();
+            let runtime = runtime.clone();
+            let access = access.clone();
+            tokio::spawn(async move { RuntimeAdapter::new(store, runtime).execute(access).await })
+        };
+        timeout(Duration::from_secs(1), store.persistence_entered.notified())
+            .await
+            .unwrap();
+        let retained = inner.load_state().await.unwrap().retained_result.unwrap();
+        assert_eq!(retained.effect, access);
+        assert!(!runtime.testing_has_applied_effect(6).await);
+
+        if invalidate_owner {
+            runtime.abort();
+            store.persistence_release.notify_one();
+            assert!(task.await.unwrap().is_err());
+        } else {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.snapshot().await.write_status != AccessStatus::Granted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!runtime.testing_has_applied_effect(6).await);
+
+        let replay = RuntimeAdapter::new(inner.clone(), runtime.clone())
+            .execute(access)
+            .await
+            .unwrap();
+        assert_eq!(replay, retained.result);
+        assert!(!runtime.testing_has_applied_effect(6).await);
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    }
+}
+
+#[tokio::test]
+async fn prepared_access_effect_reconstructs_at_each_durable_cutpoint() {
+    for (suffix, failure, expected_stage) in [
+        (
+            "intent",
+            EffectPersistenceFailure::BlockAfterBegin,
+            Some(EffectStage::IntentCommitted),
+        ),
+        (
+            "applied",
+            EffectPersistenceFailure::BlockAfterApplied,
+            Some(EffectStage::EffectApplied),
+        ),
+        (
+            "completed",
+            EffectPersistenceFailure::BlockAfterComplete,
+            None,
+        ),
+    ] {
+        let directory = crate::host::tests::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let local = identity(1, &format!("prepared-restart-{suffix}"));
+        let inner = fresh_disk_store(directory.path(), local.clone());
+        let old_control = Arc::new(CustomRoleGate::default());
+        let runtime = Arc::new(PodRuntime::new(
+            local.clone(),
+            Arc::new(CustomRoleService(old_control)),
+            inner.clone(),
+        ));
+        runtime
+            .bind_replica_session(
+                ResourceUid::new("frozen-copy"),
+                ProcessSessionId::new(format!("prepared-restart-{suffix}-old")),
+            )
+            .unwrap();
+        let adapter = RuntimeAdapter::new(inner.clone(), runtime.clone());
+        for (index, action) in [
+            RuntimeEffectAction::Open(OpenMode::New),
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority(
+                local.clone(),
+                vec![local.clone()],
+            ))),
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::ReconfigurationPending,
+                write: AccessStatus::ReconfigurationPending,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            adapter
+                .execute(effect(index as u64 + 1, action))
+                .await
+                .unwrap();
+        }
+
+        let access = effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        );
+        let store = Arc::new(FailingEffectStore::new(inner.clone(), failure));
+        let execution = {
+            let runtime = runtime.clone();
+            let store = store.clone();
+            let access = access.clone();
+            tokio::spawn(async move { RuntimeAdapter::new(store, runtime).execute(access).await })
+        };
+        timeout(Duration::from_secs(1), store.persistence_entered.notified())
+            .await
+            .unwrap();
+
+        let interrupted = inner.load_state().await.unwrap();
+        match expected_stage {
+            Some(stage) => {
+                let pending = interrupted.pending_effect.as_ref().unwrap();
+                assert_eq!(pending.effect, access, "{suffix}");
+                assert_eq!(pending.stage, stage, "{suffix}");
+                assert_ne!(
+                    interrupted.retained_result.as_ref().unwrap().effect,
+                    access,
+                    "{suffix}"
+                );
+            }
+            None => {
+                assert!(interrupted.pending_effect.is_none(), "{suffix}");
+                let retained = interrupted.retained_result.as_ref().unwrap();
+                assert_eq!(retained.effect, access, "{suffix}");
+            }
+        }
+
+        runtime.abort();
+        execution.abort();
+        assert!(execution.await.unwrap_err().is_cancelled(), "{suffix}");
+        drop(adapter);
+        drop(store);
+        drop(runtime);
+        drop(inner);
+
+        let reopened = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+        let recovered_control = Arc::new(CustomRoleGate::default());
+        recovered_control
+            .block_grant_progress
+            .store(true, Ordering::SeqCst);
+        let recovered = Arc::new(PodRuntime::new(
+            local,
+            Arc::new(CustomRoleService(recovered_control.clone())),
+            reopened.clone(),
+        ));
+        assert_eq!(
+            recovered.snapshot().await.write_status,
+            AccessStatus::NotPrimary,
+            "{suffix}"
+        );
+        let recovery = {
+            let reopened = reopened.clone();
+            let recovered = recovered.clone();
+            tokio::spawn(async move {
+                AgentService::new(reopened, recovered.clone(), recovered, "token")
+                    .unwrap()
+                    .reconstruct_runtime()
+                    .await
+            })
+        };
+        timeout(
+            Duration::from_secs(1),
+            recovered_control.progress_entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            recovered.snapshot().await.write_status,
+            AccessStatus::Granted,
+            "{suffix}"
+        );
+        assert!(
+            !recovered_control
+                .native_access_granted
+                .load(Ordering::SeqCst),
+            "{suffix}"
+        );
+        recovered_control.progress_released.notify_one();
+        recovery.await.unwrap().unwrap();
+
+        let state = reopened.load_state().await.unwrap();
+        assert!(state.pending_effect.is_none(), "{suffix}");
+        let retained = state.retained_result.as_ref().unwrap();
+        assert_eq!(retained.effect, access, "{suffix}");
+        assert_eq!(
+            recovered.snapshot().await.write_status,
+            AccessStatus::Granted,
+            "{suffix}"
+        );
+        if expected_stage.is_some() {
+            assert!(recovered.testing_has_applied_effect(5).await, "{suffix}");
+        } else {
+            assert!(!recovered.testing_has_applied_effect(5).await, "{suffix}");
+            let before = recovered.snapshot().await;
+            recovered_control
+                .block_grant_progress
+                .store(true, Ordering::SeqCst);
+            let replay = timeout(
+                Duration::from_millis(100),
+                RuntimeAdapter::new(reopened, recovered.clone()).execute(access),
+            )
+            .await
+            .expect("retained replay attempted another access publication")
+            .unwrap();
+            assert_eq!(replay, retained.result, "{suffix}");
+            let after = recovered.snapshot().await;
+            assert_eq!(after.read_status, before.read_status, "{suffix}");
+            assert_eq!(after.write_status, before.write_status, "{suffix}");
+            assert!(!recovered.testing_has_applied_effect(5).await, "{suffix}");
+            assert!(
+                recovered_control
+                    .block_grant_progress
+                    .swap(false, Ordering::SeqCst),
+                "{suffix}: retained replay consumed the publication proof gate"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -8765,7 +9206,7 @@ async fn custom_access_durable_rejection_closes_native_access_and_retries_exactl
                     async move { RuntimeAdapter::new(store, runtime).execute(access).await },
                 )
             };
-            timeout(Duration::from_secs(1), store.complete_entered.notified())
+            timeout(Duration::from_secs(1), store.persistence_entered.notified())
                 .await
                 .unwrap();
             assert!(control.native_access_granted.load(Ordering::SeqCst));
