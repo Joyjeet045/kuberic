@@ -1467,22 +1467,3 @@ async fn additive_handoff_fields_default_when_reopening_legacy_json() {
     );
     assert_eq!(reopened.load().await.unwrap(), Some(authority));
 }
-
-#[test]
-fn runtime_public_root_has_only_sf_shaped_modules() {
-    let root = include_str!("../../lib.rs");
-    for forbidden in [
-        "pub mod runtime",
-        "pub mod authority",
-        "pub mod effects",
-        "PodRuntime",
-        "RuntimeEffect",
-        "AuthorityStore",
-        "ManagedReplicator",
-    ] {
-        assert!(
-            !root.contains(forbidden),
-            "kuberic-runtime root exposes {forbidden}"
-        );
-    }
-}

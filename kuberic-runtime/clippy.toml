@@ -1,0 +1,4 @@
+disallowed-types = [
+  { path = "kuberic_runtime::host::hosting::PodRuntime", reason = "narrow host modules must use purpose-specific runtime views" },
+  { path = "kuberic_runtime::replicator::PrimaryReplicator", reason = "host transport must route builds through the admitted build coordinator" },
+]

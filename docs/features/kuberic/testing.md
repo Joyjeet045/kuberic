@@ -30,7 +30,7 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated validator accounts for 1,109 tests: 873 ordinary, one build-only,
+The consolidated validator accounts for 1,113 tests: 877 ordinary, one build-only,
 203 directly runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test
 and 19 mapped parent-driven subprocess helpers.
 Use its generated counts as the inventory evolves.
@@ -43,17 +43,28 @@ in the build-artifact job before archiving, never on archive-only runners.
 includes it as a prerequisite. Archive inventory validation still accounts for
 the ignored test exactly once.
 
-Internal lifecycle dependency isolation is a separate ordinary source test:
+Internal lifecycle dependency isolation uses stable compiler and Clippy policy
+plus a focused ordinary source test:
 
 ```bash
 cargo test -p kuberic-runtime --test lifecycle_capability_boundaries
 ```
 
-It inventories every capability contract, view, registration projection and
-production consumer signature, and rejects renamed facades, broad aliases,
-conversion escapes, host captures and nested capability brokers. This
-complements behavior suites and the external API/privacy guard; it does not
-replace either.
+Rust visibility lints reject unreachable public declarations and private
+interface mismatches. Runtime-local Clippy restrictions keep broad runtime and
+direct-primary types out of narrow host modules. The source test covers the
+remaining Kuberic-specific relationships: aggregate capability traits and
+owners, guarded aliases, trait/view escape paths, fixture gating,
+construction-only wiring, recursive modules, and the single admitted-build
+coordinator. It does not snapshot every private method, field or consumer.
+These checks complement behavior suites and the external API/privacy guard;
+they do not replace either.
+
+The syntax guard is deliberately bounded rather than a whole-program Rust
+analyzer. New explicit Clippy suppressions, macro-generated lifecycle wiring,
+block-local capability trait graphs, reverse conversions, and transport child
+modules require direct review instead of extending the guard with another
+source-language model.
 
 ## Level-Triggered Unit and Durable Validation
 

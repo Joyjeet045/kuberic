@@ -47,11 +47,6 @@ private-path documented impl crate::host::process::RunningReplica::fn handle (& 
 private-path documented impl crate::host::process::RunningReplica::fn shutdown (& self)
 private-path documented impl crate::host::process::RunningReplica::fn shutdown_signal (& self) -> watch :: Receiver < bool >
 private-path documented impl crate::host::transport::KubernetesDnsResolver::fn new (resource_uid : ResourceUid , namespace : impl Into < Arc < str > >) -> Self
-private-path documented impl crate::replicator::queue::ReplicationQueue::fn clear (& mut self)
-private-path documented impl crate::replicator::queue::ReplicationQueue::fn first_lsn (& self) -> Option < Lsn >
-private-path documented impl crate::replicator::queue::ReplicationQueue::fn operations_from (& self , from_lsn : Lsn) -> Vec < Operation >
-private-path documented impl crate::replicator::queue::ReplicationQueue::fn push (& mut self , operation : Operation)
-private-path documented impl crate::replicator::queue::ReplicationQueue::fn truncate_committed (& mut self , committed_lsn : Lsn)
 private-path documented struct crate::host::process::ReplicaBuildDiagnostics
 private-path documented struct crate::host::process::ReplicaDiagnostics
 private-path documented struct crate::host::process::ReplicaHandle
@@ -59,7 +54,6 @@ private-path documented struct crate::host::process::ReplicaHost< A , R >
 private-path documented struct crate::host::process::ReplicaProcessConfig
 private-path documented struct crate::host::process::RunningReplica
 private-path documented struct crate::host::transport::KubernetesDnsResolver
-private-path documented struct crate::replicator::queue::ReplicationQueue
 private-path documented trait crate::host::transport::ReplicaEndpointResolver: Send + Sync
 private-path documented trait crate::host::transport::ReplicaEndpointResolver::fn control_endpoint (& self , identity : & ReplicaIdentity) -> String
 private-path documented trait crate::host::transport::ReplicaEndpointResolver::fn replication_endpoint (& self , identity : & ReplicaIdentity) -> String

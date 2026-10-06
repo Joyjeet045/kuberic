@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::host::Result;
 #[cfg(all(test, feature = "testing"))]
+#[allow(clippy::disallowed_types)]
 use crate::host::hosting::PodRuntime;
 use crate::host::hosting::{
     BuildAttemptRuntime, BuildRuntime, OutboundRuntime, PeerDiscoveryRuntime,
@@ -150,6 +151,7 @@ impl BuildDispatchCancellation {
 
 #[cfg(all(test, feature = "testing"))]
 #[doc(hidden)]
+#[allow(clippy::disallowed_types)]
 pub(crate) async fn testing_cancel_build_dispatch(
     runtime: Arc<PodRuntime>,
     build_id: crate::protocol::types::OperationId,

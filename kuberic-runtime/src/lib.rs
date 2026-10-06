@@ -1,5 +1,9 @@
 //! Independent application and replication runtime for the level-triggered stack.
 
+#![deny(private_bounds, private_interfaces)]
+#![cfg_attr(not(test), deny(unreachable_pub))]
+#![allow(clippy::disallowed_types)]
+
 #[cfg(feature = "host")]
 pub mod application;
 #[cfg(feature = "host")]

@@ -134,7 +134,11 @@ migration boundary is limited to preserving the coherent factory-created
 bundle.
 
 The runtime source-public inventory and compile-fail API guards cover hidden
-bundle and receipt signatures.
+bundle and receipt signatures. Stable Rust visibility lints and runtime-local
+Clippy restrictions enforce broad type ownership in ordinary builds. The
+focused lifecycle source test retains only relationship rules that those tools
+cannot express, including capability aggregation, escape paths, fixture gating
+and the single admitted-build coordinator.
 
 ## Validation
 

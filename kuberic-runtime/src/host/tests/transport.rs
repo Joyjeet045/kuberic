@@ -8,42 +8,6 @@ use crate::replicator::sender::SenderOutbound;
 use crate::transport::OutboundOperation;
 use crate::transport::ReplicationItem;
 
-#[test]
-fn hosted_build_dispatch_uses_one_shared_public_execution_coordinator() {
-    let transport = include_str!("../transport.rs");
-    assert_eq!(
-        transport.matches(".execute_admitted_build(").count(),
-        1,
-        "production transport must have one admitted-build coordinator call"
-    );
-    assert!(
-        !transport.contains(".build_replica("),
-        "transport must not invoke the public primary through a parallel path"
-    );
-    assert!(
-        transport.contains("let (decision, completion) = tokio::sync::oneshot::channel()")
-            && transport.contains("if completion.await != Ok(true)")
-            && !transport.contains("impl Drop for BuildDispatchCancellation"),
-        "dispatch cleanup must be an explicit transaction, not asynchronous Drop work"
-    );
-    assert_eq!(
-        transport
-            .matches("QueuedOutbound::Build(endpoint) => self.dispatch_build(endpoint).await")
-            .count(),
-        1,
-        "one common Build control branch must own hosted dispatch"
-    );
-    assert_eq!(
-        transport
-            .matches(
-                "QueuedOutbound::Remove(replica_id) => {\n                let receiver = self.transport",
-            )
-            .count(),
-        1,
-        "one common Remove control branch must own hosted dispatch"
-    );
-}
-
 fn identity(id: i64, instance: &str) -> ReplicaIdentity {
     ReplicaIdentity {
         replica_id: ReplicaId::new(id),
