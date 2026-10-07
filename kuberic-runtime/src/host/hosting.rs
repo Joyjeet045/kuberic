@@ -776,18 +776,10 @@ impl PodRuntime {
                 weak_self: weak_self.clone(),
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
-                custom_authority_attempt: StdMutex::new(Weak::new()),
-                custom_authority_invalidated: AtomicBool::new(false),
-                custom_access_requires_authorization: AtomicBool::new(false),
-                pending_authority_recovery: StdMutex::new(None),
-                custom_restoration: Mutex::new(()),
+                custom_authority: custom::CustomAuthorityContainment::new(weak_self.clone()),
                 replica_session: OnceLock::new(),
                 #[cfg(all(test, feature = "testing"))]
                 access_effect_acceptance_gate: StdMutex::new(None),
-                #[cfg(all(test, feature = "testing"))]
-                authority_publication_gate: StdMutex::new(None),
-                #[cfg(all(test, feature = "testing"))]
-                custom_restoration_gate: StdMutex::new(None),
                 #[cfg(all(test, feature = "testing"))]
                 peer_discovery_ready_gate: StdMutex::new(None),
             }),
@@ -810,7 +802,9 @@ impl PodRuntime {
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
         };
-        *self.host.authority_publication_gate.lock().unwrap() = Some(gate.clone());
+        self.host
+            .custom_authority
+            .set_publication_gate(gate.clone());
         gate
     }
 
@@ -820,7 +814,9 @@ impl PodRuntime {
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
         };
-        *self.host.custom_restoration_gate.lock().unwrap() = Some(gate.clone());
+        self.host
+            .custom_authority
+            .set_restoration_gate(gate.clone());
         gate
     }
 
@@ -875,12 +871,11 @@ impl PodRuntime {
     }
 
     pub(super) fn stage_authority_recovery(&self, effect: Option<RuntimeEffect>) {
-        *self.host.pending_authority_recovery.lock().unwrap() =
-            effect.filter(|effect| matches!(effect.action, RuntimeEffectAction::AdmitAuthority(_)));
+        self.host.custom_authority.stage_recovery(effect);
     }
 
     pub(super) fn finish_authority_recovery(&self) {
-        self.host.pending_authority_recovery.lock().unwrap().take();
+        self.host.custom_authority.finish_recovery();
     }
 
     pub(crate) fn bind_replica_session(
@@ -1434,96 +1429,25 @@ struct RuntimeHost {
     weak_self: Weak<Self>,
     aborted: AtomicBool,
     closed: AtomicBool,
-    custom_authority_attempt: StdMutex<Weak<AtomicBool>>,
-    custom_authority_invalidated: AtomicBool,
-    custom_access_requires_authorization: AtomicBool,
-    pending_authority_recovery: StdMutex<Option<RuntimeEffect>>,
-    custom_restoration: Mutex<()>,
+    custom_authority: custom::CustomAuthorityContainment,
     #[cfg(all(test, feature = "testing"))]
     access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
-    #[cfg(all(test, feature = "testing"))]
-    authority_publication_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
-    #[cfg(all(test, feature = "testing"))]
-    custom_restoration_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
     #[cfg(all(test, feature = "testing"))]
     peer_discovery_ready_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
 }
 
-impl OpenAttempt<'_> {
-    fn authority(host: &RuntimeHost) -> OpenAttempt<'_> {
-        let mut slot = host.custom_authority_attempt.lock().unwrap();
-        let (entered, owned) = match slot.upgrade() {
-            Some(entered) => (entered, false),
-            None => {
-                let entered = Arc::new(AtomicBool::new(false));
-                host.custom_authority_invalidated
-                    .store(false, Ordering::Release);
-                *slot = Arc::downgrade(&entered);
-                (entered, true)
-            }
-        };
-        drop(slot);
-        OpenAttempt {
-            host,
-            entered: Some(entered),
-            owned,
-            complete: false,
-        }
-    }
-
-    fn arm(&self) {
-        self.entered
-            .as_ref()
-            .unwrap()
-            .store(true, Ordering::Release);
-    }
-
-    fn complete(mut self) {
-        if self.owned {
-            self.entered
-                .as_ref()
-                .unwrap()
-                .store(false, Ordering::Release);
-        }
-        self.complete = true;
-    }
-
-    fn validate(&self) -> Result<()> {
-        if self.host.aborted.load(Ordering::Acquire)
-            || self.host.closed.load(Ordering::Acquire)
-            || self
-                .host
-                .custom_authority_invalidated
-                .load(Ordering::Acquire)
-        {
-            return Err(RuntimeError::OperationCancelled);
-        }
-        Ok(())
-    }
-}
-
 impl RuntimeHost {
     fn custom_recovery_pending(&self) -> bool {
-        !BuildHost::is_managed(self) && self.pending_authority_recovery.lock().unwrap().is_some()
+        !BuildHost::is_managed(self) && self.custom_authority.recovery_pending()
     }
 
     fn custom_configuration_blocked(&self) -> bool {
-        self.custom_recovery_pending()
-            || self
-                .custom_authority_attempt
-                .lock()
-                .unwrap()
-                .upgrade()
-                .is_some_and(|entered| entered.load(Ordering::Acquire))
+        self.custom_recovery_pending() || self.custom_authority.attempt_entered()
     }
 
     #[cfg(all(test, feature = "testing"))]
     async fn pause_custom_restoration(&self) {
-        let gate = self.custom_restoration_gate.lock().unwrap().take();
-        if let Some(gate) = gate {
-            gate.entered.notify_one();
-            gate.release.notified().await;
-        }
+        self.custom_authority.pause_restoration().await;
     }
 }
 
@@ -1690,7 +1614,7 @@ impl RuntimeHost {
 
     async fn observe_report_progress(&self) -> Result<()> {
         let _restoration = if !BuildHost::is_managed(self) {
-            Some(self.custom_restoration.lock().await)
+            Some(self.custom_authority.restoration().await)
         } else {
             None
         };
@@ -1729,13 +1653,11 @@ impl RuntimeHost {
 
     async fn reconcile_report_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
         let _restoration = if !BuildHost::is_managed(self) {
-            Some(self.custom_restoration.lock().await)
+            Some(self.custom_authority.restoration().await)
         } else {
             None
         };
-        if self
-            .custom_access_requires_authorization
-            .load(Ordering::Acquire)
+        if self.custom_authority.authorization_required()
             && (read == AccessStatus::Granted || write == AccessStatus::Granted)
         {
             return Err(RuntimeError::ReconfigurationPending);
@@ -2162,19 +2084,11 @@ impl ReplicatorRegistration for RuntimeHost {
 struct OpenAttempt<'a> {
     host: &'a RuntimeHost,
     complete: bool,
-    entered: Option<Arc<AtomicBool>>,
-    owned: bool,
 }
 
 impl Drop for OpenAttempt<'_> {
     fn drop(&mut self) {
-        if !self.complete
-            && self.owned
-            && self
-                .entered
-                .as_ref()
-                .is_none_or(|entered| entered.load(Ordering::Acquire))
-        {
+        if !self.complete {
             self.host.abort();
         }
     }
@@ -2465,7 +2379,7 @@ impl RuntimeHost {
         let authority_attempt = if matches!(effect.action, RuntimeEffectAction::AdmitAuthority(_))
             && !BuildHost::is_managed(self)
         {
-            Some(OpenAttempt::authority(self))
+            Some(self.custom_authority.attempt())
         } else {
             None
         };
@@ -2889,8 +2803,6 @@ impl RuntimeHost {
         let mut attempt = OpenAttempt {
             host: self,
             complete: false,
-            entered: None,
-            owned: true,
         };
         let registration: Arc<dyn ReplicatorRegistration> =
             self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;

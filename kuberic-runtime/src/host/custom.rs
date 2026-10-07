@@ -29,9 +29,12 @@ use super::lifecycle::{
     AccessLifecycle, AuthorityLifecycle, BuildCancellation, BuildLifecycle, LifecycleObservation,
     LifecycleWiring, OutboundLifecycle, ProcessLifecycle, TopologyLifecycle,
 };
-use super::{AppliedEffect, OpenAttempt, RuntimeHost, empty_snapshot};
+use super::{AppliedEffect, RuntimeHost, empty_snapshot};
+#[path = "custom/authority.rs"]
+mod authority;
 #[path = "custom_removal.rs"]
 mod removal;
+pub(super) use authority::CustomAuthorityContainment;
 
 const ACCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1465,7 +1468,6 @@ pub(super) struct CustomReplicatorHost {
     deferred_configuration_abort: StdMutex<Option<tokio::task::AbortHandle>>,
     configuration_generation: Arc<AtomicU64>,
     configuration_commit: Arc<Mutex<()>>,
-    configuration_callback: Arc<Mutex<()>>,
     access_generation: Arc<AtomicU64>,
     published_access_generation: Arc<AtomicU64>,
     access_commit: Arc<Mutex<()>>,
@@ -1516,7 +1518,6 @@ impl CustomReplicatorHost {
             deferred_configuration_abort: StdMutex::new(None),
             configuration_generation: Arc::new(AtomicU64::new(0)),
             configuration_commit: Arc::new(Mutex::new(())),
-            configuration_callback: Arc::new(Mutex::new(())),
             access_generation: Arc::new(AtomicU64::new(0)),
             published_access_generation: Arc::new(AtomicU64::new(0)),
             access_commit: Arc::new(Mutex::new(())),
@@ -1803,34 +1804,6 @@ impl CustomReplicatorHost {
         Ok(Some((current, previous)))
     }
 
-    async fn publish_prepared_configuration(
-        &self,
-        generation: u64,
-        current: ReplicaSetConfiguration,
-        authority: AdmittedAuthority,
-    ) -> Result<()> {
-        let _commit = self.configuration_commit.lock().await;
-        #[cfg(all(test, feature = "testing"))]
-        {
-            let gate = self
-                .host()?
-                .authority_publication_gate
-                .lock()
-                .unwrap()
-                .clone();
-            if let Some(gate) = gate {
-                gate.entered.notify_one();
-                gate.release.notified().await;
-            }
-        }
-        let mut state = self.state.write().await;
-        let mut configuration = self.configuration.write().await;
-        self.ensure_configuration_generation(generation)?;
-        state.authority = Some(authority);
-        *configuration = Some(current);
-        Ok(())
-    }
-
     async fn apply_configuration_update(
         primary: Arc<dyn PrimaryReplicator>,
         current: ReplicaSetConfiguration,
@@ -1867,16 +1840,8 @@ impl CustomReplicatorHost {
     }
 
     fn advance_configuration_generation(&self) -> Result<u64> {
-        if let Some(host) = self.host.upgrade()
-            && host
-                .custom_authority_attempt
-                .lock()
-                .unwrap()
-                .upgrade()
-                .is_some_and(|entered| entered.load(Ordering::Acquire))
-        {
-            host.custom_authority_invalidated
-                .store(true, Ordering::Release);
+        if let Some(host) = self.host.upgrade() {
+            host.custom_authority.invalidate_attempt();
         }
         self.configuration_generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
@@ -1961,7 +1926,11 @@ impl CustomReplicatorHost {
         let primary = self.primary.clone();
         let callback = self
             .native_receipts
-            .then(|| self.configuration_callback.clone());
+            .then(|| {
+                self.host()
+                    .map(|host| host.custom_authority.callback_lock())
+            })
+            .transpose()?;
         let handle = tokio::spawn(async move {
             let independent = callback.is_some();
             let _callback = match callback {
@@ -2047,7 +2016,12 @@ impl CustomReplicatorHost {
 
     async fn configure_custom(&self) -> Result<()> {
         self.finish_deferred_configuration().await?;
-        let callback = self.configuration_callback.clone().lock_owned().await;
+        let callback = self
+            .host()?
+            .custom_authority
+            .callback_lock()
+            .lock_owned()
+            .await;
         let host = self.active_host()?;
         if host.custom_configuration_blocked() {
             return Ok(());
@@ -3080,73 +3054,6 @@ impl CustomReplicatorHost {
         self.fence_managed_access().await
     }
 
-    async fn preflight_custom_authority(&self, authority: &AdmittedAuthority) -> Result<()> {
-        let host = self.active_host()?;
-        let store = &host.default_dependencies.replica_authority_store;
-        if authority.local_identity != host.identity
-            || store.load_retired_authority().await?.is_some()
-            || store.load_retirement_started().await?.is_some()
-        {
-            return Err(RuntimeError::AuthorityMismatch(
-                "retired or mismatched local authority".into(),
-            ));
-        }
-        if let Some(existing) = store.load().await? {
-            existing.validate()?;
-            if existing.local_identity != host.identity
-                || authority.current_configuration.epoch < existing.current_configuration.epoch
-                || (authority.current_configuration.epoch == existing.current_configuration.epoch
-                    && existing != *authority
-                    && !authority.is_current_only_completion_of(&existing))
-            {
-                return Err(RuntimeError::AuthorityMismatch(
-                    "custom proposal conflicts with durable authority".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    async fn close_for_custom_authority(&self, attempt: &OpenAttempt<'_>) -> Result<()> {
-        let host = self.active_host()?;
-        let access = self.access_commit.lock().await;
-        let configuration = self.configuration_commit.lock().await;
-        let generation = self.advance_access_generation()?;
-        self.advance_configuration_generation()?;
-        self.deferred_configuration_abort.lock().unwrap().take();
-        let deferred = self.deferred_configuration.lock().await.take();
-        if let Some(handle) = &deferred {
-            handle.abort();
-        }
-        {
-            let mut restored = self.restored_access.write().await;
-            host.custom_access_requires_authorization
-                .store(true, Ordering::Release);
-            *restored = None;
-        }
-        self.removal_witnesses.write().await.clear();
-        self.invalidate_build_attempts_without_access_locked()
-            .await?;
-        let mut state = self.state.write().await;
-        let mut host_state = host.state.write().await;
-        self.active_host()?;
-        state.read_status = AccessStatus::ReconfigurationPending;
-        state.write_status = AccessStatus::ReconfigurationPending;
-        host_state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
-        host_state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
-        self.published_access_generation
-            .store(generation, Ordering::Release);
-        attempt.arm();
-        drop(host_state);
-        drop(state);
-        drop(configuration);
-        drop(access);
-        if let Some(handle) = deferred {
-            let _ = handle.await;
-        }
-        Ok(())
-    }
-
     async fn fence_managed_access(&self) -> Result<()> {
         *self.restored_access.write().await = None;
         self.removal_witnesses.write().await.clear();
@@ -3582,41 +3489,7 @@ impl CustomReplicatorHost {
         Ok(())
     }
     pub(super) async fn restore_authority(&self) -> Result<()> {
-        let _gate = self.gate.lock().await;
-        self.state.write().await.authority = self
-            .host()?
-            .default_dependencies
-            .replica_authority_store
-            .load()
-            .await?;
-        self.state.write().await.prepared_secondary_removal = self
-            .host()?
-            .default_dependencies
-            .replica_authority_store
-            .load_secondary_removal()
-            .await?;
-        self.restore_builds().await?;
-        let pending = if self.native_receipts {
-            self.host()?
-                .pending_authority_recovery
-                .lock()
-                .unwrap()
-                .clone()
-        } else {
-            None
-        };
-        if let Some(effect) = pending
-            && let RuntimeEffectAction::AdmitAuthority(authority) = effect.action
-        {
-            drop(_gate);
-            return self
-                .apply_common_action(RuntimeEffectAction::AdmitAuthority(authority))
-                .await;
-        }
-        if self.native_receipts || self.state.read().await.authority.is_some() {
-            self.configure().await?;
-        }
-        self.refresh().await
+        self.host()?.custom_authority.restore(self).await
     }
 
     async fn wait_for_common_catchup(&self) -> Result<()> {
@@ -3768,97 +3641,13 @@ impl CustomReplicatorHost {
             }
             action => action,
         };
-        let host = self.host()?;
-        let _restoration = if matches!(&action, RuntimeEffectAction::AdmitAuthority(_)) {
-            Some(host.custom_restoration.lock().await)
-        } else {
-            None
-        };
-        let _session_registration = if matches!(&action, RuntimeEffectAction::AdmitAuthority(_)) {
-            Some(self.session_registration.lock().await)
-        } else {
-            None
-        };
+        if let RuntimeEffectAction::AdmitAuthority(authority) = action {
+            return self.host()?.custom_authority.admit(self, *authority).await;
+        }
         let _gate = self.gate.lock().await;
         let host = self.host()?;
         match action {
-            RuntimeEffectAction::AdmitAuthority(authority) => {
-                authority.validate()?;
-                self.preflight_custom_authority(&authority).await?;
-                if self.native_receipts
-                    && let Some(evidence) = &authority.scale_up
-                {
-                    let intent = evidence.intent();
-                    if intent.target == host.identity
-                        && self
-                            .state
-                            .read()
-                            .await
-                            .authority
-                            .as_ref()
-                            .is_none_or(|old| {
-                                old.current_configuration != authority.current_configuration
-                            })
-                    {
-                        let build = host
-                            .default_dependencies
-                            .build_authority_store
-                            .load_build(&intent.build_id)
-                            .await?
-                            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                        let current_receipt = self.receipt(&build).await?;
-                        let retained_receipt =
-                            self.receipts.read().await.get(&intent.build_id).cloned();
-                        if build.source != intent.primary
-                            || build.target != intent.target
-                            || build.current_configuration != intent.previous_configuration
-                            || build.replication_boundary_lsn != intent.snapshot_boundary_lsn
-                            || retained_receipt.as_ref().is_none_or(|retained| {
-                                !retained.matches_durable_selection(&current_receipt)
-                            })
-                            || !self.state.read().await.builds.iter().any(|progress| {
-                                progress.authority == build
-                                    && progress.completed
-                                    && progress.catch_up_boundary_lsn
-                                        == Some(intent.catch_up_boundary_lsn)
-                                    && progress.durable_lsn >= intent.catch_up_boundary_lsn
-                            })
-                        {
-                            return Err(RuntimeError::AuthorityNotAdmitted);
-                        }
-                    }
-                }
-                let current = self
-                    .descriptions_with_policy(Some(*authority.clone()), true)
-                    .await?
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                let _callback = self.configuration_callback.lock().await;
-                self.active_host()?;
-                let attempt = OpenAttempt::authority(&host);
-                self.close_for_custom_authority(&attempt).await?;
-                self.close_custom_native_access(false).await?;
-                let configuration_generation =
-                    self.configuration_generation.load(Ordering::Acquire);
-                let configuration = Self::apply_configuration_update(
-                    self.primary.clone(),
-                    current,
-                    authority.previous_configuration.clone(),
-                )
-                .await?;
-                self.ensure_configuration_generation(configuration_generation)?;
-                host.default_dependencies
-                    .replica_authority_store
-                    .admit(&authority)
-                    .await?;
-                self.ensure_configuration_generation(configuration_generation)?;
-                self.publish_prepared_configuration(
-                    configuration_generation,
-                    configuration,
-                    *authority,
-                )
-                .await?;
-                attempt.complete();
-            }
+            RuntimeEffectAction::AdmitAuthority(_) => unreachable!(),
             RuntimeEffectAction::AdmitBuildAuthority(_) => unreachable!(),
             RuntimeEffectAction::RegisterPeerSession { .. } => unreachable!(),
             RuntimeEffectAction::RetireBuild(id) => {
@@ -4164,8 +3953,7 @@ impl AccessLifecycle for CustomReplicatorHost {
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
         let mut restored = self.restored_access.write().await;
         if self.host().is_ok_and(|host| {
-            host.custom_access_requires_authorization
-                .load(Ordering::Acquire)
+            host.custom_authority.authorization_required()
                 && (read == AccessStatus::Granted || write == AccessStatus::Granted)
         }) {
             return;
@@ -4188,10 +3976,10 @@ impl AccessLifecycle for CustomReplicatorHost {
 
     async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
         let restored = self.restored_access.read().await;
-        if self.host().is_ok_and(|host| {
-            host.custom_access_requires_authorization
-                .load(Ordering::Acquire)
-        }) {
+        if self
+            .host()
+            .is_ok_and(|host| host.custom_authority.authorization_required())
+        {
             None
         } else {
             *restored

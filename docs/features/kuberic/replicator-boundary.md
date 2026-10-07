@@ -119,17 +119,29 @@ provide neither an atomic application/authority-store transaction nor rollback.
 No new replicator method, capability, registration or wrapper requirement is
 introduced.
 
-The custom host first checks structural, durable-conflict and required build
-evidence. It then invalidates old work and saved grants, explicitly closes both
-read/write projections, and completes bounded native access revocation before
-calling the application. This also interrupts identical-authority replay and
-same-primary scale-up access. Report/deferred restoration accepted earlier
-is serialized before staging; its host-owned continuation retains ownership even
-if the requesting reporter is dropped. Already-entered incidental configuration
-callbacks likewise finish before candidate application. Independent direct and
-deferred configuration share a private callback owner; dropping a peer-discovery
-observer does not release a stateful callback into a newer authority. Subsequent
-stale restoration cannot reopen access.
+Each runtime host owns one `CustomAuthorityContainment`. It contains the
+independent authorization latch, exact pending recovery, and the shared
+configuration-callback and report-restoration serialization locks. Each
+admission creates a short-lived `CustomAuthorityAttempt`; nested staging and
+host effect completion share the same entered-attempt state so invalidation or
+caller loss cannot publish or record stale success
+(`kuberic-runtime/src/host/custom/authority.rs:17-117,358-399`,
+`kuberic-runtime/src/host/hosting.rs:2379-2385,2641-2648`).
+
+The containment owner first checks structural, durable-conflict and required
+build evidence. It then invalidates old work and saved grants, explicitly
+closes both read/write projections, and completes bounded native access
+revocation before calling the application. This also interrupts
+identical-authority replay and same-primary scale-up access. Report/deferred
+restoration accepted earlier is serialized before staging; its host-owned
+continuation retains ownership even if the requesting reporter is dropped.
+Already-entered incidental configuration callbacks likewise finish before
+candidate application. Independent direct and deferred configuration share the
+containment callback owner; dropping a peer-discovery observer does not release
+a stateful callback into a newer authority. Subsequent stale restoration cannot
+reopen access
+(`kuberic-runtime/src/host/custom/authority.rs:119-327`,
+`kuberic-runtime/src/host/custom.rs:1929-1933,2020-2024`).
 Successful admission requires callback acceptance, authority-store success and
 owned generation/session-valid publication. It remains closed until fresh
 explicit access authorization.

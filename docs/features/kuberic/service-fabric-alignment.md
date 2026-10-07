@@ -36,10 +36,13 @@ access, builds, topology and progress are represented across the durable
 agent, hosting layer, custom-replicator host and default replication engine.
 Broad runtime actions and snapshots cross these layers.
 
-The primary simplification should therefore be a **typed replica-runtime
+The long-term simplification should therefore remain a **typed replica-runtime
 boundary**, followed by state-owner separation and then decomposition of
-`host/custom.rs`. Splitting the file before correcting the boundary would
-distribute the existing coupling without reducing it.
+`host/custom.rs`. However, custom-authority containment now adds one immediate
+prerequisite: extract its transient admission and recovery ownership from the
+general host before changing the managed replicator boundary. Splitting
+`host/custom.rs` before either ownership correction would distribute the
+existing coupling without reducing it.
 
 ## Service Fabric Architecture
 
@@ -139,6 +142,7 @@ The intended Kuberic boundary is already visible:
 | Controller evaluator/executor | Pure cluster planning followed by Kubernetes or agent-command execution |
 | Durable agent state | Authority, reconfiguration stage, journaled effects, retained results and transition evidence |
 | Hosting layer | Application and replicator registration, staged role projection and effect execution |
+| Custom-authority operation state | Attempt ownership, invalidation, pending exact recovery and restoration serialization |
 | `CustomReplicatorHost` | Configuration, access, build, peer, topology and outbound adaptation |
 | Default runtime replicator | Replication progress, copy/build streams, repair targets, local-write fencing and log mechanics |
 
@@ -150,13 +154,18 @@ The durable agent state owns the facts required to resume reconfiguration
 The coordinator persists and advances explicit transition stages
 (`kuberic-runtime/src/host/coordinator.rs:318-614`).
 
-The complexity appears below that boundary:
+The remaining complexity appears below that boundary:
 
 - hosting carries a fallback runtime snapshot and process-local lifecycle
-  projection (`kuberic-runtime/src/host/hosting.rs:124-163`);
+  projection, and holds one host-lifetime custom-authority containment owner
+  (`kuberic-runtime/src/host/hosting.rs:1417-1451`);
+- `CustomAuthorityContainment` owns independent custom-authority attempt
+  invalidation, pending exact recovery, the authorization latch, and
+  callback/restoration serialization
+  (`kuberic-runtime/src/host/custom/authority.rs:17-150`);
 - `CustomReplicatorHost` owns sessions, addresses, retirements, build state,
-  receipts, configurations, access generations, locks and another runtime
-  snapshot (`kuberic-runtime/src/host/custom.rs:1440-1472`);
+  receipts, configurations, access generations and another runtime snapshot
+  (`kuberic-runtime/src/host/custom.rs:1448-1481`);
 - the default replication engine also stores role, access, admitted authority,
   removal, retirement, copy and replication progress
   (`kuberic-runtime/src/runtime.rs:49-82,168-200`);
@@ -167,6 +176,14 @@ Some repetition is intentional: durable truth, execution fencing and public
 projection are different concepts. The problem is that the distinctions are
 encoded through merge rules and conventions rather than narrow types owned by
 specific components.
+
+The agent service owns its control and replication listeners. Address-based
+startup binds them internally, while the opt-in testing facade can transfer
+already-bound listeners into the same serving lifecycle
+(`kuberic-runtime/src/host/service.rs:456-490`,
+`kuberic-runtime/src/testing/service.rs:76-85`). This closes a fixture
+release/rebind race but does not change replication, authority or runtime state
+ownership and does not require another simplification phase.
 
 ## Differences That Create Complexity
 
@@ -181,6 +198,23 @@ This narrows consumers without dividing implementation state.
 Service Fabric uses distinct durable aggregate, proxy and replication owners.
 Kuberic should retain its capability-facing interfaces but give those
 capabilities explicit state owners.
+
+### Transient Custom-Authority Ownership Is Explicit
+
+Custom-authority admission now has an explicit host-lifetime
+`CustomAuthorityContainment` owner and transient `CustomAuthorityAttempt`
+guard, directionally aligned with Service Fabric's `EntityJobItem`. The owner
+contains preflight, access closure, callback execution, authority publication,
+exact recovery, invalidation and restoration serialization without changing a
+replicator interface
+(`kuberic-runtime/src/host/custom/authority.rs:17-190,264-399`,
+`kuberic-runtime/src/host/custom.rs:3491-3493,3644-3646`).
+
+This containment is necessary because independent custom configuration is a
+stateful callback rather than a dry-run validator. It establishes the
+operation-ownership seam needed before the private managed boundary changes,
+without absorbing managed peer recovery, reporting or general partition
+execution.
 
 ### RA Vocabulary Crosses the Replicator Boundary
 
@@ -231,7 +265,8 @@ and make reporting a composition of owned, read-only observations.
 
 ### Explicit State Owners
 
-Kuberic should converge on three principal owners:
+Kuberic should converge on three long-lived principal owners plus a transient
+operation owner:
 
 #### `PartitionAgentState`
 
@@ -277,6 +312,25 @@ Replication and copy state:
 
 This owner should not understand controller transition evidence or the general
 agent effect journal.
+
+#### `PartitionOperation`
+
+Transient operation state:
+
+- exact command, effect and durable revision ownership;
+- operation cancellation, invalidation and supersession;
+- ordered runtime instruction progress;
+- externally visible publication readiness;
+- handoff to durable recovery obligations after interruption.
+
+This corresponds to the useful part of Service Fabric's `EntityJobItem`. It
+must not become another durable partition aggregate or universal runtime
+facade. The first concrete extraction should distinguish a host-lifetime
+`CustomAuthorityContainment` owner from a short-lived
+`CustomAuthorityAttempt` guard. Containment owns the authorization latch,
+pending recovery and callback/restoration serialization; the guard owns entry,
+invalidation and completion of one attempt. `PartitionOperation` generalizes
+the attempt model later rather than absorbing all host-lifetime policy.
 
 ### Typed Runtime Instructions
 
@@ -331,6 +385,60 @@ individual safety responsibilities.
 
 ## Simplification Plan
 
+### Interface and Persistence Constraints
+
+- `Replicator` and `PrimaryReplicator` are protected interfaces and must not
+  change in any phase.
+- Private managed lifecycle and data-plane boundaries may change when required
+  by the typed proxy design.
+- Backward compatibility for persisted runtime data is not required. A phase
+  that changes durable formats may bump the schema and reject old stores
+  explicitly rather than adding migration code.
+
+### Phase 0: Extract Custom-Authority Operation Ownership
+
+**Goal:** contain the complexity added by fail-closed custom-authority
+admission and exact recovery before changing the private managed lifecycle
+boundary.
+
+Planned work:
+
+- introduce a host-lifetime `CustomAuthorityContainment` owner with a
+  short-lived `CustomAuthorityAttempt` guard;
+- move the authorization latch, pending recovery and callback/restoration
+  serialization out of `RuntimeHost`;
+- move attempt entry, invalidation and completion into the attempt guard;
+- move custom-authority preflight, access closure, callback execution,
+  authority publication and exact recovery orchestration out of
+  `CustomReplicatorHost`;
+- keep managed durable-first admission separate from independent custom
+  callback-first containment;
+- leave managed peer-recovery behavior and reporting redesign outside this
+  extraction;
+- preserve the existing `Replicator`, `PrimaryReplicator`,
+  `ManagedReplicatorLifecycle`, `ManagedReplicatorDataPlane` and
+  `ReplicatorInterfaces` contracts during this extraction.
+
+Exit criteria:
+
+- one host-lifetime owner contains custom-authority policy, and one attempt
+  guard owns the lifetime and cancellation rules of each attempt;
+- failed, dropped or ambiguous attempts cannot reopen access or record effect
+  success;
+- callback serialization and restoration restrictions cannot end merely
+  because one waiting caller or attempt guard is dropped;
+- restart reconciles only the exact pending candidate before obsolete
+  configuration can be applied;
+- report and peer-discovery restoration cannot race or outlive newer authority
+  ownership;
+- all custom-authority rejection, persistence-error, cancellation, restart and
+  peer-session restoration regressions remain intact.
+
+Implementation status: complete. The private extraction is implemented in
+`kuberic-runtime/src/host/custom/authority.rs:17-399`; the managed lifecycle
+and data-plane boundaries and all public replicator interfaces remain
+unchanged.
+
 ### Phase 1: Establish the Typed Replica-Runtime Boundary
 
 **Goal:** stop exposing the complete RA effect vocabulary to the replication
@@ -366,15 +474,19 @@ Planned work:
 - define one reporting composition rule for each field;
 - replace implicit precedence with constructors that require the owning view;
 - make reporting read-only and move restoration/reconciliation into an
-  explicit recovery task.
+  explicit recovery task;
+- define recovery triggers, retry ownership, shutdown behavior and
+  supersession fencing independently of report polling.
 
 Exit criteria:
 
 - each authority, role, access and progress field has one documented owner;
 - reporting does not mutate or repair lifecycle state;
+- eligible deferred recovery progresses without requiring a status request,
+  while superseded or unauthorized restoration remains closed;
 - adding an engine-only progress field does not change durable agent
   serialization;
-- persisted data remains backward-readable or receives an explicit migration.
+- durable-format changes follow the explicit fail-closed schema-change policy.
 
 ### Phase 3: Narrow Effect Completion
 
@@ -385,17 +497,23 @@ Planned work:
 
 - define operation-specific outcome and receipt types;
 - update effect persistence and replay to compare the relevant outcome only;
+- define which durable fields each outcome is allowed to update;
 - keep a diagnostic snapshot outside the correctness contract;
 - consolidate duplicated snapshot-to-postcondition conversion and retained
-  result handling.
+  result handling;
+- replace persisted result formats directly and reject old schemas explicitly
+  when necessary.
 
 Exit criteria:
 
 - role, epoch, access, catch-up and build effects have independent completion
   contracts;
+- each outcome updates only its declared durable fields;
 - unrelated runtime fields cannot invalidate an effect replay;
 - exact replay still rejects a changed action or changed canonical result;
-- topology receipts remain authority- and operation-bound.
+- topology receipts remain authority- and operation-bound;
+- incompatible old stores fail explicitly rather than being silently
+  misinterpreted.
 
 ### Phase 4: Consolidate Partition Execution
 
@@ -428,6 +546,7 @@ Planned modules:
 
 | Module | Responsibility |
 |---|---|
+| `proxy/authority.rs` | Independent custom-authority admission, containment and exact recovery |
 | `proxy/access.rs` | Access preparation, publication, acceptance and rollback |
 | `proxy/configuration.rs` | Configuration projection and peer-session registration |
 | `proxy/build.rs` | Build admission, generation, cancellation and completion |
@@ -471,10 +590,29 @@ Exit criteria:
 - retry state has explicit sequence/ownership fencing;
 - joint current/previous configuration guarantees remain unchanged.
 
+## Phase Dependencies and Validation
+
+- Phase 0 is a behavior-preserving private extraction; it must not absorb
+  managed peer recovery, reporting redesign or general partition execution.
+- Phase 1 may use temporary private adapters, which remain until all managed
+  callers use typed operations.
+- Phase 2 must establish the independent recovery task before reporting becomes
+  read-only.
+- Phase 3 changes persistence and durable-field updates together; compatibility
+  with existing stores is intentionally out of scope.
+- Phase 4 extends the Phase 0 attempt model into partition execution rather
+  than introducing a competing operation owner.
+- Every phase must preserve ordinary, cancellation, dropped-caller,
+  late-completion, restart and live-cluster safety tests relevant to its
+  boundary.
+- Update `replicator-boundary.md` in the same phase whenever ownership,
+  persistence, reporting or recovery behavior changes.
+
 ## Guarantees to Preserve
 
 Alignment must not weaken:
 
+- the `Replicator` and `PrimaryReplicator` interface contracts;
 - durable transition stages and deterministic replay;
 - exact Pod, PVC, replica and process-session fencing;
 - epoch and configuration monotonicity;
@@ -485,6 +623,11 @@ Alignment must not weaken:
 - current and previous configuration quorum requirements;
 - cancellation-safe build and access cleanup;
 - native receipt and generation validation;
+- failed or ambiguous custom-authority admission remaining fail-closed;
+- exact pending custom authority being reconciled before obsolete stored
+  configuration;
+- access restoration requiring matching authority, role, session and native
+  proof;
 - independent custom replicators using only public SF-shaped interfaces.
 
 ## Service Fabric Patterns Not to Copy
@@ -507,12 +650,17 @@ and more visible, not to reproduce Service Fabric internally.
 
 ## Recommended Starting Point
 
-Begin with **Phase 1: Establish the Typed Replica-Runtime Boundary**. It creates
-the architectural seam needed by every later simplification and prevents the
-`host/custom.rs` decomposition from becoming a cosmetic file split.
+Begin with **Phase 0: Extract Custom-Authority Operation Ownership**. The
+authority fix established the required behavior but divided its transient
+state and orchestration between the general runtime host and custom adapter.
+Consolidating that ownership is a private refactoring with a strong regression
+contract and does not require another replicator-interface change.
 
-The first implementation should be considered complete only when the managed
-replicator no longer accepts general runtime effects, access publication has a
-clear host-proxy owner, operation-specific receipts replace broad completion
-where introduced, and all existing fencing and recovery behavior remains
-observable through the current validation suites.
+After Phase 0, continue with **Phase 1: Establish the Typed Replica-Runtime
+Boundary**. That phase creates the architectural seam needed by every later
+simplification and prevents the broader `host/custom.rs` decomposition from
+becoming a cosmetic file split. It should be considered complete only when the
+managed replicator no longer accepts general runtime effects, access
+publication has a clear host-proxy owner, operation-specific receipts replace
+broad completion where introduced, and all existing fencing and recovery
+behavior remains observable through the current validation suites.

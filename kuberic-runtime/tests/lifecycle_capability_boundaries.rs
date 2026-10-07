@@ -241,6 +241,7 @@ fn allowed_aggregates(relative: &Path) -> &'static [&'static str] {
             "ManagedLifecycleBackend",
             "CustomReplicatorHost",
         ],
+        Some("custom/authority.rs") => &["CustomAuthorityContainment", "CustomAuthorityAttempt"],
         Some("hosting.rs") => &[
             "RegisteredReplicator",
             "HostedPrimaryReplicator",
