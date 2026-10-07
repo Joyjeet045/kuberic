@@ -514,6 +514,75 @@ async fn secondary_removal_contracts_are_rejected_without_durable_mutation() {
     }
 }
 
+#[tokio::test]
+async fn bound_agent_listeners_remain_owned_until_shutdown() {
+    let local = identity();
+    let resource_uid = ResourceUid::new("resource-1");
+    let pod_uid = PodUid::new("pod-1");
+    let pvc_uid = PvcUid::new("pvc-1");
+    let initialization_id =
+        derive_initialization_id(&resource_uid, local.replica_id, &pod_uid, &pvc_uid);
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = Arc::new(
+        SqliteStore::create_authorized(
+            &path,
+            AgentState::new(StorageIdentity {
+                schema_version: SCHEMA_VERSION,
+                resource_uid,
+                local_identity: local.clone(),
+                pod_uid,
+                pvc_uid,
+                initialization_id,
+                effective_policy: EffectivePolicy::fixed(1, 0).unwrap(),
+            }),
+        )
+        .unwrap(),
+    );
+    let runtime = Arc::new(PodRuntime::new(
+        local,
+        Arc::new(ReplayApplication),
+        store.clone(),
+    ));
+    let service = AgentService::new(store, runtime.clone(), runtime, "token").unwrap();
+    let control = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let replication = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let control_address = control.local_addr().unwrap();
+    let replication_address = replication.local_addr().unwrap();
+    let (ready, mut ready_rx) = watch::channel(false);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let server =
+        tokio::spawn(service.serve_with_listeners(control, replication, ready, shutdown_rx));
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ready_rx.wait_for(|ready| *ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::net::TcpStream::connect(control_address)
+        .await
+        .unwrap();
+    assert_eq!(
+        TcpListener::bind(control_address).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    assert_eq!(
+        TcpListener::bind(replication_address).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+    TcpListener::bind(control_address).unwrap();
+    TcpListener::bind(replication_address).unwrap();
+}
+
 struct NoopApplication {
     streams: Mutex<Vec<OperationStream>>,
 }

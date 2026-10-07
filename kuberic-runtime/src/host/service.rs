@@ -458,11 +458,21 @@ where
         control_address: SocketAddr,
         replication_address: SocketAddr,
         ready: watch::Sender<bool>,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let control_listener = TcpListener::bind(control_address).await?;
         let replication_listener = TcpListener::bind(replication_address).await?;
+        self.serve_with_listeners(control_listener, replication_listener, ready, shutdown)
+            .await
+    }
 
+    pub(crate) async fn serve_with_listeners(
+        self,
+        control_listener: TcpListener,
+        replication_listener: TcpListener,
+        ready: watch::Sender<bool>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
         let control_service = self.clone();
         let peer_service = self.clone();
         let replication_service = self.clone();

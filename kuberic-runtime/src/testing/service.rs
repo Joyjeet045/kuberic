@@ -72,4 +72,16 @@ impl AgentService {
             .serve(control, replication, ready, shutdown)
             .await
     }
+
+    pub async fn serve_with_listeners(
+        self,
+        control: tokio::net::TcpListener,
+        replication: tokio::net::TcpListener,
+        ready: tokio::sync::watch::Sender<bool>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> crate::host::Result<()> {
+        self.inner
+            .serve_with_listeners(control, replication, ready, shutdown)
+            .await
+    }
 }
