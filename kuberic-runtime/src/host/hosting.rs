@@ -11,7 +11,8 @@ use crate::application::{ClientWrite, WriteReceipt};
 use crate::application::{OpenContext, OpenMode, StateProvider, StatefulServiceReplica};
 use crate::authority::{
     AdmittedAuthority, AuthorityStore, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
-    BuildProgressStore, LocalWriteJournal, ReplicaAuthorityStore, ReplicationProgressStore,
+    BuildProgressStore, LocalWriteJournal, LocalWritePhase, ReplicaAuthorityStore,
+    ReplicationProgressStore,
 };
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::control::proto;
@@ -38,10 +39,24 @@ use crate::transport::{OutboundOperation, ReplicaEndpoint};
 use crate::{Result, RuntimeError};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 
 tokio::task_local! {
     static ACCESS_PROOF_VIEW: (AccessStatus, AccessStatus);
+    static ACCESS_PUBLICATION_DEADLINE: tokio::time::Instant;
+}
+
+fn access_publication_deadline() -> Option<tokio::time::Instant> {
+    ACCESS_PUBLICATION_DEADLINE
+        .try_with(|deadline| *deadline)
+        .ok()
+}
+
+async fn with_access_publication_deadline<F: Future>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> F::Output {
+    ACCESS_PUBLICATION_DEADLINE.scope(deadline, future).await
 }
 
 pub(super) async fn with_access_proof_view<F>(
@@ -761,9 +776,20 @@ impl PodRuntime {
                 weak_self: weak_self.clone(),
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
+                custom_authority_attempt: StdMutex::new(Weak::new()),
+                custom_authority_invalidated: AtomicBool::new(false),
+                custom_access_requires_authorization: AtomicBool::new(false),
+                pending_authority_recovery: StdMutex::new(None),
+                custom_restoration: Mutex::new(()),
                 replica_session: OnceLock::new(),
                 #[cfg(all(test, feature = "testing"))]
                 access_effect_acceptance_gate: StdMutex::new(None),
+                #[cfg(all(test, feature = "testing"))]
+                authority_publication_gate: StdMutex::new(None),
+                #[cfg(all(test, feature = "testing"))]
+                custom_restoration_gate: StdMutex::new(None),
+                #[cfg(all(test, feature = "testing"))]
+                peer_discovery_ready_gate: StdMutex::new(None),
             }),
         }
     }
@@ -775,6 +801,36 @@ impl PodRuntime {
             release: Arc::new(tokio::sync::Notify::new()),
         };
         *self.host.access_effect_acceptance_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn testing_pause_authority_publication(&self) -> AccessEffectAcceptanceGate {
+        let gate = AccessEffectAcceptanceGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.host.authority_publication_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn testing_pause_custom_restoration(&self) -> AccessEffectAcceptanceGate {
+        let gate = AccessEffectAcceptanceGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.host.custom_restoration_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn testing_pause_peer_discovery_ready(&self) -> AccessEffectAcceptanceGate {
+        let gate = AccessEffectAcceptanceGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.host.peer_discovery_ready_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
 
@@ -816,6 +872,15 @@ impl PodRuntime {
     #[cfg(all(test, feature = "testing"))]
     pub(crate) async fn restore_authority(&self) -> Result<()> {
         self.host.recovery_lifecycle()?.restore_authority().await
+    }
+
+    pub(super) fn stage_authority_recovery(&self, effect: Option<RuntimeEffect>) {
+        *self.host.pending_authority_recovery.lock().unwrap() =
+            effect.filter(|effect| matches!(effect.action, RuntimeEffectAction::AdmitAuthority(_)));
+    }
+
+    pub(super) fn finish_authority_recovery(&self) {
+        self.host.pending_authority_recovery.lock().unwrap().take();
     }
 
     pub(crate) fn bind_replica_session(
@@ -926,7 +991,7 @@ impl PodRuntime {
             }
             self.host.change_application_role(role).await?;
         }
-        let (read_status, write_status) = if has_transition {
+        let (read_status, write_status) = if has_transition || self.host.custom_recovery_pending() {
             (
                 AccessStatus::ReconfigurationPending,
                 AccessStatus::ReconfigurationPending,
@@ -1369,13 +1434,268 @@ struct RuntimeHost {
     weak_self: Weak<Self>,
     aborted: AtomicBool,
     closed: AtomicBool,
+    custom_authority_attempt: StdMutex<Weak<AtomicBool>>,
+    custom_authority_invalidated: AtomicBool,
+    custom_access_requires_authorization: AtomicBool,
+    pending_authority_recovery: StdMutex<Option<RuntimeEffect>>,
+    custom_restoration: Mutex<()>,
     #[cfg(all(test, feature = "testing"))]
     access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+    #[cfg(all(test, feature = "testing"))]
+    authority_publication_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+    #[cfg(all(test, feature = "testing"))]
+    custom_restoration_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+    #[cfg(all(test, feature = "testing"))]
+    peer_discovery_ready_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+}
+
+impl OpenAttempt<'_> {
+    fn authority(host: &RuntimeHost) -> OpenAttempt<'_> {
+        let mut slot = host.custom_authority_attempt.lock().unwrap();
+        let (entered, owned) = match slot.upgrade() {
+            Some(entered) => (entered, false),
+            None => {
+                let entered = Arc::new(AtomicBool::new(false));
+                host.custom_authority_invalidated
+                    .store(false, Ordering::Release);
+                *slot = Arc::downgrade(&entered);
+                (entered, true)
+            }
+        };
+        drop(slot);
+        OpenAttempt {
+            host,
+            entered: Some(entered),
+            owned,
+            complete: false,
+        }
+    }
+
+    fn arm(&self) {
+        self.entered
+            .as_ref()
+            .unwrap()
+            .store(true, Ordering::Release);
+    }
+
+    fn complete(mut self) {
+        if self.owned {
+            self.entered
+                .as_ref()
+                .unwrap()
+                .store(false, Ordering::Release);
+        }
+        self.complete = true;
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.host.aborted.load(Ordering::Acquire)
+            || self.host.closed.load(Ordering::Acquire)
+            || self
+                .host
+                .custom_authority_invalidated
+                .load(Ordering::Acquire)
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        Ok(())
+    }
+}
+
+impl RuntimeHost {
+    fn custom_recovery_pending(&self) -> bool {
+        !BuildHost::is_managed(self) && self.pending_authority_recovery.lock().unwrap().is_some()
+    }
+
+    fn custom_configuration_blocked(&self) -> bool {
+        self.custom_recovery_pending()
+            || self
+                .custom_authority_attempt
+                .lock()
+                .unwrap()
+                .upgrade()
+                .is_some_and(|entered| entered.load(Ordering::Acquire))
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    async fn pause_custom_restoration(&self) {
+        let gate = self.custom_restoration_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
 }
 
 #[async_trait]
 impl ReportHost for RuntimeHost {
     async fn observe_progress(&self) -> Result<()> {
+        if !BuildHost::is_managed(self) {
+            let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
+            return tokio::spawn(async move { host.observe_report_progress().await })
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        }
+        self.observe_report_progress().await
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        let lifecycle = self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::report_lifecycle);
+        let snapshot = match lifecycle {
+            Some(lifecycle) => Some(lifecycle.snapshot().await),
+            None => None,
+        };
+        self.compose_snapshot(snapshot).await
+    }
+
+    async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        if !BuildHost::is_managed(self) {
+            let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
+            return tokio::spawn(async move { host.reconcile_report_access(read, write).await })
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        }
+        self.reconcile_report_access(read, write).await
+    }
+
+    async fn partition_report(&self) -> PartitionReportSnapshot {
+        self.partition_report_snapshot().await
+    }
+
+    async fn catch_up_capability(&self) -> Result<i64> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .catch_up_capability()
+            .await
+    }
+}
+
+impl RuntimeHost {
+    async fn describe_peer_with_owned_access_recovery(
+        &self,
+        replica: crate::replicator::ReplicaInformation,
+        discovery_ready: oneshot::Sender<()>,
+    ) -> Result<()> {
+        let effect = self.effect_lock.try_lock().ok();
+        let owned_access = if effect.is_some() {
+            let state = self.state.read().await;
+            let snapshot = &state.fallback_snapshot;
+            state
+                .effects
+                .values()
+                .rev()
+                .find(|applied| {
+                    matches!(
+                        applied.effect.action,
+                        RuntimeEffectAction::SetAccessStatus { .. }
+                            | RuntimeEffectAction::SetReadStatus(_)
+                            | RuntimeEffectAction::SetWriteStatus(_)
+                    )
+                })
+                .map(|applied| applied.result.postcondition.clone())
+                .filter(|owned| {
+                    snapshot.open
+                        && snapshot.role_transition.is_none()
+                        && state.reported_fault.is_none()
+                        && owned.authority.is_some()
+                        && owned.authority == snapshot.authority
+                        && owned.role == snapshot.role
+                        && owned.read_status == snapshot.read_status
+                        && owned.write_status == snapshot.write_status
+                        && (owned.read_status == AccessStatus::Granted
+                            || owned.write_status == AccessStatus::Granted)
+                })
+        } else {
+            None
+        };
+        self.peer_lifecycle()?.describe_peer(replica).await?;
+        let Some(owned) = owned_access else {
+            return Ok(());
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        #[cfg(all(test, feature = "testing"))]
+        {
+            let gate = self.peer_discovery_ready_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        let mut discovery_ready = Some(discovery_ready);
+        for attempt in 0..3 {
+            let current = self.snapshot().await;
+            if !current.open
+                || current.role_transition.is_some()
+                || current.authority != owned.authority
+                || current.role != owned.role
+                || (current.read_status == owned.read_status
+                    && current.write_status == owned.write_status)
+            {
+                return Ok(());
+            }
+            let store = &self.default_dependencies.replica_authority_store;
+            if store.load().await? != owned.authority
+                || store.load_retired_authority().await?.is_some()
+                || store.load_retirement_started().await?.is_some()
+            {
+                return Ok(());
+            }
+            if owned.write_status == AccessStatus::Granted
+                && self
+                    .default_dependencies
+                    .local_write_journal
+                    .load_local_writes()
+                    .await?
+                    .iter()
+                    .any(|write| write.phase != LocalWritePhase::Committed)
+                && let Some(ready) = discovery_ready.take()
+            {
+                let _ = ready.send(());
+            }
+            let access = self
+                .registered
+                .get()
+                .and_then(RegisteredReplicator::access_lifecycle)
+                .ok_or(RuntimeError::NotOpen)?;
+            let result = async {
+                let ready = with_access_publication_deadline(
+                    deadline,
+                    access.begin_effect(owned.read_status, owned.write_status),
+                )
+                .await?;
+                let (_, accepted) = ready.accept().await?;
+                accepted.commit().await
+            }
+            .await;
+            match result {
+                Err(RuntimeError::OperationCancelled) if attempt < 2 => {
+                    tokio::task::yield_now().await
+                }
+                result => {
+                    if discovery_ready.is_none()
+                        && let Err(error) = &result
+                    {
+                        tracing::warn!(%error, "owned peer access recovery remains closed");
+                    }
+                    return result;
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn observe_report_progress(&self) -> Result<()> {
+        let _restoration = if !BuildHost::is_managed(self) {
+            Some(self.custom_restoration.lock().await)
+        } else {
+            None
+        };
+        #[cfg(all(test, feature = "testing"))]
+        self.pause_custom_restoration().await;
         if let Some(lifecycle) = self
             .registered
             .get()
@@ -1407,19 +1727,21 @@ impl ReportHost for RuntimeHost {
         Ok(())
     }
 
-    async fn snapshot(&self) -> RuntimeSnapshot {
-        let lifecycle = self
-            .registered
-            .get()
-            .and_then(RegisteredReplicator::report_lifecycle);
-        let snapshot = match lifecycle {
-            Some(lifecycle) => Some(lifecycle.snapshot().await),
-            None => None,
+    async fn reconcile_report_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        let _restoration = if !BuildHost::is_managed(self) {
+            Some(self.custom_restoration.lock().await)
+        } else {
+            None
         };
-        self.compose_snapshot(snapshot).await
-    }
-
-    async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        if self
+            .custom_access_requires_authorization
+            .load(Ordering::Acquire)
+            && (read == AccessStatus::Granted || write == AccessStatus::Granted)
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        #[cfg(all(test, feature = "testing"))]
+        self.pause_custom_restoration().await;
         if let Some(lifecycle) = self
             .registered
             .get()
@@ -1431,19 +1753,8 @@ impl ReportHost for RuntimeHost {
             state.fallback_snapshot.read_status = read;
             state.fallback_snapshot.write_status = write;
         }
+
         Ok(())
-    }
-
-    async fn partition_report(&self) -> PartitionReportSnapshot {
-        self.partition_report_snapshot().await
-    }
-
-    async fn catch_up_capability(&self) -> Result<i64> {
-        self.registered
-            .get()
-            .ok_or(RuntimeError::NotOpen)?
-            .catch_up_capability()
-            .await
     }
 }
 
@@ -1457,6 +1768,21 @@ impl BuildHost for RuntimeHost {
     }
 
     async fn describe_peer(&self, replica: crate::replicator::ReplicaInformation) -> Result<()> {
+        if BuildHost::is_managed(self) {
+            let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
+            let (ready, discovered) = oneshot::channel();
+            let mut recovery = tokio::spawn(async move {
+                host.describe_peer_with_owned_access_recovery(replica, ready)
+                    .await
+            });
+            return tokio::select! {
+                result = &mut recovery => result.map_err(|error| RuntimeError::Application(error.to_string()))?,
+                result = discovered => match result {
+                    Ok(()) => Ok(()),
+                    Err(_) => recovery.await.map_err(|error| RuntimeError::Application(error.to_string()))?,
+                },
+            };
+        }
         self.peer_lifecycle()?.describe_peer(replica).await
     }
 
@@ -1836,11 +2162,19 @@ impl ReplicatorRegistration for RuntimeHost {
 struct OpenAttempt<'a> {
     host: &'a RuntimeHost,
     complete: bool,
+    entered: Option<Arc<AtomicBool>>,
+    owned: bool,
 }
 
 impl Drop for OpenAttempt<'_> {
     fn drop(&mut self) {
-        if !self.complete {
+        if !self.complete
+            && self.owned
+            && self
+                .entered
+                .as_ref()
+                .is_none_or(|entered| entered.load(Ordering::Acquire))
+        {
             self.host.abort();
         }
     }
@@ -2128,6 +2462,13 @@ impl RuntimeHost {
         {
             return Err(RuntimeError::Closed);
         }
+        let authority_attempt = if matches!(effect.action, RuntimeEffectAction::AdmitAuthority(_))
+            && !BuildHost::is_managed(self)
+        {
+            Some(OpenAttempt::authority(self))
+        } else {
+            None
+        };
         let mut access_commit = None;
         match effect.action.clone() {
             RuntimeEffectAction::RetireReplica(retired) => {
@@ -2339,7 +2680,7 @@ impl RuntimeHost {
             RuntimeEffectAction::Abort => self.abort_action().await,
         }
         #[cfg(all(test, feature = "testing"))]
-        if access_commit.is_some() {
+        if access_commit.is_some() || authority_attempt.is_some() {
             let gate = self.access_effect_acceptance_gate.lock().unwrap().clone();
             if let Some(gate) = gate {
                 gate.entered.notify_waiters();
@@ -2383,11 +2724,14 @@ impl RuntimeHost {
             let commit = commit.into_effect(self.weak_self.clone(), applied);
             return Ok(RuntimeEffectExecution::prepared(result, commit));
         }
-        self.state
-            .write()
-            .await
-            .effects
-            .insert(result.sequence, applied);
+        let mut state = self.state.write().await;
+        if let Some(attempt) = &authority_attempt {
+            attempt.validate()?;
+        }
+        state.effects.insert(result.sequence, applied);
+        if let Some(attempt) = authority_attempt {
+            attempt.complete();
+        }
         Ok(RuntimeEffectExecution::completed(result))
     }
 
@@ -2545,6 +2889,8 @@ impl RuntimeHost {
         let mut attempt = OpenAttempt {
             host: self,
             complete: false,
+            entered: None,
+            owned: true,
         };
         let registration: Arc<dyn ReplicatorRegistration> =
             self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;

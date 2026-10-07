@@ -629,10 +629,20 @@ async fn begin_access_effect(
     let (accept_tx, accept_rx) = oneshot::channel();
     let (accepted_tx, accepted_rx) = oneshot::channel();
     let (decision_tx, decision_rx) = oneshot::channel();
+    let deadline = super::access_publication_deadline();
     let completion = tokio::spawn(async move {
-        access
-            .run_access_transaction(read, write, ready_tx, accept_rx, accepted_tx, decision_rx)
-            .await
+        let transaction = access.run_access_transaction(
+            read,
+            write,
+            ready_tx,
+            accept_rx,
+            accepted_tx,
+            decision_rx,
+        );
+        match deadline {
+            Some(deadline) => super::with_access_publication_deadline(deadline, transaction).await,
+            None => transaction.await,
+        }
     });
     match ready_rx.await {
         Ok(()) => Ok(ReadyAccessTransaction {

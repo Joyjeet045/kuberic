@@ -109,6 +109,57 @@ also validates its native session, generation, progress, and fence. Independent
 custom implementations instead complete their public progress/revocation
 callback contract; they do not acquire managed-native receipts.
 
+## Custom authority admission
+
+Independent custom replicators use the existing current/joint configuration
+callbacks to accept an exact proposed topology before the host persists its
+authority. Those callbacks apply configuration and can mutate live or durable
+application state. They are not pure validation operations, and the interfaces
+provide neither an atomic application/authority-store transaction nor rollback.
+No new replicator method, capability, registration or wrapper requirement is
+introduced.
+
+The custom host first checks structural, durable-conflict and required build
+evidence. It then invalidates old work and saved grants, explicitly closes both
+read/write projections, and completes bounded native access revocation before
+calling the application. This also interrupts identical-authority replay and
+same-primary scale-up access. Report/deferred restoration accepted earlier
+is serialized before staging; its host-owned continuation retains ownership even
+if the requesting reporter is dropped. Already-entered incidental configuration
+callbacks likewise finish before candidate application. Independent direct and
+deferred configuration share a private callback owner; dropping a peer-discovery
+observer does not release a stateful callback into a newer authority. Subsequent
+stale restoration cannot reopen access.
+Successful admission requires callback acceptance, authority-store success and
+owned generation/session-valid publication. It remains closed until fresh
+explicit access authorization.
+
+| Boundary | Authority and containment |
+|---|---|
+| Pre-application structural/conflict rejection | No candidate callback/admission; existing session need not abort. |
+| Callback rejection, including partial mutation | No candidate authority admission; entered attempt aborts with access closed. Application rollback is not claimed. |
+| Store error before write | Candidate may already be applied by the custom engine; host authority remains old/absent. Current session aborts. |
+| Store commits then returns an error | Candidate may be durable despite failure. Current session aborts; no read-back-as-success, authority erasure or compensating old configuration. |
+| Dropped entered attempt or stale completion | Synchronous Abort contains the session; late external mutation/durable commit is possible, but invalidated work cannot record host effect success. |
+| Host success followed by journal failure | Exact cached success can finish journal replay without another configuration callback in the same host. |
+
+Effect intent remains durable before staging. A fresh independent host with
+pending authority intent reconciles the exact candidate before applying obsolete
+stored configuration, reconstructs role/epoch/application state, then performs
+ordinary exact effect replay and journal completion. Startup access stays closed
+and an old persisted grant is not restored. Current/previous descriptors remain
+exact; process-session descriptions are fresh. Callbacks can repeat across
+recovery. A conflicting newer/same-epoch authority, missing required fresh build
+proof, or a custom engine refusing exact reconciliation fails closed rather than
+substituting a proposal or promising universal recovery liveness. Dropping an
+entered callback/store future leaves its recorded pending intent; a returned
+cancellation may instead cancel that intent under the existing adapter rules.
+
+Managed built-in admission retains its distinct durable-authority-before-
+configuration order, exact durable configuration check, same-primary continuity
+and existing recovery sequence. The custom containment policy does not weaken
+or reorder that managed path.
+
 ## Persistence, reporting, and recovery
 
 SQLite persists effect intent before execution and completion only after the
@@ -123,6 +174,10 @@ observations and can retry deferred access restoration. It preserves
 `live_builds_only`, so old-session build evidence is not resurrected. Catch-up
 composition retains an accepted boundary only while the native engine still
 reports catch-up complete.
+Independent custom authority staging supersedes old restoration authorization:
+report-driven grant restoration remains disabled for that host instance.
+An earlier durable/deferred grant cannot reopen the new configuration; initial
+and later regrants require fresh explicit access effects.
 
 Recovery reconstructs authority and native stores, reissues or reobserves
 pending effects, and keeps access closed until public/native proof is accepted.

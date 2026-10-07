@@ -98,6 +98,19 @@ Services can observe `partition.get_write_status()`; custom factories receive
 the same access gate through `ReplicatorFactoryContext::write_status`.
 Custom implementations must honor that gate rather than infer write access
 from the Primary role.
+
+Independent custom authority admission calls the existing current/joint
+configuration operation **before** persisting the candidate host authority, so
+an unsupported topology can be rejected without admitting it. This is stateful
+provisional application, not a dry-run validator: access closes first, and an
+entered attempt that fails or is abandoned aborts the current host session.
+Successful admission also leaves access closed until fresh authorization.
+There is no atomic application/store transaction or automatic rollback.
+Built-in managed admission instead persists exact authority before configuration
+application; its durable-authority check and access-preservation rules remain
+unchanged. See [the replicator boundary](../docs/features/kuberic/replicator-boundary.md#custom-authority-admission)
+for persistence-error and exact-recovery behavior.
+
 The built-in engine fences pending writes whenever access changes away from
 `Granted`, including `NoWriteQuorum`, while preserving the admitted epoch and
 configuration so returning quorum can restore access non-destructively.

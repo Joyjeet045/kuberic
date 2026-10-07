@@ -129,6 +129,8 @@ pub(crate) struct SqliteStore {
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     path: PathBuf,
     connection: Mutex<Connection>,
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) authority_admission_failure: std::sync::atomic::AtomicUsize,
 }
 
 impl SqliteStore {
@@ -160,6 +162,8 @@ impl SqliteStore {
                 #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
                 path: path.clone(),
                 connection: Mutex::new(connection),
+                #[cfg(all(test, feature = "testing"))]
+                authority_admission_failure: std::sync::atomic::AtomicUsize::new(0),
             })
         })();
         if result.is_err() {
@@ -209,6 +213,8 @@ impl SqliteStore {
             #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
             path,
             connection: Mutex::new(connection),
+            #[cfg(all(test, feature = "testing"))]
+            authority_admission_failure: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1130,6 +1136,16 @@ impl ReplicaAuthorityStore for SqliteStore {
 
     async fn admit(&self, authority: &AdmittedAuthority) -> ContractResult<()> {
         authority.validate()?;
+        #[cfg(all(test, feature = "testing"))]
+        let failure = self
+            .authority_admission_failure
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(all(test, feature = "testing"))]
+        if failure == 1 {
+            return Err(ContractError::Persistence(
+                "injected authority failure before write".into(),
+            ));
+        }
         self.contract_transaction(|transaction| {
             let state = load_state_from_connection(transaction)
                 .map_err(|e| ContractError::Persistence(e.to_string()))?;
@@ -1184,7 +1200,14 @@ impl ReplicaAuthorityStore for SqliteStore {
                 )
                 .map_err(contract_sqlite_error)?;
             Ok(())
-        })
+        })?;
+        #[cfg(all(test, feature = "testing"))]
+        if failure == 2 {
+            return Err(ContractError::Persistence(
+                "injected authority failure after commit".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn load_secondary_removal(&self) -> ContractResult<Option<SecondaryRemovalPreparation>> {

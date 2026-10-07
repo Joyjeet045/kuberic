@@ -585,6 +585,12 @@ where
             state.identity.resource_uid.clone(),
             self.sessions.local_session().clone(),
         )?;
+        self.runtime.stage_authority_recovery(
+            state
+                .pending_effect
+                .as_ref()
+                .map(|pending| pending.effect.clone()),
+        );
         let transition = startup_transition(&state);
         let removal_pending = state.pending_effect.as_ref().is_some_and(|p| {
             matches!(
@@ -711,6 +717,7 @@ where
         {
             return Err(error);
         }
+        self.runtime.finish_authority_recovery();
         let build_recovery = self.store.load_state().await?;
         if let Some(retained) = build_recovery.retained_result.as_ref()
             && let crate::effects::RuntimeEffectAction::AdmitBuildAuthority(authority) =

@@ -29,13 +29,10 @@ use super::lifecycle::{
     AccessLifecycle, AuthorityLifecycle, BuildCancellation, BuildLifecycle, LifecycleObservation,
     LifecycleWiring, OutboundLifecycle, ProcessLifecycle, TopologyLifecycle,
 };
-use super::{AppliedEffect, RuntimeHost, empty_snapshot};
+use super::{AppliedEffect, OpenAttempt, RuntimeHost, empty_snapshot};
 #[path = "custom_removal.rs"]
 mod removal;
 
-#[cfg(feature = "testing")]
-const ACCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-#[cfg(not(feature = "testing"))]
 const ACCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1283,12 +1280,20 @@ impl ManagedLifecycleBackend {
         decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()> {
         let projection = self.common.reserve_access_projection(read, write).await?;
+        let deadline = super::access_publication_deadline();
         let publication = {
             let publication = self.publish_managed_access(projection.clone());
             tokio::pin!(publication);
             tokio::select! {
-                result = &mut publication => Some(result),
+                biased;
                 _ = ready.closed() => None,
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => None,
+                result = &mut publication => Some(result),
             }
         };
         let Some(publication) = publication else {
@@ -1460,6 +1465,7 @@ pub(super) struct CustomReplicatorHost {
     deferred_configuration_abort: StdMutex<Option<tokio::task::AbortHandle>>,
     configuration_generation: Arc<AtomicU64>,
     configuration_commit: Arc<Mutex<()>>,
+    configuration_callback: Arc<Mutex<()>>,
     access_generation: Arc<AtomicU64>,
     published_access_generation: Arc<AtomicU64>,
     access_commit: Arc<Mutex<()>>,
@@ -1510,6 +1516,7 @@ impl CustomReplicatorHost {
             deferred_configuration_abort: StdMutex::new(None),
             configuration_generation: Arc::new(AtomicU64::new(0)),
             configuration_commit: Arc::new(Mutex::new(())),
+            configuration_callback: Arc::new(Mutex::new(())),
             access_generation: Arc::new(AtomicU64::new(0)),
             published_access_generation: Arc::new(AtomicU64::new(0)),
             access_commit: Arc::new(Mutex::new(())),
@@ -1640,14 +1647,24 @@ impl CustomReplicatorHost {
         })
     }
 
-    async fn descriptions(&self) -> Result<Option<ReplicaSetConfiguration>> {
+    async fn descriptions_for_authority(
+        &self,
+        authority: Option<AdmittedAuthority>,
+    ) -> Result<Option<ReplicaSetConfiguration>> {
+        self.descriptions_with_policy(authority, false).await
+    }
+
+    async fn descriptions_with_policy(
+        &self,
+        authority: Option<AdmittedAuthority>,
+        exact: bool,
+    ) -> Result<Option<ReplicaSetConfiguration>> {
         let host = self.host()?;
         let builds = host
             .default_dependencies
             .build_authority_store
             .load_builds()
             .await?;
-        let authority = self.state.read().await.authority.clone();
         let previous = authority
             .as_ref()
             .and_then(|a| a.previous_configuration.clone());
@@ -1658,7 +1675,9 @@ impl CustomReplicatorHost {
             .max_by_key(|b| b.current_configuration.epoch)
             .map(|b| b.current_configuration.clone());
         let configuration = match (admitted, incoming) {
-            (Some(admitted), Some(incoming)) if incoming.epoch > admitted.epoch => Some(incoming),
+            (Some(admitted), Some(incoming)) if !exact && incoming.epoch > admitted.epoch => {
+                Some(incoming)
+            }
             (Some(admitted), _) => Some(admitted),
             (None, incoming) => incoming,
         };
@@ -1758,6 +1777,11 @@ impl CustomReplicatorHost {
         }))
     }
 
+    async fn descriptions(&self) -> Result<Option<ReplicaSetConfiguration>> {
+        let authority = self.state.read().await.authority.clone();
+        self.descriptions_for_authority(authority).await
+    }
+
     async fn published_configuration(&self) -> Option<ReplicaSetConfiguration> {
         let _commit = self.configuration_commit.lock().await;
         self.configuration.read().await.clone()
@@ -1777,6 +1801,34 @@ impl CustomReplicatorHost {
             .as_ref()
             .and_then(|a| a.previous_configuration.clone());
         Ok(Some((current, previous)))
+    }
+
+    async fn publish_prepared_configuration(
+        &self,
+        generation: u64,
+        current: ReplicaSetConfiguration,
+        authority: AdmittedAuthority,
+    ) -> Result<()> {
+        let _commit = self.configuration_commit.lock().await;
+        #[cfg(all(test, feature = "testing"))]
+        {
+            let gate = self
+                .host()?
+                .authority_publication_gate
+                .lock()
+                .unwrap()
+                .clone();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        let mut state = self.state.write().await;
+        let mut configuration = self.configuration.write().await;
+        self.ensure_configuration_generation(generation)?;
+        state.authority = Some(authority);
+        *configuration = Some(current);
+        Ok(())
     }
 
     async fn apply_configuration_update(
@@ -1815,6 +1867,17 @@ impl CustomReplicatorHost {
     }
 
     fn advance_configuration_generation(&self) -> Result<u64> {
+        if let Some(host) = self.host.upgrade()
+            && host
+                .custom_authority_attempt
+                .lock()
+                .unwrap()
+                .upgrade()
+                .is_some_and(|entered| entered.load(Ordering::Acquire))
+        {
+            host.custom_authority_invalidated
+                .store(true, Ordering::Release);
+        }
         self.configuration_generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
                 generation.checked_add(1)
@@ -1864,6 +1927,9 @@ impl CustomReplicatorHost {
     }
 
     async fn defer_configuration(&self) -> Result<()> {
+        if self.host()?.custom_configuration_blocked() {
+            return Ok(());
+        }
         {
             let _commit = self.configuration_commit.lock().await;
             self.deferred_configuration_abort.lock().unwrap().take();
@@ -1879,6 +1945,9 @@ impl CustomReplicatorHost {
         };
         let _commit = self.configuration_commit.lock().await;
         self.active_host()?;
+        if self.host()?.custom_configuration_blocked() {
+            return Ok(());
+        }
         if authority_before != self.state.read().await.authority
             || sessions_before != *self.sessions.read().await
         {
@@ -1890,7 +1959,25 @@ impl CustomReplicatorHost {
         let configuration_commit = self.configuration_commit.clone();
         let host = self.host.clone();
         let primary = self.primary.clone();
+        let callback = self
+            .native_receipts
+            .then(|| self.configuration_callback.clone());
         let handle = tokio::spawn(async move {
+            let independent = callback.is_some();
+            let _callback = match callback {
+                Some(callback) => Some(callback.lock_owned().await),
+                None => None,
+            };
+            if independent
+                && (configuration_generation.load(Ordering::Acquire) != generation
+                    || host.upgrade().is_none_or(|host| {
+                        host.aborted.load(Ordering::Acquire)
+                            || host.closed.load(Ordering::Acquire)
+                            || host.custom_configuration_blocked()
+                    }))
+            {
+                return Err(RuntimeError::OperationCancelled);
+            }
             let current = tokio::time::timeout(
                 std::time::Duration::from_secs(75),
                 Self::apply_configuration_update(primary, current, previous),
@@ -1925,12 +2012,21 @@ impl CustomReplicatorHost {
     }
 
     async fn configure(&self) -> Result<()> {
+        if self.native_receipts {
+            return self.configure_custom().await;
+        }
+        if self.host()?.custom_configuration_blocked() {
+            return Ok(());
+        }
         self.finish_deferred_configuration().await?;
         let Some((current, previous)) = self.configuration_update().await? else {
             return Ok(());
         };
         let generation = {
             let _commit = self.configuration_commit.lock().await;
+            if self.host()?.custom_configuration_blocked() {
+                return Ok(());
+            }
             if self.configuration.read().await.as_ref() == Some(&current) {
                 self.configuration_generation.load(Ordering::Acquire)
             } else {
@@ -1949,6 +2045,53 @@ impl CustomReplicatorHost {
         Ok(())
     }
 
+    async fn configure_custom(&self) -> Result<()> {
+        self.finish_deferred_configuration().await?;
+        let callback = self.configuration_callback.clone().lock_owned().await;
+        let host = self.active_host()?;
+        if host.custom_configuration_blocked() {
+            return Ok(());
+        }
+        let Some((current, previous)) = self.configuration_update().await? else {
+            return Ok(());
+        };
+        let generation = {
+            let _commit = self.configuration_commit.lock().await;
+            self.active_host()?;
+            if host.custom_configuration_blocked() {
+                return Ok(());
+            }
+            if self.configuration.read().await.as_ref() == Some(&current) {
+                self.configuration_generation.load(Ordering::Acquire)
+            } else {
+                self.advance_configuration_generation()?
+            }
+        };
+        let primary = self.primary.clone();
+        let configuration = self.configuration.clone();
+        let commit = self.configuration_commit.clone();
+        let generations = self.configuration_generation.clone();
+        // The callback task, not its waiting caller, owns serialization through
+        // application and publication. Dropping peer discovery cannot release
+        // an already-entered stateful callback into a newer authority.
+        tokio::spawn(async move {
+            let _callback = callback;
+            let current = Self::apply_configuration_update(primary, current, previous).await?;
+            let _commit = commit.lock().await;
+            let mut configuration = configuration.write().await;
+            if host.aborted.load(Ordering::Acquire)
+                || host.closed.load(Ordering::Acquire)
+                || generations.load(Ordering::Acquire) != generation
+            {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            *configuration = Some(current);
+            Ok(())
+        })
+        .await
+        .map_err(|error| RuntimeError::Application(error.to_string()))?
+    }
+
     async fn reserve_access_projection(
         &self,
         read: AccessStatus,
@@ -1956,6 +2099,11 @@ impl CustomReplicatorHost {
     ) -> Result<AccessProjection> {
         *self.restored_access.write().await = None;
         let host = self.host()?;
+        if host.custom_configuration_blocked()
+            && (read == AccessStatus::Granted || write == AccessStatus::Granted)
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
         let faulted_grant = (read == AccessStatus::Granted || write == AccessStatus::Granted)
             && host.state.read().await.reported_fault.is_some();
         let (read, write) = if faulted_grant {
@@ -2059,6 +2207,12 @@ impl CustomReplicatorHost {
 
     async fn validate_access_projection(&self, projection: &AccessProjection) -> Result<()> {
         let host = self.active_host()?;
+        if host.custom_configuration_blocked()
+            && (projection.read == AccessStatus::Granted
+                || projection.write == AccessStatus::Granted)
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
         if projection.authority != self.state.read().await.authority
             || projection.configuration != self.published_configuration().await
             || projection.sessions != *self.sessions.read().await
@@ -2096,6 +2250,9 @@ impl CustomReplicatorHost {
                 .load(std::sync::atomic::Ordering::Acquire)
             || host.aborted.load(std::sync::atomic::Ordering::Acquire)
             || host.closed.load(std::sync::atomic::Ordering::Acquire)
+            || (host.custom_configuration_blocked()
+                && (projection.read == AccessStatus::Granted
+                    || projection.write == AccessStatus::Granted))
         {
             return Err(RuntimeError::OperationCancelled);
         }
@@ -2923,6 +3080,73 @@ impl CustomReplicatorHost {
         self.fence_managed_access().await
     }
 
+    async fn preflight_custom_authority(&self, authority: &AdmittedAuthority) -> Result<()> {
+        let host = self.active_host()?;
+        let store = &host.default_dependencies.replica_authority_store;
+        if authority.local_identity != host.identity
+            || store.load_retired_authority().await?.is_some()
+            || store.load_retirement_started().await?.is_some()
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "retired or mismatched local authority".into(),
+            ));
+        }
+        if let Some(existing) = store.load().await? {
+            existing.validate()?;
+            if existing.local_identity != host.identity
+                || authority.current_configuration.epoch < existing.current_configuration.epoch
+                || (authority.current_configuration.epoch == existing.current_configuration.epoch
+                    && existing != *authority
+                    && !authority.is_current_only_completion_of(&existing))
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "custom proposal conflicts with durable authority".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn close_for_custom_authority(&self, attempt: &OpenAttempt<'_>) -> Result<()> {
+        let host = self.active_host()?;
+        let access = self.access_commit.lock().await;
+        let configuration = self.configuration_commit.lock().await;
+        let generation = self.advance_access_generation()?;
+        self.advance_configuration_generation()?;
+        self.deferred_configuration_abort.lock().unwrap().take();
+        let deferred = self.deferred_configuration.lock().await.take();
+        if let Some(handle) = &deferred {
+            handle.abort();
+        }
+        {
+            let mut restored = self.restored_access.write().await;
+            host.custom_access_requires_authorization
+                .store(true, Ordering::Release);
+            *restored = None;
+        }
+        self.removal_witnesses.write().await.clear();
+        self.invalidate_build_attempts_without_access_locked()
+            .await?;
+        let mut state = self.state.write().await;
+        let mut host_state = host.state.write().await;
+        self.active_host()?;
+        state.read_status = AccessStatus::ReconfigurationPending;
+        state.write_status = AccessStatus::ReconfigurationPending;
+        host_state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
+        host_state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+        self.published_access_generation
+            .store(generation, Ordering::Release);
+        attempt.arm();
+        drop(host_state);
+        drop(state);
+        drop(configuration);
+        drop(access);
+        if let Some(handle) = deferred {
+            let _ = handle.await;
+        }
+        Ok(())
+    }
+
     async fn fence_managed_access(&self) -> Result<()> {
         *self.restored_access.write().await = None;
         self.removal_witnesses.write().await.clear();
@@ -3372,6 +3596,23 @@ impl CustomReplicatorHost {
             .load_secondary_removal()
             .await?;
         self.restore_builds().await?;
+        let pending = if self.native_receipts {
+            self.host()?
+                .pending_authority_recovery
+                .lock()
+                .unwrap()
+                .clone()
+        } else {
+            None
+        };
+        if let Some(effect) = pending
+            && let RuntimeEffectAction::AdmitAuthority(authority) = effect.action
+        {
+            drop(_gate);
+            return self
+                .apply_common_action(RuntimeEffectAction::AdmitAuthority(authority))
+                .await;
+        }
         if self.native_receipts || self.state.read().await.authority.is_some() {
             self.configure().await?;
         }
@@ -3527,6 +3768,12 @@ impl CustomReplicatorHost {
             }
             action => action,
         };
+        let host = self.host()?;
+        let _restoration = if matches!(&action, RuntimeEffectAction::AdmitAuthority(_)) {
+            Some(host.custom_restoration.lock().await)
+        } else {
+            None
+        };
         let _session_registration = if matches!(&action, RuntimeEffectAction::AdmitAuthority(_)) {
             Some(self.session_registration.lock().await)
         } else {
@@ -3537,6 +3784,7 @@ impl CustomReplicatorHost {
         match action {
             RuntimeEffectAction::AdmitAuthority(authority) => {
                 authority.validate()?;
+                self.preflight_custom_authority(&authority).await?;
                 if self.native_receipts
                     && let Some(evidence) = &authority.scale_up
                 {
@@ -3580,13 +3828,36 @@ impl CustomReplicatorHost {
                         }
                     }
                 }
-                self.prepare_authority_admission(&authority).await?;
+                let current = self
+                    .descriptions_with_policy(Some(*authority.clone()), true)
+                    .await?
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                let _callback = self.configuration_callback.lock().await;
+                self.active_host()?;
+                let attempt = OpenAttempt::authority(&host);
+                self.close_for_custom_authority(&attempt).await?;
+                self.close_custom_native_access(false).await?;
+                let configuration_generation =
+                    self.configuration_generation.load(Ordering::Acquire);
+                let configuration = Self::apply_configuration_update(
+                    self.primary.clone(),
+                    current,
+                    authority.previous_configuration.clone(),
+                )
+                .await?;
+                self.ensure_configuration_generation(configuration_generation)?;
                 host.default_dependencies
                     .replica_authority_store
                     .admit(&authority)
                     .await?;
-                self.state.write().await.authority = Some(*authority);
-                self.configure().await?;
+                self.ensure_configuration_generation(configuration_generation)?;
+                self.publish_prepared_configuration(
+                    configuration_generation,
+                    configuration,
+                    *authority,
+                )
+                .await?;
+                attempt.complete();
             }
             RuntimeEffectAction::AdmitBuildAuthority(_) => unreachable!(),
             RuntimeEffectAction::RegisterPeerSession { .. } => unreachable!(),
@@ -3891,7 +4162,15 @@ impl AuthorityLifecycle for CustomReplicatorHost {
 #[async_trait]
 impl AccessLifecycle for CustomReplicatorHost {
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
-        *self.restored_access.write().await = Some((read, write));
+        let mut restored = self.restored_access.write().await;
+        if self.host().is_ok_and(|host| {
+            host.custom_access_requires_authorization
+                .load(Ordering::Acquire)
+                && (read == AccessStatus::Granted || write == AccessStatus::Granted)
+        }) {
+            return;
+        }
+        *restored = Some((read, write));
     }
 
     async fn run_access_transaction(
@@ -3908,7 +4187,15 @@ impl AccessLifecycle for CustomReplicatorHost {
     }
 
     async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
-        *self.restored_access.read().await
+        let restored = self.restored_access.read().await;
+        if self.host().is_ok_and(|host| {
+            host.custom_access_requires_authorization
+                .load(Ordering::Acquire)
+        }) {
+            None
+        } else {
+            *restored
+        }
     }
 }
 

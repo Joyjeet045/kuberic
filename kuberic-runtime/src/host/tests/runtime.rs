@@ -2846,7 +2846,11 @@ struct MemoryAuthorityStore {
     build_selections: Mutex<BTreeMap<ReplicaIdentity, BuildSelection>>,
     build_progress: Mutex<BTreeMap<OperationId, DurableBuildProgress>>,
     admit_count: AtomicUsize,
+    fail_before_admit: AtomicBool,
     fail_after_admit: AtomicBool,
+    pause_admit: AtomicBool,
+    admit_entered: Notify,
+    admit_released: Notify,
     fail_build_progress_once: AtomicBool,
     pause_build_progress: AtomicBool,
     build_progress_notify: Notify,
@@ -3009,6 +3013,10 @@ impl ReplicaAuthorityStore for MemoryAuthorityStore {
     }
 
     async fn admit(&self, authority: &AdmittedAuthority) -> ContractResult<()> {
+        if self.pause_admit.swap(false, Ordering::SeqCst) {
+            self.admit_entered.notify_one();
+            self.admit_released.notified().await;
+        }
         let _guard = self.lifecycle.lock().unwrap();
         if self.retired_authority.lock().unwrap().is_some()
             || self.retirement_started.lock().unwrap().is_some()
@@ -3016,6 +3024,11 @@ impl ReplicaAuthorityStore for MemoryAuthorityStore {
             return Err(ContractError::AuthorityMismatch("retired identity".into()));
         }
         self.admit_count.fetch_add(1, Ordering::SeqCst);
+        if self.fail_before_admit.swap(false, Ordering::SeqCst) {
+            return Err(ContractError::Persistence(
+                "injected authority failure before write".into(),
+            ));
+        }
         *self.authority.lock().unwrap() = Some(authority.clone());
         if self.fail_after_admit.swap(false, Ordering::SeqCst) {
             return Err(ContractError::Persistence(
@@ -4372,6 +4385,10 @@ struct CustomRoleGate {
     revoke_error: AtomicBool,
     abort_count: AtomicUsize,
     block_configuration: AtomicBool,
+    fail_configuration: AtomicBool,
+    fail_after_configuration: AtomicBool,
+    configuration_epoch_path: Mutex<Option<std::path::PathBuf>>,
+    configuration_access: Mutex<Vec<AccessStatus>>,
     configuration_entered: Notify,
     configuration_released: Notify,
     block_catchup: AtomicBool,
@@ -4386,6 +4403,7 @@ struct CustomRoleGate {
     remove_count: AtomicUsize,
     partition: Mutex<Option<StatefulServicePartition>>,
     configurations: Mutex<Vec<crate::replicator::ReplicaSetConfiguration>>,
+    previous_configurations: Mutex<Vec<crate::replicator::ReplicaSetConfiguration>>,
     operations: Mutex<Vec<Bytes>>,
     catchups: Mutex<Vec<ReplicaSetQuorumMode>>,
 }
@@ -4461,22 +4479,19 @@ impl PrimaryReplicator for CustomRoleGate {
     }
     async fn update_catch_up_replica_set_configuration(
         &self,
-        _: crate::replicator::ReplicaSetConfiguration,
-        _: crate::replicator::ReplicaSetConfiguration,
+        current: crate::replicator::ReplicaSetConfiguration,
+        previous: crate::replicator::ReplicaSetConfiguration,
     ) -> Result<()> {
-        Ok(())
+        self.previous_configurations.lock().unwrap().push(previous);
+        self.record_configuration(current).await
     }
     async fn update_current_replica_set_configuration(
         &self,
         configuration: crate::replicator::ReplicaSetConfiguration,
     ) -> Result<()> {
-        if self.block_configuration.swap(false, Ordering::SeqCst) {
-            self.configuration_entered.notify_one();
-            self.configuration_released.notified().await;
-        }
-        self.configurations.lock().unwrap().push(configuration);
-        Ok(())
+        self.record_configuration(configuration).await
     }
+
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
         if self.block_catchup.swap(false, Ordering::SeqCst) {
             self.catchup_entered.notify_one();
@@ -4500,6 +4515,1235 @@ impl PrimaryReplicator for CustomRoleGate {
         }
         Ok(())
     }
+}
+
+impl CustomRoleGate {
+    async fn record_configuration(
+        &self,
+        configuration: crate::replicator::ReplicaSetConfiguration,
+    ) -> Result<()> {
+        let partition = self.partition.lock().unwrap().clone();
+        if let Some(partition) = partition {
+            let access = partition.get_write_status().await?;
+            self.configuration_access.lock().unwrap().push(access);
+        }
+        if self.block_configuration.swap(false, Ordering::SeqCst) {
+            self.configuration_entered.notify_one();
+            self.configuration_released.notified().await;
+        }
+        if self.fail_configuration.swap(false, Ordering::SeqCst) {
+            return Err(RuntimeError::AuthorityMismatch(
+                "injected configuration rejection".into(),
+            ));
+        }
+        if let Some(path) = self.configuration_epoch_path.lock().unwrap().as_ref() {
+            if path.exists() {
+                let old: Epoch = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                if configuration.configuration.epoch < old {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "custom durable configuration epoch regressed".into(),
+                    ));
+                }
+            }
+            std::fs::write(
+                path,
+                serde_json::to_vec(&configuration.configuration.epoch).unwrap(),
+            )
+            .unwrap();
+        }
+        self.configurations.lock().unwrap().push(configuration);
+        if self.fail_after_configuration.swap(false, Ordering::SeqCst) {
+            return Err(RuntimeError::Application(
+                "injected rejection after stateful configuration".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn rejected_custom_configuration_does_not_publish_authority() {
+    for joint in [false, true] {
+        for partial in [false, true] {
+            rejected_custom_configuration_trace(joint, partial).await;
+        }
+    }
+}
+
+async fn rejected_custom_configuration_trace(joint: bool, partial: bool) {
+    let directory = crate::host::tests::tempdir().unwrap();
+    let local = identity(1, "rejected-custom-configuration");
+    let peer = identity(2, "rejected-custom-configuration-peer");
+    let control = Arc::new(CustomRoleGate::default());
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let journal = fresh_disk_store(directory.path(), local.clone());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(control.clone())),
+        store.clone(),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("rejected-custom-configuration"),
+            ProcessSessionId::new("local-session"),
+        )
+        .unwrap();
+    let adapter = RuntimeAdapter::new(journal.clone(), runtime.clone());
+    adapter
+        .execute(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    let old = authority(local.clone(), vec![local.clone(), peer]);
+    let mut candidate = old.clone();
+    if joint {
+        let mut members = old.current_configuration.members.clone();
+        members[1].identity = identity(2, "initial-joint-replacement");
+        candidate.current_configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            local.replica_id,
+            members,
+            old.current_configuration.write_quorum,
+        );
+        candidate.previous_configuration = Some(old.current_configuration);
+        candidate.transition_kind = Some(TransitionKind::Replacement);
+    }
+    if partial {
+        control
+            .fail_after_configuration
+            .store(true, Ordering::SeqCst);
+    } else {
+        control.fail_configuration.store(true, Ordering::SeqCst);
+    }
+    let pending = effect(2, RuntimeEffectAction::AdmitAuthority(Box::new(candidate)));
+    let result = adapter.execute(pending.clone()).await;
+    assert!(result.is_err());
+    assert!(store.authority.lock().unwrap().is_none());
+    assert_eq!(store.admit_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        control.configurations.lock().unwrap().len(),
+        usize::from(partial)
+    );
+    assert_custom_authority_closed(&runtime, &control).await;
+    assert!(!runtime.testing_has_applied_effect(2).await);
+    let recorded = journal.load_state().await.unwrap().pending_effect.unwrap();
+    assert_eq!(recorded.effect, pending);
+    assert_eq!(recorded.stage, EffectStage::IntentCommitted);
+}
+
+async fn assert_custom_authority_closed(runtime: &PodRuntime, control: &CustomRoleGate) {
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.read_status, AccessStatus::ReconfigurationPending);
+    assert_eq!(snapshot.write_status, AccessStatus::ReconfigurationPending);
+    let partition = control.partition.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        partition.get_read_status().await.unwrap(),
+        AccessStatus::ReconfigurationPending
+    );
+    assert_eq!(
+        partition.get_write_status().await.unwrap(),
+        AccessStatus::ReconfigurationPending
+    );
+    assert!(!control.native_access_granted.load(Ordering::SeqCst));
+}
+
+fn next_custom_authority(old: &AdmittedAuthority) -> AdmittedAuthority {
+    let mut next = old.clone();
+    next.current_configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        old.current_configuration.primary_id,
+        old.current_configuration.members.clone(),
+        old.current_configuration.write_quorum,
+    );
+    next
+}
+
+#[tokio::test]
+async fn custom_authority_rejection_contains_partial_current_and_joint_application() {
+    for joint in [false, true] {
+        for partial in [false, true] {
+            let (runtime, control, local, _) =
+                blocked_lifecycle_fixture("custom-authority-rejection").await;
+            let old = runtime.snapshot().await.authority.unwrap();
+            let mut next = next_custom_authority(&old);
+            if joint {
+                let replaced = next.current_configuration.members[1].identity.clone();
+                let mut members = next.current_configuration.members.clone();
+                members[1].identity = identity(replaced.replica_id.value(), "replacement-instance");
+                next.current_configuration = ConfigurationDescriptor::new(
+                    Epoch::new(0, 2),
+                    local.replica_id,
+                    members,
+                    old.current_configuration.write_quorum,
+                );
+                next.previous_configuration = Some(old.current_configuration.clone());
+                next.transition_kind = Some(TransitionKind::Replacement);
+            }
+            next.validate().unwrap();
+            let before = control.configurations.lock().unwrap().len();
+            if partial {
+                control
+                    .fail_after_configuration
+                    .store(true, Ordering::SeqCst);
+            } else {
+                control.fail_configuration.store(true, Ordering::SeqCst);
+            }
+            let result = runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::AdmitAuthority(Box::new(next.clone())),
+                ))
+                .await;
+            assert!(result.is_err());
+            assert!(!runtime.testing_has_applied_effect(5).await);
+            assert_eq!(runtime.snapshot().await.authority, Some(old));
+            assert_eq!(
+                control.configurations.lock().unwrap().len(),
+                before + usize::from(partial)
+            );
+            if partial {
+                assert_eq!(
+                    control
+                        .configurations
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .configuration,
+                    next.current_configuration
+                );
+            }
+            if joint {
+                assert_eq!(
+                    control
+                        .previous_configurations
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .configuration,
+                    next.previous_configuration.unwrap()
+                );
+            }
+            assert_custom_authority_closed(&runtime, &control).await;
+            assert_eq!(control.abort_count.load(Ordering::SeqCst), 1);
+            assert!(!runtime.snapshot().await.open);
+            let reporter = runtime.report_runtime();
+            reporter.observe_progress().await.unwrap_err();
+            assert_custom_authority_closed(&runtime, &control).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_authority_persistence_errors_close_retained_access_without_rollback() {
+    for ambiguous in [false, true] {
+        for identical in [false, true] {
+            let local = identity(1, "custom-authority-store");
+            let control = Arc::new(CustomRoleGate::default());
+            let store = Arc::new(MemoryAuthorityStore::default());
+            let runtime = PodRuntime::new(
+                local.clone(),
+                Arc::new(CustomRoleService(control.clone())),
+                store.clone(),
+            );
+            runtime
+                .bind_replica_session(ResourceUid::new("custom"), ProcessSessionId::new("first"))
+                .unwrap();
+            let old = authority(local.clone(), vec![local]);
+            activate_test_primary(&runtime, old.clone(), true).await;
+            let next = if identical {
+                old.clone()
+            } else {
+                next_custom_authority(&old)
+            };
+            if ambiguous {
+                store.fail_after_admit.store(true, Ordering::SeqCst);
+            } else {
+                store.fail_before_admit.store(true, Ordering::SeqCst);
+            }
+            let result = runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::AdmitAuthority(Box::new(next.clone())),
+                ))
+                .await;
+            assert!(matches!(result, Err(RuntimeError::Application(_))));
+            assert_eq!(
+                *store.authority.lock().unwrap(),
+                Some(if ambiguous { next.clone() } else { old.clone() })
+            );
+            assert_eq!(runtime.snapshot().await.authority, Some(old));
+            assert_eq!(
+                control
+                    .configurations
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .configuration,
+                next.current_configuration
+            );
+            assert_eq!(
+                *control.configuration_access.lock().unwrap().last().unwrap(),
+                AccessStatus::ReconfigurationPending
+            );
+            assert_custom_authority_closed(&runtime, &control).await;
+            assert_eq!(control.abort_count.load(Ordering::SeqCst), 1);
+            assert!(!runtime.testing_has_applied_effect(5).await);
+            assert!(matches!(
+                runtime
+                    .apply_effect(effect(
+                        5,
+                        RuntimeEffectAction::AdmitAuthority(Box::new(next))
+                    ))
+                    .await,
+                Err(RuntimeError::Closed)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_custom_authority_callback_or_store_aborts_closed_session() {
+    for at_store in [false, true] {
+        let directory = crate::host::tests::tempdir().unwrap();
+        let local = identity(1, "custom-authority-cancel");
+        let control = Arc::new(CustomRoleGate::default());
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let journal = fresh_disk_store(directory.path(), local.clone());
+        let runtime = Arc::new(PodRuntime::new(
+            local.clone(),
+            Arc::new(CustomRoleService(control.clone())),
+            store.clone(),
+        ));
+        runtime
+            .bind_replica_session(ResourceUid::new("custom"), ProcessSessionId::new("first"))
+            .unwrap();
+        let old = authority(local.clone(), vec![local]);
+        let adapter = RuntimeAdapter::new(journal.clone(), runtime.clone());
+        for (index, action) in [
+            RuntimeEffectAction::Open(OpenMode::New),
+            RuntimeEffectAction::AdmitAuthority(Box::new(old.clone())),
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            adapter
+                .execute(effect(index as u64 + 1, action))
+                .await
+                .unwrap();
+        }
+        let next = next_custom_authority(&old);
+        if at_store {
+            store.pause_admit.store(true, Ordering::SeqCst);
+        } else {
+            control.block_configuration.store(true, Ordering::SeqCst);
+        }
+        let pending = effect(5, RuntimeEffectAction::AdmitAuthority(Box::new(next)));
+        let attempt = {
+            let runtime = runtime.clone();
+            let journal = journal.clone();
+            let pending = pending.clone();
+            tokio::spawn(
+                async move { RuntimeAdapter::new(journal, runtime).execute(pending).await },
+            )
+        };
+        timeout(Duration::from_secs(1), async {
+            if at_store {
+                store.admit_entered.notified().await;
+            } else {
+                control.configuration_entered.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_custom_authority_closed(&runtime, &control).await;
+        attempt.abort();
+        assert!(attempt.await.unwrap_err().is_cancelled());
+        assert_eq!(*store.authority.lock().unwrap(), Some(old));
+        assert_eq!(control.abort_count.load(Ordering::SeqCst), 1);
+        assert!(!runtime.testing_has_applied_effect(5).await);
+        assert!(!runtime.snapshot().await.open);
+        assert_custom_authority_closed(&runtime, &control).await;
+        let recorded = journal.load_state().await.unwrap().pending_effect.unwrap();
+        assert_eq!(recorded.effect, pending);
+        assert_eq!(recorded.stage, EffectStage::IntentCommitted);
+    }
+}
+
+#[tokio::test]
+async fn custom_authority_native_revocation_failure_never_enters_configuration() {
+    for timeout_revocation in [false, true] {
+        let (runtime, control, _, _) = blocked_lifecycle_fixture("custom-authority-revoke").await;
+        let next = next_custom_authority(&runtime.snapshot().await.authority.unwrap());
+        let before = control.configurations.lock().unwrap().len();
+        if timeout_revocation {
+            control.block_revocation.store(true, Ordering::SeqCst);
+        } else {
+            control.revoke_error.store(true, Ordering::SeqCst);
+        }
+        assert!(
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::AdmitAuthority(Box::new(next))
+                ))
+                .await
+                .is_err()
+        );
+        assert_eq!(control.configurations.lock().unwrap().len(), before);
+        assert_eq!(control.abort_count.load(Ordering::SeqCst), 1);
+        assert_custom_authority_closed(&runtime, &control).await;
+    }
+}
+
+#[tokio::test]
+async fn custom_authority_success_requires_fresh_access_authorization() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("custom-authority-success").await;
+    let old = runtime.snapshot().await.authority.unwrap();
+    runtime
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::AdmitAuthority(Box::new(old)),
+        ))
+        .await
+        .unwrap();
+    assert_custom_authority_closed(&runtime, &control).await;
+    assert_eq!(control.abort_count.load(Ordering::SeqCst), 0);
+    runtime
+        .apply_effect(effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn custom_authority_success_cannot_restore_a_superseded_report_grant() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("custom-stale-restoration").await;
+    let admitted = runtime.snapshot().await.authority.unwrap();
+    control.block_configuration.store(true, Ordering::SeqCst);
+    let attempt = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::AdmitAuthority(Box::new(admitted)),
+                ))
+                .await
+        })
+    };
+    timeout(
+        Duration::from_secs(1),
+        control.configuration_entered.notified(),
+    )
+    .await
+    .unwrap();
+    let reporter = runtime.report_runtime();
+    let stale_restoration = {
+        let reporter = runtime.report_runtime();
+        tokio::spawn(async move {
+            reporter
+                .reconcile_durable_access(AccessStatus::Granted, AccessStatus::Granted)
+                .await
+        })
+    };
+    control.configuration_released.notify_one();
+    attempt.await.unwrap().unwrap();
+    assert!(matches!(
+        stale_restoration.await.unwrap(),
+        Err(RuntimeError::ReconfigurationPending)
+    ));
+    reporter.observe_progress().await.unwrap();
+    assert_custom_authority_closed(&runtime, &control).await;
+    assert!(
+        reporter
+            .reconcile_durable_access(AccessStatus::Granted, AccessStatus::Granted)
+            .await
+            .is_err()
+    );
+    reporter.observe_progress().await.unwrap();
+    assert_custom_authority_closed(&runtime, &control).await;
+    runtime
+        .apply_effect(effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn custom_authority_serializes_preaccepted_durable_and_deferred_restoration() {
+    for (deferred, dropped) in [(false, false), (true, false), (false, true), (true, true)] {
+        let directory = crate::host::tests::tempdir().unwrap();
+        let local = identity(1, "custom-restoration-owner");
+        let store = fresh_disk_store(directory.path(), local.clone());
+        let old_control = Arc::new(CustomRoleGate::default());
+        let old = Arc::new(PodRuntime::new(
+            local.clone(),
+            Arc::new(CustomRoleService(old_control)),
+            store.clone(),
+        ));
+        old.bind_replica_session(
+            ResourceUid::new("frozen-copy"),
+            ProcessSessionId::new("old"),
+        )
+        .unwrap();
+        let admitted = authority(local.clone(), vec![local.clone()]);
+        let adapter = RuntimeAdapter::new(store.clone(), old.clone());
+        for (index, action) in [
+            RuntimeEffectAction::Open(OpenMode::New),
+            RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            adapter
+                .execute(effect(index as u64 + 1, action))
+                .await
+                .unwrap();
+        }
+        old.abort();
+        drop(adapter);
+        drop(old);
+        let control = Arc::new(CustomRoleGate::default());
+        control
+            .grant_error
+            .store(usize::from(deferred), Ordering::SeqCst);
+        let runtime = Arc::new(PodRuntime::new(
+            local,
+            Arc::new(CustomRoleService(control.clone())),
+            store.clone(),
+        ));
+        let agent =
+            AgentService::new(store.clone(), runtime.clone(), runtime.clone(), "token").unwrap();
+        agent.reconstruct_runtime().await.unwrap();
+        assert!(store.load_state().await.unwrap().pending_effect.is_none());
+        control.grant_error.store(0, Ordering::SeqCst);
+        let gate = runtime.testing_pause_custom_restoration();
+        let restoration = {
+            let report = runtime.report_runtime();
+            tokio::spawn(async move {
+                if deferred {
+                    report.observe_progress().await
+                } else {
+                    report
+                        .reconcile_durable_access(AccessStatus::Granted, AccessStatus::Granted)
+                        .await
+                }
+            })
+        };
+        timeout(Duration::from_secs(1), gate.entered.notified())
+            .await
+            .unwrap();
+        let restoration = if dropped {
+            restoration.abort();
+            assert!(restoration.await.unwrap_err().is_cancelled());
+            None
+        } else {
+            Some(restoration)
+        };
+        let before = control.configurations.lock().unwrap().len();
+        let admission = {
+            let runtime = runtime.clone();
+            let store = store.clone();
+            tokio::spawn(async move {
+                RuntimeAdapter::new(store, runtime)
+                    .execute(effect(
+                        5,
+                        RuntimeEffectAction::AdmitAuthority(Box::new(admitted)),
+                    ))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!admission.is_finished());
+        assert_eq!(control.configurations.lock().unwrap().len(), before);
+        gate.release.notify_one();
+        if let Some(restoration) = restoration {
+            restoration.await.unwrap().unwrap();
+        }
+        admission.await.unwrap().unwrap();
+        runtime.report_runtime().observe_progress().await.unwrap();
+        assert_custom_authority_closed(&runtime, &control).await;
+        RuntimeAdapter::new(store, runtime.clone())
+            .execute(effect(
+                6,
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::Granted,
+                    write: AccessStatus::Granted,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(control.native_access_granted.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn custom_authority_waits_for_owned_incidental_configuration_even_if_caller_drops() {
+    for dropped in [false, true] {
+        let (runtime, control, local, peer) =
+            blocked_lifecycle_fixture("owned-incidental-configuration").await;
+        let old = runtime.snapshot().await.authority.unwrap();
+        let next = next_custom_authority(&old);
+        control.block_configuration.store(true, Ordering::SeqCst);
+        let incidental = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                let mut description = ReplicaInformation::new(
+                    OperationId::default(),
+                    peer,
+                    "in-process://owned-config".into(),
+                );
+                description.process_session_id = ProcessSessionId::new("peer-session");
+                crate::host::testing::describe_peer(&runtime, description).await
+            })
+        };
+        timeout(
+            Duration::from_secs(1),
+            control.configuration_entered.notified(),
+        )
+        .await
+        .unwrap();
+        let incidental = if dropped {
+            incidental.abort();
+            assert!(incidental.await.unwrap_err().is_cancelled());
+            None
+        } else {
+            Some(incidental)
+        };
+        let admission = {
+            let runtime = runtime.clone();
+            let next = next.clone();
+            tokio::spawn(async move {
+                runtime
+                    .apply_effect(effect(
+                        5,
+                        RuntimeEffectAction::AdmitAuthority(Box::new(next)),
+                    ))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !admission.is_finished(),
+            "entered callback retains ownership after observer drop"
+        );
+        control.configuration_released.notify_one();
+        if let Some(incidental) = incidental {
+            incidental.await.unwrap().unwrap();
+        }
+        admission.await.unwrap().unwrap();
+        assert_eq!(runtime.snapshot().await.authority, Some(next.clone()));
+        assert_eq!(
+            control
+                .configurations
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .configuration,
+            next.current_configuration
+        );
+        assert_custom_authority_closed(&runtime, &control).await;
+        runtime
+            .apply_effect(effect(
+                6,
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::Granted,
+                    write: AccessStatus::Granted,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(control.native_access_granted.load(Ordering::SeqCst));
+        assert_eq!(
+            control
+                .configurations
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .configuration
+                .epoch,
+            Epoch::new(0, 2)
+        );
+        assert_eq!(
+            runtime.snapshot().await.authority.unwrap().local_identity,
+            local
+        );
+    }
+}
+
+#[tokio::test]
+async fn custom_authority_invalidated_publication_tail_never_records_success() {
+    for before_assignment in [false, true] {
+        for dropped in [false, true] {
+            let directory = crate::host::tests::tempdir().unwrap();
+            let local = identity(1, "custom-publication-tail");
+            let store = fresh_disk_store(directory.path(), local.clone());
+            let control = Arc::new(CustomRoleGate::default());
+            let runtime = Arc::new(PodRuntime::new(
+                local.clone(),
+                Arc::new(CustomRoleService(control.clone())),
+                store.clone(),
+            ));
+            runtime
+                .bind_replica_session(
+                    ResourceUid::new("frozen-copy"),
+                    ProcessSessionId::new("first"),
+                )
+                .unwrap();
+            let old = authority(local.clone(), vec![local]);
+            let adapter = RuntimeAdapter::new(store.clone(), runtime.clone());
+            for (index, action) in [
+                RuntimeEffectAction::Open(OpenMode::New),
+                RuntimeEffectAction::AdmitAuthority(Box::new(old.clone())),
+                RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::Granted,
+                    write: AccessStatus::Granted,
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                adapter
+                    .execute(effect(index as u64 + 1, action))
+                    .await
+                    .unwrap();
+            }
+            let gate = if before_assignment {
+                runtime.testing_pause_authority_publication()
+            } else {
+                runtime.testing_pause_access_effect_acceptance()
+            };
+            let next = next_custom_authority(&old);
+            let pending = effect(
+                5,
+                RuntimeEffectAction::AdmitAuthority(Box::new(next.clone())),
+            );
+            let attempt = {
+                let store = store.clone();
+                let runtime = runtime.clone();
+                let pending = pending.clone();
+                tokio::spawn(
+                    async move { RuntimeAdapter::new(store, runtime).execute(pending).await },
+                )
+            };
+            timeout(Duration::from_secs(1), gate.entered.notified())
+                .await
+                .unwrap();
+            assert_eq!(store.load().await.unwrap(), Some(next));
+            if dropped {
+                attempt.abort();
+                assert!(attempt.await.unwrap_err().is_cancelled());
+                assert_eq!(
+                    store
+                        .load_state()
+                        .await
+                        .unwrap()
+                        .pending_effect
+                        .unwrap()
+                        .effect,
+                    pending
+                );
+            } else {
+                runtime.abort();
+                gate.release.notify_one();
+                assert!(attempt.await.unwrap().is_err());
+            }
+            assert!(!runtime.testing_has_applied_effect(5).await);
+            if before_assignment {
+                assert_eq!(runtime.snapshot().await.authority, Some(old));
+            }
+            assert_custom_authority_closed(&runtime, &control).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_authority_late_store_commit_after_abort_cannot_publish() {
+    let local = identity(1, "custom-late-commit");
+    let control = Arc::new(CustomRoleGate::default());
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(control.clone())),
+        store.clone(),
+    ));
+    runtime
+        .bind_replica_session(ResourceUid::new("custom"), ProcessSessionId::new("first"))
+        .unwrap();
+    let old = authority(local.clone(), vec![local]);
+    activate_test_primary(&runtime, old.clone(), true).await;
+    let next = next_custom_authority(&old);
+    store.pause_admit.store(true, Ordering::SeqCst);
+    let attempt = {
+        let runtime = runtime.clone();
+        let next = next.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::AdmitAuthority(Box::new(next)),
+                ))
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), store.admit_entered.notified())
+        .await
+        .unwrap();
+    runtime.abort();
+    store.admit_released.notify_one();
+    assert!(attempt.await.unwrap().is_err());
+    assert_eq!(*store.authority.lock().unwrap(), Some(next));
+    assert_eq!(runtime.snapshot().await.authority, Some(old));
+    assert!(!runtime.testing_has_applied_effect(5).await);
+    assert_custom_authority_closed(&runtime, &control).await;
+}
+
+#[tokio::test]
+async fn custom_authority_exact_proposal_ignores_newer_build_discovery() {
+    let local = identity(1, "custom-exact");
+    let peer = identity(2, "custom-exact-peer");
+    let control = Arc::new(CustomRoleGate::default());
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(control.clone())),
+        store.clone(),
+    );
+    runtime
+        .bind_replica_session(ResourceUid::new("custom"), ProcessSessionId::new("first"))
+        .unwrap();
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    let candidate = authority(local.clone(), vec![local.clone(), peer.clone()]);
+    let discovery = next_custom_authority(&candidate);
+    let build = BuildAuthority {
+        kind: BuildAuthorityKind::Provisioning,
+        build_id: OperationId::new("unrelated-discovery"),
+        source: peer,
+        target: local,
+        current_configuration: discovery.current_configuration,
+        replication_boundary_lsn: 0,
+    };
+    store
+        .builds
+        .lock()
+        .unwrap()
+        .insert(build.build_id.clone(), build);
+    runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(candidate.clone())),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        control
+            .configurations
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .configuration,
+        candidate.current_configuration
+    );
+    assert_eq!(*store.authority.lock().unwrap(), Some(candidate));
+    assert_custom_authority_closed(&runtime, &control).await;
+}
+
+#[tokio::test]
+async fn custom_authority_preflight_conflict_never_enters_stateful_callback() {
+    let local = identity(1, "custom-conflict");
+    let control = Arc::new(CustomRoleGate::default());
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(control.clone())),
+        store.clone(),
+    );
+    runtime
+        .bind_replica_session(ResourceUid::new("custom"), ProcessSessionId::new("first"))
+        .unwrap();
+    let old = authority(local.clone(), vec![local]);
+    let newer = next_custom_authority(&old);
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    *store.authority.lock().unwrap() = Some(newer);
+    assert!(matches!(
+        runtime
+            .apply_effect(effect(
+                2,
+                RuntimeEffectAction::AdmitAuthority(Box::new(old))
+            ))
+            .await,
+        Err(RuntimeError::AuthorityMismatch(_))
+    ));
+    assert!(control.configurations.lock().unwrap().is_empty());
+    assert_eq!(store.admit_count.load(Ordering::SeqCst), 0);
+    assert_eq!(control.abort_count.load(Ordering::SeqCst), 0);
+    assert!(runtime.snapshot().await.open);
+}
+
+#[tokio::test]
+async fn custom_authority_same_primary_scale_up_closes_retained_grant() {
+    for failure in [0, 1, 2] {
+        let local = identity(1, "custom-scale-up-admit");
+        let peer = identity(2, "custom-scale-up-peer");
+        let control = Arc::new(CustomRoleGate::default());
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let runtime = PodRuntime::new(
+            local.clone(),
+            Arc::new(CustomRoleService(control.clone())),
+            store.clone(),
+        );
+        runtime
+            .bind_replica_session(ResourceUid::new("custom"), ProcessSessionId::new("first"))
+            .unwrap();
+        activate_test_primary(
+            &runtime,
+            authority(local.clone(), vec![local.clone(), peer.clone()]),
+            true,
+        )
+        .await;
+        let old = runtime.snapshot().await.authority.unwrap();
+        let target = identity(3, "custom-scale-up-target");
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            local.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: local.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: peer,
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        let mut intent = ScaleUpIntent {
+            operation_id: OperationId::default(),
+            resource_uid: ResourceUid::new("custom-scale-up-admit"),
+            spec_generation: 2,
+            desired_replicas: 3,
+            previous_configuration: old.current_configuration.clone(),
+            current_configuration: current.clone(),
+            previous_policy: EffectivePolicy::fixed(2, 30).unwrap(),
+            current_policy: EffectivePolicy::fixed(3, 30).unwrap(),
+            primary: local.clone(),
+            target,
+            build_id: OperationId::new("custom-scale-up-build"),
+            snapshot_boundary_lsn: 0,
+            catch_up_boundary_lsn: 0,
+        };
+        intent.operation_id = intent.expected_operation_id();
+        let next = AdmittedAuthority {
+            scale_up: Some(Box::new(ScaleUpConfigurationEvidence::Admission { intent })),
+            secondary_removal: None,
+            local_identity: local,
+            transition_kind: Some(TransitionKind::ScaleUp),
+            previous_configuration: Some(old.current_configuration.clone()),
+            current_configuration: current.clone(),
+            switchover_handoff: None,
+        };
+        store
+            .fail_before_admit
+            .store(failure == 1, Ordering::SeqCst);
+        store.fail_after_admit.store(failure == 2, Ordering::SeqCst);
+        let result = runtime
+            .apply_effect(effect(
+                5,
+                RuntimeEffectAction::AdmitAuthority(Box::new(next.clone())),
+            ))
+            .await;
+        assert_eq!(result.is_ok(), failure == 0);
+        assert_eq!(
+            *store.authority.lock().unwrap(),
+            Some(if failure == 1 { old.clone() } else { next })
+        );
+        assert_eq!(runtime.testing_has_applied_effect(5).await, failure == 0);
+        assert_custom_authority_closed(&runtime, &control).await;
+        assert_eq!(
+            control
+                .configurations
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .configuration,
+            current
+        );
+        assert_eq!(
+            control
+                .previous_configurations
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .configuration,
+            old.current_configuration
+        );
+        assert_eq!(
+            control.abort_count.load(Ordering::SeqCst),
+            usize::from(failure != 0)
+        );
+    }
+}
+
+#[tokio::test]
+async fn custom_authority_restart_reconciles_exact_intent_before_obsolete_configuration() {
+    for (failure, conflict, joint) in [
+        (1, false, false),
+        (2, false, false),
+        (1, true, false),
+        (1, false, true),
+        (2, false, true),
+    ] {
+        let directory = crate::host::tests::tempdir().unwrap();
+        let local = identity(1, "custom-authority-restart");
+        let store = fresh_disk_store(directory.path(), local.clone());
+        let control = Arc::new(CustomRoleGate::default());
+        let epoch_path = directory.path().join("custom-configuration-epoch.json");
+        *control.configuration_epoch_path.lock().unwrap() = Some(epoch_path.clone());
+        let first = Arc::new(PodRuntime::new(
+            local.clone(),
+            Arc::new(CustomRoleService(control.clone())),
+            store.clone(),
+        ));
+        first
+            .bind_replica_session(
+                ResourceUid::new("frozen-copy"),
+                ProcessSessionId::new("first-session"),
+            )
+            .unwrap();
+        let adapter = RuntimeAdapter::new(store.clone(), first.clone());
+        let old = authority(
+            local.clone(),
+            vec![local.clone(), identity(2, "custom-restart-peer")],
+        );
+        for (index, action) in [
+            RuntimeEffectAction::Open(OpenMode::New),
+            RuntimeEffectAction::AdmitAuthority(Box::new(old.clone())),
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            adapter
+                .execute(effect(index as u64 + 1, action))
+                .await
+                .unwrap();
+        }
+        let mut next = next_custom_authority(&old);
+        if joint {
+            let mut members = next.current_configuration.members.clone();
+            members[1].identity = identity(2, "custom-restart-replacement");
+            next.current_configuration = ConfigurationDescriptor::new(
+                Epoch::new(0, 2),
+                local.replica_id,
+                members,
+                old.current_configuration.write_quorum,
+            );
+            next.previous_configuration = Some(old.current_configuration.clone());
+            next.transition_kind = Some(TransitionKind::Replacement);
+        }
+        let pending = effect(
+            5,
+            RuntimeEffectAction::AdmitAuthority(Box::new(next.clone())),
+        );
+        store
+            .authority_admission_failure
+            .store(failure, Ordering::SeqCst);
+        assert!(adapter.execute(pending.clone()).await.is_err());
+        assert_custom_authority_closed(&first, &control).await;
+        assert_eq!(
+            store.load().await.unwrap(),
+            Some(if failure == 1 { old } else { next.clone() })
+        );
+        let recorded = store.load_state().await.unwrap().pending_effect.unwrap();
+        assert_eq!(recorded.effect, pending);
+        assert_eq!(recorded.stage, EffectStage::IntentCommitted);
+        assert!(!first.testing_has_applied_effect(5).await);
+        if conflict {
+            let mut newer = next.clone();
+            newer.current_configuration = ConfigurationDescriptor::new(
+                Epoch::new(0, 3),
+                local.replica_id,
+                next.current_configuration.members.clone(),
+                next.current_configuration.write_quorum,
+            );
+            store.admit(&newer).await.unwrap();
+        }
+        drop(adapter);
+        drop(first);
+        drop(store);
+        let reopened = Arc::new(
+            SqliteStore::open_existing(SqliteStore::metadata_database_path(directory.path()), None)
+                .unwrap(),
+        );
+        let fresh_control = Arc::new(CustomRoleGate::default());
+        *fresh_control.configuration_epoch_path.lock().unwrap() = Some(epoch_path);
+        let recovered = Arc::new(PodRuntime::new(
+            local,
+            Arc::new(CustomRoleService(fresh_control.clone())),
+            reopened.clone(),
+        ));
+        let agent = AgentService::new(
+            reopened.clone(),
+            recovered.clone(),
+            recovered.clone(),
+            "token",
+        )
+        .unwrap();
+        let recovery = agent.reconstruct_runtime().await;
+        if conflict {
+            assert!(matches!(
+                recovery,
+                Err(crate::host::HostError::Runtime(
+                    RuntimeError::AuthorityMismatch(_)
+                ))
+            ));
+            assert!(fresh_control.configurations.lock().unwrap().is_empty());
+            assert_ne!(
+                recovered.snapshot().await.write_status,
+                AccessStatus::Granted
+            );
+            assert!(!fresh_control.native_access_granted.load(Ordering::SeqCst));
+            assert_eq!(
+                reopened
+                    .load_state()
+                    .await
+                    .unwrap()
+                    .pending_effect
+                    .unwrap()
+                    .effect,
+                pending
+            );
+            assert_eq!(
+                reopened
+                    .load()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .current_configuration
+                    .epoch,
+                Epoch::new(0, 3)
+            );
+            continue;
+        }
+        recovery.unwrap();
+        let configurations = fresh_control.configurations.lock().unwrap().clone();
+        assert!(
+            configurations.len() >= 2,
+            "pre-reconciliation and ordinary exact replay"
+        );
+        for configuration in configurations {
+            assert_eq!(configuration.configuration, next.current_configuration);
+            assert_ne!(
+                configuration.replicas[0].process_session_id,
+                ProcessSessionId::new("first-session")
+            );
+        }
+        if joint {
+            for previous in fresh_control.previous_configurations.lock().unwrap().iter() {
+                assert_eq!(
+                    Some(&previous.configuration),
+                    next.previous_configuration.as_ref()
+                );
+            }
+        }
+        assert_eq!(recovered.snapshot().await.authority, Some(next.clone()));
+        assert_eq!(reopened.load().await.unwrap(), Some(next));
+        let state = reopened.load_state().await.unwrap();
+        assert!(state.pending_effect.is_none());
+        assert_eq!(
+            state.role,
+            ReplicaRole::Primary,
+            "completion follows recovered role"
+        );
+        assert_eq!(state.retained_result.unwrap().effect, pending);
+        assert_custom_authority_closed(&recovered, &fresh_control).await;
+    }
+}
+
+#[tokio::test]
+async fn custom_authority_journal_failure_replays_success_without_reapplying_configuration() {
+    let directory = crate::host::tests::tempdir().unwrap();
+    let local = identity(1, "custom-journal-replay");
+    let inner = fresh_disk_store(directory.path(), local.clone());
+    let control = Arc::new(CustomRoleGate::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(control.clone())),
+        inner.clone(),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("frozen-copy"),
+            ProcessSessionId::new("first"),
+        )
+        .unwrap();
+    RuntimeAdapter::new(inner.clone(), runtime.clone())
+        .execute(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    let store = Arc::new(FailingEffectStore::new(
+        inner.clone(),
+        EffectPersistenceFailure::Complete,
+    ));
+    let pending = effect(
+        2,
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority(local.clone(), vec![local]))),
+    );
+    let adapter = RuntimeAdapter::new(store, runtime.clone());
+    assert!(adapter.execute(pending.clone()).await.is_err());
+    assert!(runtime.testing_has_applied_effect(2).await);
+    assert_eq!(control.abort_count.load(Ordering::SeqCst), 0);
+    assert_eq!(control.configurations.lock().unwrap().len(), 1);
+    assert!(inner.load_state().await.unwrap().pending_effect.is_some());
+    adapter.execute(pending).await.unwrap();
+    assert_eq!(control.configurations.lock().unwrap().len(), 1);
+    assert!(inner.load_state().await.unwrap().pending_effect.is_none());
+    assert_custom_authority_closed(&runtime, &control).await;
 }
 
 #[async_trait]
@@ -5135,56 +6379,91 @@ async fn exercise_blocked_lifecycle_invalidation(
                 .unwrap();
         }
     }
-    match invalidation {
-        LifecycleInvalidation::Authority => {
-            let next = ConfigurationDescriptor::new(
-                Epoch::new(0, 2),
-                local.replica_id,
-                vec![
-                    ConfigurationMember {
-                        identity: local.clone(),
-                        role: ReplicaRole::Primary,
+    let mutation = async {
+        match invalidation {
+            LifecycleInvalidation::Authority => {
+                let next = ConfigurationDescriptor::new(
+                    Epoch::new(0, 2),
+                    local.replica_id,
+                    vec![
+                        ConfigurationMember {
+                            identity: local.clone(),
+                            role: ReplicaRole::Primary,
+                        },
+                        ConfigurationMember {
+                            identity: peer.clone(),
+                            role: ReplicaRole::ActiveSecondary,
+                        },
+                    ],
+                    2,
+                );
+                crate::host::testing::admit_lifecycle_authority(
+                    &runtime,
+                    AdmittedAuthority {
+                        local_identity: local,
+                        transition_kind: None,
+                        previous_configuration: None,
+                        current_configuration: next,
+                        switchover_handoff: None,
+                        secondary_removal: None,
+                        scale_up: None,
                     },
-                    ConfigurationMember {
-                        identity: peer.clone(),
-                        role: ReplicaRole::ActiveSecondary,
-                    },
-                ],
-                2,
-            );
-            crate::host::testing::admit_lifecycle_authority(
-                &runtime,
-                AdmittedAuthority {
-                    local_identity: local,
-                    transition_kind: None,
-                    previous_configuration: None,
-                    current_configuration: next,
-                    switchover_handoff: None,
-                    secondary_removal: None,
-                    scale_up: None,
-                },
-            )
-            .await
-            .unwrap();
-        }
-        LifecycleInvalidation::Session => {
-            let mut replacement = ReplicaInformation::new(
-                OperationId::default(),
-                peer,
-                format!("in-process://replacement-{suffix}"),
-            );
-            replacement.process_session_id = ProcessSessionId::new("replacement-session");
-            crate::host::testing::describe_peer(&runtime, replacement)
+                )
                 .await
-                .unwrap();
+            }
+            LifecycleInvalidation::Session => {
+                let mut replacement = ReplicaInformation::new(
+                    OperationId::default(),
+                    peer,
+                    format!("in-process://replacement-{suffix}"),
+                );
+                replacement.process_session_id = ProcessSessionId::new("replacement-session");
+                crate::host::testing::describe_peer(&runtime, replacement).await
+            }
+            LifecycleInvalidation::Close => crate::host::testing::close_lifecycle(&runtime).await,
+            LifecycleInvalidation::Abort => {
+                runtime.abort();
+                Ok(())
+            }
         }
-        LifecycleInvalidation::Close => {
-            crate::host::testing::close_lifecycle(&runtime)
+    };
+    tokio::pin!(mutation);
+    if matches!(callback, BlockedLifecycleCallback::Configuration)
+        && matches!(
+            invalidation,
+            LifecycleInvalidation::Authority | LifecycleInvalidation::Session
+        )
+    {
+        assert!(
+            timeout(Duration::from_millis(25), &mut mutation)
                 .await
-                .unwrap();
+                .is_err()
+        );
+        control.configuration_released.notify_one();
+        let mutation_result = mutation.await;
+        let result = operation.await.unwrap();
+        if matches!(invalidation, LifecycleInvalidation::Authority) {
+            mutation_result.unwrap();
+            result.unwrap();
+            assert_eq!(
+                control
+                    .configurations
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .configuration
+                    .epoch,
+                Epoch::new(0, 2)
+            );
+        } else {
+            mutation_result.unwrap();
+            assert!(result.is_err());
         }
-        LifecycleInvalidation::Abort => runtime.abort(),
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        return;
     }
+    mutation.await.unwrap();
     match callback {
         BlockedLifecycleCallback::Progress => control.progress_released.notify_one(),
         BlockedLifecycleCallback::Configuration => control.configuration_released.notify_one(),
@@ -5432,6 +6711,481 @@ async fn managed_restart_recovery_never_restores_access_before_proof() {
         .await
         .unwrap();
     assert_eq!(fresh.committed().await.unwrap().committed_lsn, 2);
+}
+
+#[tokio::test]
+async fn managed_replacement_peer_restart_restores_owned_access_before_new_write() {
+    for proof_registered_first in [false, true] {
+        let (runtime, admitted, replacement, other) = replacement_restart_primary().await;
+        for (index, session) in ["before-replacement-restart", "after-replacement-restart"]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 1 && proof_registered_first {
+                runtime
+                    .register_peer_session(replacement.clone(), ProcessSessionId::new(session))
+                    .await
+                    .unwrap();
+                assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+            }
+            let mut description = ReplicaInformation::new(
+                OperationId::default(),
+                replacement.clone(),
+                "in-process://replacement-restart".into(),
+            );
+            description.process_session_id = ProcessSessionId::new(session);
+            runtime
+                .build_runtime()
+                .describe_peer(description)
+                .await
+                .unwrap();
+        }
+        // No status-report request or fresh controller command between discovery
+        // and the write. The owned prior grant still needs new native proof.
+        assert_eq!(runtime.snapshot().await.authority, Some(admitted.clone()));
+        assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        let write = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("after-replacement-restart"),
+                data: Bytes::from_static(b"after-replacement-restart"),
+            })
+            .await
+            .unwrap();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(acknowledgement(&admitted, other, write.lsn))
+            .await
+            .unwrap();
+        assert_eq!(write.committed().await.unwrap().committed_lsn, 1);
+    }
+}
+
+async fn replacement_restart_primary() -> (
+    Arc<PodRuntime>,
+    AdmittedAuthority,
+    ReplicaIdentity,
+    ReplicaIdentity,
+) {
+    replacement_restart_primary_with_quorum_peer(true).await
+}
+
+async fn replacement_restart_primary_with_quorum_peer(
+    include_other: bool,
+) -> (
+    Arc<PodRuntime>,
+    AdmittedAuthority,
+    ReplicaIdentity,
+    ReplicaIdentity,
+) {
+    let local = identity(1, "replacement-restart-primary");
+    let replacement = identity(2, "accepted-replacement-instance");
+    let other = identity(3, "replacement-restart-quorum-peer");
+    let mut members = vec![local.clone(), replacement.clone()];
+    if include_other {
+        members.push(other.clone());
+    }
+    let mut admitted = authority(local.clone(), members);
+    admitted.current_configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        local.replica_id,
+        admitted.current_configuration.members.clone(),
+        admitted.current_configuration.write_quorum,
+    );
+    let runtime = Arc::new(PodRuntime::new(
+        local,
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("replacement-restart"),
+            ProcessSessionId::new("primary-session"),
+        )
+        .unwrap();
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    (runtime, admitted, replacement, other)
+}
+
+#[tokio::test]
+async fn managed_peer_restart_recovery_does_not_wait_on_its_own_delivery_queue() {
+    let (source, admitted, replacement, _) =
+        replacement_restart_primary_with_quorum_peer(false).await;
+    let target = Arc::new(PodRuntime::new(
+        replacement.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    target
+        .bind_replica_session(
+            ResourceUid::new("replacement-restart"),
+            ProcessSessionId::new("new-session"),
+        )
+        .unwrap();
+    let mut target_authority = admitted.clone();
+    target_authority.local_identity = replacement.clone();
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(target_authority)),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        target
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    target
+        .register_peer_session(
+            admitted.local_identity.clone(),
+            ProcessSessionId::new("primary-session"),
+        )
+        .await
+        .unwrap();
+    let mut old = ReplicaInformation::new(
+        OperationId::default(),
+        replacement.clone(),
+        "in-process://replacement-restart".into(),
+    );
+    old.process_session_id = ProcessSessionId::new("old-session");
+    source.build_runtime().describe_peer(old).await.unwrap();
+    let pending = source
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("queued-before-restart"),
+            data: Bytes::from_static(b"queued-before-restart"),
+        })
+        .await
+        .unwrap();
+    let (sender, mut queue) = tokio::sync::mpsc::channel(4);
+    sender
+        .send(pending.replication_items[0].clone())
+        .await
+        .unwrap();
+    let delivery = {
+        let source = source.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            let mut item = queue.recv().await.unwrap();
+            let mut fresh = ReplicaInformation::new(
+                OperationId::default(),
+                replacement.clone(),
+                "in-process://replacement-restart".into(),
+            );
+            fresh.process_session_id = ProcessSessionId::new("new-session");
+            source.build_runtime().describe_peer(fresh).await?;
+            source
+                .build_runtime()
+                .register_peer_session(replacement, ProcessSessionId::new("new-session"))
+                .await?;
+            item.sender_session_id = "primary-session".into();
+            item.receiver_session_id = "new-session".into();
+            let received = target.data_plane().receive_replication(item).await?;
+            let mut applied = received.applied().await?;
+            applied.receiver_session_id = "new-session".into();
+            source.data_plane().accept_acknowledgement(applied).await
+        })
+    };
+    timeout(Duration::from_secs(2), delivery)
+        .await
+        .expect("description blocked the only delivery worker needed for replay")
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        while source.snapshot().await.write_status != AccessStatus::Granted {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let _ = pending.committed().await;
+    assert_eq!(target.snapshot().await.current_progress, 1);
+    assert_eq!(source.snapshot().await.committed_lsn, 1);
+}
+
+#[tokio::test]
+async fn managed_peer_recovery_without_quorum_releases_effect_owner_before_revocation() {
+    let (source, admitted, replacement, _) =
+        replacement_restart_primary_with_quorum_peer(false).await;
+    let mut old = ReplicaInformation::new(
+        OperationId::default(),
+        replacement.clone(),
+        "in-process://replacement-restart".into(),
+    );
+    old.process_session_id = ProcessSessionId::new("old-session");
+    source.build_runtime().describe_peer(old).await.unwrap();
+    let pending = source
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("never-acknowledged-peer-recovery"),
+            data: Bytes::from_static(b"never-acknowledged-peer-recovery"),
+        })
+        .await
+        .unwrap();
+    let mut fresh = ReplicaInformation::new(
+        OperationId::default(),
+        replacement.clone(),
+        "in-process://replacement-restart".into(),
+    );
+    fresh.process_session_id = ProcessSessionId::new("new-session");
+    timeout(
+        Duration::from_secs(1),
+        source.build_runtime().describe_peer(fresh),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(source.snapshot().await.write_status, AccessStatus::Granted);
+    timeout(
+        Duration::from_secs(8),
+        source.apply_effect(effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::ReconfigurationPending,
+                write: AccessStatus::ReconfigurationPending,
+            },
+        )),
+    )
+    .await
+    .expect("unacknowledged background recovery monopolized the effect owner")
+    .unwrap();
+    assert!(source.snapshot().await.open);
+    assert_ne!(source.snapshot().await.write_status, AccessStatus::Granted);
+    source
+        .register_peer_session(replacement.clone(), ProcessSessionId::new("new-session"))
+        .await
+        .unwrap();
+    let mut late_ack = acknowledgement(&admitted, replacement.clone(), pending.lsn);
+    late_ack.receiver_session_id = "new-session".into();
+    source
+        .data_plane()
+        .accept_acknowledgement(late_ack)
+        .await
+        .unwrap();
+    let mut again = ReplicaInformation::new(
+        OperationId::default(),
+        replacement,
+        "in-process://replacement-restart".into(),
+    );
+    again.process_session_id = ProcessSessionId::new("new-session");
+    source.build_runtime().describe_peer(again).await.unwrap();
+    assert_ne!(source.snapshot().await.write_status, AccessStatus::Granted);
+    let _ = pending.committed().await;
+}
+
+#[tokio::test]
+async fn managed_peer_restart_does_not_restore_revoked_or_other_authority_access() {
+    for change_authority in [false, true] {
+        let (runtime, admitted, replacement, _) = replacement_restart_primary().await;
+        let mut old = ReplicaInformation::new(
+            OperationId::default(),
+            replacement.clone(),
+            "in-process://replacement-restart".into(),
+        );
+        old.process_session_id = ProcessSessionId::new("old-session");
+        runtime.build_runtime().describe_peer(old).await.unwrap();
+        let action = if change_authority {
+            let mut newer = admitted;
+            newer.current_configuration = ConfigurationDescriptor::new(
+                Epoch::new(0, 3),
+                newer.local_identity.replica_id,
+                newer.current_configuration.members.clone(),
+                newer.current_configuration.write_quorum,
+            );
+            RuntimeEffectAction::AdmitAuthority(Box::new(newer))
+        } else {
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::ReconfigurationPending,
+                write: AccessStatus::ReconfigurationPending,
+            }
+        };
+        runtime.apply_effect(effect(5, action)).await.unwrap();
+        let mut fresh = ReplicaInformation::new(
+            OperationId::default(),
+            replacement,
+            "in-process://replacement-restart".into(),
+        );
+        fresh.process_session_id = ProcessSessionId::new("new-session");
+        runtime.build_runtime().describe_peer(fresh).await.unwrap();
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        assert!(matches!(
+            runtime
+                .data_plane()
+                .begin_write(ClientWrite {
+                    operation_id: OperationId::new("must-stay-closed"),
+                    data: Bytes::from_static(b"must-stay-closed"),
+                })
+                .await,
+            Err(RuntimeError::WriteClosed(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn managed_peer_discovery_does_not_regrant_during_owned_access_revocation() {
+    let (runtime, _, replacement, _) = replacement_restart_primary().await;
+    let mut old = ReplicaInformation::new(
+        OperationId::default(),
+        replacement.clone(),
+        "in-process://replacement-restart".into(),
+    );
+    old.process_session_id = ProcessSessionId::new("old-session");
+    runtime.build_runtime().describe_peer(old).await.unwrap();
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let revocation = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::SetAccessStatus {
+                        read: AccessStatus::ReconfigurationPending,
+                        write: AccessStatus::ReconfigurationPending,
+                    },
+                ))
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .unwrap();
+    let mut fresh = ReplicaInformation::new(
+        OperationId::default(),
+        replacement,
+        "in-process://replacement-restart".into(),
+    );
+    fresh.process_session_id = ProcessSessionId::new("new-session");
+    runtime.build_runtime().describe_peer(fresh).await.unwrap();
+    assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    gate.release.notify_one();
+    let _ = revocation.await.unwrap();
+    assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn managed_peer_restart_waits_for_owned_write_recovery_after_observer_cancellation() {
+    for cancel_observer in [false, true] {
+        let (runtime, admitted, replacement, other) = replacement_restart_primary().await;
+        let mut old = ReplicaInformation::new(
+            OperationId::default(),
+            replacement.clone(),
+            "in-process://replacement-restart".into(),
+        );
+        old.process_session_id = ProcessSessionId::new("old-session");
+        runtime.build_runtime().describe_peer(old).await.unwrap();
+        let pending = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("interrupted-by-peer-restart"),
+                data: Bytes::from_static(b"interrupted-by-peer-restart"),
+            })
+            .await
+            .unwrap();
+        let gate = cancel_observer.then(|| runtime.testing_pause_peer_discovery_ready());
+        let discovery = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                let mut fresh = ReplicaInformation::new(
+                    OperationId::default(),
+                    replacement,
+                    "in-process://replacement-restart".into(),
+                );
+                fresh.process_session_id = ProcessSessionId::new("new-session");
+                runtime.build_runtime().describe_peer(fresh).await
+            })
+        };
+        if let Some(gate) = &gate {
+            timeout(Duration::from_secs(1), gate.entered.notified())
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if cancel_observer {
+            discovery.abort();
+            assert!(discovery.await.unwrap_err().is_cancelled());
+            gate.unwrap().release.notify_one();
+        } else {
+            timeout(Duration::from_secs(1), discovery)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        runtime
+            .register_peer_session(other.clone(), ProcessSessionId::new("quorum-session"))
+            .await
+            .unwrap();
+        let mut quorum_description = ReplicaInformation::new(
+            OperationId::default(),
+            other.clone(),
+            "in-process://quorum-peer".into(),
+        );
+        quorum_description.process_session_id = ProcessSessionId::new("quorum-session");
+        runtime
+            .build_runtime()
+            .describe_peer(quorum_description)
+            .await
+            .unwrap();
+        let mut replay_ack = acknowledgement(&admitted, other.clone(), pending.lsn);
+        replay_ack.receiver_session_id = "quorum-session".into();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(replay_ack)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while runtime.snapshot().await.write_status != AccessStatus::Granted {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = pending.committed().await;
+        let next = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("after-owned-recovery"),
+                data: Bytes::from_static(b"after-owned-recovery"),
+            })
+            .await
+            .unwrap();
+        let mut next_ack = acknowledgement(&admitted, other, next.lsn);
+        next_ack.receiver_session_id = "quorum-session".into();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(next_ack)
+            .await
+            .unwrap();
+        assert_eq!(next.committed().await.unwrap().committed_lsn, 2);
+    }
 }
 
 #[tokio::test]
@@ -5983,7 +7737,10 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
         ))
         .await
         .unwrap();
-    assert_eq!(custom.snapshot().await.write_status, AccessStatus::Granted);
+    assert_eq!(
+        custom.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
     default
         .apply_effect(effect(
             6,
@@ -5999,7 +7756,10 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
         .await
         .unwrap();
     assert_eq!(default.snapshot().await.write_status, AccessStatus::Granted);
-    assert_eq!(custom.snapshot().await.write_status, AccessStatus::Granted);
+    assert_eq!(
+        custom.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
     default
         .apply_effect(effect(7, RuntimeEffectAction::WaitForCatchup))
         .await
@@ -6011,7 +7771,10 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
     default.cancel_configuration_work().await.unwrap();
     custom.cancel_configuration_work().await.unwrap();
     assert_eq!(default.snapshot().await.write_status, AccessStatus::Granted);
-    assert_eq!(custom.snapshot().await.write_status, AccessStatus::Granted);
+    assert_eq!(
+        custom.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
     let default_peer = identity(2, "conformance-default-peer");
     let custom_peer = identity(2, "conformance-custom-peer");
     default
@@ -10083,10 +11846,19 @@ async fn session_fenced_custom_cleanup_releases_same_id_retry_admission() {
         "custom-cleanup-session-replacement".into(),
     );
     replacement.process_session_id = ProcessSessionId::new("custom-cleanup-session-replacement");
-    crate::host::testing::describe_peer(&runtime, replacement)
-        .await
-        .unwrap();
+    let replacement = {
+        let runtime = runtime.clone();
+        tokio::spawn(
+            async move { crate::host::testing::describe_peer(&runtime, replacement).await },
+        )
+    };
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !replacement.is_finished(),
+        "replacement waits for the old stateful callback"
+    );
     control.configuration_released.notify_one();
+    replacement.await.unwrap().unwrap();
     assert!(cancellation.await.unwrap().is_err());
     assert!(first.await.unwrap().is_err());
 
