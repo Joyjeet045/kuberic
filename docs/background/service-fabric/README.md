@@ -21,6 +21,8 @@ Source code reference: `build/service-fabric/` (depth-1 clone).
 
 ## Related Kuberic Documents
 
+- [Service Fabric Alignment and Runtime Simplification](../../features/kuberic/service-fabric-alignment.md)
+- [Replicator Boundary and Native Proof](../../features/kuberic/replicator-boundary.md)
 - [Archived Kuberic Replication Protocols](../../archive/v1/protocols.md)
 - [Archived Design Gaps](../../archive/v1/design-gaps.md)
 - [Archived WAL Persistence Design](../../archive/v1/future/wal-persistence.md)

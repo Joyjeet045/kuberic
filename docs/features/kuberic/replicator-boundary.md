@@ -6,6 +6,9 @@ operations always cross `Replicator` or `PrimaryReplicator`; the built-in
 engine additionally supplies an unpublished native capability for durable
 replication proof.
 
+The forward-looking comparison and phased simplification plan are documented
+in [Service Fabric Alignment and Runtime Simplification](service-fabric-alignment.md).
+
 ## Ownership
 
 The agent owns desired-state ordering, durable effect intent and completion,
