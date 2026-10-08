@@ -47,6 +47,17 @@ pub struct ReplicationBarrier {
 
 static NEXT_VFS: AtomicU64 = AtomicU64::new(1);
 
+fn next_vfs_id() -> Option<u64> {
+    let mut current = NEXT_VFS.load(Ordering::SeqCst);
+    loop {
+        let next = current.checked_add(1)?;
+        match NEXT_VFS.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 impl ReplicationBarrier {
     pub fn register(persistence: Arc<SqlitePersistence>) -> std::io::Result<(Arc<Self>, String)> {
         let committed_lsn = persistence.progress()?.committed_lsn;
@@ -57,9 +68,8 @@ impl ReplicationBarrier {
         persistence: Arc<SqlitePersistence>,
         committed_lsn: i64,
     ) -> std::io::Result<(Arc<Self>, String)> {
-        let id = NEXT_VFS
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
-            .map_err(|_| std::io::Error::other("VFS instance counter exhausted"))?;
+        let id =
+            next_vfs_id().ok_or_else(|| std::io::Error::other("VFS instance counter exhausted"))?;
         let name = format!("kuberic-sqlite-{}-{id}", std::process::id());
         let barrier = Arc::new(Self {
             last_lsn: AtomicI64::new(committed_lsn),

@@ -750,6 +750,22 @@ pub struct FencedProbe {
 
 static NEXT_PROBE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
 
+fn next_probe_id() -> Option<i64> {
+    let mut current = NEXT_PROBE.load(std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let next = current.checked_add(1)?;
+        match NEXT_PROBE.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Exact authority/access responses only: not SQL errors, unknown outcomes,
 /// missing barriers, transport unavailability, or arbitrary FailedPrecondition.
 pub fn definitive_fence(outcome: &Result<proto::ExecuteResponse, Status>) -> Result<(), String> {
@@ -775,13 +791,7 @@ pub fn definitive_fence(outcome: &Result<proto::ExecuteResponse, Status>) -> Res
 }
 
 pub async fn probe_closed(replica: &SqlitePod) -> Result<FencedProbe, String> {
-    let id = NEXT_PROBE
-        .fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |value| value.checked_add(1),
-        )
-        .expect("probe ID exhausted");
+    let id = next_probe_id().expect("probe ID exhausted");
     let before = replica
         .application
         .persistence()

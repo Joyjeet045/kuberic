@@ -45,7 +45,8 @@ impl Process {
     }
 
     fn exited(&self) -> io::Result<bool> {
-        Ok(self.events()?.contains(PollFlags::IN))
+        let events = self.events()?;
+        Ok(events.contains(PollFlags::IN) || events.contains(PollFlags::HUP))
     }
 
     fn reaped(&self) -> io::Result<bool> {
@@ -586,6 +587,7 @@ mod tests {
         }
         assert!(!process.reaped().unwrap(), "a zombie is not reaped");
         child.wait().unwrap();
+        assert!(process.exited().unwrap());
         assert!(process.reaped().unwrap());
     }
 

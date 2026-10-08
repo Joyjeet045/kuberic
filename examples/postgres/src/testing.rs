@@ -844,13 +844,21 @@ pub fn temp_data_dir(name: &str) -> PathBuf {
     std::fs::create_dir_all(&root).expect("create PostgreSQL test root");
     let root = std::fs::canonicalize(root).expect("resolve PostgreSQL test root");
     loop {
-        let counter = DIRECTORY_COUNTER
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |counter| (counter < 4096).then_some(counter + 1),
-            )
-            .expect("PostgreSQL fixture directory IDs exhausted");
+        let counter = {
+            let mut current = DIRECTORY_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+            loop {
+                assert!(current < 4096, "PostgreSQL fixture directory IDs exhausted");
+                match DIRECTORY_COUNTER.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => break current,
+                    Err(observed) => current = observed,
+                }
+            }
+        };
         let dir = root.join(fixture_directory_id(std::process::id(), counter));
         match std::fs::create_dir(&dir) {
             Ok(()) => {

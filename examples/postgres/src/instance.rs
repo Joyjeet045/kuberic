@@ -15,6 +15,17 @@ use kuberic_runtime::replicator::StatefulServicePartition;
 
 use tokio_util::sync::CancellationToken;
 
+fn increment_generation(generation: &AtomicU64) -> Option<u64> {
+    let mut current = generation.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match generation.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgProcessFault {
     Transient,
@@ -370,12 +381,8 @@ impl PgInstanceManager {
     }
 
     pub(crate) fn advance_access_generation(&self) -> Result<u64, PgError> {
-        self.access_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                generation.checked_add(1)
-            })
-            .map(|generation| generation + 1)
-            .map_err(|_| PgError::GenerationExhausted("access generation".into()))
+        increment_generation(&self.access_generation)
+            .ok_or_else(|| PgError::GenerationExhausted("access generation".into()))
     }
 
     pub(crate) async fn bind_generation_store(
@@ -1417,19 +1424,15 @@ impl PgInstanceManager {
     pub(crate) fn abort_owned(&self) -> Result<(), PgError> {
         let (generation, advanced) = {
             let current = self.current.lock().unwrap();
-            let advanced =
-                self.abort_generation
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                        value.checked_add(1)
-                    });
+            let advanced = increment_generation(&self.abort_generation);
             self.launches_closed.store(true, Ordering::Release);
             (current.clone(), advanced)
         };
         let commands = generation.helpers.capture();
         let cleanup = generation.retire(&commands, &self.data_dir);
         match advanced {
-            Ok(_) => cleanup,
-            Err(_) => {
+            Some(_) => cleanup,
+            None => {
                 Err(PgError::GenerationExhausted("process abort epoch".into())
                     .with_cleanup(cleanup))
             }
@@ -1442,19 +1445,15 @@ impl PgInstanceManager {
             if !Arc::ptr_eq(&current, generation) {
                 return None;
             }
-            let advanced =
-                self.abort_generation
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                        value.checked_add(1)
-                    });
+            let advanced = increment_generation(&self.abort_generation);
             self.launches_closed.store(true, Ordering::Release);
             advanced
         };
         let commands = generation.helpers.capture();
         let cleanup = generation.retire(&commands, &self.data_dir);
         Some(match advanced {
-            Ok(_) => cleanup,
-            Err(_) => {
+            Some(_) => cleanup,
+            None => {
                 Err(PgError::GenerationExhausted("process abort epoch".into())
                     .with_cleanup(cleanup))
             }

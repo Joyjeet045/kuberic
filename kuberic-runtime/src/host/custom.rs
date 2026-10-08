@@ -43,6 +43,17 @@ pub(super) use authority::CustomAuthorityContainment;
 
 const ACCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn increment_generation(generation: &AtomicU64) -> Option<u64> {
+    let mut current = generation.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match generation.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct BuildAdmission {
     selection: BuildSelection,
@@ -2125,21 +2136,11 @@ impl CustomReplicatorHost {
         if let Some(host) = self.host.upgrade() {
             host.custom_authority.invalidate_attempt();
         }
-        self.configuration_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                generation.checked_add(1)
-            })
-            .map(|generation| generation + 1)
-            .map_err(|_| RuntimeError::OperationCancelled)
+        increment_generation(&self.configuration_generation).ok_or(RuntimeError::OperationCancelled)
     }
 
     fn advance_access_generation(&self) -> Result<u64> {
-        self.access_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                generation.checked_add(1)
-            })
-            .map(|generation| generation + 1)
-            .map_err(|_| RuntimeError::OperationCancelled)
+        increment_generation(&self.access_generation).ok_or(RuntimeError::OperationCancelled)
     }
 
     fn ensure_configuration_generation(&self, generation: u64) -> Result<()> {
@@ -4289,16 +4290,8 @@ impl CustomReplicatorHost {
     fn notify_abort(&self) {
         self.abort_notified
             .store(true, std::sync::atomic::Ordering::Release);
-        let _ = self.configuration_generation.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |generation| generation.checked_add(1),
-        );
-        let _ = self.access_generation.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |generation| generation.checked_add(1),
-        );
+        let _ = increment_generation(&self.configuration_generation);
+        let _ = increment_generation(&self.access_generation);
         if let Some(handle) = self.deferred_configuration_abort.lock().unwrap().take() {
             handle.abort();
         }
