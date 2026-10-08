@@ -2650,7 +2650,6 @@ async fn startup_and_shutdown_acknowledge_durable_partition_faults() {
             ready_rx.wait_for(|ready| *ready).await.unwrap();
             partition.report_fault(FaultType::Permanent).await.unwrap();
             partition.report_fault(FaultType::Transient).await.unwrap();
-            assert_eq!(store.load_state().await.unwrap().reported_fault, None);
         }
         if mode != "reject" {
             shutdown.send_replace(true);

@@ -48,6 +48,10 @@ impl AgentStore for CrashStore {
     async fn load_state(&self) -> Result<AgentState> {
         self.inner.load_state().await
     }
+
+    async fn load_admitted_authority(&self) -> Result<Option<AdmittedAuthority>> {
+        Ok(self.inner.load().await?)
+    }
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect> {
         let result = self.inner.begin_effect(effect).await?;
         if matches!(

@@ -288,7 +288,12 @@ pub(crate) struct ManagedRetirementCompletionOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedReplicaObservation {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) host_generation: u64,
+    #[allow(dead_code)]
+    pub(crate) diagnostic_revision: u64,
     pub(crate) progress: NativeProgressStatus,
+    pub(crate) catch_up_capability: Lsn,
     pub(crate) builds: Vec<BuildPostcondition>,
     pub(crate) prepared_secondary_removal:
         Option<crate::protocol::types::SecondaryRemovalPreparation>,

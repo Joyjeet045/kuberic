@@ -76,6 +76,22 @@ fn result() -> RuntimeEffectResult {
     }
 }
 
+#[test]
+fn load_and_fault_observations_do_not_change_access_recovery_eligibility() {
+    let state = initial_state();
+    let mut observed = state.clone();
+    observed
+        .load_metrics
+        .push(crate::protocol::types::LoadMetric {
+            name: "queue-depth".into(),
+            value: 9,
+        });
+    observed.reported_fault = Some(crate::protocol::types::FaultType::Transient);
+    assert!(crate::host::recovery::same_recovery_eligibility(
+        &state, &observed
+    ));
+}
+
 #[derive(Default)]
 struct RecoveringRuntime {
     calls: AtomicUsize,
@@ -106,7 +122,7 @@ async fn committed_and_applied_intents_recover_without_losing_retained_completio
 
         let reopened = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
         assert_eq!(
-            inspect_recovery(reopened.as_ref(), &snapshot())
+            inspect_recovery(reopened.as_ref(), &snapshot().into())
                 .await
                 .unwrap(),
             RecoveryDecision::Reissue(Box::new(effect()))
@@ -114,7 +130,7 @@ async fn committed_and_applied_intents_recover_without_losing_retained_completio
         let runtime = Arc::new(RecoveringRuntime::default());
         let adapter = RuntimeAdapter::new(reopened.clone(), runtime.clone());
         assert_eq!(
-            recover_pending(&adapter, &snapshot()).await.unwrap(),
+            recover_pending(&adapter, &snapshot().into()).await.unwrap(),
             Some(result())
         );
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
@@ -156,17 +172,20 @@ async fn recovery_starts_idle_and_requires_closed_writes() {
     let store = Arc::new(SqliteStore::create_authorized(&path, initial_state()).unwrap());
     let runtime = Arc::new(RecoveringRuntime::default());
     let adapter = RuntimeAdapter::new(store.clone(), runtime.clone());
-    assert_eq!(recover_pending(&adapter, &snapshot()).await.unwrap(), None);
+    assert_eq!(
+        recover_pending(&adapter, &snapshot().into()).await.unwrap(),
+        None
+    );
     let mut writable = snapshot();
     writable.write_status = AccessStatus::Granted;
     assert!(matches!(
-        inspect_recovery(store.as_ref(), &writable).await,
+        inspect_recovery(store.as_ref(), &writable.into()).await,
         Err(crate::host::HostError::DurableEffectConflict(_))
     ));
     assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
     adapter.execute(effect()).await.unwrap();
     assert_eq!(
-        recover_pending(&adapter, &snapshot()).await.unwrap(),
+        recover_pending(&adapter, &snapshot().into()).await.unwrap(),
         Some(result())
     );
     assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
@@ -208,7 +227,7 @@ fn sqlite_completion_survives_process_exit_without_destructors() {
         assert_eq!(store.identity().await.unwrap(), initial_state().identity);
         assert!(store.load_state().await.unwrap().pending_effect.is_none());
         assert_eq!(
-            inspect_recovery(&store, &snapshot()).await.unwrap(),
+            inspect_recovery(&store, &snapshot().into()).await.unwrap(),
             RecoveryDecision::ReturnRetained(Box::new(
                 store.retained_result().await.unwrap().unwrap()
             ))

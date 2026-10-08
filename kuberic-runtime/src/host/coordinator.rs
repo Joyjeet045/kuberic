@@ -27,7 +27,7 @@ use crate::host::store::{AgentStore, BeginConfiguration};
 pub(crate) struct Coordinator<S, E> {
     store: Arc<S>,
     runtime: RuntimeAdapter<S, E>,
-    command_lock: Mutex<()>,
+    command_lock: Arc<Mutex<()>>,
     supersession_epoch: watch::Sender<Epoch>,
 }
 
@@ -41,9 +41,13 @@ where
         Self {
             runtime: RuntimeAdapter::new(store.clone(), executor),
             store,
-            command_lock: Mutex::new(()),
+            command_lock: Arc::new(Mutex::new(())),
             supersession_epoch,
         }
+    }
+
+    pub(crate) fn recovery_admission_lock(&self) -> Arc<Mutex<()>> {
+        self.command_lock.clone()
     }
 
     #[cfg(all(test, kuberic_workspace_tests))]

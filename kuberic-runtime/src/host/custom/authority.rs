@@ -271,10 +271,12 @@ impl CustomAuthorityContainment {
         let configuration = common.configuration_commit.lock().await;
         let generation = common.advance_access_generation()?;
         common.advance_configuration_generation()?;
-        common.deferred_configuration_abort.lock().unwrap().take();
+        if let Some(abort) = common.deferred_configuration_abort.lock().unwrap().take() {
+            abort.abort();
+        }
         let deferred = common.deferred_configuration.lock().await.take();
         if let Some(handle) = &deferred {
-            handle.abort();
+            handle.handle.abort();
         }
         {
             let mut restored = common.restored_access.write().await;
@@ -303,7 +305,7 @@ impl CustomAuthorityContainment {
         drop(configuration);
         drop(access);
         if let Some(handle) = deferred {
-            let _ = handle.await;
+            let _ = handle.handle.await;
         }
         Ok(())
     }

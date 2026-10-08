@@ -99,7 +99,14 @@ fn production_agent_restart_defers_persisted_grant_until_exact_discovery() {
         }
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let report = client.get_status(request()).await.unwrap().into_inner();
+                let report = match client.get_status(request()).await {
+                    Ok(report) => report.into_inner(),
+                    Err(status) if status.code() == tonic::Code::Unavailable => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        continue;
+                    }
+                    Err(status) => panic!("unexpected status failure: {status}"),
+                };
                 if report.write_status == wire::AccessStatus::Granted as i32 {
                     break;
                 }

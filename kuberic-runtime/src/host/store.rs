@@ -5,6 +5,7 @@ use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use crate::protocol::types::{FaultType, LoadMetric, OperationId};
 use async_trait::async_trait;
 
+use crate::authority::AdmittedAuthority;
 use crate::host::Result;
 #[cfg(test)]
 use crate::host::state::RetainedResult;
@@ -32,6 +33,8 @@ pub(crate) trait AgentStore: Send + Sync {
     async fn identity(&self) -> Result<StorageIdentity>;
 
     async fn load_state(&self) -> Result<AgentState>;
+
+    async fn load_admitted_authority(&self) -> Result<Option<AdmittedAuthority>>;
 
     async fn complete_application_initialization(&self) -> Result<()>;
 

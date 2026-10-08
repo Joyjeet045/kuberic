@@ -141,7 +141,7 @@ The intended Kuberic boundary is already visible:
 |---|---|
 | Controller evaluator/executor | Pure cluster planning followed by Kubernetes or agent-command execution |
 | Durable agent state | Authority, reconfiguration stage, journaled effects, retained results and transition evidence |
-| Hosting layer | Application and replicator registration, staged role projection and effect execution |
+| Hosting layer | Application and replicator registration, actual host-proxy role/access projection, effect execution and service-owned recovery tasks |
 | Custom-authority operation state | Attempt ownership, invalidation, pending exact recovery and restoration serialization |
 | `CustomReplicatorHost` | Configuration, access, build, peer, topology and outbound adaptation |
 | Default runtime replicator | Replication progress, copy/build streams, repair targets, local-write fencing and log mechanics |
@@ -154,30 +154,40 @@ The durable agent state owns the facts required to resume reconfiguration
 The coordinator persists and advances explicit transition stages
 (`kuberic-runtime/src/host/coordinator.rs:318-614`).
 
-The remaining complexity appears below that boundary:
+The Phase 2 ownership boundary is now explicit below that layer:
 
-- hosting carries a fallback runtime snapshot and process-local lifecycle
-  projection, and holds one host-lifetime custom-authority containment owner
-  (`kuberic-runtime/src/host/hosting.rs:1417-1451`);
+- hosting stores process-local adapter state as `ReplicaRuntimeState`, emits
+  `HostProxyObservation`, and holds one host-lifetime custom-authority
+  containment owner plus service-owned recovery task ownership
+  (`kuberic-runtime/src/host/observation.rs:50-169`,
+  `kuberic-runtime/src/host/hosting.rs:259-300,1590-1692`);
 - `CustomAuthorityContainment` owns independent custom-authority attempt
   invalidation, pending exact recovery, the authorization latch, and
   callback/restoration serialization
   (`kuberic-runtime/src/host/custom/authority.rs:17-150`);
 - `CustomReplicatorHost` owns sessions, addresses, retirements, build state,
-  receipts, configurations, access generations and another runtime snapshot
-  (`kuberic-runtime/src/host/custom.rs:1448-1481`);
+  receipts, configurations, access generations and non-durable host/proxy
+  state, and produces exact pending-restoration observations
+  (`kuberic-runtime/src/host/custom.rs:1600-1643,3940-4024`);
 - the default replication engine stores role, access, executable replication
   configuration, removal, retirement, copy and replication progress; durable
   admitted authority remains host-owned
   (`kuberic-runtime/src/runtime.rs:49-86,174-206`,
   `kuberic-runtime/src/replicator/configuration.rs:9-23`);
-- reporting composes durable and runtime observations and applies precedence
-  and reconciliation rules (`kuberic-runtime/src/host/report.rs:31-95,102-284`).
+- reporting combines `DurableAgentObservation`, `HostProxyObservation` and
+  `ReplicationEngineObservation` under an explicit linked fence. It does not
+  refresh, reconcile, restore, retry or persist lifecycle state
+  (`kuberic-runtime/src/host/observation.rs:24-244`,
+  `kuberic-runtime/src/host/report.rs:14-303`);
+- reporting validates the host authority projection against the complete
+  durable `ReplicaAuthorityStore` value instead of reconstructing transition
+  evidence from the broader agent aggregate.
 
 Some repetition is intentional: durable truth, execution fencing and public
-projection are different concepts. The problem is that the distinctions are
-encoded through merge rules and conventions rather than narrow types owned by
-specific components.
+projection are different concepts. The distinctions are now represented by
+owner-specific types and constructors. The broad `RuntimeSnapshot` remains
+only in effect-evidence/postcondition and opt-in testing paths; projection-only
+report, build, peer, outbound and restart consumers no longer transport it.
 
 The agent service owns its control and replication listeners. Address-based
 startup binds them internally, while the opt-in testing facade can transfer
@@ -189,17 +199,17 @@ ownership and does not require another simplification phase.
 
 ## Differences That Create Complexity
 
-### Capability Views Without Capability Owners
+### Capability Views Have Explicit Observation Owners
 
-`LifecycleWiring` presents separate process, authority, access, build,
-topology, observation and outbound interfaces, but one backend still
-implements the complete set
-(`kuberic-runtime/src/host/lifecycle.rs:24-183`).
-This narrows consumers without dividing implementation state.
-
-Service Fabric uses distinct durable aggregate, proxy and replication owners.
-Kuberic should retain its capability-facing interfaces but give those
-capabilities explicit state owners.
+`LifecycleWiring` still projects process, authority, access, build, topology,
+observation and outbound capabilities from a shared backend, but report,
+recovery, build, peer and outbound consumers now receive owner-specific views.
+`ReportObservationRuntime` contains only lifecycle observation. Durable effect
+access publication remains in `AccessRuntime`; restoration/reconciliation and
+progress mutation are reachable through `RecoveryRuntime` and
+`RecoveryOwnerRuntime`
+(`kuberic-runtime/src/host/lifecycle.rs:137-225,574-763`;
+`kuberic-runtime/src/host/hosting.rs:466-555`).
 
 ### Transient Custom-Authority Ownership Is Explicit
 
@@ -259,15 +269,18 @@ Service Fabric's useful pattern is not its exact locking implementation. It is
 the visible transaction shape: mutate one partition aggregate, commit it, then
 release success-gated runtime actions while preserving partition ordering.
 
-### Reporting Performs Reconciliation
+### Reporting Is Read-Only
 
-Kuberic reporting compares durable and runtime state, applies precedence rules
-and can participate in deferred restoration. This makes observation part of
-state repair and expands the consistency fence.
-
-Service Fabric separates transition execution, retry scheduling and FM
-reporting. Kuberic should move repair into an explicit recovery/control task
-and make reporting a composition of owned, read-only observations.
+Kuberic reporting compares durable, host and engine owner views under a linked
+consistency fence, but it performs no lifecycle work. `RecoveryOwner` advances
+eligible progress/access work at a bounded cadence without report polling.
+`PartitionReportOwner` separately persists load/fault revisions. Managed peer
+discovery hands exact deferred restoration to that owner rather than
+publishing from the discovery observer. Both background owners and their
+registered descendants are terminated before final persistence and runtime
+abort
+(`kuberic-runtime/src/host/recovery.rs:14-192`;
+`kuberic-runtime/src/host/service.rs:536-621`).
 
 ## Target Architecture
 
@@ -371,9 +384,9 @@ Each operation should return only the proof needed to complete that operation:
 - certified-prefix receipt;
 - secondary-removal or retirement receipt.
 
-Full runtime snapshots remain useful as host-composed diagnostics, testing and
-reporting values, but are not a managed-engine boundary or the normal
-effect-completion type.
+Full runtime snapshots remain useful for effect evidence, retained
+postconditions and opt-in testing, but are not a reporting value, managed-engine
+boundary or projection-consumer transport.
 
 ### One Local Commit Protocol
 
@@ -506,13 +519,30 @@ Planned work:
 
 Exit criteria:
 
-- each authority, role, access and progress field has one documented owner;
+- each authority, role, access, topology, build, peer and progress field has
+  one documented owner and composition rule;
 - reporting does not mutate or repair lifecycle state;
 - eligible deferred recovery progresses without requiring a status request,
   while superseded or unauthorized restoration remains closed;
 - adding an engine-only progress field does not change durable agent
   serialization;
 - durable-format changes follow the explicit fail-closed schema-change policy.
+
+Implementation status: complete. `DurableAgentObservation`,
+`ReplicaRuntimeState` / `HostProxyObservation`,
+`ReplicationEngineObservation` and consumer-specific
+projections define the owner boundary. Reporting is read-only.
+`RecoveryOwner`, `PartitionReportOwner` and `RecoveryTaskOwner` own
+caller-independent recovery, observation persistence and descendant shutdown.
+No durable schema or protected public replicator interface changed
+(`kuberic-runtime/src/host/observation.rs:1-244`;
+`kuberic-runtime/src/host/recovery.rs:14-192`;
+`kuberic-runtime/src/host/report.rs:14-303`;
+`kuberic-runtime/tests/lifecycle_capability_boundaries.rs:1266-1460`).
+Evidence includes the complete 924-test ordinary tier, the six-test PostgreSQL
+smoke tier, focused runtime/store/coordinator/recovery/crash coverage, strict
+workspace Clippy and API/privacy/source guards, plus owned fresh-cluster
+`replacement`, `quorum-loss` and `adversarial` KinD identities.
 
 ### Phase 3: Narrow Effect Completion
 

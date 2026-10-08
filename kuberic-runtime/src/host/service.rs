@@ -1,6 +1,7 @@
 //! Tonic control, peer, and replication services.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -16,7 +17,8 @@ use crate::protocol::types::{
 };
 use futures::{Stream, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedRwLockReadGuard, RwLock, watch};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock, oneshot, watch};
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
@@ -25,6 +27,7 @@ use crate::host::Result;
 use crate::host::coordinator::Coordinator;
 use crate::host::hosting::{PodRuntime, RuntimeDataPlane};
 use crate::host::provisioning::{InitializationAuthority, ObservedStorageIdentity};
+use crate::host::recovery::{PartitionReportOwner, RecoveryOwner};
 use crate::host::report::AgentReporter;
 use crate::host::runtime_adapter::RuntimeEffectExecutor;
 use crate::host::session::ProcessSession;
@@ -401,6 +404,57 @@ pub(crate) struct AgentService<S, E> {
     sessions: Arc<SessionRegistry>,
     bearer_token: Arc<str>,
     ready_state: Arc<AtomicBool>,
+    command_tasks: Arc<CommandTaskOwner>,
+}
+
+struct CommandTaskOwner {
+    closed: AtomicBool,
+    tasks: Mutex<JoinSet<()>>,
+}
+
+impl CommandTaskOwner {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            closed: AtomicBool::new(false),
+            tasks: Mutex::new(JoinSet::new()),
+        })
+    }
+
+    async fn run<T, F>(&self, task: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(crate::host::HostError::Runtime(
+                RuntimeError::OperationCancelled,
+            ));
+        }
+        let (result, completed) = oneshot::channel();
+        let mut tasks = self.tasks.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(crate::host::HostError::Runtime(
+                RuntimeError::OperationCancelled,
+            ));
+        }
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let _ = result.send(task.await);
+        });
+        drop(tasks);
+        completed
+            .await
+            .unwrap_or(Err(crate::host::HostError::Runtime(
+                RuntimeError::OperationCancelled,
+            )))
+    }
+
+    async fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
+        let mut tasks = self.tasks.lock().await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
 }
 
 impl<S, E> Clone for AgentService<S, E> {
@@ -414,6 +468,7 @@ impl<S, E> Clone for AgentService<S, E> {
             sessions: self.sessions.clone(),
             bearer_token: self.bearer_token.clone(),
             ready_state: self.ready_state.clone(),
+            command_tasks: self.command_tasks.clone(),
         }
     }
 }
@@ -446,6 +501,7 @@ where
             sessions,
             bearer_token,
             ready_state: Arc::new(AtomicBool::new(false)),
+            command_tasks: CommandTaskOwner::new(),
         })
     }
 
@@ -508,21 +564,26 @@ where
                 .await
         });
 
-        let startup = self.reconstruct_runtime();
-        tokio::pin!(startup);
-        let startup_result = tokio::select! {
-            biased;
-            result = &mut startup => result,
-            _ = wait_for_shutdown(&mut shutdown) => {
-                Err(crate::host::HostError::Runtime(
-                    crate::RuntimeError::OperationCancelled,
-                ))
+        let startup_result = {
+            let startup = self.reconstruct_runtime();
+            tokio::pin!(startup);
+            tokio::select! {
+                biased;
+                result = &mut startup => result,
+                _ = wait_for_shutdown(&mut shutdown) => {
+                    Err(crate::host::HostError::Runtime(
+                        crate::RuntimeError::OperationCancelled,
+                    ))
+                }
             }
         };
         if let Err(error) = startup_result {
             control.abort();
             replication.abort();
             let _ = tokio::join!(&mut control, &mut replication);
+            self.runtime.shutdown_recovery_tasks().await;
+            let _ = self.runtime.shutdown_configuration_work().await;
+            self.runtime.quiesce_partition_reports().await;
             let persisted = self.persist_partition_fault().await;
             self.runtime.abort();
             if let Err(persisted) = persisted {
@@ -533,10 +594,24 @@ where
             return Err(error);
         }
 
+        let recovery_owner = RecoveryOwner::with_admission_lock(
+            self.runtime.recovery_owner_runtime(),
+            self.store.clone(),
+            self.coordinator.recovery_admission_lock(),
+        );
+        let (recovery_stop, recovery_shutdown) = watch::channel(false);
+        let mut recovery_owner_task =
+            tokio::spawn(async move { recovery_owner.run(recovery_shutdown).await });
+        let partition_owner =
+            PartitionReportOwner::new(self.runtime.recovery_owner_runtime(), self.store.clone());
+        let (partition_stop, partition_shutdown) = watch::channel(false);
+        let mut partition_owner_task =
+            tokio::spawn(async move { partition_owner.run(partition_shutdown).await });
+
         self.ready_state.store(true, Ordering::Release);
         ready.send_replace(true);
         let recovery_coordinator = self.coordinator.clone();
-        let recovery_task = tokio::spawn(async move {
+        let configuration_recovery_task = tokio::spawn(async move {
             if let Err(error) = recovery_coordinator.resume_configuration().await {
                 tracing::warn!(%error, "background configuration recovery stopped");
             }
@@ -565,8 +640,28 @@ where
         };
         self.ready_state.store(false, Ordering::Release);
         ready.send_replace(false);
-        recovery_task.abort();
-        let _ = recovery_task.await;
+        configuration_recovery_task.abort();
+        let _ = configuration_recovery_task.await;
+        self.command_tasks.shutdown().await;
+        recovery_stop.send_replace(true);
+        partition_stop.send_replace(true);
+        self.runtime.shutdown_recovery_tasks().await;
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut recovery_owner_task)
+            .await
+            .is_err()
+        {
+            recovery_owner_task.abort();
+            let _ = recovery_owner_task.await;
+        }
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut partition_owner_task)
+            .await
+            .is_err()
+        {
+            partition_owner_task.abort();
+            let _ = partition_owner_task.await;
+        }
+        self.runtime.shutdown_configuration_work().await?;
+        self.runtime.quiesce_partition_reports().await;
         let persisted = self.persist_partition_fault().await;
         self.runtime.abort();
         persisted?;
@@ -576,11 +671,9 @@ where
     async fn persist_partition_fault(&self) -> Result<()> {
         tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
             let partition = self.runtime.partition_report().await;
-            if partition.reported_fault.is_some() {
-                self.store
-                    .record_partition_reports(partition.load_metrics, partition.reported_fault)
-                    .await?;
-            }
+            self.store
+                .record_partition_reports(partition.load_metrics, partition.reported_fault)
+                .await?;
             Ok(())
         })
         .await
@@ -879,9 +972,9 @@ where
             }
             ProtocolCommand::EnsureConfiguration(command) => {
                 let coordinator = self.coordinator.clone();
-                tokio::spawn(async move { coordinator.ensure_configuration(*command).await })
+                self.command_tasks
+                    .run(async move { coordinator.ensure_configuration(*command).await })
                     .await
-                    .map_err(|error| Status::internal(error.to_string()))?
                     .map_err(status_from_agent)?;
             }
             ProtocolCommand::PrepareSwitchover(command) => {
@@ -903,9 +996,9 @@ where
                         .map_err(status_from_runtime)?;
                 }
                 let coordinator = self.coordinator.clone();
-                tokio::spawn(async move { coordinator.ensure_build(*command).await })
+                self.command_tasks
+                    .run(async move { coordinator.ensure_build(*command).await })
                     .await
-                    .map_err(|error| Status::internal(error.to_string()))?
                     .map_err(status_from_agent)?;
             }
         }

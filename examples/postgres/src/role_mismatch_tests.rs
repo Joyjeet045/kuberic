@@ -101,7 +101,14 @@ async fn exercise(status: bool) {
         inject(&group, mismatch).await;
         tokio::time::timeout(Duration::from_secs(10), async {
             if status {
-                assert!(pod.status().await.is_err());
+                assert!(
+                    pod.application
+                        .native_driver()
+                        .current_progress()
+                        .await
+                        .is_err()
+                );
+                assert!(!pod.status().await.unwrap().healthy);
             } else {
                 assert!(
                     pod.runtime

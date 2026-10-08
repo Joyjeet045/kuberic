@@ -3,11 +3,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::authority::AdmittedAuthority;
 use crate::control::proto;
 use crate::protocol::types::{AccessStatus, FaultType, ReplicaRole};
 
 use crate::host::Result;
 use crate::host::hosting::ReportRuntime;
+use crate::host::observation::{DurableAgentObservation, ReportObservation};
 use crate::host::session::ProcessSession;
 use crate::host::store::AgentStore;
 
@@ -29,59 +31,26 @@ impl<S: AgentStore> AgentReporter<S> {
     }
 
     pub(crate) async fn report(&self, runtime: &ReportRuntime) -> Result<proto::AgentStatusReport> {
-        for attempt in 0..100 {
-            match runtime.observe_progress().await {
-                Ok(()) | Err(crate::RuntimeError::ReconfigurationPending) => break,
-                Err(crate::RuntimeError::OperationCancelled) if attempt < 99 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let durable = self.store.load_state().await?;
-        let snapshot = runtime.snapshot().await;
-        if durable.pending_effect.is_none()
-            && durable.reconfiguration.is_none()
-            && (snapshot.read_status != durable.read_status
-                || snapshot.write_status != durable.write_status)
-        {
-            for attempt in 0..100 {
-                match runtime
-                    .reconcile_durable_access(durable.read_status, durable.write_status)
-                    .await
-                {
-                    Ok(())
-                    | Err(
-                        crate::RuntimeError::ReconfigurationPending
-                        | crate::RuntimeError::NotOpen
-                        | crate::RuntimeError::Closed,
-                    ) => break,
-                    Err(crate::RuntimeError::OperationCancelled) if attempt < 99 => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        continue;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-        let partition = runtime.partition_report().await;
-        self.store
-            .record_partition_reports(partition.load_metrics.clone(), partition.reported_fault)
-            .await?;
         for _ in 0..3 {
-            let state = self.store.load_state().await?;
-            let snapshot = runtime.snapshot().await;
-            let catch_up_capability = if snapshot.open && snapshot.role != ReplicaRole::None {
-                Some(runtime.catch_up_capability().await?)
-            } else {
-                None
-            };
-            let confirmed_snapshot = runtime.snapshot().await;
-            let confirmed_state = self.store.load_state().await?;
-            if state != confirmed_state
-                || !same_report_fence(&snapshot, &confirmed_snapshot)
-                || !snapshot_matches_state(&confirmed_snapshot, &confirmed_state)
+            let partition = runtime.partition_report().await;
+            let state: DurableAgentObservation = self.store.load_state().await?.into();
+            let authority = self.store.load_admitted_authority().await?;
+            let snapshot = runtime.observation().await;
+            let confirmed_snapshot = runtime.observation().await;
+            let confirmed_state: DurableAgentObservation = self.store.load_state().await?.into();
+            let confirmed_authority = self.store.load_admitted_authority().await?;
+            let confirmed_partition = runtime.partition_report().await;
+            let durable_stable = state == confirmed_state && authority == confirmed_authority;
+            let fence_stable = same_report_fence(&snapshot, &confirmed_snapshot);
+            let ownership_matches = snapshot_matches_state(
+                &confirmed_snapshot,
+                &confirmed_state,
+                confirmed_authority.as_ref(),
+            );
+            if !durable_stable
+                || !fence_stable
+                || !ownership_matches
+                || partition.revision != confirmed_partition.revision
             {
                 continue;
             }
@@ -89,8 +58,7 @@ impl<S: AgentStore> AgentReporter<S> {
                 &self.session,
                 confirmed_state,
                 confirmed_snapshot,
-                catch_up_capability,
-                partition.reported_fault,
+                confirmed_partition.reported_fault,
             ));
         }
         Err(crate::host::HostError::DurableEffectConflict(
@@ -101,14 +69,16 @@ impl<S: AgentStore> AgentReporter<S> {
 
 fn build_report(
     session: &ProcessSession,
-    state: crate::host::state::AgentState,
-    snapshot: crate::effects::RuntimeSnapshot,
-    catch_up_capability: Option<i64>,
+    state: DurableAgentObservation,
+    snapshot: ReportObservation,
     reported_fault: Option<FaultType>,
 ) -> proto::AgentStatusReport {
+    let state = state.into_state();
     let mut builds = snapshot
+        .engine
         .builds
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|build| (build.authority.build_id.clone(), build))
         .collect::<BTreeMap<_, _>>();
     for (build_id, command) in &state.build_commands {
@@ -116,7 +86,7 @@ fn build_report(
             .scale_up_evidence
             .as_ref()
             .is_some_and(|evidence| &evidence.intent().build_id == build_id);
-        if !snapshot.live_builds_only
+        if !snapshot.host.live_builds_only
             && ((command.authority.is_none()
                 && !state.retired_builds.contains(build_id)
                 && !state.abandoned_builds.contains(build_id))
@@ -160,30 +130,36 @@ fn build_report(
         });
     proto::AgentStatusReport {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
-        replication_address: snapshot.replication_address.clone().unwrap_or_default(),
+        replication_address: snapshot
+            .host
+            .replication_address
+            .clone()
+            .unwrap_or_default(),
         resource_uid: state.identity.resource_uid.to_string(),
         identity: Some(state.identity.local_identity.clone().into()),
         process_session_id: session.id().to_string(),
         report_sequence: session.next_report_sequence(),
-        role: role_to_proto(snapshot.role) as i32,
-        write_status: access_to_proto(snapshot.write_status) as i32,
+        role: role_to_proto(snapshot.host.role) as i32,
+        write_status: access_to_proto(snapshot.host.write_status) as i32,
         epoch: Some(state.highest_epoch.into()),
         previous_configuration: state.previous_configuration.map(Into::into),
         current_configuration: state.current_configuration.map(Into::into),
-        current_progress: snapshot.current_progress,
-        verified_replication_lsn: snapshot.verified_replication_lsn,
-        committed_lsn: snapshot.committed_lsn,
-        catch_up_capability,
+        current_progress: snapshot.engine.current_progress,
+        verified_replication_lsn: snapshot.engine.verified_replication_lsn,
+        committed_lsn: snapshot.engine.committed_lsn,
+        catch_up_capability: snapshot.engine.catch_up_capability,
         storage_state: proto::AgentStorageState::Initialized as i32,
         pod_uid: state.identity.pod_uid.to_string(),
         pvc_uid: state.identity.pvc_uid.to_string(),
         storage_error: String::new(),
         healthy: reported_fault != Some(FaultType::Permanent),
         replica_id: state.identity.local_identity.replica_id.value(),
-        read_status: access_to_proto(snapshot.read_status) as i32,
-        current_configuration_quorum_progress: snapshot.current_configuration_quorum_progress,
-        catch_up_boundary: snapshot.catch_up_boundary,
-        catch_up_complete: snapshot.catch_up_complete,
+        read_status: access_to_proto(snapshot.host.read_status) as i32,
+        current_configuration_quorum_progress: snapshot
+            .engine
+            .current_configuration_quorum_progress,
+        catch_up_boundary: snapshot.engine.catch_up_boundary,
+        catch_up_complete: snapshot.engine.catch_up_complete,
         deactivated_lsn: state
             .deactivation
             .as_ref()
@@ -242,46 +218,77 @@ fn build_report(
 }
 
 fn snapshot_matches_state(
-    snapshot: &crate::effects::RuntimeSnapshot,
-    state: &crate::host::state::AgentState,
+    snapshot: &ReportObservation,
+    state: &DurableAgentObservation,
+    authority: Option<&AdmittedAuthority>,
 ) -> bool {
-    let authority_matches = match snapshot.authority.as_ref() {
-        Some(authority) => {
-            authority.previous_configuration == state.previous_configuration
-                && Some(&authority.current_configuration) == state.current_configuration.as_ref()
-                && authority.scale_up == state.scale_up_evidence
+    let authority_matches = match snapshot.host.authority.as_ref() {
+        Some(projected) => {
+            authority == Some(projected)
+                && projected.local_identity == state.identity.local_identity
+                && projected.previous_configuration == state.previous_configuration
+                && Some(&projected.current_configuration) == state.current_configuration.as_ref()
+                && projected.scale_up == state.scale_up_evidence
+                && projected.secondary_removal == state.secondary_removal_evidence
         }
-        None => state.previous_configuration.is_none() && state.current_configuration.is_none(),
+        None => authority.is_none(),
     };
     let access_matches = |projected, desired| {
         projected == desired
-            || (snapshot.live_builds_only
+            || (snapshot
+                .host
+                .pending_access
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.desired == (state.read_status, state.write_status)
+                        && pending.authority == snapshot.host.authority
+                        && pending.configuration_generation
+                            == snapshot.host.configuration_generation
+                        && pending
+                            .active_access_generation
+                            .unwrap_or(pending.access_generation)
+                            == snapshot.host.access_generation
+                        && pending.peer_sessions == snapshot.host.peer_sessions
+                        && pending.engine_fence == snapshot.engine.fence
+                })
                 && projected == AccessStatus::ReconfigurationPending
                 && desired == AccessStatus::Granted)
     };
-    snapshot.role == state.role
-        && access_matches(snapshot.read_status, state.read_status)
-        && access_matches(snapshot.write_status, state.write_status)
+    let engine_matches_host = match (
+        snapshot.engine.fence.as_ref(),
+        snapshot.host.authority.as_ref(),
+    ) {
+        (Some(fence), Some(authority)) => {
+            fence.configuration.as_ref().is_some_and(|configuration| {
+                configuration.local_identity == authority.local_identity
+                    && configuration.previous_configuration == authority.previous_configuration
+                    && configuration.current_configuration == authority.current_configuration
+                    && configuration.switchover_handoff == authority.switchover_handoff
+                    && configuration.secondary_removal == authority.secondary_removal
+                    && configuration.scale_up == authority.scale_up
+            })
+        }
+
+        (Some(fence), None) => fence.configuration.is_none(),
+        (None, _) => !snapshot.host.engine_required,
+    };
+    let generation_linked = if !snapshot.host.engine_required {
+        snapshot.engine.host_generation.is_none()
+    } else {
+        snapshot.engine.host_generation == snapshot.host.engine_host_generation
+            && snapshot.host.engine_host_generation.is_some()
+    };
+    snapshot.host.role == state.role
+        && access_matches(snapshot.host.read_status, state.read_status)
+        && access_matches(snapshot.host.write_status, state.write_status)
         && authority_matches
-        && snapshot.retired_authority == state.retired_authority
+        && engine_matches_host
+        && generation_linked
+        && snapshot.engine.retired_authority == state.retired_authority
 }
 
-fn same_report_fence(
-    before: &crate::effects::RuntimeSnapshot,
-    after: &crate::effects::RuntimeSnapshot,
-) -> bool {
-    before.identity == after.identity
-        && before.open == after.open
-        && before.replication_address == after.replication_address
-        && before.role == after.role
-        && before.role_transition == after.role_transition
-        && before.read_status == after.read_status
-        && before.write_status == after.write_status
-        && before.authority == after.authority
-        && before.prepared_secondary_removal == after.prepared_secondary_removal
-        && before.retired_authority == after.retired_authority
-        && before.accepted_secondary_removal == after.accepted_secondary_removal
-        && before.live_builds_only == after.live_builds_only
+fn same_report_fence(before: &ReportObservation, after: &ReportObservation) -> bool {
+    before.same_fence(after)
 }
 
 fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
@@ -382,13 +389,13 @@ mod tests {
         snapshot.live_builds_only = true;
         let fresh = ProcessSession::new();
         assert!(
-            build_report(&fresh, state.clone(), snapshot.clone(), None, None)
+            build_report(&fresh, state.clone().into(), snapshot.clone().into(), None,)
                 .builds
                 .is_empty()
         );
         snapshot.live_builds_only = false;
         assert_eq!(
-            build_report(&fresh, state, snapshot, None, None)
+            build_report(&fresh, state.into(), snapshot.into(), None)
                 .builds
                 .len(),
             1
@@ -417,9 +424,188 @@ mod tests {
         after.current_configuration_quorum_progress = 10;
         after.catch_up_boundary = Some(11);
         after.catch_up_complete = true;
+        let before: ReportObservation = before.into();
+        let mut after: ReportObservation = after.into();
         assert!(same_report_fence(&before, &after));
-
-        after.write_status = AccessStatus::Granted;
+        after.host.configuration_generation = 1;
         assert!(!same_report_fence(&before, &after));
+        after.host.configuration_generation = 0;
+        after.host.access_generation = 1;
+        assert!(!same_report_fence(&before, &after));
+        after.host.access_generation = 0;
+        after.host.peer_sessions.push((
+            before.host.identity.clone(),
+            ProcessSessionId::new("peer-session"),
+        ));
+        assert!(!same_report_fence(&before, &after));
+        after.host.peer_sessions.clear();
+        after.engine.fence = Some(crate::replicator::ManagedOperationFence {
+            configuration: None,
+            engine_session_id: "engine-session".into(),
+            engine_generation: 1,
+        });
+        assert!(!same_report_fence(&before, &after));
+        after.engine.fence = None;
+        assert!(same_report_fence(&before, &after));
+        after.host.write_status = AccessStatus::Granted;
+        assert!(!same_report_fence(&before, &after));
+    }
+
+    #[test]
+    fn exact_pending_access_is_reportable_but_stale_mismatch_is_not() {
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("source"),
+            agent_generation: AgentGeneration::new("generation"),
+        };
+        let mut state = crate::host::state::AgentState::new(crate::host::state::StorageIdentity {
+            schema_version: crate::host::state::SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource"),
+            local_identity: identity.clone(),
+            pod_uid: PodUid::new("source"),
+            pvc_uid: PvcUid::new("data"),
+            initialization_id: InitializationId::new("init"),
+            effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+        });
+        state.read_status = AccessStatus::Granted;
+        state.write_status = AccessStatus::Granted;
+        let mut observation: ReportObservation =
+            crate::host::hosting::empty_snapshot(identity).into();
+        observation.host.read_status = AccessStatus::ReconfigurationPending;
+        observation.host.write_status = AccessStatus::ReconfigurationPending;
+        observation.host.engine_required = true;
+        observation.host.engine_host_generation = Some(0);
+        let engine_fence = crate::replicator::ManagedOperationFence {
+            configuration: None,
+            engine_session_id: "engine-session".into(),
+            engine_generation: 1,
+        };
+        observation.engine.fence = Some(engine_fence.clone());
+        observation.engine.host_generation = Some(0);
+        assert!(!snapshot_matches_state(
+            &observation,
+            &state.clone().into(),
+            None
+        ));
+        observation.host.pending_access =
+            Some(crate::host::observation::PendingAccessObservation {
+                desired: (AccessStatus::Granted, AccessStatus::Granted),
+                authority: None,
+                configuration_generation: 0,
+                access_generation: 0,
+                active_access_generation: None,
+                peer_sessions: Vec::new(),
+                engine_fence: Some(engine_fence),
+            });
+        assert!(snapshot_matches_state(
+            &observation,
+            &state.clone().into(),
+            None
+        ));
+        observation.host.access_generation = 1;
+        assert!(!snapshot_matches_state(&observation, &state.into(), None));
+    }
+
+    #[test]
+    fn report_authority_requires_exact_switchover_and_local_identity() {
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("source"),
+            agent_generation: AgentGeneration::new("generation"),
+        };
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            instance_id: ReplicaInstanceId::new("target"),
+            agent_generation: AgentGeneration::new("generation"),
+        };
+        let previous = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            identity.replica_id,
+            vec![ConfigurationMember {
+                identity: identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            target.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::Primary,
+                },
+            ],
+            2,
+        );
+        let handoff = SwitchoverHandoff {
+            preparation_generation: 1,
+            preparation_operation_id: OperationId::new("preparation"),
+            request_id: SwitchoverRequestId::new("request"),
+            source: identity.clone(),
+            target,
+            starting_configuration_id: previous.configuration_id.clone(),
+            starting_epoch: previous.epoch,
+            handoff_lsn: 7,
+        };
+        let mut state = crate::host::state::AgentState::new(crate::host::state::StorageIdentity {
+            schema_version: crate::host::state::SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource"),
+            local_identity: identity.clone(),
+            pod_uid: PodUid::new("source"),
+            pvc_uid: PvcUid::new("data"),
+            initialization_id: InitializationId::new("init"),
+            effective_policy: EffectivePolicy::fixed(2, 30).unwrap(),
+        });
+        state.previous_configuration = Some(previous);
+        state.current_configuration = Some(current);
+        state.prepared_switchover = Some(handoff.clone());
+        let authority = AdmittedAuthority {
+            local_identity: identity.clone(),
+            transition_kind: Some(crate::protocol::types::TransitionKind::PlannedSwitchover),
+            previous_configuration: state.previous_configuration.clone(),
+            current_configuration: state.current_configuration.clone().unwrap(),
+            switchover_handoff: Some(handoff.clone()),
+            secondary_removal: None,
+            scale_up: None,
+        };
+        let mut observation: ReportObservation =
+            crate::host::hosting::empty_snapshot(identity).into();
+        observation.host.authority = Some(authority.clone());
+        assert!(snapshot_matches_state(
+            &observation,
+            &state.clone().into(),
+            Some(&authority)
+        ));
+
+        observation
+            .host
+            .authority
+            .as_mut()
+            .unwrap()
+            .switchover_handoff = None;
+        assert!(!snapshot_matches_state(
+            &observation,
+            &state.clone().into(),
+            Some(&authority)
+        ));
+        observation.host.authority = Some(authority);
+        observation
+            .host
+            .authority
+            .as_mut()
+            .unwrap()
+            .local_identity
+            .replica_id = ReplicaId::new(9);
+        let durable = observation.host.authority.as_ref().unwrap().clone();
+        assert!(!snapshot_matches_state(
+            &observation,
+            &state.into(),
+            Some(&durable)
+        ));
     }
 }

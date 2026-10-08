@@ -18,9 +18,9 @@ const HOST_CAPABILITY_TRAITS: &[&str] =
 #[rustfmt::skip]
 const CAPABILITY_TYPES: &[&str] = &[
     "ProcessRuntime", "AuthorityRuntime", "PeerRuntime", "AccessClosure", "AccessRuntime",
-    "ReportLifecycle", "EvidenceRuntime", "EffectEvidenceRuntime", "BuildLifecycleRuntime",
+    "ReportObservationRuntime", "EvidenceRuntime", "EffectEvidenceRuntime", "BuildLifecycleRuntime",
     "BuildCancellationRuntime", "OutboundLifecycleRuntime", "RemovalWitnessRuntime",
-    "TopologyRuntime", "RecoveryRuntime", "ReportRuntime", "BuildRuntime",
+    "TopologyRuntime", "RecoveryRuntime", "ReportRuntime", "RecoveryOwnerRuntime", "BuildRuntime",
     "BuildAttemptRuntime", "PeerDiscoveryRuntime", "OutboundRuntime",
 ];
 #[rustfmt::skip]
@@ -35,7 +35,7 @@ const LIFECYCLE_VIEW_RULES: &[(&str, &[&str])] = &[
     ("PeerRuntime", &["dynAuthorityLifecycle"]),
     ("AccessClosure", &["dynAccessLifecycle"]),
     ("AccessRuntime", &["dynAccessLifecycle"]),
-    ("ReportLifecycle", &["dynAccessLifecycle", "dynLifecycleObservation"]),
+    ("ReportObservationRuntime", &["dynLifecycleObservation"]),
     ("EvidenceRuntime", &["dynLifecycleObservation"]),
     ("EffectEvidenceRuntime", &["dynLifecycleObservation"]),
     ("BuildLifecycleRuntime", &["dynBuildLifecycle", "dynBuildCancellation", "BuildCancellationRuntime"]),
@@ -48,6 +48,7 @@ const LIFECYCLE_VIEW_RULES: &[(&str, &[&str])] = &[
 #[rustfmt::skip]
 const HOSTING_VIEW_RULES: &[(&str, &[&str])] = &[
     ("ReportRuntime", &["dynReportHost"]),
+    ("RecoveryOwnerRuntime", &["dynRecoveryOwnerHost"]),
     ("BuildRuntime", &["dynBuildHost", "BuildAttemptRuntime"]),
     ("BuildAttemptRuntime", &["dynBuildAttemptHost"]),
     ("PeerDiscoveryRuntime", &["dynPeerDiscoveryHost"]),
@@ -231,7 +232,7 @@ fn allowed_aggregates(relative: &Path) -> &'static [&'static str] {
     match relative.to_str() {
         Some("lifecycle.rs") => &[
             "LifecycleWiring",
-            "ReportLifecycle",
+            "ReportObservationRuntime",
             "BuildLifecycleRuntime",
             "RecoveryRuntime",
         ],
@@ -249,6 +250,7 @@ fn allowed_aggregates(relative: &Path) -> &'static [&'static str] {
             "PodRuntime",
             "RuntimeDataPlane",
             "RuntimeHost",
+            "RecoveryWake",
             "HostAccessView",
             "OpenAttempt",
         ],
@@ -1005,19 +1007,12 @@ fn production_items(source: &str) -> String {
     parsed(source)
         .items
         .iter()
-        .filter(|item| {
-            !matches!(
-                item,
-                Item::Mod(module)
-                    if module.attrs.iter().any(|attribute| {
-                        let attribute = compact(attribute);
-                        attribute.contains("cfg(test)")
-                            || attribute.contains("cfg(all(test,")
-                    })
-            )
-        })
         .map(ToTokens::to_token_stream)
         .map(|tokens| tokens.to_string())
+        .filter(|tokens| {
+            let compact = tokens.replace(' ', "");
+            !compact.starts_with("#[cfg(test)]") && !compact.starts_with("#[cfg(all(test,")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1265,6 +1260,260 @@ fn validate_managed_replica_runtime_boundary(
 #[test]
 fn lifecycle_capability_boundaries_are_narrow() {
     validate_project().unwrap();
+}
+
+#[test]
+fn projection_capabilities_reject_complete_runtime_snapshots() {
+    let hosting = source("src/host/hosting.rs");
+    assert!(hosting.contains("fallback_snapshot: ReplicaRuntimeState"));
+    let custom = source("src/host/custom.rs");
+    assert!(custom.contains("state: Arc<RwLock<ReplicaRuntimeState>>"));
+    for (start, end, projection) in [
+        (
+            "trait ReportHost",
+            "pub(crate) struct ReportRuntime",
+            "ReportObservation",
+        ),
+        (
+            "trait BuildHost",
+            "trait BuildAttemptHost",
+            "BuildObservation",
+        ),
+        (
+            "trait PeerDiscoveryHost",
+            "pub(crate) struct PeerDiscoveryRuntime",
+            "PeerObservation",
+        ),
+        (
+            "trait OutboundHost",
+            "pub(crate) struct OutboundRuntime",
+            "OutboundObservation",
+        ),
+    ] {
+        let body = hosting
+            .split_once(start)
+            .and_then(|(_, rest)| rest.split_once(end).map(|(body, _)| body))
+            .unwrap_or_else(|| panic!("missing {start} capability"));
+        assert!(
+            !body.contains("RuntimeSnapshot"),
+            "{start} must not transport RuntimeSnapshot"
+        );
+        assert!(
+            body.contains(projection),
+            "{start} must transport {projection}"
+        );
+    }
+
+    let lifecycle = source("src/host/lifecycle.rs");
+    let recovery = lifecycle
+        .split_once("pub(super) struct RecoveryRuntime")
+        .and_then(|(_, rest)| {
+            rest.split_once("pub(super) struct AccessClosure")
+                .map(|(body, _)| body)
+        })
+        .expect("RecoveryRuntime capability");
+    assert!(
+        !recovery.contains("RuntimeSnapshot"),
+        "RecoveryRuntime must not transport RuntimeSnapshot"
+    );
+    assert!(recovery.contains("RecoveryObservation"));
+
+    let report_lifecycle = lifecycle
+        .split_once("pub(super) struct ReportObservationRuntime")
+        .and_then(|(_, rest)| {
+            rest.split_once("pub(super) struct EvidenceRuntime")
+                .map(|(body, _)| body)
+        })
+        .expect("ReportLifecycle capability");
+    assert!(
+        !report_lifecycle.contains("RuntimeSnapshot"),
+        "ReportObservationRuntime must not transport RuntimeSnapshot"
+    );
+    assert!(report_lifecycle.contains("ReportObservation"));
+    let report_callback_forbidden = [
+        "AccessLifecycle",
+        "observe_progress",
+        "refresh_progress",
+        "reconcile_access",
+        "run_access_transaction",
+        "restored_access",
+    ];
+    for callback in report_callback_forbidden {
+        assert!(
+            !report_lifecycle.contains(callback),
+            "ReportObservationRuntime must not expose callback {callback}"
+        );
+    }
+    let injected_report_lifecycle = format!(
+        "{report_lifecycle}\nfn injected() {{ self.observation.observe_progress().await; }}"
+    );
+    assert!(
+        report_callback_forbidden
+            .iter()
+            .any(|callback| injected_report_lifecycle.contains(callback)),
+        "report callback negative fixture must be rejected"
+    );
+
+    let report_runtime = hosting
+        .split_once("pub(crate) struct ReportRuntime")
+        .and_then(|(_, rest)| {
+            rest.split_once("pub(crate) struct RecoveryOwnerRuntime")
+                .map(|(body, _)| body)
+        })
+        .expect("ReportRuntime capability");
+    for mutation in [
+        "observe_progress",
+        "reconcile_durable_access",
+        "refresh_catch_up_capability",
+    ] {
+        assert!(
+            !report_runtime.contains(mutation),
+            "ReportRuntime must not expose lifecycle mutation {mutation}"
+        );
+    }
+    let recovery_runtime = hosting
+        .split_once("pub(crate) struct RecoveryOwnerRuntime")
+        .and_then(|(_, rest)| rest.split_once("trait BuildHost").map(|(body, _)| body))
+        .expect("RecoveryOwnerRuntime capability");
+    for owned in [
+        "observe_progress",
+        "reconcile_durable_access",
+        "refresh_catch_up_capability",
+    ] {
+        assert!(
+            recovery_runtime.contains(owned),
+            "RecoveryOwnerRuntime must own {owned}"
+        );
+    }
+    for broad_projection in [
+        "ReportHost::observation(self).await.build()",
+        "ReportHost::observation(self).await.peer()",
+        "ReportHost::observation(self).await.outbound()",
+    ] {
+        assert!(
+            !hosting.contains(broad_projection),
+            "narrow providers must not assemble the complete report observation through {broad_projection}"
+        );
+    }
+
+    let report = source("src/host/report.rs");
+    let production_report = production_items(&report);
+    let report_mutations = [
+        "record_partition_reports",
+        "complete_application_initialization",
+        "migrate_schema",
+        "begin_effect",
+        "mark_effect_applied",
+        "complete_effect",
+        "cancel_effect",
+        "begin_configuration",
+        "journal_build",
+        "abandon_build",
+        "advance_configuration",
+        "complete_configuration",
+        "set_reconfiguration",
+        "clear_reconfiguration",
+        "observe_progress",
+        "reconcile_durable_access",
+        "catch_up_capability().await",
+        "tokio::time::sleep",
+        "RuntimeError::",
+        "RuntimeSnapshot",
+    ];
+    for mutation in report_mutations {
+        assert!(
+            !production_report.contains(mutation),
+            "status reporting must not perform {mutation}"
+        );
+    }
+    let injected_report = format!(
+        "{production_report}\nasync fn injected(store: &impl AgentStore) {{ store.cancel_effect(todo!()).await; let _: RuntimeSnapshot = todo!(); }}"
+    );
+    assert!(
+        report_mutations
+            .iter()
+            .filter(|mutation| { **mutation == "cancel_effect" || **mutation == "RuntimeSnapshot" })
+            .all(|mutation| injected_report.contains(mutation)),
+        "report mutation negative fixture must be rejected"
+    );
+
+    let service = source("src/host/service.rs");
+    assert_eq!(
+        service.matches(".report(&report_runtime)").count(),
+        2,
+        "status RPC and post-command status must share the read-only reporter"
+    );
+    assert!(
+        service.contains("self.command_tasks.shutdown().await")
+            && service
+                .contains(".run(async move { coordinator.ensure_configuration(*command).await })")
+            && service.contains(".run(async move { coordinator.ensure_build(*command).await })"),
+        "configuration and build commands must remain service-owned through shutdown"
+    );
+    assert!(
+        service.find("self.command_tasks.shutdown().await")
+            < service.find("self.runtime.shutdown_configuration_work().await?"),
+        "configuration command tasks must stop before configuration cleanup"
+    );
+    assert!(
+        hosting.contains("if observation.engine.catch_up_capability.is_none()"),
+        "managed engine catch-up capability must not be overwritten by the custom cache"
+    );
+    let observation = source("src/host/observation.rs");
+    let production_observation = production_items(&observation);
+    for serialization in [
+        "Serialize",
+        "Deserialize",
+        "serde::Serialize",
+        "serde::Deserialize",
+    ] {
+        assert!(
+            !production_observation.contains(serialization),
+            "process-local owner observations must not enter durable serialization via {serialization}"
+        );
+    }
+    let durable_state = source("src/host/state.rs");
+    for transient in [
+        "HostProxyObservation",
+        "ReplicationEngineObservation",
+        "ReportObservation",
+        "PendingAccessObservation",
+        "ManagedOperationFence",
+        "engine_session_id",
+        "engine_generation",
+        "host_generation",
+        "diagnostic_revision",
+    ] {
+        assert!(
+            !durable_state.contains(transient),
+            "durable agent state must not contain transient observation {transient}"
+        );
+    }
+
+    for consumer in [
+        "src/host/custom.rs",
+        "src/host/transport.rs",
+        "src/host/recovery.rs",
+        "src/host/report.rs",
+    ] {
+        let source = source(consumer);
+        let production = production_items(&source);
+        assert!(
+            !production.contains("diagnostic_revision"),
+            "{consumer} must not depend on unrelated engine diagnostics"
+        );
+    }
+    let recovery_owner = production_items(&source("src/host/recovery.rs"));
+    for scheduling_boundary in [
+        "RecoverySchedule",
+        "custom_tick",
+        "schedule . wait_for_timer",
+    ] {
+        assert!(
+            recovery_owner.contains(scheduling_boundary),
+            "recovery scheduling must retain the explicit {scheduling_boundary} boundary"
+        );
+    }
 }
 
 #[test]

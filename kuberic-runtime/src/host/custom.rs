@@ -26,11 +26,15 @@ use crate::{Result, RuntimeError};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 
+use super::super::observation::{
+    BuildObservation, HostProxyObservation, OutboundObservation, PeerObservation,
+    PendingAccessObservation, ReplicaRuntimeState, ReplicationEngineObservation, ReportObservation,
+};
 use super::lifecycle::{
     AccessLifecycle, AuthorityLifecycle, BuildCancellation, BuildLifecycle, LifecycleObservation,
     LifecycleWiring, OutboundLifecycle, ProcessLifecycle, TopologyLifecycle,
 };
-use super::{AppliedEffect, RuntimeHost, empty_snapshot};
+use super::{AppliedEffect, RuntimeHost};
 #[path = "custom/authority.rs"]
 mod authority;
 #[path = "custom_removal.rs"]
@@ -68,16 +72,22 @@ struct AcceptedBuild {
     admission: BuildAdmission,
 }
 
+#[derive(Clone)]
+struct DeferredAccess {
+    id: u64,
+    observation: PendingAccessObservation,
+}
+
 pub(super) struct ReadyAccessTransaction {
     pub(super) accept: oneshot::Sender<()>,
     pub(super) accepted: oneshot::Receiver<Option<NativeProgressStatus>>,
     pub(super) decision: oneshot::Sender<AccessDecision>,
-    pub(super) completion: tokio::task::JoinHandle<Result<()>>,
+    pub(super) completion: oneshot::Receiver<Result<()>>,
 }
 
 pub(crate) struct AcceptedAccessTransaction {
     decision: oneshot::Sender<AccessDecision>,
-    completion: tokio::task::JoinHandle<Result<()>>,
+    completion: oneshot::Receiver<Result<()>>,
 }
 
 pub(crate) struct AcceptedAccessEffect {
@@ -186,7 +196,7 @@ impl AcceptedAccessTransaction {
         let _ = self.decision.send(decision);
         self.completion
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .unwrap_or(Err(RuntimeError::OperationCancelled))
     }
 
     pub(super) async fn commit(self) -> Result<()> {
@@ -231,7 +241,7 @@ impl AcceptedAccessEffect {
         transaction
             .completion
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .unwrap_or(Err(RuntimeError::OperationCancelled))
     }
 
     pub(crate) async fn reject(self) -> Result<()> {
@@ -410,11 +420,14 @@ fn durable_secondary_removal_receipt(
     }))
 }
 
-type DeferredConfiguration = tokio::task::JoinHandle<Result<(u64, ReplicaSetConfiguration)>>;
+struct DeferredConfiguration {
+    handle: tokio::task::JoinHandle<Result<(u64, ReplicaSetConfiguration)>>,
+}
 
 struct ManagedLifecycleBackend {
     legacy: Arc<dyn ManagedReplicatorLifecycle>,
     common: Arc<CustomReplicatorHost>,
+    engine_host_generation: AtomicU64,
     accepted_builds: RwLock<BTreeMap<OperationId, AcceptedBuild>>,
     topology_receipt: RwLock<Option<TopologyReceipt>>,
 }
@@ -494,20 +507,21 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
         if let Some(authority) = &authority {
             authority.validate()?;
         }
+        let host_generation = self.common.configuration_generation.load(Ordering::Acquire);
         self.legacy
             .restore_engine_proof(
                 authority.as_ref().map(managed_configuration),
-                self.common.configuration_generation.load(Ordering::Acquire),
+                host_generation,
             )
             .await?;
         self.common.restore_authority().await?;
         if authority.is_some() {
             self.legacy
-                .synchronize_replica_configuration(
-                    self.common.configuration_generation.load(Ordering::Acquire),
-                )
+                .synchronize_replica_configuration(host_generation)
                 .await?;
         }
+        self.engine_host_generation
+            .store(host_generation, Ordering::Release);
         self.sync_topology_status().await
     }
 
@@ -542,11 +556,12 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
             gate.release.notified().await;
         }
         self.common.install_managed_authority(&authority).await?;
+        let host_generation = self.common.configuration_generation.load(Ordering::Acquire);
         self.legacy
-            .synchronize_replica_configuration(
-                self.common.configuration_generation.load(Ordering::Acquire),
-            )
+            .synchronize_replica_configuration(host_generation)
             .await?;
+        self.engine_host_generation
+            .store(host_generation, Ordering::Release);
         self.sync_topology_status().await
     }
 
@@ -605,8 +620,29 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
 
 #[async_trait]
 impl AccessLifecycle for ManagedLifecycleBackend {
+    fn recovery_task_owner(&self) -> Option<Arc<super::RecoveryTaskOwner>> {
+        self.common
+            .host
+            .upgrade()
+            .map(|host| host.recovery_tasks.clone())
+    }
+
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
-        *self.common.restored_access.write().await = Some((read, write));
+        let fence = self.legacy.native_fence().await.ok();
+        self.common
+            .defer_access_obligation(read, write, fence)
+            .await;
+    }
+
+    async fn complete_restored_access(&self, obligation_id: Option<u64>) {
+        let mut restored = self.common.restored_access.write().await;
+        if restored.as_ref().map(|restored| restored.id) == obligation_id {
+            *restored = None;
+        }
+    }
+
+    async fn retry_restored_access(&self, obligation_id: Option<u64>) {
+        self.common.retry_access_obligation(obligation_id).await;
     }
 
     async fn run_access_transaction(
@@ -622,8 +658,19 @@ impl AccessLifecycle for ManagedLifecycleBackend {
             .await
     }
 
-    async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
-        *self.common.restored_access.read().await
+    async fn restored_access(&self) -> Option<(u64, AccessStatus, AccessStatus)> {
+        self.common
+            .restored_access
+            .read()
+            .await
+            .as_ref()
+            .map(|restored| {
+                (
+                    restored.id,
+                    restored.observation.desired.0,
+                    restored.observation.desired.1,
+                )
+            })
     }
 }
 
@@ -656,8 +703,8 @@ impl BuildLifecycle for ManagedLifecycleBackend {
             self.common
                 .ensure_build_generation(build_id, generation)
                 .await?;
-            let snapshot = self.snapshot().await;
-            if snapshot.builds.iter().any(|build| {
+            let observation = self.report_observation().await;
+            if observation.engine.builds.iter().any(|build| {
                 &build.authority.build_id == build_id
                     && &build.authority.target == target
                     && build.completed
@@ -682,11 +729,18 @@ impl BuildLifecycle for ManagedLifecycleBackend {
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
         let build_id = replica.build_id.clone();
         let target = replica.identity.clone();
-        if self.snapshot().await.builds.iter().any(|build| {
-            build.authority.build_id == build_id
-                && build.authority.target == target
-                && build.completed
-        }) {
+        if self
+            .report_observation()
+            .await
+            .engine
+            .builds
+            .iter()
+            .any(|build| {
+                build.authority.build_id == build_id
+                    && build.authority.target == target
+                    && build.completed
+            })
+        {
             return Ok(());
         }
         let endpoint = ReplicaEndpoint {
@@ -1244,6 +1298,65 @@ impl LifecycleObservation for ManagedLifecycleBackend {
         snapshot
     }
 
+    async fn report_observation(&self) -> ReportObservation {
+        let mut observation = self.common.report_observation().await;
+        let engine = self.engine_snapshot_for_host().await;
+        observation.engine.host_generation = Some(engine.host_generation);
+        observation.engine.fence = Some(engine.fence.clone());
+        observation.host.engine_required = true;
+        observation.host.engine_host_generation =
+            Some(self.engine_host_generation.load(Ordering::Acquire));
+        observation.engine.current_progress = engine.progress.current_progress;
+        observation.engine.committed_lsn = engine.progress.committed_lsn;
+        observation.engine.verified_replication_lsn = engine.progress.verified_replication_lsn;
+        observation.engine.current_configuration_quorum_progress =
+            engine.progress.current_configuration_quorum_progress;
+        observation.engine.catch_up_boundary = if engine.progress.catch_up_complete {
+            observation
+                .engine
+                .catch_up_boundary
+                .or(engine.progress.catch_up_boundary)
+        } else {
+            engine.progress.catch_up_boundary
+        };
+        observation.engine.catch_up_complete = engine.progress.catch_up_complete;
+        observation.engine.catch_up_capability = Some(engine.catch_up_capability);
+        merge_builds(&mut observation.engine.builds, engine.builds);
+        observation.host.live_builds_only = false;
+        observation.engine.prepared_secondary_removal = engine.prepared_secondary_removal;
+        observation.engine.accepted_secondary_removal = engine.accepted_secondary_removal;
+        observation.engine.retired_authority = engine.retired_authority;
+        observation
+    }
+
+    async fn host_observation(&self) -> HostProxyObservation {
+        let mut observation = self.common.host_observation().await;
+        observation.engine_required = true;
+        observation.live_builds_only = false;
+        observation.engine_host_generation =
+            Some(self.engine_host_generation.load(Ordering::Acquire));
+        observation
+    }
+
+    async fn build_observation(&self) -> BuildObservation {
+        let mut observation = self.common.build_observation().await;
+        let engine = self.engine_snapshot_for_host().await;
+        observation.current_progress = engine.progress.current_progress;
+        observation.committed_lsn = engine.progress.committed_lsn;
+        merge_builds(&mut observation.builds, engine.builds);
+        observation
+    }
+
+    async fn peer_observation(&self) -> PeerObservation {
+        let mut observation = self.common.peer_observation().await;
+        observation.retired_authority = self.engine_snapshot_for_host().await.retired_authority;
+        observation
+    }
+
+    async fn outbound_observation(&self) -> OutboundObservation {
+        self.common.outbound_observation().await
+    }
+
     async fn postcondition(&self, progress: Option<&NativeProgressStatus>) -> RuntimePostcondition {
         let mut postcondition = self.common.narrow_postcondition().await;
         match progress {
@@ -1480,7 +1593,7 @@ pub(super) struct ReplicatorLifecycleRegistration {
     pub(super) peer: super::lifecycle::PeerRuntime,
     pub(super) access_closure: super::lifecycle::AccessClosure,
     pub(super) access: super::lifecycle::AccessRuntime,
-    pub(super) report: super::lifecycle::ReportLifecycle,
+    pub(super) report: super::lifecycle::ReportObservationRuntime,
     pub(super) evidence: super::lifecycle::EvidenceRuntime,
     pub(super) effect_evidence: super::lifecycle::EffectEvidenceRuntime,
     pub(super) build: super::lifecycle::BuildLifecycleRuntime,
@@ -1502,6 +1615,7 @@ impl ReplicatorLifecycleRegistration {
         let backend = Arc::new(ManagedLifecycleBackend {
             legacy: lifecycle,
             common: common.clone(),
+            engine_host_generation: AtomicU64::new(0),
             accepted_builds: RwLock::default(),
             topology_receipt: RwLock::default(),
         });
@@ -1527,7 +1641,7 @@ impl ReplicatorLifecycleRegistration {
         let peer = wiring.peer_runtime();
         let access_closure = wiring.access_closure();
         let access = wiring.access_runtime();
-        let report = wiring.report_lifecycle();
+        let report = wiring.report_observation();
         let evidence = wiring.evidence_runtime();
         let effect_evidence = wiring.effect_evidence_runtime();
         let build = wiring.build_runtime(managed);
@@ -1562,7 +1676,7 @@ pub(super) struct CustomReplicatorHost {
     native_receipts: bool,
     abort_notified: std::sync::atomic::AtomicBool,
     gate: Mutex<()>,
-    state: Arc<RwLock<RuntimeSnapshot>>,
+    state: Arc<RwLock<ReplicaRuntimeState>>,
     sessions: RwLock<BTreeMap<ReplicaIdentity, ProcessSessionId>>,
     addresses: RwLock<BTreeMap<ReplicaIdentity, (ProcessSessionId, String)>>,
     retired_sessions: RwLock<BTreeSet<(ReplicaIdentity, ProcessSessionId)>>,
@@ -1582,7 +1696,8 @@ pub(super) struct CustomReplicatorHost {
     published_access_generation: Arc<AtomicU64>,
     access_commit: Arc<Mutex<()>>,
     session_registration: Mutex<()>,
-    restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
+    restored_access: RwLock<Option<DeferredAccess>>,
+    restored_access_generation: AtomicU64,
     removal_witnesses:
         RwLock<BTreeMap<ReplicaIdentity, crate::protocol::types::SecondaryRemovalWitness>>,
     outbound: mpsc::Sender<OutboundOperation>,
@@ -1603,7 +1718,7 @@ impl CustomReplicatorHost {
             .identity
             .clone();
         let (outbound, receiver) = mpsc::channel(16);
-        let mut snapshot = empty_snapshot(identity);
+        let mut snapshot = ReplicaRuntimeState::empty(identity);
         snapshot.live_builds_only = true;
         Self {
             host,
@@ -1633,6 +1748,7 @@ impl CustomReplicatorHost {
             access_commit: Arc::new(Mutex::new(())),
             session_registration: Mutex::new(()),
             restored_access: RwLock::default(),
+            restored_access_generation: AtomicU64::new(0),
             removal_witnesses: RwLock::default(),
             outbound,
             receiver: Mutex::new(receiver),
@@ -1656,6 +1772,60 @@ impl CustomReplicatorHost {
             return Err(RuntimeError::Closed);
         }
         Ok(host)
+    }
+
+    async fn defer_access_obligation(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+        engine_fence: Option<ManagedOperationFence>,
+    ) {
+        let state = self.state.read().await;
+        let authority = state.authority.clone();
+        drop(state);
+        let peer_sessions: Vec<_> = self.sessions.read().await.clone().into_iter().collect();
+        let observation = PendingAccessObservation {
+            desired: (read, write),
+            authority,
+            configuration_generation: self.configuration_generation.load(Ordering::Acquire),
+            access_generation: self.access_generation.load(Ordering::Acquire),
+            active_access_generation: None,
+            peer_sessions,
+            engine_fence,
+        };
+        let mut restored = self.restored_access.write().await;
+        if let Some(existing) = restored.as_mut()
+            && existing.observation.desired == observation.desired
+            && existing.observation.authority == observation.authority
+            && existing.observation.configuration_generation == observation.configuration_generation
+            && existing.observation.peer_sessions == observation.peer_sessions
+            && existing.observation.engine_fence == observation.engine_fence
+        {
+            existing.observation.access_generation = observation.access_generation;
+            existing.observation.active_access_generation = None;
+            return;
+        }
+        let id = self
+            .restored_access_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        *restored = Some(DeferredAccess { id, observation });
+        drop(restored);
+        if let Some(host) = self.host.upgrade() {
+            host.notify_recovery();
+        }
+        self.changed.notify_waiters();
+    }
+
+    async fn retry_access_obligation(&self, obligation_id: Option<u64>) {
+        let generation = self.access_generation.load(Ordering::Acquire);
+        let mut restored = self.restored_access.write().await;
+        if let Some(restored) = restored.as_mut()
+            && Some(restored.id) == obligation_id
+        {
+            restored.observation.access_generation = generation;
+            restored.observation.active_access_generation = None;
+        }
     }
 
     fn active_host(&self) -> Result<Arc<RuntimeHost>> {
@@ -1979,24 +2149,34 @@ impl CustomReplicatorHost {
     }
 
     async fn finish_deferred_configuration(&self) -> Result<()> {
-        let Some(mut handle) = self.deferred_configuration.lock().await.take() else {
+        let mut deferred = self.deferred_configuration.lock().await;
+        let Some(deferred_configuration) = deferred.as_mut() else {
             return Ok(());
         };
-        let (generation, _) =
-            match tokio::time::timeout(std::time::Duration::from_secs(75), &mut handle).await {
-                Ok(result) => result.map_err(|error| {
-                    if error.is_cancelled() {
-                        RuntimeError::OperationCancelled
-                    } else {
-                        RuntimeError::Application(error.to_string())
-                    }
-                })??,
-                Err(_) => {
-                    handle.abort();
-                    return Err(RuntimeError::OperationCancelled);
-                }
-            };
+        let outcome = match tokio::time::timeout(
+            std::time::Duration::from_secs(75),
+            &mut deferred_configuration.handle,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                deferred_configuration.handle.abort();
+                let _ = (&mut deferred_configuration.handle).await;
+                *deferred = None;
+                return Err(RuntimeError::OperationCancelled);
+            }
+        };
+        *deferred = None;
+        drop(deferred);
         self.deferred_configuration_abort.lock().unwrap().take();
+        let (generation, _) = outcome.map_err(|error| {
+            if error.is_cancelled() {
+                RuntimeError::OperationCancelled
+            } else {
+                RuntimeError::Application(error.to_string())
+            }
+        })??;
         self.ensure_configuration_generation(generation)?;
         Ok(())
     }
@@ -2005,13 +2185,12 @@ impl CustomReplicatorHost {
         if self.host()?.custom_configuration_blocked() {
             return Ok(());
         }
-        {
-            let _commit = self.configuration_commit.lock().await;
-            self.deferred_configuration_abort.lock().unwrap().take();
-            if let Some(handle) = self.deferred_configuration.lock().await.take() {
-                handle.abort();
-                let _ = handle.await;
-            }
+        if let Some(abort) = self.deferred_configuration_abort.lock().unwrap().take() {
+            abort.abort();
+        }
+        if let Some(deferred) = self.deferred_configuration.lock().await.take() {
+            deferred.handle.abort();
+            let _ = deferred.handle.await;
         }
         let authority_before = self.state.read().await.authority.clone();
         let sessions_before = self.sessions.read().await.clone();
@@ -2041,7 +2220,11 @@ impl CustomReplicatorHost {
                     .map(|host| host.custom_authority.callback_lock())
             })
             .transpose()?;
+        let (start, started) = oneshot::channel();
         let handle = tokio::spawn(async move {
+            started
+                .await
+                .map_err(|_| RuntimeError::OperationCancelled)?;
             let independent = callback.is_some();
             let _callback = match callback {
                 Some(callback) => Some(callback.lock_owned().await),
@@ -2086,7 +2269,8 @@ impl CustomReplicatorHost {
             Ok((generation, current))
         });
         *self.deferred_configuration_abort.lock().unwrap() = Some(handle.abort_handle());
-        *self.deferred_configuration.lock().await = Some(handle);
+        *self.deferred_configuration.lock().await = Some(DeferredConfiguration { handle });
+        let _ = start.send(());
         Ok(())
     }
 
@@ -2158,22 +2342,22 @@ impl CustomReplicatorHost {
         // The callback task, not its waiting caller, owns serialization through
         // application and publication. Dropping peer discovery cannot release
         // an already-entered stateful callback into a newer authority.
-        tokio::spawn(async move {
-            let _callback = callback;
-            let current = Self::apply_configuration_update(primary, current, previous).await?;
-            let _commit = commit.lock().await;
-            let mut configuration = configuration.write().await;
-            if host.aborted.load(Ordering::Acquire)
-                || host.closed.load(Ordering::Acquire)
-                || generations.load(Ordering::Acquire) != generation
-            {
-                return Err(RuntimeError::OperationCancelled);
-            }
-            *configuration = Some(current);
-            Ok(())
-        })
-        .await
-        .map_err(|error| RuntimeError::Application(error.to_string()))?
+        host.clone()
+            .run_owned_recovery(async move {
+                let _callback = callback;
+                let current = Self::apply_configuration_update(primary, current, previous).await?;
+                let _commit = commit.lock().await;
+                let mut configuration = configuration.write().await;
+                if host.aborted.load(Ordering::Acquire)
+                    || host.closed.load(Ordering::Acquire)
+                    || generations.load(Ordering::Acquire) != generation
+                {
+                    return Err(RuntimeError::OperationCancelled);
+                }
+                *configuration = Some(current);
+                Ok(())
+            })
+            .await
     }
 
     async fn reserve_access_projection(
@@ -2181,7 +2365,6 @@ impl CustomReplicatorHost {
         read: AccessStatus,
         write: AccessStatus,
     ) -> Result<AccessProjection> {
-        *self.restored_access.write().await = None;
         let host = self.host()?;
         if host.custom_configuration_blocked()
             && (read == AccessStatus::Granted || write == AccessStatus::Granted)
@@ -2233,6 +2416,7 @@ impl CustomReplicatorHost {
             }
         }
         let _commit = self.access_commit.lock().await;
+        let mut restored = self.restored_access.write().await;
         self.active_host()?;
         if authority_before != self.state.read().await.authority
             || configuration_before != self.published_configuration().await
@@ -2246,6 +2430,16 @@ impl CustomReplicatorHost {
         // reservation. The caller installs rollback ownership immediately,
         // without an intervening await.
         let access_generation = self.advance_access_generation()?;
+        if let Some(restored) = restored.as_mut()
+            && restored.observation.desired == (read, write)
+            && restored.observation.authority == authority_before
+            && restored.observation.configuration_generation == configuration_generation
+            && restored.observation.peer_sessions
+                == sessions_before.clone().into_iter().collect::<Vec<_>>()
+        {
+            restored.observation.active_access_generation = Some(access_generation);
+        }
+        drop(restored);
         Ok(AccessProjection {
             previous_read,
             previous_write,
@@ -2402,12 +2596,20 @@ impl CustomReplicatorHost {
         decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()> {
         let projection = self.reserve_access_projection(read, write).await?;
+        let deadline = super::access_publication_deadline();
         let publication = {
             let publication = self.publish_common_access_projection(projection.clone());
             tokio::pin!(publication);
             tokio::select! {
-                result = &mut publication => Some(result),
+                biased;
                 _ = ready.closed() => None,
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => None,
+                result = &mut publication => Some(result),
             }
         };
         let Some(publication) = publication else {
@@ -3116,13 +3318,15 @@ impl CustomReplicatorHost {
     }
 
     async fn invalidate_configuration_attempts_without_access_locked(&self) -> Result<()> {
-        let _commit = self.configuration_commit.lock().await;
         self.advance_configuration_generation()?;
-        self.deferred_configuration_abort.lock().unwrap().take();
-        if let Some(handle) = self.deferred_configuration.lock().await.take() {
-            handle.abort();
-            let _ = handle.await;
+        if let Some(abort) = self.deferred_configuration_abort.lock().unwrap().take() {
+            abort.abort();
         }
+        if let Some(deferred) = self.deferred_configuration.lock().await.take() {
+            deferred.handle.abort();
+            let _ = deferred.handle.await;
+        }
+        let _commit = self.configuration_commit.lock().await;
         Ok(())
     }
 
@@ -3882,13 +4086,13 @@ impl CustomReplicatorHost {
         Ok(())
     }
     pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
-        let mut snapshot = self.state.read().await.clone();
+        let mut state = self.state.read().await.clone();
         if !self.native_receipts {
-            return snapshot;
+            return state.into();
         }
         let receipts = self.receipts.read().await.clone();
         let mut current = Vec::new();
-        for build in snapshot.builds {
+        for build in state.builds {
             if let Some(receipt) = receipts.get(&build.authority.build_id)
                 && let Ok(current_receipt) = self.receipt(&build.authority).await
                 && receipt.matches_durable_selection(&current_receipt)
@@ -3901,8 +4105,111 @@ impl CustomReplicatorHost {
                 current.push(build);
             }
         }
-        snapshot.builds = current;
-        snapshot
+        state.builds = current;
+        state.into()
+    }
+
+    async fn report_observation(&self) -> ReportObservation {
+        let state = self.state.read().await.clone();
+        let builds = self.reportable_builds(&state).await;
+        let host = self.host_observation().await;
+        ReportObservation {
+            host,
+            engine: ReplicationEngineObservation {
+                fence: None,
+                host_generation: None,
+                prepared_secondary_removal: state.prepared_secondary_removal,
+                retired_authority: state.retired_authority,
+                accepted_secondary_removal: state.accepted_secondary_removal,
+                current_progress: state.current_progress,
+                verified_replication_lsn: state.verified_replication_lsn,
+                committed_lsn: state.committed_lsn,
+                current_configuration_quorum_progress: state.current_configuration_quorum_progress,
+                catch_up_boundary: state.catch_up_boundary,
+                catch_up_complete: state.catch_up_complete,
+                catch_up_capability: None,
+                builds,
+            },
+        }
+    }
+
+    async fn host_observation(&self) -> HostProxyObservation {
+        let state = self.state.read().await.clone();
+        let peer_sessions: Vec<_> = self.sessions.read().await.clone().into_iter().collect();
+        let pending_access = if self
+            .host()
+            .is_ok_and(|host| host.custom_authority.authorization_required())
+        {
+            None
+        } else {
+            self.restored_access
+                .read()
+                .await
+                .as_ref()
+                .map(|restored| restored.observation.clone())
+        };
+        HostProxyObservation {
+            identity: state.identity,
+            open: state.open,
+            replication_address: state.replication_address,
+            role: state.role,
+            role_transition: state.role_transition,
+            read_status: state.read_status,
+            write_status: state.write_status,
+            authority: state.authority,
+            live_builds_only: state.live_builds_only,
+            engine_required: false,
+            configuration_generation: self.configuration_generation.load(Ordering::Acquire),
+            engine_host_generation: None,
+            access_generation: self.access_generation.load(Ordering::Acquire),
+            peer_sessions,
+            pending_access,
+        }
+    }
+
+    async fn reportable_builds(&self, state: &ReplicaRuntimeState) -> Vec<BuildPostcondition> {
+        if !self.native_receipts {
+            return state.builds.clone();
+        }
+        let receipts = self.receipts.read().await.clone();
+        let retired = self.retired_builds.read().await.clone();
+        let mut current = Vec::new();
+        for build in state.builds.clone() {
+            if let Some(receipt) = receipts.get(&build.authority.build_id)
+                && let Ok(current_receipt) = self.receipt(&build.authority).await
+                && receipt.matches_durable_selection(&current_receipt)
+                && !retired.contains(&build.authority.build_id)
+            {
+                current.push(build);
+            }
+        }
+        current
+    }
+
+    async fn build_observation(&self) -> BuildObservation {
+        let state = self.state.read().await.clone();
+        BuildObservation {
+            authority: state.authority.clone(),
+            builds: self.reportable_builds(&state).await,
+            current_progress: state.current_progress,
+            committed_lsn: state.committed_lsn,
+        }
+    }
+
+    async fn peer_observation(&self) -> PeerObservation {
+        let state = self.state.read().await;
+        PeerObservation {
+            authority: state.authority.clone(),
+            retired_authority: state.retired_authority.clone(),
+        }
+    }
+
+    async fn outbound_observation(&self) -> OutboundObservation {
+        let state = self.state.read().await;
+        OutboundObservation {
+            open: state.open,
+            authority: state.authority.clone(),
+        }
     }
 
     async fn narrow_postcondition(&self) -> RuntimePostcondition {
@@ -4060,15 +4367,29 @@ impl AuthorityLifecycle for CustomReplicatorHost {
 
 #[async_trait]
 impl AccessLifecycle for CustomReplicatorHost {
+    fn recovery_task_owner(&self) -> Option<Arc<super::RecoveryTaskOwner>> {
+        self.host.upgrade().map(|host| host.recovery_tasks.clone())
+    }
+
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
-        let mut restored = self.restored_access.write().await;
         if self.host().is_ok_and(|host| {
             host.custom_authority.authorization_required()
                 && (read == AccessStatus::Granted || write == AccessStatus::Granted)
         }) {
             return;
         }
-        *restored = Some((read, write));
+        self.defer_access_obligation(read, write, None).await;
+    }
+
+    async fn complete_restored_access(&self, obligation_id: Option<u64>) {
+        let mut restored = self.restored_access.write().await;
+        if restored.as_ref().map(|restored| restored.id) == obligation_id {
+            *restored = None;
+        }
+    }
+
+    async fn retry_restored_access(&self, obligation_id: Option<u64>) {
+        self.retry_access_obligation(obligation_id).await;
     }
 
     async fn run_access_transaction(
@@ -4084,7 +4405,7 @@ impl AccessLifecycle for CustomReplicatorHost {
             .await
     }
 
-    async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
+    async fn restored_access(&self) -> Option<(u64, AccessStatus, AccessStatus)> {
         let restored = self.restored_access.read().await;
         if self
             .host()
@@ -4092,7 +4413,13 @@ impl AccessLifecycle for CustomReplicatorHost {
         {
             None
         } else {
-            *restored
+            restored.as_ref().map(|restored| {
+                (
+                    restored.id,
+                    restored.observation.desired.0,
+                    restored.observation.desired.1,
+                )
+            })
         }
     }
 }
@@ -4122,8 +4449,8 @@ impl BuildLifecycle for CustomReplicatorHost {
         loop {
             let changed = self.changed.notified();
             self.ensure_build_generation(build_id, generation).await?;
-            let snapshot = CustomReplicatorHost::snapshot(self).await;
-            if snapshot.builds.iter().any(|build| {
+            let observation = CustomReplicatorHost::report_observation(self).await;
+            if observation.engine.builds.iter().any(|build| {
                 &build.authority.build_id == build_id
                     && &build.authority.target == target
                     && build.completed
@@ -4146,11 +4473,18 @@ impl BuildLifecycle for CustomReplicatorHost {
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
         let build_id = replica.build_id.clone();
         let target = replica.identity.clone();
-        if self.snapshot().await.builds.iter().any(|build| {
-            build.authority.build_id == build_id
-                && build.authority.target == target
-                && build.completed
-        }) {
+        if self
+            .report_observation()
+            .await
+            .engine
+            .builds
+            .iter()
+            .any(|build| {
+                build.authority.build_id == build_id
+                    && build.authority.target == target
+                    && build.completed
+            })
+        {
             return Ok(());
         }
         self.enqueue_build_wait(ReplicaEndpoint {
@@ -4410,7 +4744,11 @@ impl LifecycleObservation for CustomReplicatorHost {
     }
 
     async fn observe_progress(&self) -> Result<()> {
-        if !CustomReplicatorHost::snapshot(self).await.open {
+        if !CustomReplicatorHost::report_observation(self)
+            .await
+            .host
+            .open
+        {
             return Ok(());
         }
         let result = CustomReplicatorHost::apply_common_action(
@@ -4428,6 +4766,26 @@ impl LifecycleObservation for CustomReplicatorHost {
 
     async fn snapshot(&self) -> RuntimeSnapshot {
         CustomReplicatorHost::snapshot(self).await
+    }
+
+    async fn report_observation(&self) -> ReportObservation {
+        CustomReplicatorHost::report_observation(self).await
+    }
+
+    async fn host_observation(&self) -> HostProxyObservation {
+        CustomReplicatorHost::host_observation(self).await
+    }
+
+    async fn build_observation(&self) -> BuildObservation {
+        CustomReplicatorHost::build_observation(self).await
+    }
+
+    async fn peer_observation(&self) -> PeerObservation {
+        CustomReplicatorHost::peer_observation(self).await
+    }
+
+    async fn outbound_observation(&self) -> OutboundObservation {
+        CustomReplicatorHost::outbound_observation(self).await
     }
 
     async fn postcondition(

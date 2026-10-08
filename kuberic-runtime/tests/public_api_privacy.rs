@@ -99,7 +99,7 @@ path = "private.rs"
         "module `coordinator` is private",
         "module `hosting` is private",
         "module `provisioning` is private",
-        "no `recovery` in `host`",
+        "module `recovery` is private",
         "module `report` is private",
         "module `runtime_adapter` is private",
         "module `service` is private",

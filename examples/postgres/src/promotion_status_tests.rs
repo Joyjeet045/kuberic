@@ -4,8 +4,6 @@ use kuberic_runtime::protocol::types::{AccessStatus, FaultType, TransitionKind};
 use kuberic_runtime::replicator::Replicator;
 use kuberic_runtime::testing::report::AgentReporter;
 use kuberic_runtime::testing::{authority::AdmittedAuthority, effects::RuntimeEffectAction};
-use std::future::{Future, poll_fn};
-use std::task::Poll;
 
 async fn followed_candidate() -> PgGroup {
     let mut group = PgGroup::singleton().await;
@@ -135,7 +133,7 @@ async fn complete_and_fence(mut group: PgGroup, generation: u64) {
                 .await
                 .is_err()
         );
-        assert!(pod.status().await.is_err());
+        assert!(!pod.status().await.unwrap().healthy);
     })
     .await
     .unwrap();
@@ -174,31 +172,30 @@ async fn concurrent_status() {
     let reporter = AgentReporter::new(pod.store.clone());
     let mut progress = Box::pin(driver.current_progress());
     let mut report = Box::pin(reporter.report(&pod.runtime));
-    poll_fn(|cx| {
-        assert!(progress.as_mut().poll(cx).is_pending());
-        assert!(report.as_mut().poll(cx).is_pending());
-        Poll::Ready(())
-    })
-    .await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(250), async {
-            tokio::join!(&mut progress, &mut report)
-        })
+    let report_result = tokio::time::timeout(Duration::from_millis(250), &mut report)
         .await
-        .is_err(),
-        "status must wait for role publication, not inspect the promotion gap"
+        .expect("read-only status must not wait for promotion callbacks")
+        .unwrap();
+    assert_ne!(
+        report_result.write_status,
+        kuberic_runtime::control::proto::AccessStatus::Granted as i32
+    );
+    drop(report);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut progress)
+            .await
+            .is_err(),
+        "progress remains serialized with role publication"
     );
     assert_eq!(assert_promotion_gap(&group).await, generation);
     gate.release.notify_one();
     tokio::time::timeout(Duration::from_secs(30), async {
-        let (promoted, progress, report) = tokio::join!(&mut promotion, &mut progress, &mut report);
+        let (promoted, progress) = tokio::join!(&mut promotion, &mut progress);
         promoted.unwrap();
         progress.unwrap();
-        report.unwrap();
     })
     .await
     .unwrap();
-    drop(report);
     drop(progress);
     drop(promotion);
     complete_and_fence(group, generation).await;

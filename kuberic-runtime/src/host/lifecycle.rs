@@ -16,6 +16,10 @@ use crate::replicator::ReplicaInformation;
 use crate::transport::{OutboundOperation, ReplicaEndpoint};
 use crate::{Result, RuntimeError};
 
+use super::super::observation::{
+    BuildObservation, HostProxyObservation, OutboundObservation, PeerObservation,
+    RecoveryObservation, ReportObservation,
+};
 use super::custom::{
     AccessDecision, BuildAdmission, BuildCompletionConfirmation, ReadyAccessTransaction,
 };
@@ -49,7 +53,10 @@ pub(super) trait AuthorityLifecycle: Send + Sync {
 
 #[async_trait]
 pub(super) trait AccessLifecycle: Send + Sync {
+    fn recovery_task_owner(&self) -> Option<Arc<super::RecoveryTaskOwner>>;
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus);
+    async fn complete_restored_access(&self, obligation_id: Option<u64>);
+    async fn retry_restored_access(&self, obligation_id: Option<u64>);
     async fn run_access_transaction(
         &self,
         read: AccessStatus,
@@ -59,7 +66,7 @@ pub(super) trait AccessLifecycle: Send + Sync {
         accepted: oneshot::Sender<Option<NativeProgressStatus>>,
         decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()>;
-    async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)>;
+    async fn restored_access(&self) -> Option<(u64, AccessStatus, AccessStatus)>;
 }
 
 #[async_trait]
@@ -138,6 +145,11 @@ pub(super) trait LifecycleObservation: Send + Sync {
     async fn refresh_progress(&self) -> Result<()>;
     async fn observe_progress(&self) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn report_observation(&self) -> ReportObservation;
+    async fn host_observation(&self) -> HostProxyObservation;
+    async fn build_observation(&self) -> BuildObservation;
+    async fn peer_observation(&self) -> PeerObservation;
+    async fn outbound_observation(&self) -> OutboundObservation;
     async fn postcondition(&self, progress: Option<&NativeProgressStatus>) -> RuntimePostcondition;
 }
 
@@ -213,9 +225,8 @@ impl LifecycleWiring {
         }
     }
 
-    pub(super) fn report_lifecycle(&self) -> ReportLifecycle {
-        ReportLifecycle {
-            access: self.access.clone(),
+    pub(super) fn report_observation(&self) -> ReportObservationRuntime {
+        ReportObservationRuntime {
             observation: self.observation.clone(),
         }
     }
@@ -586,8 +597,25 @@ impl RecoveryRuntime {
         self.authority.restore_authority().await
     }
 
-    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.observation.snapshot().await
+    pub(super) async fn observation(&self) -> RecoveryObservation {
+        let observation = self.observation.report_observation().await;
+        RecoveryObservation::new(
+            observation.host.read_status,
+            observation.host.write_status,
+            observation.host.authority,
+        )
+    }
+
+    pub(super) async fn observe_progress(&self) -> Result<()> {
+        self.observation.observe_progress().await
+    }
+
+    pub(super) async fn reconcile_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<()> {
+        restore_access(self.access.clone(), read, write).await
     }
 
     pub(super) async fn restore_access(
@@ -630,7 +658,8 @@ async fn begin_access_effect(
     let (accepted_tx, accepted_rx) = oneshot::channel();
     let (decision_tx, decision_rx) = oneshot::channel();
     let deadline = super::access_publication_deadline();
-    let completion = tokio::spawn(async move {
+    let owner = access.recovery_task_owner();
+    let transaction = async move {
         let transaction = access.run_access_transaction(
             read,
             write,
@@ -643,7 +672,16 @@ async fn begin_access_effect(
             Some(deadline) => super::with_access_publication_deadline(deadline, transaction).await,
             None => transaction.await,
         }
-    });
+    };
+    let completion = if let Some(owner) = owner {
+        owner.spawn_graceful(transaction).await
+    } else {
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = result_tx.send(transaction.await);
+        });
+        result_rx
+    };
     match ready_rx.await {
         Ok(()) => Ok(ReadyAccessTransaction {
             accept: accept_tx,
@@ -653,7 +691,7 @@ async fn begin_access_effect(
         }),
         Err(_) => completion
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .unwrap_or(Err(RuntimeError::OperationCancelled))
             .and(Err(RuntimeError::OperationCancelled)),
     }
 }
@@ -663,9 +701,21 @@ async fn commit_access(
     read: AccessStatus,
     write: AccessStatus,
 ) -> Result<()> {
-    let transaction = begin_access_effect(access, read, write).await?;
+    let obligation_id = access.restored_access().await.map(|restored| restored.0);
+    commit_access_obligation(access, read, write, obligation_id).await
+}
+
+async fn commit_access_obligation(
+    access: Arc<dyn AccessLifecycle>,
+    read: AccessStatus,
+    write: AccessStatus,
+    obligation_id: Option<u64>,
+) -> Result<()> {
+    let transaction = begin_access_effect(access.clone(), read, write).await?;
     let (_, transaction) = transaction.accept().await?;
-    transaction.commit().await
+    transaction.commit().await?;
+    access.complete_restored_access(obligation_id).await;
+    Ok(())
 }
 
 async fn restore_access(
@@ -673,10 +723,15 @@ async fn restore_access(
     read: AccessStatus,
     write: AccessStatus,
 ) -> Result<()> {
-    match commit_access(access.clone(), read, write).await {
+    let obligation_id = access.restored_access().await.map(|restored| restored.0);
+    match commit_access_obligation(access.clone(), read, write, obligation_id).await {
         Err(RuntimeError::ReconfigurationPending) => {
             access.defer_restored_access(read, write).await;
             Err(RuntimeError::ReconfigurationPending)
+        }
+        Err(RuntimeError::OperationCancelled) => {
+            access.retry_restored_access(obligation_id).await;
+            Err(RuntimeError::OperationCancelled)
         }
         result => result,
     }
@@ -694,6 +749,10 @@ pub(super) struct AccessRuntime {
 }
 
 impl AccessRuntime {
+    pub(super) async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
+        self.inner.defer_restored_access(read, write).await;
+    }
+
     pub(super) async fn begin_effect(
         &self,
         read: AccessStatus,
@@ -704,30 +763,29 @@ impl AccessRuntime {
 }
 
 #[derive(Clone)]
-pub(super) struct ReportLifecycle {
-    access: Arc<dyn AccessLifecycle>,
+pub(super) struct ReportObservationRuntime {
     observation: Arc<dyn LifecycleObservation>,
 }
 
-impl ReportLifecycle {
-    pub(super) async fn observe_progress(&self) -> Result<()> {
-        self.observation.observe_progress().await?;
-        if let Some((read, write)) = self.access.restored_access().await {
-            commit_access(self.access.clone(), read, write).await?;
-        }
-        Ok(())
+impl ReportObservationRuntime {
+    pub(super) async fn report_observation(&self) -> ReportObservation {
+        self.observation.report_observation().await
     }
 
-    pub(super) async fn reconcile_access(
-        &self,
-        read: AccessStatus,
-        write: AccessStatus,
-    ) -> Result<()> {
-        restore_access(self.access.clone(), read, write).await
+    pub(super) async fn host_observation(&self) -> HostProxyObservation {
+        self.observation.host_observation().await
     }
 
-    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.observation.snapshot().await
+    pub(super) async fn build_observation(&self) -> BuildObservation {
+        self.observation.build_observation().await
+    }
+
+    pub(super) async fn peer_observation(&self) -> PeerObservation {
+        self.observation.peer_observation().await
+    }
+
+    pub(super) async fn outbound_observation(&self) -> OutboundObservation {
+        self.observation.outbound_observation().await
     }
 }
 
@@ -768,7 +826,14 @@ mod tests {
 
     #[async_trait]
     impl AccessLifecycle for FailingAccess {
+        fn recovery_task_owner(&self) -> Option<Arc<super::super::RecoveryTaskOwner>> {
+            None
+        }
+
         async fn defer_restored_access(&self, _read: AccessStatus, _write: AccessStatus) {}
+        async fn complete_restored_access(&self, _obligation_id: Option<u64>) {}
+
+        async fn retry_restored_access(&self, _obligation_id: Option<u64>) {}
 
         async fn run_access_transaction(
             &self,
@@ -782,7 +847,7 @@ mod tests {
             Err(RuntimeError::Application("pre-ready failure".into()))
         }
 
-        async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
+        async fn restored_access(&self) -> Option<(u64, AccessStatus, AccessStatus)> {
             None
         }
     }

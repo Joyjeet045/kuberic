@@ -288,12 +288,12 @@ where
         {
             return Ok(());
         }
-        let snapshot = self.runtime.snapshot().await;
-        if snapshot.builds.iter().any(|build| {
+        let observation = self.runtime.observation().await;
+        if observation.builds.iter().any(|build| {
             build.authority.build_id == endpoint.build_id
                 && build.authority.target == endpoint.identity
                 && build.completed
-                && build.durable_lsn >= snapshot.current_progress
+                && build.durable_lsn >= observation.current_progress
         }) {
             return Ok(());
         }
@@ -494,7 +494,7 @@ where
         let session = self.peer_session(receiver).await?;
         if self
             .runtime
-            .snapshot()
+            .observation()
             .await
             .authority
             .as_ref()
@@ -904,11 +904,11 @@ async fn queued_matches_runtime_authority(
     runtime: &OutboundRuntime,
     queued: &QueuedOutbound,
 ) -> bool {
-    let snapshot = runtime.snapshot().await;
-    if !snapshot.open {
+    let observation = runtime.observation().await;
+    if !observation.open {
         return matches!(queued, QueuedOutbound::Remove(_) | QueuedOutbound::Evict(_));
     }
-    let Some(authority) = snapshot.authority else {
+    let Some(authority) = observation.authority else {
         return !matches!(
             queued,
             QueuedOutbound::Replication { .. } | QueuedOutbound::Copy { .. }
@@ -946,12 +946,12 @@ where
             return Ok(());
         }
         let state = store.load_state().await?;
-        let runtime_snapshot = runtime.snapshot().await;
-        let runtime_authority = runtime_snapshot.authority;
-        if runtime_authority.is_some() || runtime_snapshot.retired_authority.is_some() {
+        let runtime_observation = runtime.observation().await;
+        let runtime_authority = runtime_observation.authority;
+        if runtime_authority.is_some() || runtime_observation.retired_authority.is_some() {
             sessions.retain_members(runtime_authority.as_ref()).await;
         }
-        if let Some(retired) = runtime_snapshot.retired_authority {
+        if let Some(retired) = runtime_observation.retired_authority {
             for member in &retired.report.intent.previous_configuration.members {
                 transport.lock().await.evict_peer(&member.identity);
                 sessions.retire_peer(&member.identity).await;
@@ -988,7 +988,7 @@ where
                 }
                 if let Ok(report) = dispatcher.peer_report(&member.identity).await {
                     if runtime
-                        .snapshot()
+                        .observation()
                         .await
                         .authority
                         .as_ref()

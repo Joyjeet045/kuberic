@@ -260,6 +260,10 @@ impl AgentStore for SqliteStore {
         load_state_from_connection(&connection)
     }
 
+    async fn load_admitted_authority(&self) -> Result<Option<AdmittedAuthority>> {
+        Ok(ReplicaAuthorityStore::load(self).await?)
+    }
+
     async fn complete_application_initialization(&self) -> Result<()> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;

@@ -419,6 +419,10 @@ impl AgentStore for ScaleUpProductionCutStore {
         self.inner.load_state().await
     }
 
+    async fn load_admitted_authority(&self) -> Result<Option<AdmittedAuthority>> {
+        Ok(self.inner.load().await?)
+    }
+
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect> {
         let begun = self.inner.begin_effect(effect).await?;
         if self.cut.as_deref().is_some_and(|cut| {
@@ -5230,9 +5234,12 @@ async fn recovery_reissues_committed_intent_without_reporting_completion() {
 
     let reopened = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
     assert_eq!(
-        inspect_recovery(reopened.as_ref(), &snapshot(AccessStatus::NotPrimary))
-            .await
-            .unwrap(),
+        inspect_recovery(
+            reopened.as_ref(),
+            &snapshot(AccessStatus::NotPrimary).into(),
+        )
+        .await
+        .unwrap(),
         RecoveryDecision::Reissue(Box::new(effect()))
     );
     let runtime = Arc::new(FakeRuntime {
@@ -5241,7 +5248,7 @@ async fn recovery_reissues_committed_intent_without_reporting_completion() {
     });
     let adapter = RuntimeAdapter::new(reopened.clone(), runtime.clone());
     assert_eq!(
-        recover_pending(&adapter, &snapshot(AccessStatus::NotPrimary))
+        recover_pending(&adapter, &snapshot(AccessStatus::NotPrimary).into())
             .await
             .unwrap(),
         Some(result())
@@ -5272,7 +5279,7 @@ async fn recovery_reobserves_effect_applied_before_completion_persistence() {
         result: result(),
     });
     let adapter = RuntimeAdapter::new(reopened.clone(), runtime.clone());
-    let recovered = recover_pending(&adapter, &snapshot(AccessStatus::NotPrimary))
+    let recovered = recover_pending(&adapter, &snapshot(AccessStatus::NotPrimary).into())
         .await
         .unwrap();
     assert_eq!(recovered, Some(result()));
@@ -5317,7 +5324,7 @@ async fn recovery_refuses_a_runtime_that_did_not_start_write_closed() {
     let path = SqliteStore::metadata_database_path(directory.path());
     let store = SqliteStore::create_authorized(&path, AgentState::new(storage_identity())).unwrap();
     assert!(matches!(
-        inspect_recovery(&store, &snapshot(AccessStatus::Granted)).await,
+        inspect_recovery(&store, &snapshot(AccessStatus::Granted).into()).await,
         Err(AgentError::DurableEffectConflict(_))
     ));
 }
