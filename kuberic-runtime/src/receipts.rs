@@ -1,6 +1,6 @@
 use crate::protocol::types::{
-    AccessStatus, ConfigurationId, Epoch, ReplicaIdentity, SecondaryRemovalPreparation,
-    SecondaryRemovalWitness, SecondaryScaleDownCleanup, SwitchoverRequestId,
+    ConfigurationId, Epoch, ReplicaIdentity, SecondaryRemovalPreparation, SecondaryRemovalWitness,
+    SecondaryScaleDownCleanup, SwitchoverRequestId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,19 +34,6 @@ pub(crate) struct NativeTopologyStatus {
     pub(crate) prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
     pub(crate) accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
     pub(crate) retired_authority: Option<RetiredAuthority>,
-}
-
-/// Native access preparation. The exact value must be supplied back to the
-/// engine for publication.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct AccessPreparation {
-    pub(crate) authority: Option<AdmittedAuthority>,
-    pub(crate) engine_session_id: String,
-    pub(crate) engine_generation: u64,
-    pub(crate) read: AccessStatus,
-    pub(crate) write: AccessStatus,
-    pub(crate) current_progress: i64,
-    pub(crate) committed_lsn: i64,
 }
 
 /// Durable certified-prefix settlement evidence.

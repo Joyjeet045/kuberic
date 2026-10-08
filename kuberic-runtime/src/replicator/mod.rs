@@ -1,3 +1,4 @@
+pub(crate) mod configuration;
 pub(crate) mod copy;
 mod queue;
 pub(crate) mod quorum;
@@ -14,23 +15,23 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::protocol::types::{
-    AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
-    PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
+    AccessStatus, ConfigurationDescriptor, ConfigurationId, Epoch, FaultType, LoadMetric,
+    OperationId, PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
+    SecondaryRemovalWitness, SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
+    SwitchoverRequestId,
 };
-use crate::receipts::{
-    AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
-    NativeTopologyStatus, TopologyReceipt,
-};
+use crate::receipts::{NativeProgressStatus, NativeTopologyStatus};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
 use crate::authority::{
-    AdmittedAuthority, BuildAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
-    ReplicaAuthorityStore, ReplicationProgressStore,
+    BuildAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
+    ReplicaAuthorityStore, ReplicationProgressStore, RetiredAuthority,
 };
-use crate::effects::{RuntimeEffectAction, RuntimeSnapshot};
+use crate::effects::BuildPostcondition;
 use crate::engine::DurableState;
+use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
 #[cfg(all(test, kuberic_workspace_tests))]
 use crate::runtime::PendingWrite;
@@ -82,21 +83,75 @@ pub trait StateReplicator: Send + Sync {
 #[doc(hidden)]
 pub(crate) trait ManagedReplicatorLifecycle: Send + Sync {
     async fn fence_writes(&self) -> Result<()>;
-    async fn settle_primary_prefix(&self) -> Result<CertifiedPrefixReceipt>;
+    async fn settle_primary_prefix(&self) -> Result<ManagedCertifiedPrefixOutcome>;
     async fn cancel_configuration_work(&self) -> Result<()>;
     async fn prepare_access(
         &self,
         read: AccessStatus,
         write: AccessStatus,
-    ) -> Result<AccessPreparation>;
-    async fn publish_access(&self, preparation: AccessPreparation) -> Result<()>;
-    async fn lock_native_fence(&self, expected: &NativeOperationToken)
-    -> Result<ManagedFenceGuard>;
-    async fn native_fence(&self) -> Result<NativeOperationToken>;
+    ) -> Result<ManagedAccessPreparation>;
+    async fn publish_access(&self, preparation: ManagedAccessPreparation) -> Result<()>;
+    async fn lock_native_fence(
+        &self,
+        expected: &ManagedOperationFence,
+    ) -> Result<ManagedFenceGuard>;
+    async fn native_fence(&self) -> Result<ManagedOperationFence>;
     async fn progress_status(&self) -> NativeProgressStatus;
     async fn topology_status(&self) -> NativeTopologyStatus;
-    async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()>;
-    async fn apply_topology(&self, action: RuntimeEffectAction) -> Result<TopologyReceipt>;
+    async fn prepare_replica_configuration(
+        &self,
+        configuration: ManagedReplicaConfiguration,
+        host_generation: u64,
+    ) -> Result<ManagedConfigurationPreparation>;
+    async fn commit_replica_configuration(
+        &self,
+        preparation: ManagedConfigurationPreparation,
+    ) -> Result<()>;
+    async fn synchronize_replica_configuration(&self, host_generation: u64) -> Result<()>;
+    async fn authorize_failover_prefix(
+        &self,
+        boundary: Lsn,
+    ) -> Result<ManagedCertifiedPrefixOutcome>;
+    async fn prepare_switchover(
+        &self,
+        preparation_generation: u64,
+        request_id: SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: ConfigurationId,
+        starting_epoch: Epoch,
+    ) -> Result<ManagedSwitchoverOutcome>;
+    async fn prepare_secondary_removal(
+        &self,
+        intent: SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<ManagedRemovalPreparationOutcome>;
+    async fn observe_secondary_removal_witness(
+        &self,
+        witness: SecondaryRemovalWitness,
+    ) -> Result<ManagedRemovalWitnessOutcome>;
+    async fn observe_secondary_removal_progress(
+        &self,
+        witness: SecondaryRemovalWitness,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<ManagedRemovalProgressOutcome>;
+    async fn accept_secondary_removal_commit(
+        &self,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<ManagedRemovalAcceptanceOutcome>;
+    async fn accept_historical_secondary_removal_commit(
+        &self,
+        command: crate::protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<ManagedHistoricalRemovalAcceptanceOutcome>;
+    async fn fence_retirement(
+        &self,
+        retired: RetiredAuthority,
+    ) -> Result<ManagedRetirementFenceOutcome>;
+    async fn complete_retirement(
+        &self,
+        retired: RetiredAuthority,
+    ) -> Result<ManagedRetirementCompletionOutcome>;
     async fn register_peer_session_proof(
         &self,
         identity: ReplicaIdentity,
@@ -105,8 +160,12 @@ pub(crate) trait ManagedReplicatorLifecycle: Send + Sync {
     async fn admit_build_authority_proof(&self, authority: BuildAuthority) -> Result<()>;
     async fn retire_build_proof(&self, build_id: OperationId) -> Result<()>;
     async fn refresh_progress_proof(&self) -> Result<()>;
-    async fn restore_engine_proof(&self) -> Result<()>;
-    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn restore_engine_proof(
+        &self,
+        configuration: Option<ManagedReplicaConfiguration>,
+        host_generation: u64,
+    ) -> Result<()>;
+    async fn observe_engine(&self) -> ManagedReplicaObservation;
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
     async fn detach_outbound_build_stream(&self, build_id: &OperationId) -> Result<()>;
     async fn complete_open(&self, replication_address: String) -> Result<()>;
@@ -116,6 +175,146 @@ pub(crate) trait ManagedReplicatorLifecycle: Send + Sync {
         primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()>;
     fn abort(&self);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedOperationFence {
+    pub(crate) configuration: Option<ManagedReplicaConfiguration>,
+    pub(crate) engine_session_id: String,
+    pub(crate) engine_generation: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedConfigurationPreparation {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) configuration: ManagedReplicaConfiguration,
+    pub(crate) host_generation: u64,
+    pub(crate) active: Arc<AtomicBool>,
+    pub(crate) native_generation: Arc<AtomicU64>,
+}
+
+impl Drop for ManagedConfigurationPreparation {
+    fn drop(&mut self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.native_generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedAccessPreparation {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) read: AccessStatus,
+    pub(crate) write: AccessStatus,
+    pub(crate) current_progress: Lsn,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedCertifiedPrefixOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) verified_lsn: Lsn,
+    pub(crate) settled_lsn: Lsn,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedSwitchoverOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) preparation_generation: u64,
+    pub(crate) request_id: SwitchoverRequestId,
+    pub(crate) source: ReplicaIdentity,
+    pub(crate) target: ReplicaIdentity,
+    pub(crate) starting_configuration_id: ConfigurationId,
+    pub(crate) starting_epoch: Epoch,
+    pub(crate) handoff_lsn: Lsn,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRemovalPreparationOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) preparation: crate::protocol::types::SecondaryRemovalPreparation,
+    pub(crate) verified_lsn: Option<Lsn>,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRemovalWitnessOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) witness: SecondaryRemovalWitness,
+    pub(crate) verified_lsn: Option<Lsn>,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRemovalProgressOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) witness: SecondaryRemovalWitness,
+    pub(crate) accepted: SecondaryScaleDownCleanup,
+    pub(crate) verified_lsn: Option<Lsn>,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRemovalAcceptanceOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) accepted: SecondaryScaleDownCleanup,
+    pub(crate) verified_lsn: Option<Lsn>,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedHistoricalRemovalAcceptanceOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) accepted: SecondaryScaleDownCleanup,
+    pub(crate) verified_lsn: Option<Lsn>,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRetirementFenceOutcome {
+    pub(crate) engine_session_id: String,
+    pub(crate) engine_generation: u64,
+    pub(crate) retired: RetiredAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRetirementCompletionOutcome {
+    pub(crate) engine_session_id: String,
+    pub(crate) engine_generation: u64,
+    pub(crate) retired: RetiredAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedReplicaObservation {
+    pub(crate) progress: NativeProgressStatus,
+    pub(crate) builds: Vec<BuildPostcondition>,
+    pub(crate) prepared_secondary_removal:
+        Option<crate::protocol::types::SecondaryRemovalPreparation>,
+    pub(crate) accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
+    pub(crate) retired_authority: Option<RetiredAuthority>,
+}
+
+#[async_trait]
+pub(crate) trait ManagedReplicaStore: Send + Sync {
+    async fn load_configuration(&self) -> Result<Option<ManagedReplicaConfiguration>>;
+    async fn load_secondary_removal(
+        &self,
+    ) -> Result<Option<crate::protocol::types::SecondaryRemovalPreparation>>;
+    async fn record_secondary_removal(
+        &self,
+        preparation: &crate::protocol::types::SecondaryRemovalPreparation,
+    ) -> Result<()>;
+    async fn load_secondary_removal_commit(&self) -> Result<Option<SecondaryScaleDownCleanup>>;
+    async fn record_secondary_removal_commit(
+        &self,
+        committed: &SecondaryScaleDownCleanup,
+    ) -> Result<()>;
+    async fn load_retired_authority(&self) -> Result<Option<RetiredAuthority>>;
+    async fn load_retirement_started(&self) -> Result<Option<RetiredAuthority>>;
+    async fn record_retirement_started(&self, authority: &RetiredAuthority) -> Result<()>;
+    async fn retire(&self, authority: &RetiredAuthority) -> Result<()>;
 }
 
 #[doc(hidden)]
@@ -569,6 +768,7 @@ pub(crate) trait PartitionAccessView: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct DefaultReplicatorDependencies {
     pub(crate) replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
+    pub(crate) managed_store: Arc<dyn ManagedReplicaStore>,
     pub(crate) replication_progress_store: Arc<dyn ReplicationProgressStore>,
     pub(crate) local_write_journal: Arc<dyn LocalWriteJournal>,
     pub(crate) build_authority_store: Arc<dyn BuildAuthorityStore>,
@@ -738,7 +938,7 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         })?;
         let engine = DefaultReplicatorInner::new(
             context.identity.clone(),
-            dependencies.replica_authority_store,
+            dependencies.managed_store,
             dependencies.replication_progress_store,
             dependencies.local_write_journal,
             dependencies.build_authority_store,

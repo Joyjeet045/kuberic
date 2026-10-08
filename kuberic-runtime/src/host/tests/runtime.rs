@@ -2851,6 +2851,9 @@ struct MemoryAuthorityStore {
     pause_admit: AtomicBool,
     admit_entered: Notify,
     admit_released: Notify,
+    pause_replication_progress_load: AtomicBool,
+    replication_progress_load_entered: Notify,
+    replication_progress_load_released: Notify,
     fail_build_progress_once: AtomicBool,
     pause_build_progress: AtomicBool,
     build_progress_notify: Notify,
@@ -3045,6 +3048,13 @@ impl ReplicationProgressStore for MemoryAuthorityStore {
         &self,
         fence: &AuthorityFence,
     ) -> ContractResult<Option<ReplicationProgress>> {
+        if self
+            .pause_replication_progress_load
+            .swap(false, Ordering::SeqCst)
+        {
+            self.replication_progress_load_entered.notify_one();
+            self.replication_progress_load_released.notified().await;
+        }
         Ok(self
             .replication_progress
             .lock()
@@ -3518,7 +3528,9 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn settle_primary_prefix(&self) -> Result<crate::receipts::CertifiedPrefixReceipt> {
+    async fn settle_primary_prefix(
+        &self,
+    ) -> Result<crate::replicator::ManagedCertifiedPrefixOutcome> {
         panic!("registration tests do not settle certified prefixes")
     }
 
@@ -3530,22 +3542,25 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         &self,
         _read: AccessStatus,
         _write: AccessStatus,
-    ) -> Result<crate::receipts::AccessPreparation> {
+    ) -> Result<crate::replicator::ManagedAccessPreparation> {
         panic!("registration tests do not prepare access")
     }
 
-    async fn publish_access(&self, _preparation: crate::receipts::AccessPreparation) -> Result<()> {
+    async fn publish_access(
+        &self,
+        _preparation: crate::replicator::ManagedAccessPreparation,
+    ) -> Result<()> {
         panic!("registration tests do not publish access")
     }
 
     async fn lock_native_fence(
         &self,
-        _expected: &crate::receipts::NativeOperationToken,
+        _expected: &crate::replicator::ManagedOperationFence,
     ) -> Result<crate::replicator::ManagedFenceGuard> {
         panic!("registration tests do not lock native fencing")
     }
 
-    async fn native_fence(&self) -> Result<crate::receipts::NativeOperationToken> {
+    async fn native_fence(&self) -> Result<crate::replicator::ManagedOperationFence> {
         panic!("registration tests do not request native fencing")
     }
 
@@ -3557,14 +3572,93 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         panic!("registration tests do not request native topology status")
     }
 
-    async fn admit_authority_proof(&self, _authority: AdmittedAuthority) -> Result<()> {
-        Ok(())
+    async fn prepare_replica_configuration(
+        &self,
+        _configuration: crate::replicator::configuration::ManagedReplicaConfiguration,
+        _host_generation: u64,
+    ) -> Result<crate::replicator::ManagedConfigurationPreparation> {
+        panic!("registration tests do not prepare configuration")
     }
 
-    async fn apply_topology(
+    async fn commit_replica_configuration(
         &self,
-        _action: RuntimeEffectAction,
-    ) -> Result<crate::receipts::TopologyReceipt> {
+        _preparation: crate::replicator::ManagedConfigurationPreparation,
+    ) -> Result<()> {
+        panic!("registration tests do not commit configuration")
+    }
+
+    async fn synchronize_replica_configuration(&self, _host_generation: u64) -> Result<()> {
+        panic!("registration tests do not synchronize configuration")
+    }
+
+    async fn authorize_failover_prefix(
+        &self,
+        _boundary: i64,
+    ) -> Result<crate::replicator::ManagedCertifiedPrefixOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn prepare_switchover(
+        &self,
+        _preparation_generation: u64,
+        _request_id: crate::protocol::types::SwitchoverRequestId,
+        _source: ReplicaIdentity,
+        _target: ReplicaIdentity,
+        _starting_configuration_id: crate::protocol::types::ConfigurationId,
+        _starting_epoch: Epoch,
+    ) -> Result<crate::replicator::ManagedSwitchoverOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn prepare_secondary_removal(
+        &self,
+        _intent: crate::protocol::types::SecondaryScaleDownIntent,
+        _process_session_id: ProcessSessionId,
+        _report_sequence: u64,
+    ) -> Result<crate::replicator::ManagedRemovalPreparationOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn observe_secondary_removal_witness(
+        &self,
+        _witness: crate::protocol::types::SecondaryRemovalWitness,
+    ) -> Result<crate::replicator::ManagedRemovalWitnessOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn observe_secondary_removal_progress(
+        &self,
+        _witness: crate::protocol::types::SecondaryRemovalWitness,
+        _committed: crate::protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<crate::replicator::ManagedRemovalProgressOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn accept_secondary_removal_commit(
+        &self,
+        _committed: crate::protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<crate::replicator::ManagedRemovalAcceptanceOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn accept_historical_secondary_removal_commit(
+        &self,
+        _command: crate::protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<crate::replicator::ManagedHistoricalRemovalAcceptanceOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn fence_retirement(
+        &self,
+        _retired: crate::authority::RetiredAuthority,
+    ) -> Result<crate::replicator::ManagedRetirementFenceOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn complete_retirement(
+        &self,
+        _retired: crate::authority::RetiredAuthority,
+    ) -> Result<crate::replicator::ManagedRetirementCompletionOutcome> {
         panic!("registration tests do not apply native topology")
     }
 
@@ -3588,11 +3682,15 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn restore_engine_proof(&self) -> Result<()> {
+    async fn restore_engine_proof(
+        &self,
+        _configuration: Option<crate::replicator::configuration::ManagedReplicaConfiguration>,
+        _host_generation: u64,
+    ) -> Result<()> {
         Ok(())
     }
 
-    async fn snapshot(&self) -> crate::effects::RuntimeSnapshot {
+    async fn observe_engine(&self) -> crate::replicator::ManagedReplicaObservation {
         panic!("registration tests do not request snapshots")
     }
 
@@ -12665,6 +12763,234 @@ async fn explicit_abort_stops_replicator_before_application() {
 }
 
 #[tokio::test]
+async fn public_configuration_callback_cannot_regress_replicator_epoch() {
+    let local = identity(1, "public-epoch-primary");
+    let peer = identity(2, "public-epoch-peer");
+    let admitted = authority(local.clone(), vec![local, peer]);
+    let runtime = open_primary(
+        Arc::new(TestApplication::default()),
+        admitted
+            .current_configuration
+            .members
+            .iter()
+            .map(|member| member.identity.clone())
+            .collect(),
+    )
+    .await;
+    let primary = runtime.primary_replicator().await.unwrap();
+    primary.update_epoch(Epoch::new(0, 2)).await.unwrap();
+    assert!(matches!(
+        primary
+            .update_current_replica_set_configuration(admitted.current_configuration.clone().into())
+            .await,
+        Err(RuntimeError::AuthorityMismatch(_))
+    ));
+}
+
+#[tokio::test]
+async fn invalid_durable_authority_is_rejected_before_native_projection() {
+    let local = identity(1, "invalid-authority-local");
+    let peer = identity(2, "invalid-authority-peer");
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = PodRuntime::new(
+        local.clone(),
+        Arc::new(TestApplication::default()),
+        store.clone(),
+    );
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    let invalid = AdmittedAuthority {
+        local_identity: local,
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            ReplicaId::new(99),
+            vec![ConfigurationMember {
+                identity: peer,
+                role: ReplicaRole::ActiveSecondary,
+            }],
+            1,
+        ),
+        switchover_handoff: None,
+        secondary_removal: None,
+        scale_up: None,
+    };
+    assert!(matches!(
+        runtime
+            .apply_effect(effect(
+                2,
+                RuntimeEffectAction::AdmitAuthority(Box::new(invalid))
+            ))
+            .await,
+        Err(RuntimeError::AuthorityMismatch(_))
+    ));
+    assert!(store.load().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn same_primary_failover_copy_uses_explicit_failover_build_policy() {
+    let primary = identity(1, "same-primary-failover-source");
+    let target = identity(2, "same-primary-failover-target");
+    let members = vec![
+        ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        },
+        ConfigurationMember {
+            identity: target.clone(),
+            role: ReplicaRole::ActiveSecondary,
+        },
+    ];
+    let previous =
+        ConfigurationDescriptor::new(Epoch::new(0, 1), primary.replica_id, members.clone(), 2);
+    let current = ConfigurationDescriptor::new(Epoch::new(0, 2), primary.replica_id, members, 2);
+    let admitted = AdmittedAuthority {
+        local_identity: primary.clone(),
+        transition_kind: Some(TransitionKind::Failover),
+        previous_configuration: Some(previous),
+        current_configuration: current,
+        switchover_handoff: None,
+        secondary_removal: None,
+        scale_up: None,
+    };
+    admitted.validate().unwrap();
+    let application = Arc::new(TestApplication::default());
+    application.seed_progress(1);
+    let runtime = PodRuntime::new(
+        primary,
+        application,
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    for (sequence, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted)),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(sequence as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let prepared = prepare_copy_authorized(
+        &runtime,
+        PrepareCopyRequest {
+            build_id: OperationId::new("same-primary-failover-build"),
+            target,
+            configuration: BuildConfiguration::Current,
+            copy_context: empty_copy_context(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.authority.kind, BuildAuthorityKind::Failover);
+}
+
+#[tokio::test]
+async fn queued_ack_cannot_cross_a_prepared_configuration_cut() {
+    let local = identity(1, "queued-ack-primary");
+    let peer = identity(2, "queued-ack-peer");
+    let third = identity(3, "queued-ack-third");
+    let peer_session = ProcessSessionId::new("queued-ack-peer-session");
+    let admitted = authority(local.clone(), vec![local.clone(), peer.clone(), third]);
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(TestApplication::default()),
+        store.clone(),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("queued-ack-resource"),
+            ProcessSessionId::new("queued-ack-local-session"),
+        )
+        .unwrap();
+    for (sequence, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        RuntimeEffectAction::RegisterPeerSession {
+            identity: peer.clone(),
+            session: peer_session.clone(),
+        },
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(sequence as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let pending = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("queued-ack-write"),
+            data: Bytes::from_static(b"queued"),
+        })
+        .await
+        .unwrap();
+    let next = AdmittedAuthority {
+        transition_kind: Some(TransitionKind::Failover),
+        previous_configuration: Some(admitted.current_configuration.clone()),
+        current_configuration: ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            admitted.current_configuration.primary_id,
+            admitted.current_configuration.members.clone(),
+            admitted.current_configuration.write_quorum,
+        ),
+        ..admitted.clone()
+    };
+    next.validate().unwrap();
+    store
+        .pause_replication_progress_load
+        .store(true, Ordering::SeqCst);
+    store.pause_admit.store(true, Ordering::SeqCst);
+    let admission = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    6,
+                    RuntimeEffectAction::AdmitAuthority(Box::new(next)),
+                ))
+                .await
+        })
+    };
+    store.replication_progress_load_entered.notified().await;
+    let queued_ack = {
+        let runtime = runtime.clone();
+        let mut acknowledgement = acknowledgement(&admitted, peer, 1);
+        acknowledgement.receiver_session_id = peer_session.to_string();
+        tokio::spawn(async move {
+            runtime
+                .peer_discovery_runtime()
+                .accept_acknowledgement(acknowledgement)
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    store.replication_progress_load_released.notify_one();
+    store.admit_entered.notified().await;
+    assert!(matches!(
+        queued_ack.await.unwrap(),
+        Err(RuntimeError::ReconfigurationPending)
+    ));
+    assert!(!matches!(
+        timeout(Duration::from_millis(50), pending.committed()).await,
+        Ok(Ok(_))
+    ));
+    store.admit_released.notify_one();
+    admission.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn ambiguous_primary_authority_admission_fences_pending_writes_and_old_acks() {
     let local = identity(1, "primary");
     let secondary = identity(2, "secondary");
@@ -12726,6 +13052,109 @@ async fn ambiguous_primary_authority_admission_fences_pending_writes_and_old_ack
     let snapshot = runtime.snapshot().await;
     assert_eq!(snapshot.committed_lsn, 0);
     assert_eq!(snapshot.write_status, AccessStatus::ReconfigurationPending);
+}
+
+#[tokio::test]
+async fn failed_managed_authority_persistence_invalidates_preparation_and_allows_exact_retry() {
+    let local = identity(1, "managed-persist-retry-primary");
+    let secondary = identity(2, "managed-persist-retry-secondary");
+    let admitted = authority(local.clone(), vec![local.clone(), secondary]);
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = PodRuntime::new(local, Arc::new(TestApplication::default()), store.clone());
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let next = AdmittedAuthority {
+        current_configuration: ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            admitted.current_configuration.primary_id,
+            admitted.current_configuration.members.clone(),
+            admitted.current_configuration.write_quorum,
+        ),
+        ..admitted.clone()
+    };
+    let admission = effect(
+        5,
+        RuntimeEffectAction::AdmitAuthority(Box::new(next.clone())),
+    );
+    store.fail_before_admit.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        runtime.apply_effect(admission.clone()).await,
+        Err(RuntimeError::Application(_))
+    ));
+    assert_eq!(store.load().await.unwrap(), Some(admitted));
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+
+    runtime.apply_effect(admission).await.unwrap();
+    assert_eq!(store.load().await.unwrap(), Some(next));
+}
+
+#[tokio::test]
+async fn cancelled_post_commit_managed_admission_replays_before_common_publication() {
+    let local = identity(1, "post-commit-retry-primary");
+    let secondary = identity(2, "post-commit-retry-secondary");
+    let admitted = authority(local.clone(), vec![local.clone(), secondary]);
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local,
+        Arc::new(TestApplication::default()),
+        store.clone(),
+    ));
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let next = AdmittedAuthority {
+        current_configuration: ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            admitted.current_configuration.primary_id,
+            admitted.current_configuration.members.clone(),
+            admitted.current_configuration.write_quorum,
+        ),
+        ..admitted.clone()
+    };
+    let effect = effect(
+        5,
+        RuntimeEffectAction::AdmitAuthority(Box::new(next.clone())),
+    );
+    let gate = runtime.testing_pause_managed_configuration_commit();
+    let task = {
+        let runtime = runtime.clone();
+        let effect = effect.clone();
+        tokio::spawn(async move { runtime.apply_effect(effect).await })
+    };
+    gate.entered.notified().await;
+    assert_eq!(store.load().await.unwrap(), Some(next.clone()));
+    assert_eq!(runtime.snapshot().await.authority, Some(admitted));
+    task.abort();
+    let _ = task.await;
+
+    runtime.apply_effect(effect).await.unwrap();
+    assert_eq!(runtime.snapshot().await.authority, Some(next));
 }
 
 #[tokio::test]

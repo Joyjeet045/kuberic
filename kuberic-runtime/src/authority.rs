@@ -18,7 +18,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ContractError, ContractResult as Result};
-use crate::transport::{CopyItem, ReplicationAck, ReplicationItem};
+use crate::transport::{CopyItem, ReplicationItem};
 
 pub(crate) fn validate_build_envelope(
     authority: &BuildAuthority,
@@ -384,16 +384,6 @@ impl AdmittedAuthority {
             envelope.epoch,
             envelope.previous_configuration_id.as_ref(),
             &envelope.current_configuration_id,
-        )
-    }
-
-    pub(crate) fn validate_acknowledgement(&self, acknowledgement: &ReplicationAck) -> Result<()> {
-        self.validate_fence(
-            &acknowledgement.sender,
-            &acknowledgement.receiver,
-            acknowledgement.epoch,
-            acknowledgement.previous_configuration_id.as_ref(),
-            &acknowledgement.current_configuration_id,
         )
     }
 

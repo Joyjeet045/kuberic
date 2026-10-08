@@ -57,10 +57,26 @@ recovery receive opaque narrow views rather than a universal lifecycle facade.
 The split changes reachability, not synchronization: authority, sessions,
 generations, cleanup claims and the outbound queue remain shared.
 
-There is no all-capability supertrait, generic lifecycle action hook, backend
-enum, or getter that reconstructs the complete owner. Managed and custom
-implementations continue to use explicit common routing and their distinct
-proof mechanisms.
+The managed capability exposes explicit replication operations for executable
+configuration, peer sessions, build proof, progress refresh, acknowledgement,
+access, certified-prefix settlement, switchover, every secondary-removal stage
+and retirement. Each removal and retirement stage has a distinct outcome type
+containing only that stage's evidence. There is no all-capability supertrait,
+generic lifecycle action hook,
+backend operation enum, compatibility dispatcher or getter that reconstructs
+the complete owner. Application role, replicator role and epoch remain separate
+application/public operations; access retains its private prepare/publish/
+decision protocol.
+
+Durable `AdmittedAuthority` is host-owned. Before managed admission, the host
+derives `ManagedReplicaConfiguration`, which contains only executable current/
+previous configuration and replication-required handoff, removal and scale-up
+evidence plus explicit executable build policy. The engine, replication log
+and quorum tracker do not import
+controller effects, transition kinds, durable authority or broad runtime
+snapshots. A narrow managed store view projects the already-durable
+configuration and exposes only replication-specific removal and retirement
+persistence.
 
 ## Native topology receipts
 
@@ -70,9 +86,12 @@ retirement. `TopologyReceipt` stores those canonical payloads directly in an
 effect result. There is no catch-up/build/removal receipt layer and no generic
 operation-evidence wrapper duplicating the same payload.
 
-The host revalidates topology receipts against the durable intent and current
-authority. Standard-operation staleness is validated from host admission plus
-the native topology fence captured around the public call.
+The engine returns transient operation-specific outcomes fenced by executable
+configuration, engine session and engine generation. The host binds the outcome
+to the exact captured durable authority, reconstructs the existing durable
+receipt/token shape and revalidates it against the intent. Standard-operation
+staleness is validated from host admission plus the typed native fence captured
+around the public call.
 
 ## Access publication
 
@@ -105,9 +124,10 @@ writes and clears an unaccepted projection. Rollback is generation-scoped, so
 it cannot revoke a newer accepted grant. Final effect acceptance is serialized
 with projection invalidation. Common ownership validates authority,
 configuration, peer sessions, role, and access generations. The built-in engine
-also validates its native session, generation, progress, and fence. Independent
-custom implementations instead complete their public progress/revocation
-callback contract; they do not acquire managed-native receipts.
+also validates its executable configuration, native session, generation,
+progress, and fence. An access preparation contains no durable authority.
+Independent custom implementations instead complete their public progress/
+revocation callback contract; they do not acquire managed-native receipts.
 
 ## Custom authority admission
 
@@ -167,10 +187,21 @@ substituting a proposal or promising universal recovery liveness. Dropping an
 entered callback/store future leaves its recorded pending intent; a returned
 cancellation may instead cancel that intent under the existing adapter rules.
 
-Managed built-in admission retains its distinct durable-authority-before-
-configuration order, exact durable configuration check, same-primary continuity
-and existing recovery sequence. The custom containment policy does not weaken
-or reorder that managed path.
+Managed built-in admission uses an explicit prepared boundary. The engine first
+validates the executable candidate, replication progress, handoff/build proof
+and log epoch, then advances its native generation and returns one owned
+preparation. The host persists the exact durable authority, the engine consumes
+that exact preparation through prevalidated, non-fallible log/quorum mutation,
+then completes the remaining fallible public configuration callbacks under the
+existing exact-effect recovery contract. The host publishes common
+configuration and the engine synchronizes the final host generation. Dropping a
+preparation synchronously invalidates it and advances the native generation. A
+before-write
+store failure leaves the old durable authority and permits exact retry; an
+ambiguous post-write failure remains write-closed and leaves the durable
+candidate for recovery. Same-primary continuity preserves the access projection
+while generation fencing rejects obsolete completion. The custom containment
+policy does not weaken, replace or reorder this managed-only protocol.
 
 ## Persistence, reporting, and recovery
 
@@ -181,8 +212,10 @@ JSON fields remain backward-readable through serde defaults; this refactor does
 not introduce a database schema migration.
 
 Reporting uses an opaque reconciliatory view rather than the complete hosting
-runtime. It composes durable agent authority with current public/native
-observations and can retry deferred access restoration. It preserves
+runtime. The engine returns `ManagedReplicaObservation`, containing only
+progress, build, removal and retirement facts; the host composes durable
+authority, role, access and the existing runtime snapshot/postcondition. It can
+retry deferred access restoration and preserves
 `live_builds_only`, so old-session build evidence is not resurrected. Catch-up
 composition retains an accepted boundary only while the native engine still
 reports catch-up complete.
@@ -194,6 +227,9 @@ and later regrants require fresh explicit access effects.
 Recovery reconstructs authority and native stores, reissues or reobserves
 pending effects, and keeps access closed until public/native proof is accepted.
 A previously persisted granted snapshot is never sufficient to reopen writes.
+Managed recovery validates and loads the full durable authority in the host,
+derives executable configuration and reuses the same prepare/commit protocol
+before common restoration or access publication.
 
 ## Compatibility
 
@@ -219,7 +255,7 @@ cargo test -p kuberic-runtime --test public_api_inventory
 cargo test -p kuberic-runtime --test lifecycle_capability_boundaries
 scripts/check_runtime_public_api.sh
 cargo nextest run --profile ordinary -p kuberic-runtime --features testing --lib \
-  -E 'test(/^host::tests::(runtime|store|coordinator|crash_boundaries)::/)'
+  -E 'test(/^host::tests::(runtime|store|coordinator|recovery|crash_boundaries)::/)'
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 

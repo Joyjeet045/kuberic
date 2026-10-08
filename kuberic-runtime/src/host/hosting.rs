@@ -12,7 +12,7 @@ use crate::application::{OpenContext, OpenMode, StateProvider, StatefulServiceRe
 use crate::authority::{
     AdmittedAuthority, AuthorityStore, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
     BuildProgressStore, LocalWriteJournal, LocalWritePhase, ReplicaAuthorityStore,
-    ReplicationProgressStore,
+    ReplicationProgressStore, RetiredAuthority,
 };
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::control::proto;
@@ -24,13 +24,15 @@ use crate::protocol::types::{
     AccessStatus, Epoch, FaultType, LoadMetric, OperationId, PartitionId, PartitionInformation,
     ReplicaIdentity, ReplicaRole,
 };
+use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::copy::{
     BuildConfiguration, PrepareCopyRequest, PreparedCopy as RuntimePreparedCopy,
 };
 use crate::replicator::{
-    DefaultReplicatorDependencies, ManagedReplicatorDataPlane, PartitionAccessView,
-    PrimaryReplicator, Replicator, ReplicatorAttachment, ReplicatorCreationReservation,
-    ReplicatorFactoryContext, ReplicatorRegistration, StatefulServicePartition,
+    DefaultReplicatorDependencies, ManagedReplicaStore, ManagedReplicatorDataPlane,
+    PartitionAccessView, PrimaryReplicator, Replicator, ReplicatorAttachment,
+    ReplicatorCreationReservation, ReplicatorFactoryContext, ReplicatorRegistration,
+    StatefulServicePartition,
 };
 use crate::runtime::PendingReplication as RuntimePendingReplication;
 #[cfg(all(test, kuberic_workspace_tests))]
@@ -44,6 +46,102 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 tokio::task_local! {
     static ACCESS_PROOF_VIEW: (AccessStatus, AccessStatus);
     static ACCESS_PUBLICATION_DEADLINE: tokio::time::Instant;
+}
+
+struct ManagedReplicaStoreView {
+    inner: Arc<dyn ReplicaAuthorityStore>,
+}
+
+fn managed_configuration(authority: AdmittedAuthority) -> ManagedReplicaConfiguration {
+    ManagedReplicaConfiguration {
+        local_identity: authority.local_identity,
+        previous_configuration: authority.previous_configuration,
+        current_configuration: authority.current_configuration,
+        switchover_handoff: authority.switchover_handoff,
+        secondary_removal: authority.secondary_removal,
+        scale_up: authority.scale_up,
+        build_kind: if authority.transition_kind
+            == Some(crate::protocol::types::TransitionKind::Failover)
+        {
+            BuildAuthorityKind::Failover
+        } else {
+            BuildAuthorityKind::Provisioning
+        },
+    }
+}
+
+#[async_trait]
+impl ManagedReplicaStore for ManagedReplicaStoreView {
+    async fn load_configuration(&self) -> Result<Option<ManagedReplicaConfiguration>> {
+        let Some(authority) = self.inner.load().await? else {
+            return Ok(None);
+        };
+        authority.validate()?;
+        Ok(Some(managed_configuration(authority)))
+    }
+
+    async fn load_secondary_removal(
+        &self,
+    ) -> Result<Option<crate::protocol::types::SecondaryRemovalPreparation>> {
+        self.inner
+            .load_secondary_removal()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_secondary_removal(
+        &self,
+        preparation: &crate::protocol::types::SecondaryRemovalPreparation,
+    ) -> Result<()> {
+        self.inner
+            .record_secondary_removal(preparation)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn load_secondary_removal_commit(
+        &self,
+    ) -> Result<Option<crate::protocol::types::SecondaryScaleDownCleanup>> {
+        self.inner
+            .load_secondary_removal_commit()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_secondary_removal_commit(
+        &self,
+        committed: &crate::protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.inner
+            .record_secondary_removal_commit(committed)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn load_retired_authority(&self) -> Result<Option<RetiredAuthority>> {
+        self.inner
+            .load_retired_authority()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn load_retirement_started(&self) -> Result<Option<RetiredAuthority>> {
+        self.inner
+            .load_retirement_started()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_retirement_started(&self, authority: &RetiredAuthority) -> Result<()> {
+        self.inner
+            .record_retirement_started(authority)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn retire(&self, authority: &RetiredAuthority) -> Result<()> {
+        self.inner.retire(authority).await.map_err(Into::into)
+    }
 }
 
 fn access_publication_deadline() -> Option<tokio::time::Instant> {
@@ -745,6 +843,9 @@ impl PodRuntime {
     {
         let application: Arc<dyn StatefulServiceReplica> = application;
         let replica_authority_store: Arc<dyn ReplicaAuthorityStore> = authority_store.clone();
+        let managed_store: Arc<dyn ManagedReplicaStore> = Arc::new(ManagedReplicaStoreView {
+            inner: replica_authority_store.clone(),
+        });
         let replication_progress_store: Arc<dyn ReplicationProgressStore> = authority_store.clone();
         let local_write_journal: Arc<dyn LocalWriteJournal> = authority_store.clone();
         let build_authority_store: Arc<dyn BuildAuthorityStore> = authority_store.clone();
@@ -756,6 +857,7 @@ impl PodRuntime {
                 application: application.clone(),
                 default_dependencies: DefaultReplicatorDependencies {
                     replica_authority_store,
+                    managed_store,
                     replication_progress_store,
                     local_write_journal,
                     build_authority_store,
@@ -782,6 +884,8 @@ impl PodRuntime {
                 access_effect_acceptance_gate: StdMutex::new(None),
                 #[cfg(all(test, feature = "testing"))]
                 peer_discovery_ready_gate: StdMutex::new(None),
+                #[cfg(all(test, feature = "testing"))]
+                managed_configuration_commit_gate: StdMutex::new(None),
             }),
         }
     }
@@ -827,6 +931,16 @@ impl PodRuntime {
             release: Arc::new(tokio::sync::Notify::new()),
         };
         *self.host.peer_discovery_ready_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn testing_pause_managed_configuration_commit(&self) -> AccessEffectAcceptanceGate {
+        let gate = AccessEffectAcceptanceGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.host.managed_configuration_commit_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
 
@@ -1434,6 +1548,8 @@ struct RuntimeHost {
     access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
     #[cfg(all(test, feature = "testing"))]
     peer_discovery_ready_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+    #[cfg(all(test, feature = "testing"))]
+    managed_configuration_commit_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
 }
 
 impl RuntimeHost {

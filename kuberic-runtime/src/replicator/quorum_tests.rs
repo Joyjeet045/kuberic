@@ -1,11 +1,28 @@
 use super::QuorumTracker;
-use crate::authority::AdmittedAuthority;
+use crate::authority::{AdmittedAuthority, BuildAuthorityKind};
 use crate::protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, TransitionKind,
 };
 use crate::removal_fixture;
+use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::transport::ReplicationAck;
+
+fn managed(authority: AdmittedAuthority) -> ManagedReplicaConfiguration {
+    ManagedReplicaConfiguration {
+        local_identity: authority.local_identity,
+        previous_configuration: authority.previous_configuration,
+        current_configuration: authority.current_configuration,
+        switchover_handoff: authority.switchover_handoff,
+        secondary_removal: authority.secondary_removal,
+        scale_up: authority.scale_up,
+        build_kind: if authority.transition_kind == Some(TransitionKind::Failover) {
+            BuildAuthorityKind::Failover
+        } else {
+            BuildAuthorityKind::Provisioning
+        },
+    }
+}
 
 fn removal_authority(size: i64, current_only: bool) -> AdmittedAuthority {
     let intent = removal_fixture::intent(&(1..=size).collect::<Vec<_>>(), 1);
@@ -33,7 +50,7 @@ fn reduction_quorums_require_session_bound_verified_cc_progress_not_raw_acks() {
             .intent
             .clone();
         let mut tracker = QuorumTracker::default();
-        tracker.configure(authority.clone(), 100).unwrap();
+        tracker.configure(managed(authority.clone()), 100).unwrap();
         assert_eq!(tracker.catch_up_boundary(), Some(10));
         assert!(
             !tracker.catch_up_complete(),
@@ -100,7 +117,7 @@ fn reduction_quorums_require_session_bound_verified_cc_progress_not_raw_acks() {
             );
         }
         tracker
-            .configure(removal_authority(size, true), 100)
+            .configure(managed(removal_authority(size, true)), 100)
             .unwrap();
         assert!(
             !tracker.catch_up_complete(),
@@ -121,7 +138,7 @@ async fn reduction_evidence_never_relaxes_general_dual_write_quorum_commit() {
     for size in [2, 4] {
         let authority = removal_authority(size, false);
         let mut tracker = QuorumTracker::default();
-        tracker.configure(authority.clone(), 10).unwrap();
+        tracker.configure(managed(authority.clone()), 10).unwrap();
         let completion = tracker.register_write(11).unwrap();
         tracker.record_local_progress(11).unwrap();
         for member in authority
@@ -274,7 +291,7 @@ async fn session_change_invalidates_ordinary_client_quorum_credit_and_stale_acks
     authority.secondary_removal = None;
     let peer = authority.current_configuration.members[1].identity.clone();
     let mut tracker = QuorumTracker::default();
-    tracker.configure(authority.clone(), 10).unwrap();
+    tracker.configure(managed(authority.clone()), 10).unwrap();
     tracker
         .register_peer_session(peer.clone(), ProcessSessionId::new("old"))
         .unwrap();
@@ -373,7 +390,7 @@ async fn two_incarnations_of_one_replica_receive_distinct_quorum_credit() {
         switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
-    tracker.configure(authority.clone(), 0).unwrap();
+    tracker.configure(managed(authority.clone()), 0).unwrap();
     tracker.record_local_progress(1).unwrap();
     let mut completion = tracker.register_write(1).unwrap();
 
@@ -416,7 +433,7 @@ async fn stale_authority_ack_cannot_advance_progress_or_commit() {
         switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
-    tracker.configure(authority.clone(), 0).unwrap();
+    tracker.configure(managed(authority.clone()), 0).unwrap();
     tracker.record_local_progress(1).unwrap();
     let mut completion = tracker.register_write(1).unwrap();
 
@@ -479,11 +496,11 @@ async fn authority_change_fails_pending_writes_instead_of_rebinding_them() {
         switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
-    tracker.configure(initial, 0).unwrap();
+    tracker.configure(managed(initial), 0).unwrap();
     tracker.record_local_progress(1).unwrap();
     let completion = tracker.register_write(1).unwrap();
 
-    tracker.configure(advanced, 1).unwrap();
+    tracker.configure(managed(advanced), 1).unwrap();
     assert!(completion.await.unwrap().is_err());
     assert_eq!(tracker.committed_lsn(), 0);
 }
@@ -533,13 +550,13 @@ fn authority_change_discards_remote_acknowledgement_credit() {
         switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
-    tracker.configure(initial.clone(), 10).unwrap();
+    tracker.configure(managed(initial.clone()), 10).unwrap();
     tracker
         .acknowledge(&acknowledgement(&initial, secondary, 10))
         .unwrap();
     assert_eq!(tracker.current_configuration_quorum_progress(), 10);
 
-    tracker.configure(advanced, 10).unwrap();
+    tracker.configure(managed(advanced), 10).unwrap();
     assert_eq!(tracker.current_configuration_quorum_progress(), 0);
     assert!(!tracker.catch_up_complete());
 }
@@ -580,7 +597,7 @@ fn catch_up_requires_recorded_cc_boundary() {
         switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
-    tracker.configure(authority.clone(), 10).unwrap();
+    tracker.configure(managed(authority.clone()), 10).unwrap();
     assert_eq!(tracker.catch_up_boundary(), Some(10));
     assert!(!tracker.catch_up_complete());
 
@@ -629,7 +646,7 @@ fn catch_up_requires_each_derived_must_catch_up_member() {
         switchover_handoff: None,
     };
     let mut tracker = QuorumTracker::default();
-    tracker.configure(authority.clone(), 5).unwrap();
+    tracker.configure(managed(authority.clone()), 5).unwrap();
     tracker
         .acknowledge(&acknowledgement(&authority, old_primary, 10))
         .unwrap();
