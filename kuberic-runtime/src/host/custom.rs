@@ -1837,10 +1837,12 @@ impl CustomReplicatorHost {
     }
 
     pub(super) async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()> {
-        self.apply_common_action(RuntimeEffectAction::RegisterPeerSession {
-            identity: replica.identity.clone(),
-            session: replica.process_session_id.clone(),
-        })
+        let host = self.host()?;
+        let _restoration = host.custom_authority.restoration().await;
+        self.register_common_peer_under_restoration(
+            replica.identity.clone(),
+            replica.process_session_id.clone(),
+        )
         .await?;
         {
             let _gate = self.gate.lock().await;
@@ -3859,6 +3861,17 @@ impl CustomReplicatorHost {
     }
 
     async fn register_common_peer(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        let host = self.host()?;
+        let _restoration = host.custom_authority.restoration().await;
+        self.register_common_peer_under_restoration(identity, session)
+            .await
+    }
+
+    async fn register_common_peer_under_restoration(
         &self,
         identity: ReplicaIdentity,
         session: ProcessSessionId,

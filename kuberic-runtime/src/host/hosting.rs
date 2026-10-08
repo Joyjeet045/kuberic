@@ -1285,6 +1285,11 @@ impl PodRuntime {
                 .sync_access_projection(recovery.observation().await)
                 .await;
         }
+        let _restoration = if !BuildHost::is_managed(self.host.as_ref()) {
+            Some(self.host.custom_authority.restoration().await)
+        } else {
+            None
+        };
         if let Some((target_role, epoch_completed, application_completed)) = transition {
             self.host.change_replicator_role(target_role).await?;
             if target_role == ReplicaRole::Primary && epoch_completed {

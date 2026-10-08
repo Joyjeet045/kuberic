@@ -999,11 +999,15 @@ where
                     }
                     let session = report.process_session_id.clone();
                     if runtime_authority.is_some()
-                        && runtime
+                        && let Err(error) = runtime
                             .register_peer_session(member.identity.clone(), session.clone())
                             .await
-                            .is_err()
                     {
+                        tracing::debug!(
+                            peer = ?member.identity,
+                            %error,
+                            "peer session registration deferred"
+                        );
                         continue;
                     }
                     sessions

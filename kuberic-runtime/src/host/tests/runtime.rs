@@ -5224,6 +5224,148 @@ async fn custom_authority_serializes_preaccepted_durable_and_deferred_restoratio
 }
 
 #[tokio::test]
+async fn pending_custom_authority_replay_releases_session_registration_ownership() {
+    let directory = crate::host::tests::tempdir().unwrap();
+    let local = identity(1, "pending-custom-authority-replay");
+    let store = fresh_disk_store(directory.path(), local.clone());
+    let original = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(Arc::new(CustomRoleGate::default()))),
+        store.clone(),
+    ));
+    original
+        .bind_replica_session(
+            ResourceUid::new("pending-custom-authority-replay"),
+            ProcessSessionId::new("original-session"),
+        )
+        .unwrap();
+    RuntimeAdapter::new(store.clone(), original.clone())
+        .execute(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    let admitted = authority(local.clone(), vec![local.clone()]);
+    let pending = effect(
+        2,
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+    );
+    store.begin_effect(&pending).await.unwrap();
+    original.abort();
+    drop(original);
+
+    let recovered = Arc::new(PodRuntime::new(
+        local,
+        Arc::new(CustomRoleService(Arc::new(CustomRoleGate::default()))),
+        store.clone(),
+    ));
+    let agent =
+        AgentService::new(store.clone(), recovered.clone(), recovered.clone(), "token").unwrap();
+    timeout(Duration::from_secs(2), agent.reconstruct_runtime())
+        .await
+        .expect("pending authority replay reacquired session registration")
+        .unwrap();
+    let state = store.load_state().await.unwrap();
+    assert!(state.pending_effect.is_none());
+    assert_eq!(recovered.snapshot().await.authority, Some(admitted));
+}
+
+#[tokio::test]
+async fn peer_session_replacement_waits_for_startup_authority_restoration() {
+    let directory = crate::host::tests::tempdir().unwrap();
+    let local = identity(1, "startup-restoration-primary");
+    let peer = identity(2, "startup-restoration-peer");
+    let store = fresh_disk_store(directory.path(), local.clone());
+    let original = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(Arc::new(CustomRoleGate::default()))),
+        store.clone(),
+    ));
+    original
+        .bind_replica_session(
+            ResourceUid::new("startup-restoration"),
+            ProcessSessionId::new("original-session"),
+        )
+        .unwrap();
+    let adapter = RuntimeAdapter::new(store.clone(), original.clone());
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::New),
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority(
+            local.clone(),
+            vec![local.clone(), peer.clone()],
+        ))),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        adapter
+            .execute(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    original.abort();
+    drop(adapter);
+    drop(original);
+
+    let control = Arc::new(CustomRoleGate::default());
+    control.block_configuration.store(true, Ordering::SeqCst);
+    let recovered = Arc::new(PodRuntime::new(
+        local,
+        Arc::new(CustomRoleService(control.clone())),
+        store.clone(),
+    ));
+    let agent = AgentService::new(store, recovered.clone(), recovered.clone(), "token").unwrap();
+    let reconstruction = tokio::spawn(async move { agent.reconstruct_runtime().await });
+    timeout(
+        Duration::from_secs(1),
+        control.configuration_entered.notified(),
+    )
+    .await
+    .unwrap();
+
+    let replacement = {
+        let recovered = recovered.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            crate::host::testing::register_lifecycle_peer_session(
+                &recovered,
+                peer,
+                ProcessSessionId::new("replacement-session"),
+            )
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !replacement.is_finished(),
+        "peer session crossed startup authority restoration"
+    );
+
+    control.configuration_released.notify_waiters();
+    timeout(Duration::from_secs(2), reconstruction)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(2), replacement)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let configurations = control.configurations.lock().unwrap();
+    let peer_description = configurations
+        .last()
+        .unwrap()
+        .replicas
+        .iter()
+        .find(|replica| replica.identity == peer)
+        .unwrap();
+    assert_eq!(
+        peer_description.process_session_id,
+        ProcessSessionId::new("replacement-session")
+    );
+}
+
+#[tokio::test]
 async fn custom_authority_waits_for_owned_incidental_configuration_even_if_caller_drops() {
     for dropped in [false, true] {
         let (runtime, control, local, peer) =
@@ -6738,10 +6880,10 @@ async fn exercise_blocked_lifecycle_invalidation(
             LifecycleInvalidation::Authority | LifecycleInvalidation::Session
         )
     {
+        let blocked = timeout(Duration::from_millis(25), &mut mutation).await;
         assert!(
-            timeout(Duration::from_millis(25), &mut mutation)
-                .await
-                .is_err()
+            blocked.is_err(),
+            "{callback:?} mutation {invalidation:?} completed early: {blocked:?}"
         );
         control.configuration_released.notify_one();
         let mutation_result = mutation.await;
@@ -6762,7 +6904,21 @@ async fn exercise_blocked_lifecycle_invalidation(
             );
         } else {
             mutation_result.unwrap();
-            assert!(result.is_err());
+            result.unwrap();
+            assert!(
+                control
+                    .configurations
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .replicas
+                    .iter()
+                    .any(|replica| {
+                        replica.process_session_id == ProcessSessionId::new("replacement-session")
+                    }),
+                "replacement session was not published after the owned callback"
+            );
         }
         assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
         return;

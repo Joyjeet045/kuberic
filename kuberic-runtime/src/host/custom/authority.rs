@@ -117,6 +117,7 @@ impl CustomAuthorityContainment {
     }
 
     pub(in super::super) async fn restore(&self, common: &CustomReplicatorHost) -> Result<()> {
+        let session_registration = common.session_registration.lock().await;
         let gate = common.gate.lock().await;
         common.state.write().await.authority = common
             .host()?
@@ -139,6 +140,7 @@ impl CustomAuthorityContainment {
             && let RuntimeEffectAction::AdmitAuthority(authority) = effect.action
         {
             drop(gate);
+            drop(session_registration);
             return common
                 .apply_common_action(RuntimeEffectAction::AdmitAuthority(authority))
                 .await;

@@ -90,7 +90,7 @@ nextest-postgres-smoke:
     scratch="${TMPDIR:-$PWD/target/paw-tmp}"
     mkdir -p "$scratch"
     TMPDIR="$scratch" scripts/install_nextest.sh
-    filter='test(/^(tests::singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_sql|fresh_native_build_requires_durable_replay_and_exact_lineage|acknowledged_row_is_replayed_before_candidate_primary_callback_completes|planned_switchover_requires_source_shutdown_before_target_writes|scaling_reopens_agent_after_built_boundary|storage_failure_is_explicit_and_keeps_clients_closed)$/)'
+    filter='test(/^(tests::singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_sql|tests::three_public_custom_hosts_reopen_same_roots_with_fresh_sessions|fresh_native_build_requires_durable_replay_and_exact_lineage|acknowledged_row_is_replayed_before_candidate_primary_callback_completes|planned_switchover_requires_source_shutdown_before_target_writes|scaling_reopens_agent_after_built_boundary|storage_failure_is_explicit_and_keeps_clients_closed)$/)'
     TMPDIR="$scratch" cargo nextest run \
       --workspace --all-features --profile postgres -E "$filter"
 

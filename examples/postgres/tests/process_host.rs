@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use kuberic_runtime::application::{OpenContext, RoleChange};
 use kuberic_runtime::control::proto::{self as wire, agent_control_client::AgentControlClient};
 use kuberic_runtime::host::ReplicaEndpointResolver;
-use kuberic_runtime::host::{ReplicaHost, ReplicaProcessConfig, RunningReplica};
+use kuberic_runtime::host::{
+    ApplicationStorageState, ReplicaDiagnostics, ReplicaHost, ReplicaProcessConfig, RunningReplica,
+};
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationMember, Epoch, FaultType, PodUid, PvcUid, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation,
@@ -24,12 +26,14 @@ use postgres_replicated::instance::PgInstanceManager;
 use postgres_replicated::native::PgNativeObserver;
 use postgres_replicated::proto::{self as pgwire, pg_data_service_client::PgDataServiceClient};
 use postgres_replicated::testing::{
-    ProcessProbe, TestDataDir, allocate_port, find_pg_bin, wrapped_pg_bin,
+    PgGroup, ProcessProbe, TestDataDir, allocate_port, find_pg_bin, wrapped_pg_bin,
 };
 use postgres_replicated::{PgService, PgServiceConfig};
+use tokio_postgres::NoTls;
 use tonic::{Request, transport::Channel};
 
 const TOKEN: &str = "host-local-postgres-test";
+const PUBLIC_GROUP_TOKEN: &str = "host-local-native-build";
 
 fn postgres_binary() -> PathBuf {
     std::env::var_os("NEXTEST_BIN_EXE_postgres_replicated")
@@ -83,10 +87,14 @@ fn configuration() -> ConfigurationDescriptor {
 }
 
 fn authorized<T>(message: T) -> Request<T> {
+    authorized_with(message, TOKEN)
+}
+
+fn authorized_with<T>(message: T, token: &str) -> Request<T> {
     let mut request = Request::new(message);
     request
         .metadata_mut()
-        .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     request
 }
 
@@ -355,6 +363,306 @@ async fn stop(running: &mut RunningReplica, application: &PgService) {
     assert!(!application.instance().is_running().await);
 }
 
+#[derive(Clone)]
+struct GroupResolver {
+    routes: Arc<BTreeMap<ReplicaIdentity, (SocketAddr, SocketAddr)>>,
+}
+
+impl ReplicaEndpointResolver for GroupResolver {
+    fn control_endpoint(&self, identity: &ReplicaIdentity) -> String {
+        format!(
+            "http://{}",
+            self.routes
+                .get(identity)
+                .expect("exact public group member")
+                .0
+        )
+    }
+
+    fn replication_endpoint(&self, identity: &ReplicaIdentity) -> String {
+        format!(
+            "http://{}",
+            self.routes
+                .get(identity)
+                .expect("exact public group member")
+                .1
+        )
+    }
+}
+
+struct PublicGroupMember {
+    identity: ReplicaIdentity,
+    control: SocketAddr,
+    replication: SocketAddr,
+    application: Arc<PgService>,
+    coordination: Option<tokio::task::JoinHandle<()>>,
+    task: Option<tokio::task::JoinHandle<kuberic_runtime::host::Result<RunningReplica>>>,
+    running: Option<RunningReplica>,
+}
+
+impl Drop for PublicGroupMember {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        if let Some(running) = &self.running {
+            running.shutdown();
+        }
+        if let Some(coordination) = &self.coordination {
+            coordination.abort();
+        }
+        self.application.abort();
+    }
+}
+
+struct PublicGroup {
+    members: Vec<PublicGroupMember>,
+}
+
+impl PublicGroup {
+    async fn start(roots: &[(ReplicaIdentity, PathBuf, u16)]) -> Self {
+        let mut endpoints = Vec::with_capacity(roots.len());
+        for (identity, _, _) in roots {
+            endpoints.push((
+                identity.clone(),
+                format!("127.0.0.1:{}", allocate_port().await)
+                    .parse()
+                    .unwrap(),
+                format!("127.0.0.1:{}", allocate_port().await)
+                    .parse()
+                    .unwrap(),
+            ));
+        }
+        let routes = Arc::new(
+            endpoints
+                .iter()
+                .map(|(identity, control, replication)| {
+                    (identity.clone(), (*control, *replication))
+                })
+                .collect(),
+        );
+        let resolver = Arc::new(GroupResolver { routes });
+        let mut members = Vec::with_capacity(roots.len());
+        for ((identity, root, pg_port), (_, control, replication)) in roots.iter().zip(endpoints) {
+            let coordination_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let coordination_address = coordination_listener.local_addr().unwrap();
+            let service = PgServiceConfig {
+                resource_uid: ResourceUid::new("postgres-native-test"),
+                application_root: root.join("application"),
+                pg_data: root.join("pgdata"),
+                pg_bin: find_pg_bin(),
+                pg_port: *pg_port,
+                replication_address: format!("http://{coordination_address}"),
+            };
+            let storage = PgService::storage_state(&service).unwrap();
+            assert_eq!(storage, ApplicationStorageState::Established);
+            let application = Arc::new(
+                PgService::deferred(service).with_coordination_token(PUBLIC_GROUP_TOKEN.into()),
+            );
+            let coordination_service =
+                PgDataServiceImpl::new(application.clone(), PUBLIC_GROUP_TOKEN.into());
+            let coordination = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(coordination_service.into_server())
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                        coordination_listener,
+                    ))
+                    .await
+                    .unwrap();
+            });
+            let host = ReplicaHost::new(
+                ReplicaProcessConfig {
+                    resource_uid: ResourceUid::new("postgres-native-test"),
+                    replica_id: identity.replica_id,
+                    pod_uid: PodUid::new(identity.instance_id.as_str()),
+                    pvc_uid: PvcUid::new(format!("pvc-{}", identity.instance_id)),
+                    data_root: root.clone(),
+                    control_address: control,
+                    replication_address: replication,
+                    bearer_token: PUBLIC_GROUP_TOKEN.into(),
+                    rpc_deadline: Duration::from_secs(5),
+                    transport_window_capacity: 16,
+                },
+                application.clone(),
+                storage,
+                resolver.clone(),
+            );
+            members.push(PublicGroupMember {
+                identity: identity.clone(),
+                control,
+                replication,
+                application,
+                coordination: Some(coordination),
+                task: Some(tokio::spawn(host.start())),
+                running: None,
+            });
+        }
+        Self { members }
+    }
+
+    async fn ready(&mut self) {
+        for member in &mut self.members {
+            let mut task = member.task.take().expect("member startup task");
+            let result = match tokio::time::timeout(Duration::from_secs(60), &mut task).await {
+                Ok(result) => result.expect("public group member startup task"),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    panic!(
+                        "public group member {} startup deadline",
+                        member.identity.replica_id
+                    );
+                }
+            };
+            member.running = Some(result.unwrap_or_else(|error| {
+                panic!(
+                    "public group member {} startup: {error}",
+                    member.identity.replica_id
+                )
+            }));
+        }
+    }
+
+    async fn diagnostics(&self) -> BTreeMap<i64, ReplicaDiagnostics> {
+        let mut diagnostics = BTreeMap::new();
+        for member in &self.members {
+            diagnostics.insert(
+                member.identity.replica_id.value(),
+                member
+                    .running
+                    .as_ref()
+                    .expect("ready public group member")
+                    .handle()
+                    .diagnostics()
+                    .await
+                    .unwrap(),
+            );
+        }
+        diagnostics
+    }
+
+    fn endpoints(&self) -> BTreeMap<i64, (SocketAddr, SocketAddr)> {
+        self.members
+            .iter()
+            .map(|member| {
+                (
+                    member.identity.replica_id.value(),
+                    (member.control, member.replication),
+                )
+            })
+            .collect()
+    }
+
+    fn application(&self, replica_id: i64) -> &PgService {
+        self.members
+            .iter()
+            .find(|member| member.identity.replica_id.value() == replica_id)
+            .expect("public group member")
+            .application
+            .as_ref()
+    }
+
+    async fn shutdown(&mut self) {
+        for member in &self.members {
+            member
+                .running
+                .as_ref()
+                .expect("ready public group member")
+                .shutdown();
+        }
+        for member in &mut self.members {
+            member
+                .running
+                .as_mut()
+                .expect("ready public group member")
+                .wait()
+                .await
+                .unwrap();
+            member.application.close().await.unwrap();
+            assert!(!member.application.instance().is_running().await);
+            if let Some(coordination) = member.coordination.take() {
+                coordination.abort();
+                assert!(coordination.await.unwrap_err().is_cancelled());
+            }
+        }
+    }
+}
+
+async fn group_client(address: SocketAddr) -> AgentControlClient<Channel> {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            if let Ok(client) = AgentControlClient::connect(format!("http://{address}")).await {
+                return client;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("public group control listener")
+}
+
+fn stale_group_configuration(
+    session: &str,
+    identity: &ReplicaIdentity,
+    configuration: &ConfigurationDescriptor,
+) -> Request<wire::ExecuteCommandRequest> {
+    authorized_with(
+        wire::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: "postgres-native-test".into(),
+            target: Some(identity.clone().into()),
+            expected_process_session_id: session.into(),
+            command: Some(wire::execute_command_request::Command::EnsureConfiguration(
+                Box::new(wire::EnsureConfigurationCommand {
+                    operation_id: "stale-public-group-session".into(),
+                    current_configuration: Some(configuration.clone().into()),
+                    current_epoch: Some(configuration.epoch.into()),
+                    effective_policy: Some(wire::EffectivePolicy {
+                        replica_set_size: 3,
+                        write_quorum: 2,
+                        read_quorum: 2,
+                        failover_delay_seconds: 30,
+                    }),
+                    local_replica_id: identity.replica_id.value(),
+                    expected_instance_id: identity.instance_id.to_string(),
+                    expected_agent_generation: identity.agent_generation.to_string(),
+                    transition_kind: wire::TransitionKind::Bootstrap as i32,
+                    primary_write_status: wire::AccessStatus::Granted as i32,
+                    grant_write: true,
+                    ..Default::default()
+                }),
+            )),
+        },
+        PUBLIC_GROUP_TOKEN,
+    )
+}
+
+async fn public_group_contents(
+    group: &PublicGroup,
+    replica_id: i64,
+) -> Option<BTreeMap<i64, String>> {
+    let connection_string = group
+        .application(replica_id)
+        .instance()
+        .connection_string()
+        .replace("dbname=postgres", "dbname=kuberic");
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
+        .await
+        .ok()?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Some(
+        client
+            .query("SELECT id, value FROM phase6_rows ORDER BY id", &[])
+            .await
+            .ok()?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect(),
+    )
+}
+
 fn files(path: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     fn visit(base: &Path, path: &Path, result: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
         if !path.exists() {
@@ -553,6 +861,108 @@ async fn singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_s
         .await
         .unwrap();
     stop(&mut running, &restarted.application).await;
+}
+
+async fn established_three_member_group() -> PgGroup {
+    let mut group = PgGroup::singleton().await;
+    group.add(2).await;
+    group.add(3).await;
+    group.write("before public host restart").await;
+    group.assert_contents().await;
+    group
+}
+
+async fn three_public_custom_hosts_reopen_same_roots_with_fresh_sessions() {
+    let mut attempts = 0;
+    let mut established = loop {
+        attempts += 1;
+        match tokio::spawn(established_three_member_group()).await {
+            Ok(group) => break group,
+            Err(error) if error.is_panic() && attempts < 3 => {}
+            Err(error) => panic!("three-member setup failed after {attempts} attempts: {error}"),
+        }
+    };
+
+    let configuration = established.configuration.clone();
+    let expected = established.expected.clone();
+    let roots = established
+        .pods
+        .values()
+        .map(|pod| {
+            (
+                pod.identity.clone(),
+                pod.root.clone(),
+                pod.application.instance().port(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for pod in established.pods.values_mut() {
+        let processes = ProcessProbe::postgres(pod.application.instance().data_dir());
+        pod.shutdown().await.unwrap();
+        processes.assert_reaped();
+    }
+    established.pods.clear();
+
+    let mut first = PublicGroup::start(&roots).await;
+    first.ready().await;
+    let first_diagnostics = first.diagnostics().await;
+    for diagnostics in first_diagnostics.values() {
+        assert_eq!(
+            diagnostics.current_configuration.as_deref(),
+            Some(configuration.configuration_id.as_str())
+        );
+    }
+    assert_eq!(
+        public_group_contents(&first, configuration.primary_id.value()).await,
+        Some(expected.clone())
+    );
+    let first_endpoints = first.endpoints();
+    let first_sessions = first_diagnostics
+        .iter()
+        .map(|(id, diagnostics)| (*id, diagnostics.process_session.clone()))
+        .collect::<BTreeMap<_, _>>();
+    first.shutdown().await;
+    drop(first);
+
+    let mut replacement = PublicGroup::start(&roots).await;
+    assert!(
+        replacement
+            .endpoints()
+            .iter()
+            .all(|(id, endpoints)| first_endpoints.get(id) != Some(endpoints))
+    );
+    replacement.ready().await;
+    let replacement_diagnostics = replacement.diagnostics().await;
+    for member in &replacement.members {
+        let id = member.identity.replica_id.value();
+        let diagnostics = replacement_diagnostics.get(&id).unwrap();
+        assert_ne!(
+            diagnostics.process_session,
+            *first_sessions.get(&id).unwrap()
+        );
+        assert_eq!(
+            diagnostics.current_configuration.as_deref(),
+            Some(configuration.configuration_id.as_str())
+        );
+        let mut client = group_client(member.control).await;
+        assert_eq!(
+            client
+                .execute(stale_group_configuration(
+                    first_sessions.get(&id).unwrap(),
+                    &member.identity,
+                    &configuration,
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+    assert_eq!(
+        public_group_contents(&replacement, configuration.primary_id.value()).await,
+        Some(expected.clone())
+    );
+    replacement.shutdown().await;
 }
 
 async fn establish_storage(root: &Path) {
@@ -2911,6 +3321,7 @@ mod tests {
     host_test!(fresh_host_waits_without_touching_application_storage);
     host_test!(closed_host_releases_the_partition_and_driver);
     host_test!(singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_sql);
+    host_test!(three_public_custom_hosts_reopen_same_roots_with_fresh_sessions);
     host_test!(established_storage_loss_never_reinitializes_postgres);
     host_test!(missing_pgdata_alone_persists_permanent_fault_before_start_returns);
     host_test!(changed_application_root_never_initializes_or_mutates_storage);
