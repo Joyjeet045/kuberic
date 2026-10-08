@@ -2197,7 +2197,7 @@ impl SwitchoverModel {
                         report_sequence: report.report_sequence,
                     },
                 );
-                if self.steps % 2 == 0 {
+                if self.steps.is_multiple_of(2) {
                     report.process_session_id =
                         ProcessSessionId::new(format!("{}-{}", key.replica_id, self.steps));
                     report.report_sequence = 1;

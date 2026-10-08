@@ -319,9 +319,9 @@ impl PgDurableState {
         }
         if let Some(build) = &self.native_build
             && !selected.contains(&build.request.authority.build_id)
-            && !self
+            && self
                 .retired_build_epoch
-                .is_some_and(|floor| build.request.authority.current_configuration.epoch <= floor)
+                .is_none_or(|floor| build.request.authority.current_configuration.epoch > floor)
         {
             self.retired_builds
                 .insert(build.request.authority.build_id.clone());

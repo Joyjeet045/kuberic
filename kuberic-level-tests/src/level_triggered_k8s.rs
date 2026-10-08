@@ -5987,10 +5987,10 @@ fn scale_up_cancellation_failure_and_retry(
     let mut stages = Vec::new();
     loop {
         let step = manual_live_step(cluster, deadline)?;
-        if let Some(stage) = scale_up_stage(&step.plan) {
-            if stages.last() != Some(&stage) {
-                stages.push(stage);
-            }
+        if let Some(stage) = scale_up_stage(&step.plan)
+            && stages.last() != Some(&stage)
+        {
+            stages.push(stage);
         }
         let status = cluster.status()?;
         assert_scale_up_condition_context(&status)?;
@@ -6019,10 +6019,10 @@ fn scale_up_cancellation_failure_and_retry(
     let mut replacement = None;
     loop {
         let step = manual_live_step(cluster, deadline)?;
-        if let Some(stage) = scale_up_stage(&step.plan) {
-            if stages.last() != Some(&stage) {
-                stages.push(stage);
-            }
+        if let Some(stage) = scale_up_stage(&step.plan)
+            && stages.last() != Some(&stage)
+        {
+            stages.push(stage);
         }
         record_cleanup_deletions(
             cluster,

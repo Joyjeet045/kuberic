@@ -741,27 +741,26 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                 _ => None,
             })?;
         (report.epoch < configuration.epoch).then_some((member, report))
-    }) {
-        if let Some(previous) = report.current_configuration.as_ref() {
-            return Plan::Execute {
-                command: ProtocolCommand::EnsureConfiguration(Box::new(
-                    failover_configuration_command(
-                        previous,
-                        configuration,
-                        member,
-                        policy,
-                        OperationId::new(format!(
-                            "accepted-correction:{}:{}",
-                            configuration.configuration_id, member.identity.replica_id
-                        )),
-                        Some(report.current_progress),
-                        AccessStatus::ReconfigurationPending,
-                        false,
-                        Vec::new(),
-                    ),
-                )),
-            };
-        }
+    }) && let Some(previous) = report.current_configuration.as_ref()
+    {
+        return Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(Box::new(
+                failover_configuration_command(
+                    previous,
+                    configuration,
+                    member,
+                    policy,
+                    OperationId::new(format!(
+                        "accepted-correction:{}:{}",
+                        configuration.configuration_id, member.identity.replica_id
+                    )),
+                    Some(report.current_progress),
+                    AccessStatus::ReconfigurationPending,
+                    false,
+                    Vec::new(),
+                ),
+            )),
+        };
     }
 
     if let Some((member, report, previous)) = configuration.members.iter().find_map(|member| {

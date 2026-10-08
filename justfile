@@ -63,6 +63,11 @@ nextest-test partition="": install-nextest
 nextest-postgres partition="":
     #!/usr/bin/env bash
     set -euo pipefail
+    if [[ -n "${WSL_INTEROP:-}" || -n "${WSL_DISTRO_NAME:-}" ]] \
+      || grep -qi 'microsoft-standard-WSL' /proc/sys/kernel/osrelease 2>/dev/null; then
+      echo "Skipping PostgreSQL tests: WSL does not provide the required pidfd reaping semantics."
+      exit 0
+    fi
     scratch="${TMPDIR:-$PWD/target/paw-tmp}"
     mkdir -p "$scratch"
     TMPDIR="$scratch" scripts/install_nextest.sh
@@ -77,6 +82,11 @@ nextest-postgres partition="":
 nextest-postgres-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
+    if [[ -n "${WSL_INTEROP:-}" || -n "${WSL_DISTRO_NAME:-}" ]] \
+      || grep -qi 'microsoft-standard-WSL' /proc/sys/kernel/osrelease 2>/dev/null; then
+      echo "Skipping PostgreSQL smoke tests: WSL does not provide the required pidfd reaping semantics."
+      exit 0
+    fi
     scratch="${TMPDIR:-$PWD/target/paw-tmp}"
     mkdir -p "$scratch"
     TMPDIR="$scratch" scripts/install_nextest.sh

@@ -151,6 +151,8 @@ PostgreSQL tests run real local subprocesses with durable stores and
 exact-session authority. They require an unprivileged Linux account, pidfds,
 subreapers, readable `/proc` and compatible PostgreSQL binaries. PostgreSQL 16
 is the validated host major. Missing prerequisites fail rather than skip.
+The `just` PostgreSQL recipes detect WSL and skip the tier because its kernel
+does not provide the pidfd reaping semantics required by the process supervisor.
 
 ```bash
 just nextest-postgres-smoke

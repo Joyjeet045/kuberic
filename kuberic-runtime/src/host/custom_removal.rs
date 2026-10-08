@@ -45,18 +45,17 @@ impl CustomReplicatorHost {
             .replica_authority_store
             .load_secondary_removal()
             .await?
+            && previous.intent == preparation.intent
         {
-            if previous.intent == preparation.intent {
-                if previous.process_session_id != preparation.process_session_id
-                    || previous.report_sequence != preparation.report_sequence
-                {
-                    return Err(RuntimeError::AuthorityNotAdmitted);
-                }
-                let mut state = self.state.write().await;
-                state.committed_lsn = previous.boundary_lsn;
-                state.prepared_secondary_removal = Some(previous);
-                return Ok(());
+            if previous.process_session_id != preparation.process_session_id
+                || previous.report_sequence != preparation.report_sequence
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
             }
+            let mut state = self.state.write().await;
+            state.committed_lsn = previous.boundary_lsn;
+            state.prepared_secondary_removal = Some(previous);
+            return Ok(());
         }
         self.set_access(
             AccessStatus::ReconfigurationPending,

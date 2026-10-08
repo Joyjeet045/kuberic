@@ -392,10 +392,12 @@ impl CustomAuthorityAttempt<'_> {
 
 impl Drop for CustomAuthorityAttempt<'_> {
     fn drop(&mut self) {
-        if !self.complete && self.owned && self.entered.load(Ordering::Acquire) {
-            if let Some(host) = self.host.upgrade() {
-                host.abort();
-            }
+        if !self.complete
+            && self.owned
+            && self.entered.load(Ordering::Acquire)
+            && let Some(host) = self.host.upgrade()
+        {
+            host.abort();
         }
     }
 }

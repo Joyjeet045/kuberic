@@ -16,7 +16,7 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/youyuanwu/kuberic"
 description = "Stateful replication framework for Kubernetes"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 kuberic-controller = { version = "0.0.1", path = "kuberic-controller" }
