@@ -5,6 +5,12 @@ in place to the level-triggered v2 stack. There is no second SQLite application
 and no classic runtime/operator dependency. The primary serves SQL over gRPC;
 secondaries retain durable WAL-frame history but do not serve client SQL.
 
+Here, "v2 stack" means Kuberic's current level-triggered runtime and agent
+architecture. It does not mean an SF-style V2 Transactional Replicator. A
+proposal to move SQLite's application-owned durable frame log into such a
+future layer is documented in
+[SQLite on a V2 Transactional Replicator](v2-transactional-replicator.md).
+
 This unpublished example depends directly only on `kuberic-runtime` among
 production Kuberic crates. It enables runtime `host` support; the application-
 specific commit-barrier implementation is its private `commit_barrier` module
@@ -251,6 +257,7 @@ control/replication/application listener settings. Listener defaults are
 
 ## References
 
+- [SQLite on a V2 Transactional Replicator](v2-transactional-replicator.md)
 - [V2 runtime interfaces](../../../kuberic-runtime/README.md)
 - [Replica hosting and opt-in transport](../../../kuberic-runtime/README.md)
 - [Example-owned commit-barrier VFS](../../../examples/sqlite/src/commit_barrier/mod.rs)

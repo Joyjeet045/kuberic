@@ -9,6 +9,10 @@ This is experimental software, not a production deployment guide.
 Use a **fresh deployment** with protocol 9 / agent schema 5. There is no v1 data
 import, metadata conversion, mixed-version operation or rolling-upgrade contract.
 
+The current implementation uses a separate checksummed PostgreSQL metadata
+store. The proposed replacement is documented in
+[PostgreSQL Restart-Stateless Metadata](stateless-metadata.md).
+
 ## Architecture and Authority
 
 `PgService` implements `StatefulServiceReplica`; its `open` returns the

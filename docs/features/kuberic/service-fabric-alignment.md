@@ -44,6 +44,32 @@ general host before changing the managed replicator boundary. Splitting
 `host/custom.rs` before either ownership correction would distribute the
 existing coupling without reducing it.
 
+The default-replicator durability target is specified separately in
+[Stateless Default Replicator](stateless-default-replicator.md). That design
+makes the managed engine restart-reconstructable like the Service Fabric V1
+Replicator while retaining agent-owned topology durability and
+state-provider-owned application durability.
+
+The current default replicator is not restart-stateless. Its durable progress,
+local-write and build stores give it some of the continuation characteristics
+of the Service Fabric V2 Transactional Replicator. However, those records are
+spread across the agent store, replication engine and application
+`DurableState`; they do not form V2's coherent transaction log, provider
+checkpoint and replay model.
+
+Alignment therefore has two distinct targets:
+
+1. the ordinary default replicator becomes an SF V1-style transient transport
+   and quorum engine;
+2. an optional future V2 layer may deliberately add a transactional log,
+   provider checkpoints, recovery replay, copy history and backup above that
+   V1 engine.
+
+Existing managed-engine persistence must not be retained merely by calling it
+V2. Agent workflow records remain agent-owned, application durability remains
+provider-owned for V1 services, and any future V2 storage must have an
+explicit transactional-replicator contract.
+
 ## Service Fabric Architecture
 
 ### Reconfiguration Agent
@@ -197,6 +223,48 @@ already-bound listeners into the same serving lifecycle
 release/rebind race but does not change replication, authority or runtime state
 ownership and does not require another simplification phase.
 
+### Current Durability Is V2-Like but Not a V2 Replicator
+
+The current default replicator is closer to SF V2 than SF V1 in one narrow
+respect: it receives durable stores and restores engine work after process
+restart. The host supplies durable authority, replication progress,
+local-write, build-authority and build-progress capabilities. The engine uses
+them to continue pending writes, replication boundaries and builds rather than
+starting empty.
+
+That resemblance must not obscure the ownership difference:
+
+| Concern | Current Kuberic default replicator | SF V1 | SF V2 |
+|---|---|---|---|
+| Replicator-layer durable storage | Shared agent/engine stores | None | Dedicated transactional and physical log |
+| Pending writes | Engine workflow journal | Process-local | Structured commit/abort transaction records |
+| Application records | Opaque operations retained by `DurableState` | State provider-owned | V2 logical redo/undo records |
+| Restart recovery | Agent records plus engine stores plus application progress | RA replay plus state-provider progress | Provider checkpoint plus V2 log replay |
+| Builds and copy | Durable engine authority/progress plus application staging | Restarted from RA/provider state | Progress-vector selection, provider copy and log suffix |
+| Checkpoints and backup | Application-specific | Application-specific | Framework-coordinated |
+
+The current design therefore contains pieces of both models:
+
+- V1-shaped public replication and state-provider interfaces;
+- V2-like durable continuation inside the managed engine;
+- application-owned retained history and copy state;
+- agent-owned topology and effect journals.
+
+This is overlapping persistence, not an intentional V2 architecture. A real
+V2 layer would own a complete application transaction and recovery protocol:
+
+```text
+provider checkpoint + V2 durable log -> recovered application state
+```
+
+It would remain layered over the V1 transport and RA-facing lifecycle. It
+would not own replica topology, reconfiguration effects or agent authority.
+See
+[SF V2 Transactional Replicator](../../background/service-fabric/v2-transactional-replicator.md)
+for the reference model and
+[SQLite on a V2 Transactional Replicator](../sqlite/v2-transactional-replicator.md)
+for the proposed first Kuberic consumer.
+
 ## Differences That Create Complexity
 
 ### Capability Views Have Explicit Observation Owners
@@ -320,7 +388,7 @@ replication algorithms.
 
 #### `ReplicationEngine`
 
-Replication and copy state:
+Transient V1 replication and copy state:
 
 - current, previous and idle membership;
 - local epoch and role;
@@ -332,7 +400,15 @@ Replication and copy state:
 - build and removal mechanics.
 
 This owner should not understand controller transition evidence or the general
-agent effect journal.
+agent effect journal. For the ordinary default replicator, its queues, peer
+sessions, ACK aggregation, build cursors and pending client completions are
+process-local and reconstructed from agent authority plus state-provider
+progress after restart.
+
+A future V2 Transactional Replicator is a separate owner layered above this
+engine. It may durably own transaction records, stable LSNs, provider
+checkpoint coordination, recovery replay and copy history. Those concerns must
+not be added back to the V1 engine as isolated continuation stores.
 
 #### `PartitionOperation`
 
@@ -409,13 +485,16 @@ individual safety responsibilities.
 
 ### Interface and Persistence Constraints
 
-- `Replicator` and `PrimaryReplicator` are protected interfaces and must not
-  change in any phase.
+- `Replicator`, `PrimaryReplicator` and `StateProvider` are protected
+  interfaces and must not change in any phase.
 - Private managed lifecycle and data-plane boundaries may change when required
   by the typed proxy design.
 - Backward compatibility for persisted runtime data is not required. A phase
   that changes durable formats may bump the schema and reject old stores
   explicitly rather than adding migration code.
+- Removing V1 engine persistence and introducing a V2 transactional log are
+  separate changes. The latter requires new V2 transaction and provider
+  contracts rather than extending the protected V1 `StateProvider`.
 
 ### Phase 0: Extract Custom-Authority Operation Ownership
 
@@ -668,7 +747,8 @@ Exit criteria:
 
 Alignment must not weaken:
 
-- the `Replicator` and `PrimaryReplicator` interface contracts;
+- the `Replicator`, `PrimaryReplicator` and `StateProvider` interface
+  contracts;
 - durable transition stages and deterministic replay;
 - exact Pod, PVC, replica and process-session fencing;
 - epoch and configuration monotonicity;

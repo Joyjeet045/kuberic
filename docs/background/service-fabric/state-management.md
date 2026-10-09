@@ -68,6 +68,69 @@ SF has **two distinct replicators** with different persistence models:
 - All Reliable Collection mutations are logged before replication
 - This is where the shared/dedicated log architecture lives
 
+See [V2 Transactional Replicator](v2-transactional-replicator.md) for the
+component design, transaction and recovery paths, copy protocol, and complete
+API ownership model.
+
+### V1 Restart and Recovery Ownership
+
+The V1 Fabric Replicator is stateless across process restart in the narrow
+durability sense: it does not reopen a replicator-owned log, checkpoint, or
+metadata database. Its live role engine, operation queues, peer sessions,
+replica-set configuration, and queue progress disappear with the process.
+Recovery works because Service Fabric divides the required facts between the
+service's state provider and the Reconfiguration Agent (RA).
+
+| Recovery fact | Durable or authoritative owner |
+|---|---|
+| Applied service data and last committed LSN | `IStateProvider` |
+| Epoch metadata needed by the service | `IStateProvider::BeginUpdateEpoch` / `EndUpdateEpoch` |
+| Copy representation and retained application history | `IStateProvider::GetCopyContext` / `GetCopyState` |
+| Partition membership, previous/current configuration, replica roles and reconfiguration phase | RA and Failover Manager state |
+| Live replication queue, peer ACKs, send windows and sessions | V1 Replicator memory only |
+
+On restart, the responsibilities compose as follows:
+
+1. The RA recreates the service and V1 Replicator and drives the required role,
+   epoch, replica-set configuration and catch-up operations again.
+2. When creating an initial primary, the Replicator asks the state provider for
+   `GetLastCommittedSequenceNumber()`. It uses that value to initialize the
+   next replication LSN; it does not recover the value from replicator-owned
+   storage
+   (`src/prod/src/Reliability/Replication/Replicator.ChangeRoleAsyncOperation.cpp:128-184`).
+3. Epoch changes are forwarded to the state provider together with the last
+   LSN from the previous epoch. Successful completion means the provider has
+   accepted whatever durable fencing or epoch work its implementation requires
+   (`src/prod/src/Reliability/Replication/PrimaryReplicator.UpdateEpochAsyncOperation.cpp:25-87`;
+   `src/prod/src/Reliability/Replication/ComProxyStateProvider.cpp:63-150`).
+4. The RA supplies previous/current membership and quorum configuration through
+   the primary-replicator configuration APIs. The V1 Replicator reconstructs
+   its in-memory membership and sessions from those calls rather than loading
+   them from disk.
+5. If a replica cannot catch up from retained operations, the Replicator asks
+   the primary state provider for copy context/state and streams that
+   application-defined snapshot to the rebuilding secondary.
+
+The constructor's `hasPersistedState` argument does **not** make the V1
+Replicator persistent. It tells the replication protocol whether the service
+has durable state and therefore affects acknowledgement, copy, and queue
+retention behavior. The durable write boundary remains the state provider:
+for a persisted service, it applies and persists an operation before
+acknowledging the operation stream item. For a volatile service, no disk
+recovery is promised.
+
+This division also explains why the V1 Replicator can discard its process-local
+metadata safely:
+
+- the state provider is the durable authority for application progress;
+- the RA is the authority for topology, role, and reconfiguration intent;
+- the Replicator is an executable, reconstructable data-plane component
+  between those two owners.
+
+It must not be interpreted as the whole Service Fabric replica being
+stateless. The **Replicator component** is restart-reconstructable, while the
+state provider and RA retain the durable facts needed to rebuild it.
+
 ### Shared Log vs Dedicated Log (Windows vs Linux)
 
 The V2 Transactional Replicator uses a two-tier log architecture, with
@@ -890,4 +953,3 @@ handling (Level 2 above) is essential even after a successful service-level
 check.
 
 ---
-
