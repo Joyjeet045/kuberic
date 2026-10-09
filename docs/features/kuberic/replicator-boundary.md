@@ -9,6 +9,40 @@ replication proof.
 The forward-looking comparison and phased simplification plan are documented
 in [Service Fabric Alignment and Runtime Simplification](service-fabric-alignment.md).
 
+The unpublished native capability describes the current implementation, not
+the target contract. Runtime-to-replicator interaction must use only public
+interfaces. The stateless default-replicator migration removes the private
+managed lifecycle, data-plane, observation and receipt attachment and hosts
+the built-in default through the same public bundle shape as an
+application-provided replicator. See
+[Stateless Default Replicator](stateless-default-replicator.md).
+The replacement is built beside the current engine; the private attachment is
+deleted only at the final cutover rather than incrementally refactored.
+Process launch selects the legacy or preview transport owner before any
+replication listener is bound. The selection is immutable, exposed through
+public construction, and never falls back after replacement Open failure.
+
+The target evidence model is also public-only: the runtime records exact
+completion of public lifecycle/primary calls and reports only public current
+progress and catch-up capability. Copy boundaries, ACK sets, quorum positions,
+transport sessions and provider progress remain inside the Replicator. The
+controller must stop depending on those current native observation fields
+before the private capability is removed.
+
+After `on_data_loss`, the Replicator validates exact provider/peer history
+rather than trusting the callback boolean. Incompatible history returns a
+public rebuild-required error. The faulted incarnation is permanently retired;
+corrective copy targets a new empty replica/storage/PVC incarnation without
+adding a runtime backchannel.
+
+During recovery, public progress exposes the provider's durable applied tail
+for election while access remains closed. Serving readiness still requires
+completion of public configuration, catch-up and data-loss processing.
+
+Build requirement, exact source/target/session authorization and terminal
+public completion remain agent-owned in a public build store. Engine copy
+cursors and partial stream progress are not persisted.
+
 ## Ownership
 
 The agent owns desired-state ordering, durable effect intent and completion,

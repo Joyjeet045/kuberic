@@ -36,13 +36,13 @@ access, builds, topology and progress are represented across the durable
 agent, hosting layer, custom-replicator host and default replication engine.
 Broad runtime actions and snapshots cross these layers.
 
-The long-term simplification should therefore remain a **typed replica-runtime
-boundary**, followed by state-owner separation and then decomposition of
-`host/custom.rs`. However, custom-authority containment now adds one immediate
-prerequisite: extract its transient admission and recovery ownership from the
-general host before changing the managed replicator boundary. Splitting
-`host/custom.rs` before either ownership correction would distribute the
-existing coupling without reducing it.
+The typed boundary, state-owner separation and narrow effect contracts are now
+complete foundations. The remaining simplification should move the runtime and
+controller to a public-only contract, build a new stateless default Replicator
+beside the legacy engine, then delete the managed path. Decomposing
+`host/custom.rs` before that deletion would organize substantial code that the
+replacement removes, so source decomposition is deferred until the
+post-cutover shape is known.
 
 The default-replicator durability target is specified separately in
 [Stateless Default Replicator](stateless-default-replicator.md). That design
@@ -69,6 +69,12 @@ Existing managed-engine persistence must not be retained merely by calling it
 V2. Agent workflow records remain agent-owned, application durability remains
 provider-owned for V1 services, and any future V2 storage must have an
 explicit transactional-replicator contract.
+
+These targets make the roadmap branch after the shared agent/runtime
+foundations. Partition execution and progress semantics remain alignment work.
+Source decomposition is then an independent maintainability track, while the
+default-replicator track removes engine metadata persistence before an optional
+transactional-replicator track can become authoritative for any application.
 
 ## Service Fabric Architecture
 
@@ -298,20 +304,29 @@ execution.
 
 ### RA Vocabulary Is Contained by a Typed Replicator Boundary
 
-`ManagedReplicatorLifecycle` includes explicit executable-configuration,
-access, peer, topology, build, recovery and narrow-observation operations
+The current implementation uses a private managed boundary as an intermediate
+containment step. `ManagedReplicatorLifecycle` includes explicit
+executable-configuration, access, peer, topology, build, recovery and
+narrow-observation operations
 (`kuberic-runtime/src/replicator/mod.rs:83-166`). General
 `RuntimeEffectAction`, durable `AdmittedAuthority`, transition kind and broad
 runtime snapshots do not cross into the engine. The host proxy translates
 controller-owned transitions into operation-specific engine instructions and
 binds transient outcomes back to durable receipts.
 
-This now follows the Service Fabric ownership pattern: the replicator handles
-replication configuration, fencing, copy, replication and progress, while
-application role remains outside the engine. Replicator role and epoch remain
-separate public `Replicator` operations outside the private managed lifecycle
-contract; their public handlers update engine/log state without exposing the
-RA's complete transition vocabulary.
+This is not the final runtime/replicator contract. Runtime-to-replicator
+interaction must use only the public `Replicator`, `PrimaryReplicator`,
+`StateReplicator`, `StateProvider` and `DurableState` interfaces. The built-in
+default may be product-provided, but it must not receive a privileged private
+lifecycle, data-plane, observation or receipt channel from the runtime.
+
+The target Service Fabric ownership pattern is that the replicator handles
+replication configuration, fencing, copy, replication and progress behind its
+public implementation. Application role remains outside the engine, while
+replicator role, epoch, configuration, catch-up, build and removal cross only
+their existing public methods. Agent receipts are runtime-owned records of
+durable intent, exact public-call completion and current agent/session fences;
+they are not returned through an unpublished engine contract.
 
 ### Effects Have Operation-Specific Completion Contracts
 
@@ -448,24 +463,33 @@ The agent-to-proxy boundary should use explicit operations such as:
 
 The proxy can compose public service and replicator calls into the required
 order. The replication engine receives only replication-specific operations.
-General `RuntimeEffectAction` values must not cross into
-`ManagedReplicatorLifecycle`.
+General `RuntimeEffectAction` values must not cross a public replicator
+interface, and the proxy must not bypass those interfaces through a managed
+capability.
 
-### Typed Outcomes and Receipts
+### SF-Style Public Evidence
 
-Each operation should return only the proof needed to complete that operation:
+The target runtime observes the same narrow surface as the SF RA proxy:
 
-- role-change outcome;
-- epoch-update receipt;
-- access-preparation receipt;
-- catch-up receipt;
-- build-completion receipt;
-- certified-prefix receipt;
-- secondary-removal or retirement receipt.
+- first/last replication progress through public progress methods;
+- success or failure of exact public role, epoch, configuration, catch-up,
+  build, removal, data-loss, close and abort operations;
+- service access computed and published by the runtime after those operations.
 
-Full runtime snapshots remain useful for effect evidence, retained
-postconditions and opt-in testing, but are not a reporting value, managed-engine
-boundary or projection-consumer transport.
+SF does not expose a build's internal copy/catch-up boundary to the RA.
+Successful `BuildReplica` completion marks the remote proxy ready, while the
+Replicator owns the boundary and transport session internally
+(`src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReplicatorBuildIdleReplicaAsyncOperation.cpp:311-350`,
+`src/prod/src/Reliability/Replication/PrimaryReplicator.BuildIdleAsyncOperation.cpp:42-135`).
+Likewise, SF status reporting copies only first/last acknowledged LSNs from the
+public Replicator
+(`src/prod/src/Reliability/Failover/ra/ReconfigurationAgentProxy.ActionListExecutorAsyncOperation.cpp:801-823`).
+
+Kuberic's runtime receipts therefore contain the exact public call, durable
+operation/revision, authority and process-session fences. They do not contain
+engine-private ACK sets, quorum positions, copy boundaries or native
+observations. Full runtime snapshots remain useful for local diagnostics and
+testing but are not a correctness or reporting contract.
 
 ### One Local Commit Protocol
 
@@ -486,12 +510,46 @@ individual safety responsibilities.
 
 ## Simplification Plan
 
+### Roadmap Topology
+
+The completed phases established narrow ownership and effect contracts. The
+remaining roadmap avoids deep refactoring of the managed engine that Phase 7
+will delete:
+
+| Track | Purpose | Ordering |
+|---|---|---|
+| Public operation ownership | Give durable command/public-call sequencing one minimal owner | Phase 4 |
+| Public V1 contract | Remove controller/runtime dependence on private evidence | Phase 5 |
+| V1 replacement | Build the stateless engine beside the legacy engine, then cut over and delete the legacy path | Phases 6-7 |
+| Deferred maintainability | Decompose the remaining custom host only after the managed path is gone | After Phase 7 |
+| Optional V2 storage | Add a deliberate transactional log and provider protocol above V1 | Phase 8 |
+
+The critical replication path is therefore:
+
+```text
+Phase 4 minimal public operation ownership
+    -> Phase 5 public V1 evidence contract
+    -> Phase 6 parallel stateless default replicator
+    -> Phase 7 cutover and legacy deletion
+    -> Phase 8 optional V2 transactional replicator and SQLite migration
+```
+
+Lock cleanup, legacy managed-state decomposition and per-peer mailbox
+refactoring are not prerequisites. They belong in the replacement engine or
+post-cutover cleanup, not in the engine that will be removed.
+
 ### Interface and Persistence Constraints
 
 - `Replicator`, `PrimaryReplicator` and `StateProvider` are protected
   interfaces and must not change in any phase.
-- Private managed lifecycle and data-plane boundaries may change when required
-  by the typed proxy design.
+- Runtime-to-replicator interaction must use only public interfaces. The
+  private managed lifecycle, data-plane, observation and receipt attachments
+  are transitional implementation details and must be removed.
+- Implementation-private types may organize the default replicator internally,
+  but the runtime must not call or receive them.
+- Public construction and settings types may carry immutable endpoint and
+  security configuration, but must not carry callbacks, agent-store handles or
+  host-only capabilities.
 - Backward compatibility for persisted runtime data is not required. A phase
   that changes durable formats may bump the schema and reject old stores
   explicitly rather than adding migration code.
@@ -582,6 +640,12 @@ types, and source guards reject broad lifecycle/data-plane/store leakage and
 wrong-stage outcome substitution. Managed restart validates full authority in
 the host and reuses the prepared admission path.
 
+This phase is an intermediate containment result, not the final public
+boundary. Phase 7 removes the private managed attachment after its durable
+responsibilities have moved to the agent or state provider and its
+process-local responsibilities have moved behind the default replicator's
+public implementation.
+
 ### Phase 2: Separate State Ownership and Observations
 
 **Goal:** make durable, host-runtime and replication-engine facts impossible to
@@ -666,80 +730,214 @@ Evidence includes 946 ordinary tests, seven PostgreSQL smoke tests, strict
 workspace Clippy, doctests, public API/privacy checks and lifecycle source
 guards.
 
-### Phase 4: Consolidate Partition Execution
+### Phase 4: Establish Public Partition Operation Ownership
 
-**Goal:** make one local transaction model explain command admission, durable
-commit and runtime effects.
+**Goal:** give durable command ownership and ordered public calls one minimal
+execution model without refactoring the legacy managed engine.
 
 Planned work:
 
-- introduce a partition execution context containing durable revision,
-  transition result and ordered proxy instructions;
+- introduce a `PartitionOperation` context containing operation ID, durable
+  revision, cancellation/supersession state and ordered public instructions;
 - centralize command admission and supersession checks;
-- execute external calls outside state locks and revalidate revision on
-  completion;
-- identify which configuration, access and build generations remain necessary;
-- preserve separate per-peer and replication-engine synchronization.
+- execute public application/replicator calls outside durable-state locks;
+- revalidate revision and operation ownership before persisting completion or
+  publishing access;
+- retain existing legacy engine generations, locks and private adapters until
+  cutover unless a change is required for correctness;
+- use the same operation owner for custom replicators and the future built-in
+  replacement.
 
 Exit criteria:
 
-- one documented linearization point exists for durable authority changes;
+- one owner explains the lifetime, cancellation and supersession of every
+  external public call;
 - commit failure cannot publish runtime success;
-- supersession and cancellation have one ownership rule;
-- redundant generation or lock domains are removed only after adversarial
-  tests demonstrate equivalent fencing.
+- late public-call completion cannot complete a newer operation or reopen
+  access;
+- no broad lock, generation or source-layout cleanup is required to finish the
+  phase.
 
-### Phase 5: Decompose `host/custom.rs`
+### Phase 5: Establish the Public V1 Evidence Contract
 
-**Goal:** make the source layout reflect the new ownership boundaries.
+**Goal:** make the runtime and controller depend only on public progress and
+exact public-call completion before the replacement engine exists.
 
-Planned modules:
+Planned work:
+
+- define role-specific public current progress, catch-up capability and
+  election-safe recovery progress;
+- reduce reporting to public first/last progress plus agent-owned
+  role/access/configuration and durable operation completion;
+- remove controller decisions based on native verified/quorum/committed
+  progress or reported internal build boundaries;
+- replace native topology/build fields in durable outcomes with exact public
+  call, authority, revision, operation and process-session fences;
+- define public completion recipes for catch-up, switchover, build, removal,
+  data loss, retirement and rebuild-required failure;
+- bump the report/protocol version and reject mixed evidence formats;
+- introduce one new agent-owned public build store containing only build
+  authorization, exact source/target/session identity and terminal public-call
+  completion; do not carry engine copy cursors or native progress;
+- update PostgreSQL and every custom replicator to satisfy the new public
+  progress, build and error semantics.
+
+Exit criteria:
+
+- the runtime and controller require no evidence unavailable through public
+  interfaces;
+- successful exact `build_replica` completion is sufficient build proof;
+- failover and scale-down use only public first/last progress, PC/CC state and
+  durable public operation completion;
+- recovery progress can elect a provisional primary without implying serving
+  readiness;
+- public errors retain typed rebuild-required identity across transport,
+  durable operation failure and controller handling;
+- public-only test implementations and new-protocol controller/runtime tests
+  pass;
+- none of the Phase 5 protocol, report, durable-outcome or store formats is
+  activated against the legacy production engine.
+
+### Phase 6: Build the Stateless Default Replicator
+
+**Goal:** implement a new SF V1-style built-in Replicator beside the legacy
+engine, using only the public runtime/replicator contract.
+
+The complete ownership, recovery, migration and validation design is in
+[Stateless Default Replicator](stateless-default-replicator.md).
+
+Planned work:
+
+- create a separate stateless default implementation rather than reshaping
+  `DefaultReplicatorInner` in place;
+- add an immutable process launch selection for `LegacyManaged` or
+  `StatelessPreview`, decided before any replication listener is bound;
+- expose that selection through public construction/settings so the host and
+  selected factory agree without inspecting private capabilities;
+- in legacy mode, retain the agent-owned replication listener; in preview
+  mode, do not bind or register that service and let the replacement own the
+  endpoint;
+- require exactly one selected engine and provider writer; replacement Open
+  failure aborts startup and never falls back to legacy;
+- return only the standard public `ReplicatorInterfaces` bundle;
+- own listener, authentication, peer sessions, ACK aggregation, copy,
+  replication queues, retry and cancellation internally;
+- initialize applied, committed and retained progress from
+  `StateProvider`/`DurableState`;
+- implement public role, epoch, PC/CC, catch-up, build, removal and data-loss
+  behavior against an empty engine session;
+- implement role-specific progress types, per-peer mailboxes and retry
+  mechanics inside the replacement rather than the legacy engine;
+- validate exact history after `on_data_loss` and return
+  `ReplicaRebuildRequired` for incompatible providers;
+- permanently retire divergent incarnations and build empty replacements;
+- run the replacement through public conformance, crash-boundary and live
+  tests while the legacy engine remains the production default.
+
+Exit criteria:
+
+- the replacement opens no agent/engine metadata store;
+- it exposes no private lifecycle, data-plane, observation, fencing or receipt
+  capability;
+- agent authority plus provider state reconstruct a fresh engine;
+- all-survivor restart can elect, settle and serve without private evidence;
+- build, removal, switchover, failover and ambiguous-write contracts match the
+  approved public plan;
+- SQLite and KVStore2 pass the fresh-storage and corrective-replacement suites;
+- production still selects the legacy engine until the complete replacement
+  acceptance suite passes.
+- hosted preview tests prove endpoint ownership, failed-Open cleanup, immutable
+  selection and unchanged production manifests.
+
+### Phase 7: Cut Over and Remove the Legacy Managed Path
+
+**Goal:** atomically activate the replacement, then remove the implementation
+structures that existed only for the managed engine.
+
+Planned work:
+
+- stop every application and require fresh agent/application storage for the
+  breaking activation; persisted compatibility is intentionally unsupported;
+- switch `DefaultReplicatorFactory` to the Phase 6 implementation;
+- remove `ManagedReplicatorLifecycle`, `ManagedReplicatorDataPlane`, managed
+  attachments, native observations and private receipts;
+- remove the agent-owned default replication RPC dispatch path;
+- delete the legacy `DefaultReplicatorInner` persistence/recovery path and its
+  managed authority, replication-progress, local-write and engine-build
+  continuation dependencies;
+- migrate all public/custom build consumers to the Phase 5 agent-owned public
+  build store, then delete `BuildAuthorityStore`, `BuildProgressStore` and
+  their old tables;
+- replace the agent schema outright; old default and custom agent stores are
+  rejected rather than migrated;
+- start PostgreSQL and other custom replicators from fresh agent/application
+  state under the new public contract;
+- update source guards and documentation to enforce the public-only boundary.
+
+Exit criteria:
+
+- the replacement is the only built-in default engine;
+- no runtime code can attach or discover a managed/private replicator
+  capability;
+- every deployment activates only from fresh storage;
+- custom replicators satisfy the new public contract without retained legacy
+  state or effect compatibility;
+- the legacy engine, adapters and data-plane server are unreachable or
+  deleted;
+- ordinary, PostgreSQL smoke and fresh SQLite/KVStore2 live suites pass.
+
+### Deferred Maintenance: Decompose `host/custom.rs`
+
+Full source decomposition is intentionally deferred until after Phase 7.
+Removing the managed backend first prevents a file split around code that will
+be deleted. Any later decomposition should contain only the remaining
+public/custom path:
 
 | Module | Responsibility |
 |---|---|
-| `proxy/authority.rs` | Independent custom-authority admission, containment and exact recovery |
-| `proxy/access.rs` | Access preparation, publication, acceptance and rollback |
-| `proxy/configuration.rs` | Configuration projection and peer-session registration |
-| `proxy/build.rs` | Build admission, generation, cancellation and completion |
-| `proxy/topology.rs` | Catch-up, failover, switchover, removal and retirement instructions |
-| `proxy/managed.rs` | Managed/native proof adaptation |
-| `proxy/mod.rs` | Host-proxy composition and lifecycle registration |
+| `proxy/authority.rs` | Independent custom-authority admission and recovery |
+| `proxy/access.rs` | Public access sequencing and publication |
+| `proxy/configuration.rs` | Public configuration and peer descriptions |
+| `proxy/build.rs` | Public build admission, cancellation and completion |
+| `proxy/topology.rs` | Public catch-up, removal and retirement sequencing |
+| `proxy/mod.rs` | Public host-proxy composition |
 
-State such as `AccessState`, `BuildState`, `ConfigurationState` and
-`PeerState` should own their locks and invariants. A file-only move without
-state ownership is not sufficient.
+This maintenance work is not a prerequisite for Phase 8.
 
-Exit criteria:
+### Phase 8: Add an Optional V2 Transactional Replicator
 
-- no replacement file becomes another universal lifecycle implementation;
-- capability modules access only their owned state plus explicit shared
-  context;
-- lock ordering is documented at the owning type;
-- the current source-analysis guards become smaller rather than learning the
-  structure of additional monolithic files.
+**Goal:** add deliberate transactional durability above the stateless V1
+engine without reintroducing isolated continuation stores into that engine.
 
-### Phase 6: Strengthen Progress and Retry Types
-
-**Goal:** adopt the useful Replicator distinctions without copying its legacy
-queue machinery.
+The Service Fabric reference model is documented in
+[SF V2 Transactional Replicator](../../background/service-fabric/v2-transactional-replicator.md).
+The first proposed Kuberic consumer and migration plan are documented in
+[SQLite on a V2 Transactional Replicator](../sqlite/v2-transactional-replicator.md).
 
 Planned work:
 
-- introduce typed received, applied, committed, verified and catch-up
-  positions;
-- represent build completion as copy completion plus a replication fence;
-- isolate per-peer progress updates with a coalescing one-runner mailbox where
-  useful;
-- separate transition retry policy and reporting retry policy from transition
-  handlers;
-- test catch-up, quorum and queue predicates independently of transport.
+- define separate transactional-replicator and transactional-provider
+  contracts rather than extending the protected V1 provider interface;
+- implement one coherent durable log, stable-prefix, checkpoint, replay, copy
+  and backup owner above V1;
+- prove the contracts with a test provider before migrating SQLite;
+- move SQLite generic transaction logging and recovery into V2 while retaining
+  SQLite-specific WAL interpretation and checkpoint images in the provider;
+- use an atomic storage-generation switch so the old application frame log and
+  V2 log are never simultaneous authorities for new writes.
 
 Exit criteria:
 
-- progress values with different meanings cannot be accidentally compared;
-- slow peers cannot serialize unrelated peer progress;
-- retry state has explicit sequence/ownership fencing;
-- joint current/previous configuration guarantees remain unchanged.
+- V2 is layered over the Phase 6 replacement after the Phase 7 cutover and
+  owns no agent topology or
+  reconfiguration state;
+- provider checkpoint plus V2 log recover the selected committed application
+  state;
+- SQLite serving never mixes old-stack logging, recovery or copy with V2-backed
+  writes;
+- V2 activation is optional and ordinary V1 state providers remain supported;
+- no V2 serving path activates before Phase 7 has removed the legacy managed
+  engine.
 
 ## Phase Dependencies and Validation
 
@@ -751,8 +949,30 @@ Exit criteria:
   read-only.
 - Phase 3 changes persistence and durable-field updates together; compatibility
   with existing stores is intentionally out of scope.
-- Phase 4 extends the Phase 0 attempt model into partition execution rather
-  than introducing a competing operation owner.
+- Phase 4 extends the Phase 0 attempt model only far enough to own public call
+  ordering, cancellation and revision revalidation. It must not spend time
+  simplifying legacy managed-engine locks or generations.
+- Phase 5 depends on Phase 4 operation ownership and defines a new, incompatible
+  protocol/store contract. It is tested independently but never activated
+  against the legacy production engine.
+- Phase 6 builds a separate replacement while the legacy engine remains the
+  production default. Its immutable pre-bind launch selection is a Phase 6
+  prerequisite; internal progress types, per-peer mailboxes and retry mechanics
+  belong in the replacement, not the legacy engine.
+- Phase 7 requires the complete Phase 6 acceptance suite. It performs one
+  atomic switch, removes the private managed attachment and deletes the legacy
+  persistence/recovery path.
+- Phase 7 activates through one breaking protocol boundary after old
+  runtimes are stopped. SQLite, KVStore2, PostgreSQL and every other
+  application restart from fresh agent/application storage; no intermediate
+  protocol or persistence phase activates independently. Persisted
+  compatibility, enrollment, backup restore and rolling migration are out of
+  scope.
+- Full `host/custom.rs` decomposition is post-cutover maintenance and does not
+  gate the replacement or V2.
+- Phase 8 may prototype contracts after the V1 layering boundary is stable,
+  but no application may activate V2 storage before the Phase 7 exit criteria
+  hold.
 - Every phase must preserve ordinary, cancellation, dropped-caller,
   late-completion, restart and live-cluster safety tests relevant to its
   boundary.
@@ -774,12 +994,13 @@ Alignment must not weaken:
 - copy plus replication-gap closure;
 - current and previous configuration quorum requirements;
 - cancellation-safe build and access cleanup;
-- native receipt and generation validation;
+- equivalent authority, operation, process-session and generation validation
+  around public replicator calls;
 - failed or ambiguous custom-authority admission remaining fail-closed;
 - exact pending custom authority being reconciled before obsolete stored
   configuration;
-- access restoration requiring matching authority, role, session and native
-  proof;
+- access restoration requiring matching authority, role, session, durable
+  revision and exact public-call completion;
 - independent custom replicators using only public SF-shaped interfaces.
 
 ## Service Fabric Patterns Not to Copy
@@ -802,17 +1023,14 @@ and more visible, not to reproduce Service Fabric internally.
 
 ## Recommended Starting Point
 
-Begin with **Phase 0: Extract Custom-Authority Operation Ownership**. The
-authority fix established the required behavior but divided its transient
-state and orchestration between the general runtime host and custom adapter.
-Consolidating that ownership is a private refactoring with a strong regression
-contract and does not require another replicator-interface change.
+Phases 0-3 are complete. Continue with **Phase 4: Establish Public Partition
+Operation Ownership**. Keep it deliberately small: command ownership, ordered
+public calls, cancellation/supersession and revision revalidation only.
 
-After Phase 0, continue with **Phase 1: Establish the Typed Replica-Runtime
-Boundary**. That phase creates the architectural seam needed by every later
-simplification and prevents the broader `host/custom.rs` decomposition from
-becoming a cosmetic file split. It should be considered complete only when the
-managed replicator no longer accepts general runtime effects, access
-publication has a clear host-proxy owner, operation-specific receipts replace
-broad completion where introduced, and all existing fencing and recovery
-behavior remains observable through the current validation suites.
+Then complete **Phase 5: Establish the Public V1 Evidence Contract** before
+building the replacement in **Phase 6**. Phase 6 should add a new engine beside
+the legacy implementation rather than refactoring `DefaultReplicatorInner`.
+After its full acceptance suite passes, **Phase 7** performs the fresh-storage
+cutover and deletes the legacy managed path. Decompose the remaining custom
+host only if its post-cutover shape still warrants it. Phase 8 builds optional
+V2 durability on the completed public-only V1 replacement.
