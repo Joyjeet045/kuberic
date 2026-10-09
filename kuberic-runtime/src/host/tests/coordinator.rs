@@ -11,12 +11,11 @@ use std::sync::{Arc, Mutex};
 use super::tempdir;
 use crate::RuntimeError;
 use crate::authority::{AdmittedAuthority, BuildAuthorityStore, BuildProgressStore};
-use crate::effects::{
-    RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
-};
+use crate::effects::{RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
 use crate::host::Result;
 use crate::host::command::{admit_configuration, admit_persisted_configuration};
 use crate::host::coordinator::Coordinator;
+use crate::host::observation::ReplicaRuntimeState;
 use crate::host::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use crate::host::sqlite_store::SqliteStore;
 use crate::host::state::{
@@ -516,32 +515,23 @@ async fn secondary_removal_preparation_and_retirement_keep_exact_restart_receipt
 }
 
 struct FakeRuntime {
-    state: Mutex<RuntimePostcondition>,
+    state: Mutex<ReplicaRuntimeState>,
     calls: Mutex<Vec<&'static str>>,
     fail_once: Mutex<Option<&'static str>>,
 }
 
 impl FakeRuntime {
     fn new() -> Self {
+        let mut state = ReplicaRuntimeState::empty(identity());
+        state.open = true;
+        state.current_progress = 7;
+        state.verified_replication_lsn = Some(7);
+        state.committed_lsn = 7;
+        state.current_configuration_quorum_progress = 7;
+        state.catch_up_boundary = Some(7);
+        state.catch_up_complete = true;
         Self {
-            state: Mutex::new(RuntimePostcondition {
-                prepared_secondary_removal: None,
-                retired_authority: None,
-                accepted_secondary_removal: None,
-                open: true,
-                role: ReplicaRole::None,
-                role_transition: None,
-                read_status: AccessStatus::NotPrimary,
-                write_status: AccessStatus::NotPrimary,
-                authority: None,
-                current_progress: 7,
-                verified_replication_lsn: Some(7),
-                committed_lsn: 7,
-                current_configuration_quorum_progress: 7,
-                catch_up_boundary: None,
-                catch_up_complete: true,
-                builds: Vec::new(),
-            }),
+            state: Mutex::new(state),
             calls: Mutex::new(Vec::new()),
             fail_once: Mutex::new(None),
         }
@@ -582,6 +572,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
         }
         drop(fail_once);
         let mut state = self.state.lock().unwrap();
+        let action = effect.action.clone();
         match effect.action {
             RuntimeEffectAction::AdmitAuthority(authority) => {
                 let preserve_scale_up = authority.scale_up.as_deref().is_some_and(|evidence| {
@@ -694,8 +685,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
         Ok(RuntimeEffectResult {
             operation_id: effect.operation_id,
             sequence: effect.sequence,
-            topology_receipt: None,
-            postcondition: state.clone(),
+            outcome: state.effect_outcome(&action, None, None)?,
         })
     }
 }

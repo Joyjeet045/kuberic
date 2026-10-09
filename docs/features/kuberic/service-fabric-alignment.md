@@ -313,17 +313,20 @@ separate public `Replicator` operations outside the private managed lifecycle
 contract; their public handlers update engine/log state without exposing the
 RA's complete transition vocabulary.
 
-### Broad Snapshots Act as Completion Contracts
+### Effects Have Operation-Specific Completion Contracts
 
-`RuntimePostcondition` carries most of `RuntimeSnapshot`: authority, role,
-access, topology, progress, removal, retirement and all builds
-(`kuberic-runtime/src/effects.rs:104-181`).
-Consequently, an operation that changes one fact can depend on unrelated
-fields, and every layer must understand the same broad representation.
+`RuntimeEffectOutcome` is a closed, action-compatible result model. Role,
+epoch, access, catch-up and build completion retain only their canonical facts
+and required authority or receipt proof. The durable completion transaction
+matches the exact action/outcome pair and applies only that operation's
+declared fields (`kuberic-runtime/src/effects.rs:250-619`;
+`kuberic-runtime/src/host/sqlite_store.rs:417-991`).
 
-Service Fabric uses operation-specific completion and progress concepts.
-Kuberic should preserve exact replay and receipt validation while narrowing the
-result required by each effect.
+`RuntimeSnapshot` remains a diagnostic/testing observation, not persisted
+effect identity. Intent-only recovery establishes the first canonical result;
+the applied marker persists that exact result; retained replay returns the
+historical action/result record. Unrelated runtime observations cannot change
+completion equality.
 
 ### Multiple Overlapping Serialization Domains
 
@@ -649,6 +652,19 @@ Exit criteria:
 - topology receipts remain authority- and operation-bound;
 - incompatible old stores fail explicitly rather than being silently
   misinterpreted.
+
+Implementation status: complete. Schema 6 persists tagged narrow outcomes and
+rejects schema 5 without migration. The applied marker stores the exact
+canonical result, and one shared recorded-effect shape is used for process-local
+and durable retention. Store completion is exhaustive and action-owned; exact
+duplicates are idempotent, changed actions/results fail closed, topology
+receipts retain their variant-specific authority and operation binding, and
+late catch-up/build completion revalidates current durable authority. Full
+runtime snapshots remain available for diagnostics and opt-in testing only.
+The public `Replicator` and `PrimaryReplicator` interfaces remain unchanged.
+Evidence includes 946 ordinary tests, seven PostgreSQL smoke tests, strict
+workspace Clippy, doctests, public API/privacy checks and lifecycle source
+guards.
 
 ### Phase 4: Consolidate Partition Execution
 

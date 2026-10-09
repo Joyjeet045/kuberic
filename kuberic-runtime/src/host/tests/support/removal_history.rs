@@ -98,10 +98,21 @@ where
     let (ready, mut ready_rx) = watch::channel(false);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(service.serve(address, replication, ready, shutdown_rx));
-    tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.wait_for(|r| *r))
-        .await
-        .unwrap()
-        .unwrap();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ready_rx.wait_for(|ready| *ready),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        readiness => {
+            server.abort();
+            panic!(
+                "history service readiness failed: {readiness:?}; server result: {:?}",
+                server.await
+            );
+        }
+    }
     let client =
         proto::agent_control_client::AgentControlClient::connect(format!("http://{address}"))
             .await
@@ -589,10 +600,25 @@ async fn recover_history(pending_ordinary: bool) {
                         let mut expected = before.clone();
                         let pending = expected.pending_effect.as_mut().unwrap();
                         pending.effect = effect;
+                        pending.stage = crate::host::state::EffectStage::IntentCommitted;
+                        pending.applied_result = None;
                         if cut == 3 {
                             pending.stage = crate::host::state::EffectStage::EffectApplied;
+                            pending.applied_result = converted
+                                .pending_effect
+                                .as_ref()
+                                .and_then(|pending| pending.applied_result.clone());
                         }
-                        assert_eq!(converted, expected, "conversion changes only mode/stage");
+                        assert_eq!(
+                            converted.pending_effect, expected.pending_effect,
+                            "conversion changes mode and resets the canonical baseline"
+                        );
+                        let mut normalized = converted;
+                        normalized.pending_effect = expected.pending_effect.clone();
+                        assert_eq!(
+                            normalized, expected,
+                            "conversion must not change unrelated durable state"
+                        );
                         assert!(
                             late.store
                                 .load_secondary_removal_commit()
@@ -608,8 +634,11 @@ async fn recover_history(pending_ordinary: bool) {
                     }
                     late.store.begin_effect(&effect).await.unwrap();
                     if cut == 2 {
-                        late.runtime.apply_effect(effect.clone()).await.unwrap();
-                        late.store.mark_effect_applied(&effect).await.unwrap();
+                        let result = late.runtime.apply_effect(effect.clone()).await.unwrap();
+                        late.store
+                            .mark_effect_applied(&effect, &result)
+                            .await
+                            .unwrap();
                     }
                     assert!(
                         late.store

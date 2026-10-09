@@ -63,8 +63,12 @@ impl AgentStore for CrashStore {
         self.effect_hit("intent", &effect.operation_id);
         Ok(result)
     }
-    async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> Result<()> {
-        self.inner.mark_effect_applied(effect).await?;
+    async fn mark_effect_applied(
+        &self,
+        effect: &RuntimeEffect,
+        result: &RuntimeEffectResult,
+    ) -> Result<()> {
+        self.inner.mark_effect_applied(effect, result).await?;
         if matches!(
             effect.action,
             RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)

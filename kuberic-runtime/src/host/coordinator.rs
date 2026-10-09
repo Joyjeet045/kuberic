@@ -133,14 +133,18 @@ where
             }
         };
         let result = self.runtime.execute(effect).await?;
-        result
-            .postcondition
-            .prepared_secondary_removal
-            .ok_or_else(|| {
-                crate::host::HostError::DurableEffectConflict(
-                    "preparation omitted terminal evidence".into(),
-                )
-            })
+        match result.outcome {
+            crate::effects::RuntimeEffectOutcome::SecondaryRemovalPrepared(completion) => {
+                completion.prepared_secondary_removal.ok_or_else(|| {
+                    crate::host::HostError::DurableEffectConflict(
+                        "preparation omitted terminal evidence".into(),
+                    )
+                })
+            }
+            _ => Err(crate::host::HostError::DurableEffectConflict(
+                "preparation returned an incompatible outcome".into(),
+            )),
+        }
     }
 
     pub(crate) async fn accept_secondary_removal_commit(
@@ -240,15 +244,14 @@ where
             }
         };
         let result = self.runtime.execute(effect).await?;
-        result
-            .postcondition
-            .retired_authority
-            .map(|r| r.report)
-            .ok_or_else(|| {
-                crate::host::HostError::DurableEffectConflict(
-                    "retirement omitted terminal evidence".into(),
-                )
-            })
+        match result.outcome {
+            crate::effects::RuntimeEffectOutcome::ReplicaRetired(completion) => {
+                Ok(completion.retired.report)
+            }
+            _ => Err(crate::host::HostError::DurableEffectConflict(
+                "retirement returned an incompatible outcome".into(),
+            )),
+        }
     }
     pub(crate) async fn ensure_switchover_prepared(
         &self,
@@ -284,7 +287,7 @@ where
                         "operation ID was reused with another switchover preparation".into(),
                     ));
                 }
-                retained.effect
+                retained.record.effect
             } else {
                 RuntimeEffect {
                     operation_id: command.operation_id,
@@ -481,8 +484,17 @@ where
                     } else {
                         CoordinatorStage::Deactivate
                     };
-                    self.advance(&record, next, Some(result.postcondition.current_progress))
-                        .await?;
+                    let current_progress = match result.outcome {
+                        crate::effects::RuntimeEffectOutcome::ApplicationProgressRefreshed {
+                            current_progress,
+                        } => current_progress,
+                        _ => {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "progress refresh returned an incompatible outcome".into(),
+                            ));
+                        }
+                    };
+                    self.advance(&record, next, Some(current_progress)).await?;
                 }
                 CoordinatorStage::Catchup => {
                     self.execute(&record, "catchup", RuntimeEffectAction::WaitForCatchup)

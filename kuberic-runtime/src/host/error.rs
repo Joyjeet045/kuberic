@@ -19,6 +19,8 @@ pub enum HostError {
     InitializationNotAuthorized(String),
     #[error("durable effect conflict: {0}")]
     DurableEffectConflict(String),
+    #[error("stale effect completion: {0}")]
+    StaleEffectCompletion(String),
     #[error("command rejected: {0}")]
     CommandRejected(String),
     #[error("transport session rejected: {0}")]

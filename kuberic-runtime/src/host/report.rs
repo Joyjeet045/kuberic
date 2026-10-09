@@ -235,6 +235,7 @@ fn snapshot_matches_state(
     };
     let access_matches = |projected, desired| {
         projected == desired
+            || (projected != AccessStatus::Granted && desired != AccessStatus::Granted)
             || (snapshot
                 .host
                 .pending_access

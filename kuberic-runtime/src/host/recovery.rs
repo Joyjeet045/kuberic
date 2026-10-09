@@ -378,7 +378,7 @@ where
 {
     match inspect_recovery(adapter.store().as_ref(), runtime).await? {
         RecoveryDecision::Idle => Ok(None),
-        RecoveryDecision::ReturnRetained(retained) => Ok(Some(retained.result)),
+        RecoveryDecision::ReturnRetained(retained) => Ok(Some(retained.record.result)),
         RecoveryDecision::Reissue(effect) => adapter.execute(*effect).await.map(Some),
     }
 }

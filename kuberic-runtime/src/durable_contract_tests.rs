@@ -24,26 +24,41 @@ fn authority() -> AdmittedAuthority {
 }
 
 #[test]
-fn authority_optional_evidence_preserves_legacy_defaults_and_field_names() {
+fn authority_nullable_evidence_requires_explicit_durable_fields() {
     let authority = authority();
-    let mut value = serde_json::to_value(&authority).unwrap();
-    let fields = value.as_object_mut().unwrap();
-    for key in ["switchover_handoff", "secondary_removal", "scale_up"] {
-        assert_eq!(fields.remove(key), Some(Value::Null));
-    }
+    let value = serde_json::to_value(&authority).unwrap();
     assert_eq!(
-        fields.keys().map(String::as_str).collect::<Vec<_>>(),
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
         [
             "current_configuration",
             "local_identity",
             "previous_configuration",
+            "scale_up",
+            "secondary_removal",
+            "switchover_handoff",
             "transition_kind",
         ],
     );
     assert_eq!(
-        serde_json::from_value::<AdmittedAuthority>(value).unwrap(),
+        serde_json::from_value::<AdmittedAuthority>(value.clone()).unwrap(),
         authority
     );
+    for key in [
+        "transition_kind",
+        "previous_configuration",
+        "switchover_handoff",
+        "secondary_removal",
+        "scale_up",
+    ] {
+        let mut missing = value.clone();
+        assert!(missing.as_object_mut().unwrap().remove(key).is_some());
+        assert!(serde_json::from_value::<AdmittedAuthority>(missing).is_err());
+    }
 }
 
 #[test]
@@ -98,7 +113,7 @@ fn effects_and_open_modes_preserve_durable_enum_representation() {
 }
 
 #[test]
-fn local_write_and_role_transition_preserve_missing_field_defaults() {
+fn local_write_defaults_remain_compatible_but_role_completion_is_strict() {
     let write: DurableLocalWrite = serde_json::from_value(json!({
         "operation_id": "write-op",
         "lsn": 12,
@@ -109,14 +124,15 @@ fn local_write_and_role_transition_preserve_missing_field_defaults() {
     assert_eq!(write.committed_lsn, 0);
     assert_eq!(write.phase, LocalWritePhase::Registered);
     assert_eq!(write.data, Bytes::from_static(&[1, 2]));
-    let role: RoleTransition = serde_json::from_value(json!({
-        "completed_role": "none",
-        "target_role": "primary",
-        "replicator_completed": true,
-        "application_completed": false,
-    }))
-    .unwrap();
-    assert!(!role.epoch_completed);
+    assert!(
+        serde_json::from_value::<RoleTransition>(json!({
+            "completed_role": "none",
+            "target_role": "primary",
+            "replicator_completed": true,
+            "application_completed": false,
+        }))
+        .is_err()
+    );
 }
 
 #[test]

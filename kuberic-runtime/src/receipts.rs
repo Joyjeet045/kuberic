@@ -7,9 +7,18 @@ use serde::{Deserialize, Serialize};
 use crate::authority::AdmittedAuthority;
 use crate::authority::RetiredAuthority;
 
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
 /// Exact native engine identity captured before a public operation begins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NativeOperationToken {
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) engine_session_id: String,
     pub(crate) engine_generation: u64,
@@ -63,9 +72,13 @@ pub(crate) struct SwitchoverReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SecondaryRemovalReceipt {
     pub(crate) token: NativeOperationToken,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) preparation: Option<SecondaryRemovalPreparation>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) witness: Option<SecondaryRemovalWitness>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) accepted: Option<SecondaryScaleDownCleanup>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) verified_lsn: Option<i64>,
     pub(crate) committed_lsn: i64,
 }

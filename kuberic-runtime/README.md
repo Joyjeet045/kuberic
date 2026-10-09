@@ -169,7 +169,7 @@ After process termination, a started record is finalized without Open: terminati
 already closed the prior host. The pending agent effect then completes its exact
 durable receipt normally. Failed finalization keeps reconstruction closed.
 Preparation, acceptance, and retirement postconditions are unpublished managed
-contracts, not additions to the SF-shaped application traits. Agent schema-5
+contracts, not additions to the SF-shaped application traits. Agent schema-6
 storage persists preparation, accepted-current-only, and retirement evidence.
 Recovery revalidates accepted evidence before restoring previously granted
 access; preparation and current-only coordination by themselves stay closed.
@@ -190,7 +190,7 @@ authority into the runtime. It freezes a separate post-enumeration catch-up
 boundary, admits the candidate through independently validated previous and
 expanded policies, and may preserve same-primary writes only while both
 configurations remain writable. Candidate readiness/copy completion alone never
-grants membership or quorum credit. Protocol 9/schema 5 require a fresh
+grants membership or quorum credit. Protocol 9/agent schema 6 require a fresh
 coordinated v2 deployment; the removed classic v1 stack has no conversion path.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 include separating replication proof from Kubernetes cleanup obligations; neither

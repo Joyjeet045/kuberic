@@ -5,20 +5,25 @@ use serde::{Deserialize, Serialize};
 
 use super::authority::RetiredAuthority;
 use super::authority::{AdmittedAuthority, BuildAuthority};
+use crate::application::OpenMode;
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
 use crate::protocol::types::{
     ProcessSessionId, SecondaryRemovalPreparation, SecondaryRemovalWitness,
     SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
 };
-use serde_json::Value as TopologyReceipt;
-
-use crate::application::OpenMode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleTransition {
     pub completed_role: ReplicaRole,
     pub target_role: ReplicaRole,
     pub replicator_completed: bool,
-    #[serde(default)]
     pub epoch_completed: bool,
     pub application_completed: bool,
 }
@@ -93,7 +98,7 @@ pub struct BuildPostcondition {
     pub last_sequence: u64,
     pub durable_lsn: i64,
     pub completed: bool,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub catch_up_boundary_lsn: Option<i64>,
 }
 
@@ -122,56 +127,8 @@ pub struct RuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimePostcondition {
-    pub open: bool,
-    pub role: ReplicaRole,
-    pub role_transition: Option<RoleTransition>,
-    pub read_status: AccessStatus,
-    pub write_status: AccessStatus,
-    pub authority: Option<AdmittedAuthority>,
-    #[serde(default)]
-    pub prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
-    #[serde(default)]
-    pub retired_authority: Option<RetiredAuthority>,
-    #[serde(default)]
-    pub accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
-    pub current_progress: i64,
-    pub verified_replication_lsn: Option<i64>,
-    pub committed_lsn: i64,
-    pub current_configuration_quorum_progress: i64,
-    pub catch_up_boundary: Option<i64>,
-    pub catch_up_complete: bool,
-    pub builds: Vec<BuildPostcondition>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeEffectResult {
     pub operation_id: OperationId,
     pub sequence: u64,
-    #[serde(default)]
-    pub topology_receipt: Option<Box<TopologyReceipt>>,
-    pub postcondition: RuntimePostcondition,
-}
-
-impl From<RuntimeSnapshot> for RuntimePostcondition {
-    fn from(snapshot: RuntimeSnapshot) -> Self {
-        Self {
-            open: snapshot.open,
-            role: snapshot.role,
-            role_transition: snapshot.role_transition,
-            read_status: snapshot.read_status,
-            write_status: snapshot.write_status,
-            authority: snapshot.authority,
-            prepared_secondary_removal: snapshot.prepared_secondary_removal,
-            retired_authority: snapshot.retired_authority,
-            accepted_secondary_removal: snapshot.accepted_secondary_removal,
-            current_progress: snapshot.current_progress,
-            verified_replication_lsn: snapshot.verified_replication_lsn,
-            committed_lsn: snapshot.committed_lsn,
-            current_configuration_quorum_progress: snapshot.current_configuration_quorum_progress,
-            catch_up_boundary: snapshot.catch_up_boundary,
-            catch_up_complete: snapshot.catch_up_complete,
-            builds: snapshot.builds,
-        }
-    }
+    pub outcome: serde_json::Value,
 }

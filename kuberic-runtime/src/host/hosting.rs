@@ -17,8 +17,8 @@ use crate::authority::{
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::control::proto;
 use crate::effects::{
-    RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
-    RuntimeSnapshot,
+    BuildCompletion, BuildEffectState, RecordedEffect, RoleTransition, RuntimeEffect,
+    RuntimeEffectAction, RuntimeEffectOutcome, RuntimeEffectResult, RuntimeSnapshot,
 };
 use crate::protocol::types::{
     AccessStatus, Epoch, FaultType, LoadMetric, OperationId, PartitionId, PartitionInformation,
@@ -361,11 +361,7 @@ pub(crate) enum OutboundReplication {
     Evict(ReplicaIdentity),
 }
 
-#[derive(Debug, Clone)]
-struct AppliedEffect {
-    effect: RuntimeEffect,
-    result: RuntimeEffectResult,
-}
+type AppliedEffect = RecordedEffect;
 
 #[derive(Debug)]
 struct HostState {
@@ -1586,6 +1582,10 @@ impl PodRuntime {
         self.host.discard_cancelled_build_effect(effect).await
     }
 
+    pub(crate) async fn discard_runtime_effect(&self, effect: &RuntimeEffect) -> Result<()> {
+        self.host.discard_runtime_effect(effect).await
+    }
+
     pub(crate) async fn reissue_outbound_build(
         &self,
         build_id: OperationId,
@@ -2029,7 +2029,10 @@ impl RuntimeHost {
                             | RuntimeEffectAction::SetWriteStatus(_)
                     )
                 })
-                .map(|applied| applied.result.postcondition.clone())
+                .and_then(|applied| match &applied.result.outcome {
+                    RuntimeEffectOutcome::AccessChanged(owned) => Some(owned.clone()),
+                    _ => None,
+                })
                 .filter(|owned| {
                     snapshot.open
                         && snapshot.role_transition.is_none()
@@ -3170,22 +3173,33 @@ impl RuntimeHost {
             .get()
             .and_then(RegisteredReplicator::topology_lifecycle)
         {
-            Some(topology) => topology.receipt(&effect.action).await.map(Box::new),
+            Some(topology) => topology.receipt(&effect.action).await,
             None => None,
         };
-        let postcondition = match self
+        let outcome = match self
             .registered
             .get()
             .and_then(RegisteredReplicator::effect_evidence)
         {
-            Some(evidence) => evidence.postcondition(access_progress.as_ref()).await,
-            None => snapshot_postcondition(self.snapshot().await),
+            Some(evidence) => {
+                evidence
+                    .effect_outcome(
+                        &effect.action,
+                        access_progress.as_ref(),
+                        topology_receipt.as_ref(),
+                    )
+                    .await?
+            }
+            None => self.state.read().await.fallback_snapshot.effect_outcome(
+                &effect.action,
+                access_progress.as_ref(),
+                topology_receipt.as_ref(),
+            )?,
         };
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
-            topology_receipt,
-            postcondition,
+            outcome,
         };
         let applied = AppliedEffect {
             effect,
@@ -3248,19 +3262,30 @@ impl RuntimeHost {
             }
         }
         self.build_lifecycle()?.cancel(build_id).await?;
-        let snapshot = self.snapshot().await;
-        if snapshot
+        let state = self.state.read().await.fallback_snapshot.clone();
+        if state
             .builds
             .iter()
             .any(|build| &build.authority.build_id == build_id)
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
+        let (target, _) = match &effect.action {
+            RuntimeEffectAction::BuildReplica {
+                target,
+                replication_address,
+                ..
+            } => (target.clone(), replication_address),
+            _ => unreachable!(),
+        };
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
-            topology_receipt: None,
-            postcondition: snapshot_postcondition(snapshot),
+            outcome: RuntimeEffectOutcome::BuildReplica(BuildCompletion {
+                build_id: build_id.clone(),
+                target,
+                state: BuildEffectState::Abandoned,
+            }),
         };
         self.state.write().await.effects.insert(
             result.sequence,
@@ -3278,6 +3303,10 @@ impl RuntimeHost {
                 "only a build effect can be discarded after cancellation".into(),
             ));
         }
+        self.discard_runtime_effect(effect).await
+    }
+
+    async fn discard_runtime_effect(&self, effect: &RuntimeEffect) -> Result<()> {
         let _guard = self.effect_lock.lock().await;
         let mut state = self.state.write().await;
         match state.effects.get(&effect.sequence) {
@@ -3324,8 +3353,11 @@ impl RuntimeHost {
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
-            topology_receipt: None,
-            postcondition: confirmation.postcondition.clone(),
+            outcome: RuntimeEffectOutcome::BuildReplica(BuildCompletion {
+                build_id: build_id.clone(),
+                target: target.clone(),
+                state: BuildEffectState::Completed(Box::new(confirmation.build.clone())),
+            }),
         };
         self.state.write().await.effects.insert(
             result.sequence,
@@ -3856,25 +3888,4 @@ fn recovery_observation(snapshot: RuntimeSnapshot) -> RecoveryObservation {
 #[cfg(test)]
 pub(crate) fn empty_snapshot(identity: ReplicaIdentity) -> RuntimeSnapshot {
     ReplicaRuntimeState::empty(identity).into()
-}
-
-fn snapshot_postcondition(snapshot: RuntimeSnapshot) -> RuntimePostcondition {
-    RuntimePostcondition {
-        open: snapshot.open,
-        role: snapshot.role,
-        role_transition: snapshot.role_transition,
-        read_status: snapshot.read_status,
-        write_status: snapshot.write_status,
-        authority: snapshot.authority,
-        prepared_secondary_removal: snapshot.prepared_secondary_removal,
-        retired_authority: snapshot.retired_authority,
-        accepted_secondary_removal: snapshot.accepted_secondary_removal,
-        current_progress: snapshot.current_progress,
-        verified_replication_lsn: snapshot.verified_replication_lsn,
-        committed_lsn: snapshot.committed_lsn,
-        current_configuration_quorum_progress: snapshot.current_configuration_quorum_progress,
-        catch_up_boundary: snapshot.catch_up_boundary,
-        catch_up_complete: snapshot.catch_up_complete,
-        builds: snapshot.builds,
-    }
 }

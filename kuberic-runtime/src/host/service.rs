@@ -778,15 +778,17 @@ where
                 crate::effects::RuntimeEffectAction::Open(_)
             )
         {
-            self.store.mark_effect_applied(&pending.effect).await?;
-            self.store
-                .complete_effect(&crate::effects::RuntimeEffectResult {
+            let result = pending.applied_result.as_deref().cloned().unwrap_or(
+                crate::effects::RuntimeEffectResult {
                     operation_id: pending.effect.operation_id.clone(),
                     sequence: pending.effect.sequence,
-                    topology_receipt: None,
-                    postcondition: self.runtime.snapshot().await.into(),
-                })
+                    outcome: crate::effects::RuntimeEffectOutcome::Opened,
+                },
+            );
+            self.store
+                .mark_effect_applied(&pending.effect, &result)
                 .await?;
+            self.store.complete_effect(&result).await?;
         }
         let pending_acceptance = state.pending_effect.as_ref().is_some_and(|pending| {
             matches!(
@@ -896,7 +898,8 @@ where
             .report(&report_runtime)
             .await
             .map_err(|error| match error {
-                crate::host::HostError::DurableEffectConflict(message) => {
+                crate::host::HostError::DurableEffectConflict(message)
+                | crate::host::HostError::StaleEffectCompletion(message) => {
                     Status::unavailable(message)
                 }
                 other => status_from_agent(other),
@@ -1042,6 +1045,33 @@ fn startup_transition(
     state: &AgentState,
 ) -> Option<(crate::protocol::types::ReplicaRole, bool, bool)> {
     if let Some(pending) = &state.pending_effect {
+        if let Some(result) = pending.applied_result.as_deref() {
+            match &result.outcome {
+                crate::effects::RuntimeEffectOutcome::ReplicatorRoleChanged(completion) => {
+                    let transition = completion.role_transition.as_ref()?;
+                    return Some((
+                        transition.target_role,
+                        transition.epoch_completed,
+                        transition.application_completed,
+                    ));
+                }
+                crate::effects::RuntimeEffectOutcome::EpochUpdated(completion) => {
+                    let transition = completion.role_transition.as_ref()?;
+                    return Some((
+                        transition.target_role,
+                        true,
+                        transition.application_completed,
+                    ));
+                }
+                crate::effects::RuntimeEffectOutcome::ApplicationRoleChanged {
+                    completion, ..
+                }
+                | crate::effects::RuntimeEffectOutcome::RoleChanged(completion) => {
+                    return Some((completion.role, true, true));
+                }
+                _ => {}
+            }
+        }
         match pending.effect.action {
             crate::effects::RuntimeEffectAction::ChangeRole(role)
             | crate::effects::RuntimeEffectAction::ChangeReplicatorRole(role) => {
@@ -1287,6 +1317,7 @@ where
 fn status_from_agent(error: crate::host::HostError) -> Status {
     match error {
         crate::host::HostError::DurableEffectConflict(_)
+        | crate::host::HostError::StaleEffectCompletion(_)
         | crate::host::HostError::CommandRejected(_) => {
             Status::failed_precondition(error.to_string())
         }

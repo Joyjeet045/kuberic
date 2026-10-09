@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 use crate::authority::{AdmittedAuthority, BuildAuthority, RetiredAuthority};
-use crate::effects::{RuntimeEffectAction, RuntimePostcondition, RuntimeSnapshot};
+use crate::effects::{RuntimeEffectAction, RuntimeEffectOutcome, RuntimeSnapshot};
 use crate::protocol::command::AcceptSecondaryRemovalCommit;
 use crate::protocol::types::{
     AccessStatus, ConfigurationId, Epoch, OperationId, ProcessSessionId, ReplicaIdentity,
@@ -150,7 +150,12 @@ pub(super) trait LifecycleObservation: Send + Sync {
     async fn build_observation(&self) -> BuildObservation;
     async fn peer_observation(&self) -> PeerObservation;
     async fn outbound_observation(&self) -> OutboundObservation;
-    async fn postcondition(&self, progress: Option<&NativeProgressStatus>) -> RuntimePostcondition;
+    async fn effect_outcome(
+        &self,
+        action: &RuntimeEffectAction,
+        progress: Option<&NativeProgressStatus>,
+        receipt: Option<&TopologyReceipt>,
+    ) -> Result<RuntimeEffectOutcome>;
 }
 
 #[async_trait]
@@ -810,11 +815,13 @@ impl EffectEvidenceRuntime {
         self.inner.refresh_progress().await
     }
 
-    pub(super) async fn postcondition(
+    pub(super) async fn effect_outcome(
         &self,
+        action: &RuntimeEffectAction,
         progress: Option<&NativeProgressStatus>,
-    ) -> RuntimePostcondition {
-        self.inner.postcondition(progress).await
+        receipt: Option<&TopologyReceipt>,
+    ) -> Result<RuntimeEffectOutcome> {
+        self.inner.effect_outcome(action, progress, receipt).await
     }
 }
 

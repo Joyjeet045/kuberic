@@ -1,7 +1,7 @@
 //! Durable replica-agent state.
 
 use crate::authority::{DurableBuildProgress, RetiredAuthority};
-use crate::effects::{RuntimeEffect, RuntimeEffectResult};
+use crate::effects::{RecordedEffect, RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::EnsureConfiguration;
 use crate::protocol::command::EnsureReplicaBuild;
 use crate::protocol::types::{
@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-// Fresh schema-5 stores bind application paths and initialization permission.
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+// Schema 6 stores action-specific effect outcomes and reject broad schema-5 results.
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,14 +48,29 @@ pub(crate) enum EffectStage {
 pub(crate) struct PendingEffect {
     pub(crate) effect: RuntimeEffect,
     pub(crate) stage: EffectStage,
+    pub(crate) applied_result: Option<Box<RuntimeEffectResult>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RetainedResult {
     pub(crate) operation_id: OperationId,
-    pub(crate) effect: RuntimeEffect,
-    pub(crate) result: RuntimeEffectResult,
+    #[serde(flatten)]
+    pub(crate) record: RecordedEffect,
+}
+
+impl std::ops::Deref for RetainedResult {
+    type Target = RecordedEffect;
+
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
+impl std::ops::DerefMut for RetainedResult {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.record
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

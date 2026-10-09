@@ -115,7 +115,7 @@ classic data is imported. See the [SQLite design](docs/features/sqlite/design.md
 `postgres-replicated` is an application-owned custom replicator.
 PostgreSQL owns WAL streaming, physical recovery, synchronous policy and
 promotion while Kuberic owns generic authority and lifecycle choreography.
-Fresh protocol-9/schema-5 storage is required. See the
+Fresh protocol-9/agent-schema-6 storage is required. See the
 [PostgreSQL design](docs/features/postgres/design.md).
 
 ## Distribution Status

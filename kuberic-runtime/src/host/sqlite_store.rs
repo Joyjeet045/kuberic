@@ -9,14 +9,15 @@ use crate::authority::{
     DurableBuildProgress, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
     ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore, RetiredAuthority,
 };
-use crate::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
+use crate::effects::{
+    BuildEffectState, RuntimeEffect, RuntimeEffectAction, RuntimeEffectOutcome, RuntimeEffectResult,
+};
 use crate::error::{ContractError, ContractResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use crate::protocol::types::{
     AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaIdentity,
     ReplicaRole, SecondaryRemovalPreparation, SwitchoverHandoff, TransitionKind,
 };
-use crate::receipts::TopologyReceipt;
 use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
@@ -46,81 +47,92 @@ fn switchover_receipt_matches(
         && receipt.handoff_lsn >= 0
 }
 
-fn validate_topology_receipt(effect: &RuntimeEffect, result: &RuntimeEffectResult) -> Result<()> {
-    let Some(receipt) = result.topology_receipt.as_deref() else {
-        return Ok(());
-    };
-    let valid = match (&effect.action, receipt) {
-        (
-            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary),
-            TopologyReceipt::CertifiedPrefix(receipt),
-        ) => receipt.settled_lsn == *boundary,
-        (
-            RuntimeEffectAction::ChangeApplicationRole(ReplicaRole::Primary),
-            TopologyReceipt::CertifiedPrefix(_),
-        ) => true,
-        (
-            RuntimeEffectAction::PrepareSwitchover {
-                preparation_generation,
-                request_id,
-                source,
-                target,
-                starting_configuration_id,
-                starting_epoch,
-            },
-            TopologyReceipt::Switchover(receipt),
-        ) => switchover_receipt_matches(
-            receipt,
-            *preparation_generation,
-            request_id,
-            source,
-            target,
-            starting_configuration_id,
-            *starting_epoch,
-        ),
-        (
-            RuntimeEffectAction::PrepareSecondaryRemoval { intent, .. },
-            TopologyReceipt::SecondaryRemoval(receipt),
-        ) => receipt
-            .preparation
-            .as_ref()
-            .is_some_and(|preparation| preparation.intent == **intent),
-        (
-            RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness),
-            TopologyReceipt::SecondaryRemoval(receipt),
-        ) => receipt.witness.as_ref() == Some(witness),
-        (
-            RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed },
-            TopologyReceipt::SecondaryRemoval(receipt),
-        ) => {
-            receipt.witness.as_ref() == Some(witness)
-                && receipt.accepted.as_ref() == Some(committed)
-        }
-        (
-            RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed),
-            TopologyReceipt::SecondaryRemoval(receipt),
-        ) => receipt.accepted.as_ref() == Some(committed),
-        (
-            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command),
-            TopologyReceipt::SecondaryRemoval(receipt),
-        ) => receipt.accepted.as_ref() == Some(&command.committed),
-        (RuntimeEffectAction::FenceRetirement(retired), TopologyReceipt::Retirement(receipt)) => {
-            receipt.retired == **retired && !receipt.completed
-        }
-        (
-            RuntimeEffectAction::RetireReplica(retired)
-            | RuntimeEffectAction::CompleteRetirement(retired),
-            TopologyReceipt::Retirement(receipt),
-        ) => receipt.retired == **retired && receipt.completed,
-        _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(crate::host::HostError::DurableEffectConflict(
-            "topology receipt does not match durable intent".into(),
-        ))
+fn validate_native_token(
+    token: &crate::receipts::NativeOperationToken,
+    authority: Option<&AdmittedAuthority>,
+) -> Result<()> {
+    if token.engine_session_id.is_empty() || token.authority.as_ref() != authority {
+        return Err(crate::host::HostError::StaleEffectCompletion(
+            "topology receipt authority or engine session is stale".into(),
+        ));
     }
+    Ok(())
+}
+
+fn apply_admitted_authority(
+    state: &mut AgentState,
+    completion: &crate::effects::AuthorityCompletion,
+) {
+    let authority = &completion.authority;
+    state.read_status = completion.read_status;
+    state.write_status = completion.write_status;
+    state.previous_configuration = authority.previous_configuration.clone();
+    state.current_configuration = Some(authority.current_configuration.clone());
+    state.highest_epoch = state
+        .highest_epoch
+        .max(authority.current_configuration.epoch);
+    state.secondary_removal_evidence = authority.secondary_removal.clone();
+    state.scale_up_evidence = authority.scale_up.clone();
+    if let Some(evidence) = authority.scale_up.as_deref() {
+        let intent = evidence.intent();
+        state.admitted_policy = Some(intent.current_policy.clone());
+        state.previous_policy = authority
+            .previous_configuration
+            .as_ref()
+            .map(|_| intent.previous_policy.clone());
+    } else if let Some(evidence) = &authority.secondary_removal {
+        state.admitted_policy = Some(evidence.preparation.intent.current_policy.clone());
+        state.previous_policy = authority
+            .previous_configuration
+            .as_ref()
+            .map(|_| evidence.preparation.intent.previous_policy.clone());
+    } else {
+        let policy = state
+            .admitted_policy
+            .clone()
+            .unwrap_or_else(|| state.identity.effective_policy.clone());
+        state.previous_policy = authority
+            .previous_configuration
+            .as_ref()
+            .map(|_| policy.clone());
+        state.admitted_policy = Some(policy);
+    }
+    if state
+        .prepared_secondary_removal
+        .as_ref()
+        .is_some_and(|prepared| {
+            authority.current_configuration.epoch > prepared.intent.current_configuration.epoch
+        })
+    {
+        state.prepared_secondary_removal = None;
+    }
+    state.accepted_secondary_removal = completion.accepted_secondary_removal.clone();
+    if completion
+        .accepted_secondary_removal
+        .as_ref()
+        .is_some_and(|cleanup| {
+            state.prepared_secondary_removal.as_ref() == Some(&cleanup.evidence.preparation)
+        })
+    {
+        state.prepared_secondary_removal = None;
+    }
+}
+
+fn apply_process_completion(
+    state: &mut AgentState,
+    completion: &crate::effects::ProcessCompletion,
+) {
+    state.role = completion.role;
+    state.read_status = completion.read_status;
+    state.write_status = completion.write_status;
+    state.previous_configuration = completion
+        .authority
+        .as_ref()
+        .and_then(|authority| authority.previous_configuration.clone());
+    state.current_configuration = completion
+        .authority
+        .as_ref()
+        .map(|authority| authority.current_configuration.clone());
 }
 
 const DATABASE_FILE: &str = "agent.sqlite3";
@@ -332,8 +344,10 @@ impl AgentStore for SqliteStore {
                         {
                             validate_acceptance_conversion(transaction, command)?;
                             // Admission above binds the local identity and full certificate.
-                            // Change only the execution mode; even EffectApplied is retained.
+                            // Historical recovery must establish its own canonical result.
                             pending.effect = effect.clone();
+                            pending.stage = EffectStage::IntentCommitted;
+                            pending.applied_result = None;
                             write_agent_state(transaction, &state)?;
                             return Ok(BeginEffect::Pending(effect.clone()));
                         }
@@ -344,18 +358,34 @@ impl AgentStore for SqliteStore {
                         }
                     }
                 }
-                return Ok(BeginEffect::Pending(pending.effect.clone()));
+                return match (&pending.stage, pending.applied_result.as_deref()) {
+                    (EffectStage::IntentCommitted, None) => {
+                        Ok(BeginEffect::Pending(pending.effect.clone()))
+                    }
+                    (EffectStage::EffectApplied, Some(result)) => Ok(BeginEffect::Applied {
+                        effect: pending.effect.clone(),
+                        result: Box::new(result.clone()),
+                    }),
+                    _ => Err(crate::host::HostError::Corrupt(
+                        "pending effect stage and canonical result disagree".into(),
+                    )),
+                };
             }
             state.pending_effect = Some(PendingEffect {
                 effect: effect.clone(),
                 stage: EffectStage::IntentCommitted,
+                applied_result: None,
             });
             write_agent_state(transaction, &state)?;
             Ok(BeginEffect::Execute(effect.clone()))
         })
     }
 
-    async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> Result<()> {
+    async fn mark_effect_applied(
+        &self,
+        effect: &RuntimeEffect,
+        result: &RuntimeEffectResult,
+    ) -> Result<()> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let pending = state.pending_effect.as_mut().ok_or_else(|| {
@@ -368,7 +398,18 @@ impl AgentStore for SqliteStore {
                     "runtime effect does not match durable intent".into(),
                 ));
             }
+            result
+                .validate_for(effect)
+                .map_err(|message| crate::host::HostError::DurableEffectConflict(message.into()))?;
+            if let Some(existing) = pending.applied_result.as_deref()
+                && existing != result
+            {
+                return Err(crate::host::HostError::DurableEffectConflict(
+                    "runtime effect produced a changed canonical result".into(),
+                ));
+            }
             pending.stage = EffectStage::EffectApplied;
+            pending.applied_result = Some(Box::new(result.clone()));
             write_agent_state(transaction, &state)
         })
     }
@@ -376,199 +417,271 @@ impl AgentStore for SqliteStore {
     async fn complete_effect(&self, result: &RuntimeEffectResult) -> Result<()> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            let pending = state.pending_effect.take().ok_or_else(|| {
+            if state.pending_effect.is_none() {
+                let retained = state.removal_effects.get(&result.operation_id).or_else(|| {
+                    state
+                        .retained_result
+                        .as_ref()
+                        .filter(|retained| retained.operation_id == result.operation_id)
+                });
+                if let Some(retained) = retained {
+                    if retained.result == *result {
+                        return Ok(());
+                    }
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "retained effect completion changed its canonical result".into(),
+                    ));
+                }
+            }
+            let pending = state.pending_effect.as_ref().ok_or_else(|| {
                 crate::host::HostError::DurableEffectConflict(
                     "effect completion has no durable intent".into(),
                 )
             })?;
-            if pending.effect.operation_id != result.operation_id
-                || pending.effect.sequence != result.sequence
+            result
+                .validate_for(&pending.effect)
+                .map_err(|message| crate::host::HostError::DurableEffectConflict(message.into()))?;
+            if pending.stage != EffectStage::EffectApplied
+                || pending.applied_result.as_deref() != Some(result)
             {
                 return Err(crate::host::HostError::DurableEffectConflict(
-                    "effect completion does not match durable intent".into(),
+                    "effect completion differs from the durably applied canonical result".into(),
                 ));
             }
-            validate_topology_receipt(&pending.effect, result)?;
+            let pending = state.pending_effect.take().unwrap();
+            let durable_authority: Option<AdmittedAuthority> = load_json_optional(
+                transaction,
+                "SELECT authority_json FROM replica_authority WHERE singleton = 1",
+                [],
+            )?;
             if let RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) =
                 &pending.effect.action
             {
                 crate::host::removal::admit_commit(command, &state)?;
             }
-            state.role = result.postcondition.role;
-            state.read_status = result.postcondition.read_status;
-            state.write_status = result.postcondition.write_status;
-            state.previous_configuration = result
-                .postcondition
-                .authority
-                .as_ref()
-                .and_then(|authority| authority.previous_configuration.clone());
-            state.current_configuration = result
-                .postcondition
-                .authority
-                .as_ref()
-                .map(|authority| authority.current_configuration.clone());
-            if let Some(configuration) = state.current_configuration.as_ref() {
-                state.highest_epoch = state.highest_epoch.max(configuration.epoch);
-            }
-            if let Some(authority) = &result.postcondition.authority {
-                state.secondary_removal_evidence = authority.secondary_removal.clone();
-                state.scale_up_evidence = authority.scale_up.clone();
-                if let Some(evidence) = authority.scale_up.as_deref() {
-                    let intent = evidence.intent();
-                    state.admitted_policy = Some(intent.current_policy.clone());
-                    state.previous_policy = authority
-                        .previous_configuration
-                        .as_ref()
-                        .map(|_| intent.previous_policy.clone());
-                } else if let Some(evidence) = &authority.secondary_removal {
-                    state.admitted_policy =
-                        Some(evidence.preparation.intent.current_policy.clone());
-                    state.previous_policy = authority
-                        .previous_configuration
-                        .as_ref()
-                        .map(|_| evidence.preparation.intent.previous_policy.clone());
-                } else {
-                    let policy = state
-                        .admitted_policy
-                        .clone()
-                        .unwrap_or_else(|| state.identity.effective_policy.clone());
-                    state.previous_policy = authority
-                        .previous_configuration
-                        .as_ref()
-                        .map(|_| policy.clone());
-                    state.admitted_policy = Some(policy);
+            match (&pending.effect.action, &result.outcome) {
+                (RuntimeEffectAction::Open(_), RuntimeEffectOutcome::Opened)
+                | (
+                    RuntimeEffectAction::RegisterPeerSession { .. },
+                    RuntimeEffectOutcome::PeerSessionRegistered { .. },
+                )
+                | (
+                    RuntimeEffectAction::ObserveReplicationAck { .. },
+                    RuntimeEffectOutcome::ReplicationAckObserved { .. },
+                ) => {}
+                (
+                    RuntimeEffectAction::AdmitAuthority(_),
+                    RuntimeEffectOutcome::AuthorityAdmitted(completion),
+                ) => {
+                    apply_admitted_authority(&mut state, completion);
+                    let authority = serde_json::to_string(&completion.authority).map_err(|error| {
+                        crate::host::HostError::Corrupt(format!(
+                            "cannot serialize admitted authority: {error}"
+                        ))
+                    })?;
+                    transaction.execute(
+                        "INSERT INTO replica_authority(singleton, authority_json) VALUES(1, ?1)
+                         ON CONFLICT(singleton) DO UPDATE SET authority_json = excluded.authority_json",
+                        [authority],
+                    )?;
                 }
-                if state.prepared_secondary_removal.as_ref().is_some_and(|p| {
-                    authority.current_configuration.epoch > p.intent.current_configuration.epoch
-                }) {
-                    state.prepared_secondary_removal = None;
-                }
-            }
-            state.accepted_secondary_removal =
-                result.postcondition.accepted_secondary_removal.clone();
-            if result
-                .postcondition
-                .accepted_secondary_removal
-                .as_ref()
-                .is_some_and(|c| {
-                    state.prepared_secondary_removal.as_ref() == Some(&c.evidence.preparation)
-                })
-            {
-                state.prepared_secondary_removal = None;
-            }
-            match &pending.effect.action {
-                RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
-                    crate::protocol::validation::validate_accept_secondary_removal_commit(command)
-                        .map_err(|e| {
-                            crate::host::HostError::DurableEffectConflict(e.to_string())
-                        })?;
-                    let intent = &command.committed.evidence.preparation.intent;
-                    let receipt = match result.topology_receipt.as_deref() {
-                        Some(TopologyReceipt::SecondaryRemoval(receipt)) => Some(receipt),
-                        _ => None,
-                    };
-                    if !command.local_recovery
-                        || command.operation_id != pending.effect.operation_id
-                        || command.target != state.identity.local_identity
-                        || intent.resource_uid != state.identity.resource_uid
-                        || result.postcondition.accepted_secondary_removal.as_ref()
-                            != Some(&command.committed)
-                        || receipt.is_some_and(|receipt| {
-                            receipt.accepted.as_ref() != Some(&command.committed)
-                        })
-                        || result.postcondition.role != ReplicaRole::ActiveSecondary
-                        || result.postcondition.write_status == AccessStatus::Granted
-                        || result.postcondition.role_transition.is_some()
-                        || result.postcondition.authority.as_ref().is_none_or(|a| {
-                            a.local_identity != command.target
-                                || a.previous_configuration.is_some()
-                                || a.current_configuration != intent.current_configuration
-                                || a.secondary_removal.as_ref() != Some(&command.committed.evidence)
-                        })
-                        || result
-                            .postcondition
-                            .verified_replication_lsn
-                            .is_none_or(|lsn| {
-                                lsn < command.committed.evidence.preparation.boundary_lsn
-                            })
-                    {
-                        return Err(crate::host::HostError::DurableEffectConflict(
-                            "historical acceptance omitted exact local postcondition".into(),
-                        ));
-                    }
-                }
-                RuntimeEffectAction::PrepareSecondaryRemoval {
-                    intent,
-                    process_session_id,
-                    report_sequence,
-                } => {
-                    let receipt = match result.topology_receipt.as_deref() {
-                        Some(TopologyReceipt::SecondaryRemoval(receipt)) => Some(receipt),
-                        _ => None,
-                    };
-                    let prepared = result
-                        .postcondition
-                        .prepared_secondary_removal
-                        .as_ref()
-                        .ok_or_else(|| {
-                            crate::host::HostError::DurableEffectConflict(
-                                "preparation omitted durable boundary".into(),
-                            )
-                        })?;
+                (
+                    RuntimeEffectAction::PrepareSecondaryRemoval {
+                        intent,
+                        process_session_id,
+                        report_sequence,
+                    },
+                    RuntimeEffectOutcome::SecondaryRemovalPrepared(completion),
+                ) => {
+                    let prepared =
+                        completion
+                            .prepared_secondary_removal
+                            .as_ref()
+                            .ok_or_else(|| {
+                                crate::host::HostError::DurableEffectConflict(
+                                    "preparation omitted durable boundary".into(),
+                                )
+                            })?;
                     crate::protocol::validation::validate_secondary_removal_preparation(prepared)
-                        .map_err(|e| crate::host::HostError::DurableEffectConflict(e.to_string()))?;
+                        .map_err(|error| {
+                        crate::host::HostError::DurableEffectConflict(error.to_string())
+                    })?;
                     if &prepared.intent != intent.as_ref()
                         || &prepared.process_session_id != process_session_id
                         || prepared.report_sequence != *report_sequence
                         || prepared.operation_id != pending.effect.operation_id
-                        || receipt
-                            .is_some_and(|receipt| receipt.preparation.as_ref() != Some(prepared))
-                        || result.postcondition.role != ReplicaRole::Primary
-                        || result.postcondition.read_status == AccessStatus::Granted
-                        || result.postcondition.write_status == AccessStatus::Granted
-                        || result.postcondition.current_progress < prepared.boundary_lsn
-                        || result.postcondition.authority.as_ref().is_none_or(|a| {
-                            a.local_identity != intent.primary
-                                || a.current_configuration != intent.previous_configuration
-                                || a.previous_configuration.is_some()
+                        || completion.role != ReplicaRole::Primary
+                        || completion.read_status == AccessStatus::Granted
+                        || completion.write_status == AccessStatus::Granted
+                        || completion.current_progress < prepared.boundary_lsn
+                        || completion.authority.as_ref().is_none_or(|authority| {
+                            authority.local_identity != intent.primary
+                                || authority.current_configuration != intent.previous_configuration
+                                || authority.previous_configuration.is_some()
                         })
-                        || result
-                            .postcondition
+                        || completion
                             .verified_replication_lsn
                             .is_none_or(|lsn| lsn < prepared.boundary_lsn)
-                        || result.postcondition.committed_lsn > prepared.boundary_lsn
+                        || completion.committed_lsn > prepared.boundary_lsn
                     {
                         return Err(crate::host::HostError::DurableEffectConflict(
                             "preparation returned conflicting authority or progress".into(),
                         ));
                     }
+                    if let Some(receipt) = completion.receipt.as_deref() {
+                        if completion.authority.as_ref() != durable_authority.as_ref() {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "secondary-removal preparation completed under a different authority"
+                                    .into(),
+                            ));
+                        }
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
+                        if receipt.preparation.as_ref() != Some(prepared) {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "secondary-removal receipt does not match preparation".into(),
+                            ));
+                        }
+                    }
+                    state.read_status = completion.read_status;
+                    state.write_status = completion.write_status;
                     state.prepared_secondary_removal = Some(prepared.clone());
                 }
-                RuntimeEffectAction::RetireReplica(retired) => {
+                (
+                    RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness),
+                    RuntimeEffectOutcome::SecondaryRemovalWitnessObserved { receipt, .. },
+                ) => {
+                    if let Some(receipt) = receipt.as_deref() {
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
+                        if receipt.witness.as_ref() != Some(witness) {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "secondary-removal receipt does not match witness".into(),
+                            ));
+                        }
+                    }
+                }
+                (
+                    RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed },
+                    RuntimeEffectOutcome::SecondaryRemovalProgressObserved { receipt, .. },
+                ) => {
+                    if let Some(receipt) = receipt.as_deref() {
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
+                        if receipt.witness.as_ref() != Some(witness)
+                            || receipt.accepted.as_ref() != Some(committed)
+                        {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "secondary-removal receipt does not match observed progress".into(),
+                            ));
+                        }
+                    }
+                }
+                (
+                    RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed),
+                    RuntimeEffectOutcome::SecondaryRemovalAccepted { receipt, .. },
+                ) => {
+                    if let Some(receipt) = receipt.as_deref() {
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
+                        if receipt.accepted.as_ref() != Some(committed) {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "secondary-removal receipt does not match accepted cleanup".into(),
+                            ));
+                        }
+                    }
+                    state.accepted_secondary_removal = Some((**committed).clone());
+                    if state.prepared_secondary_removal.as_ref()
+                        == Some(&committed.evidence.preparation)
+                    {
+                        state.prepared_secondary_removal = None;
+                    }
+                }
+                (
+                    RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command),
+                    RuntimeEffectOutcome::HistoricalSecondaryRemovalAccepted(completion),
+                ) => {
+                    crate::protocol::validation::validate_accept_secondary_removal_commit(command)
+                        .map_err(|error| {
+                            crate::host::HostError::DurableEffectConflict(error.to_string())
+                        })?;
+                    let intent = &command.committed.evidence.preparation.intent;
+                    if !command.local_recovery
+                        || command.operation_id != pending.effect.operation_id
+                        || command.target != state.identity.local_identity
+                        || intent.resource_uid != state.identity.resource_uid
+                        || completion.accepted_secondary_removal != command.committed
+                        || completion.role != ReplicaRole::ActiveSecondary
+                        || completion.write_status == AccessStatus::Granted
+                        || !completion.role_transition_clear
+                        || completion.authority.as_ref().is_none_or(|authority| {
+                            authority.local_identity != command.target
+                                || authority.previous_configuration.is_some()
+                                || authority.current_configuration != intent.current_configuration
+                                || authority.secondary_removal.as_ref()
+                                    != Some(&command.committed.evidence)
+                        })
+                        || completion.verified_replication_lsn.is_none_or(|lsn| {
+                            lsn < command.committed.evidence.preparation.boundary_lsn
+                        })
+                    {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "historical acceptance omitted exact local postcondition".into(),
+                        ));
+                    }
+                    if let Some(receipt) = completion.receipt.as_deref() {
+                        if completion.authority.as_ref() != durable_authority.as_ref() {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "historical acceptance completed under a different authority"
+                                    .into(),
+                            ));
+                        }
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
+                        if receipt.accepted.as_ref() != Some(&command.committed) {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "historical acceptance receipt differs".into(),
+                            ));
+                        }
+                    }
+                    state.accepted_secondary_removal = Some(command.committed.clone());
+                    if state.prepared_secondary_removal.as_ref()
+                        == Some(&command.committed.evidence.preparation)
+                    {
+                        state.prepared_secondary_removal = None;
+                    }
+                }
+                (
+                    RuntimeEffectAction::RetireReplica(retired),
+                    RuntimeEffectOutcome::ReplicaRetired(completion),
+                ) => {
                     retired
                         .validate(&state.identity.local_identity)
-                        .map_err(|e| {
-                            crate::host::HostError::DurableEffectConflict(e.to_string())
+                        .map_err(|error| {
+                            crate::host::HostError::DurableEffectConflict(error.to_string())
                         })?;
-                    let retirement_receipt = match result.topology_receipt.as_deref() {
-                        Some(TopologyReceipt::Retirement(receipt)) => Some(receipt),
-                        _ => None,
-                    };
-                    if retirement_receipt
-                        .is_some_and(|receipt| !receipt.completed || receipt.retired != **retired)
-                        || result.postcondition.retired_authority.as_ref() != Some(retired)
-                        || result.postcondition.open
-                        || result.postcondition.role != ReplicaRole::None
-                        || result.postcondition.read_status != AccessStatus::NotPrimary
-                        || result.postcondition.write_status != AccessStatus::NotPrimary
-                        || result.postcondition.authority.is_some()
-                        || result.postcondition.role_transition.is_some()
-                        || !result.postcondition.builds.is_empty()
+                    if completion.retired != **retired
+                        || completion.open
+                        || completion.role != ReplicaRole::None
+                        || completion.read_status != AccessStatus::NotPrimary
+                        || completion.write_status != AccessStatus::NotPrimary
+                        || completion.authority.is_some()
+                        || !completion.role_transition_clear
+                        || completion.active_builds
                     {
                         return Err(crate::host::HostError::DurableEffectConflict(
                             "retirement omitted terminal closure".into(),
                         ));
                     }
+                    if let Some(receipt) = completion.receipt.as_deref()
+                        && (receipt.engine_session_id.is_empty()
+                            || !receipt.completed
+                            || receipt.retired != **retired)
+                    {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "retirement receipt does not match terminal retirement".into(),
+                        ));
+                    }
+                    state.role = completion.role;
+                    state.read_status = completion.read_status;
+                    state.write_status = completion.write_status;
+                    state.previous_configuration = None;
+                    state.current_configuration = None;
                     state.retired_authority = Some(*retired.clone());
                     state.highest_epoch = state.highest_epoch.max(retired.report.epoch);
                     state.previous_policy = None;
@@ -577,51 +690,204 @@ impl AgentStore for SqliteStore {
                     state.accepted_secondary_removal = None;
                     state.prepared_secondary_removal = None;
                 }
-                RuntimeEffectAction::RetireBuild(build_id) => {
-                    if result
-                        .postcondition
-                        .builds
-                        .iter()
-                        .any(|build| &build.authority.build_id == build_id)
-                    {
+                (
+                    RuntimeEffectAction::FenceRetirement(retired),
+                    RuntimeEffectOutcome::RetirementFenced(completion),
+                ) => {
+                    if completion.retired != **retired {
                         return Err(crate::host::HostError::DurableEffectConflict(
-                            "build retirement left the build active".into(),
+                            "retirement fence identity differs".into(),
                         ));
                     }
-                    state.retired_builds.insert(build_id.clone());
+                    if let Some(receipt) = completion.receipt.as_deref()
+                        && (receipt.engine_session_id.is_empty()
+                            || receipt.completed
+                            || receipt.retired != **retired)
+                    {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "retirement fence receipt differs".into(),
+                        ));
+                    }
+                    state.read_status = completion.read_status;
+                    state.write_status = completion.write_status;
+                    state.previous_configuration = completion
+                        .authority
+                        .as_ref()
+                        .and_then(|authority| authority.previous_configuration.clone());
+                    state.current_configuration = completion
+                        .authority
+                        .as_ref()
+                        .map(|authority| authority.current_configuration.clone());
                 }
-                _ => {}
-            }
-            if let RuntimeEffectAction::PrepareSwitchover {
-                preparation_generation,
-                request_id,
-                source,
-                target,
-                starting_configuration_id,
-                starting_epoch,
-            } = &pending.effect.action
-            {
-                let switchover_receipt = match result.topology_receipt.as_deref() {
-                    Some(TopologyReceipt::Switchover(receipt)) => Some(receipt),
-                    _ => None,
-                };
-                let authority = result.postcondition.authority.as_ref().ok_or_else(|| {
-                    crate::host::HostError::DurableEffectConflict(
-                        "planned switchover preparation omitted admitted authority".into(),
-                    )
-                })?;
-                if *preparation_generation == 0
-                    || result.postcondition.role != ReplicaRole::Primary
-                    || result.postcondition.write_status != AccessStatus::ReconfigurationPending
-                    || result.postcondition.current_progress < 0
-                    || result.postcondition.committed_lsn > result.postcondition.current_progress
-                    || authority.local_identity != *source
-                    || authority.current_configuration.configuration_id
-                        != *starting_configuration_id
-                    || authority.current_configuration.epoch != *starting_epoch
-                    || authority.primary_identity() != source
-                    || switchover_receipt.is_some_and(|receipt| {
-                        !switchover_receipt_matches(
+                (
+                    RuntimeEffectAction::CompleteRetirement(retired),
+                    RuntimeEffectOutcome::RetirementCompleted(completion),
+                ) => {
+                    if completion.retired != **retired
+                        || completion.open
+                        || completion.role != ReplicaRole::None
+                        || completion.read_status != AccessStatus::NotPrimary
+                        || completion.write_status != AccessStatus::NotPrimary
+                        || completion.authority.is_some()
+                        || !completion.role_transition_clear
+                        || completion.active_builds
+                    {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "retirement completion omitted terminal closure".into(),
+                        ));
+                    }
+                    if let Some(receipt) = completion.receipt.as_deref()
+                        && (receipt.engine_session_id.is_empty()
+                            || !receipt.completed
+                            || receipt.retired != **retired)
+                    {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "retirement completion receipt differs".into(),
+                        ));
+                    }
+                    state.role = completion.role;
+                    state.read_status = completion.read_status;
+                    state.write_status = completion.write_status;
+                    state.previous_configuration = None;
+                    state.current_configuration = None;
+                }
+                (
+                    RuntimeEffectAction::AuthorizeFailoverPrefix(boundary),
+                    RuntimeEffectOutcome::FailoverPrefixAuthorized { receipt, .. },
+                ) => {
+                    if let Some(receipt) = receipt.as_deref() {
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
+                        if receipt.settled_lsn != *boundary {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "certified-prefix receipt differs".into(),
+                            ));
+                        }
+                    }
+                }
+                (
+                    RuntimeEffectAction::AdmitBuildAuthority(_),
+                    RuntimeEffectOutcome::BuildAuthorityAdmitted { .. },
+                ) => {}
+                (
+                    RuntimeEffectAction::ChangeRole(_),
+                    RuntimeEffectOutcome::RoleChanged(completion),
+                ) => state.role = completion.role,
+                (
+                    RuntimeEffectAction::ChangeReplicatorRole(_),
+                    RuntimeEffectOutcome::ReplicatorRoleChanged(_),
+                ) => {}
+                (
+                    RuntimeEffectAction::UpdateEpoch,
+                    RuntimeEffectOutcome::EpochUpdated(completion),
+                ) => {
+                    let expected_epoch = durable_authority
+                        .as_ref()
+                        .map(|authority| authority.current_configuration.epoch)
+                        .or_else(|| {
+                            state
+                                .current_configuration
+                                .as_ref()
+                                .map(|configuration| configuration.epoch)
+                        })
+                        .ok_or_else(|| {
+                            crate::host::HostError::DurableEffectConflict(
+                                "epoch completion has no durable authority".into(),
+                            )
+                        })?;
+                    if completion.epoch != expected_epoch {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "epoch completion differs from durable authority".into(),
+                        ));
+                    }
+                    state.highest_epoch = state.highest_epoch.max(completion.epoch);
+                }
+                (
+                    RuntimeEffectAction::ChangeApplicationRole(_),
+                    RuntimeEffectOutcome::ApplicationRoleChanged {
+                        completion,
+                        receipt,
+                    },
+                ) => {
+                    if let Some(receipt) = receipt.as_deref() {
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
+                    }
+                    state.role = completion.role;
+                }
+                (
+                    RuntimeEffectAction::WaitForCatchup,
+                    RuntimeEffectOutcome::CatchUpCompleted(completion),
+                ) => {
+                    if completion.authority.as_ref() != durable_authority.as_ref() {
+                        return Err(crate::host::HostError::StaleEffectCompletion(
+                            "catch-up completed under a different authority".into(),
+                        ));
+                    }
+                }
+                (
+                    RuntimeEffectAction::SetAccessStatus { .. },
+                    RuntimeEffectOutcome::AccessChanged(completion),
+                ) => {
+                    state.read_status = completion.read_status;
+                    state.write_status = completion.write_status;
+                }
+                (
+                    RuntimeEffectAction::SetReadStatus(_),
+                    RuntimeEffectOutcome::AccessChanged(completion),
+                ) => {
+                    state.read_status = completion.read_status;
+                }
+                (
+                    RuntimeEffectAction::SetWriteStatus(_),
+                    RuntimeEffectOutcome::AccessChanged(completion),
+                ) => {
+                    state.write_status = completion.write_status;
+                }
+                (
+                    RuntimeEffectAction::PrepareSwitchover {
+                        preparation_generation,
+                        request_id,
+                        source,
+                        target,
+                        starting_configuration_id,
+                        starting_epoch,
+                    },
+                    RuntimeEffectOutcome::SwitchoverPrepared(completion),
+                ) => {
+                    let authority = completion.authority.as_ref().ok_or_else(|| {
+                        crate::host::HostError::DurableEffectConflict(
+                            "planned switchover preparation omitted admitted authority".into(),
+                        )
+                    })?;
+                    if *preparation_generation == 0
+                        || completion.role != ReplicaRole::Primary
+                        || completion.write_status != AccessStatus::ReconfigurationPending
+                        || completion.current_progress < 0
+                        || completion.committed_lsn > completion.current_progress
+                        || authority.local_identity != *source
+                        || authority.current_configuration.configuration_id
+                            != *starting_configuration_id
+                        || authority.current_configuration.epoch != *starting_epoch
+                        || authority.primary_identity() != source
+                        || !authority
+                            .current_configuration
+                            .members
+                            .iter()
+                            .any(|member| {
+                                member.identity == *target && member.role != ReplicaRole::Primary
+                            })
+                    {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "planned switchover preparation returned an invalid result".into(),
+                        ));
+                    }
+                    if let Some(receipt) = completion.receipt.as_deref() {
+                        if Some(authority) != durable_authority.as_ref() {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "planned switchover completed under a different authority".into(),
+                            ));
+                        }
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
+                        if !switchover_receipt_matches(
                             receipt,
                             *preparation_generation,
                             request_id,
@@ -629,49 +895,135 @@ impl AgentStore for SqliteStore {
                             target,
                             starting_configuration_id,
                             *starting_epoch,
-                        )
-                    })
-                    || !authority
-                        .current_configuration
-                        .members
-                        .iter()
-                        .any(|member| {
-                            member.identity == *target && member.role != ReplicaRole::Primary
-                        })
-                {
-                    return Err(crate::host::HostError::DurableEffectConflict(
-                        "planned switchover preparation returned an invalid postcondition".into(),
-                    ));
-                }
-                let handoff = SwitchoverHandoff {
-                    preparation_generation: *preparation_generation,
-                    preparation_operation_id: pending.effect.operation_id.clone(),
-                    request_id: request_id.clone(),
-                    source: source.clone(),
-                    target: target.clone(),
-                    starting_configuration_id: starting_configuration_id.clone(),
-                    starting_epoch: *starting_epoch,
-                    handoff_lsn: switchover_receipt
+                        ) {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "planned switchover receipt differs".into(),
+                            ));
+                        }
+                    }
+                    let handoff = SwitchoverHandoff {
+                        preparation_generation: *preparation_generation,
+                        preparation_operation_id: pending.effect.operation_id.clone(),
+                        request_id: request_id.clone(),
+                        source: source.clone(),
+                        target: target.clone(),
+                        starting_configuration_id: starting_configuration_id.clone(),
+                        starting_epoch: *starting_epoch,
+                        handoff_lsn: completion
+                            .receipt
+                            .as_ref()
+                            .map_or(completion.current_progress, |receipt| receipt.handoff_lsn),
+                    };
+                    if state
+                        .prepared_switchover
                         .as_ref()
-                        .map_or(result.postcondition.current_progress, |receipt| {
-                            receipt.handoff_lsn
-                        }),
-                };
-                if state
-                    .prepared_switchover
-                    .as_ref()
-                    .is_some_and(|existing| existing != &handoff)
-                {
+                        .is_some_and(|existing| existing != &handoff)
+                    {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "another planned switchover preparation is retained".into(),
+                        ));
+                    }
+                    state.write_status = completion.write_status;
+                    state.prepared_switchover = Some(handoff);
+                }
+                (
+                    RuntimeEffectAction::RefreshApplicationProgress,
+                    RuntimeEffectOutcome::ApplicationProgressRefreshed { .. },
+                ) => {}
+                (
+                    RuntimeEffectAction::BuildReplica { build_id, .. },
+                    RuntimeEffectOutcome::BuildReplica(completion),
+                ) => match &completion.state {
+                    BuildEffectState::Dispatched => {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "build dispatch is not a terminal completion".into(),
+                        ));
+                    }
+                    BuildEffectState::Completed(build) => {
+                        let active_authority: Option<BuildAuthority> = load_json_optional(
+                            transaction,
+                            "SELECT authority_json FROM build_authority WHERE build_id = ?1",
+                            [build_id.as_str()],
+                        )?;
+                        let selection: Option<crate::authority::BuildSelection> = load_lifecycle(
+                            transaction,
+                            &build_selection_key(&build.authority.target).map_err(|error| {
+                                crate::host::HostError::DurableEffectConflict(error.to_string())
+                            })?,
+                        )
+                        .map_err(|error| {
+                            crate::host::HostError::DurableEffectConflict(error.to_string())
+                        })?;
+                        if !build.completed
+                            || build.authority.build_id != *build_id
+                            || build.authority.target != completion.target
+                        {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "build completion carries contradictory identity or state".into(),
+                            ));
+                        }
+                        if active_authority.as_ref() != Some(&build.authority)
+                            || selection
+                                .as_ref()
+                                .is_none_or(|selection| selection.authority != build.authority)
+                            || state.abandoned_builds.contains(build_id)
+                            || state.retired_builds.contains(build_id)
+                        {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "build completion lost its durable authority or selection".into(),
+                            ));
+                        }
+                        let durable = state.build_progress.get(build_id).ok_or_else(|| {
+                            crate::host::HostError::DurableEffectConflict(
+                                "build completion lacks durable progress".into(),
+                            )
+                        })?;
+                        if durable.authority != build.authority
+                            || durable.last_sequence != build.last_sequence
+                            || durable.durable_lsn != build.durable_lsn
+                            || durable.completed != build.completed
+                            || durable.catch_up_boundary_lsn != build.catch_up_boundary_lsn
+                        {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "build completion differs from durable build progress".into(),
+                            ));
+                        }
+                    }
+                    BuildEffectState::Abandoned => {
+                        if !state.abandoned_builds.contains(build_id) {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "abandoned build completion lacks durable abandonment".into(),
+                            ));
+                        }
+                    }
+                },
+                (
+                    RuntimeEffectAction::RetireBuild(build_id),
+                    RuntimeEffectOutcome::BuildRetired { active, .. },
+                ) => {
+                    if *active {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "build retirement left the build active".into(),
+                        ));
+                    }
+                    state.retired_builds.insert(build_id.clone());
+                }
+                (RuntimeEffectAction::Close, RuntimeEffectOutcome::Closed(completion))
+                | (RuntimeEffectAction::Abort, RuntimeEffectOutcome::Aborted(completion)) => {
+                    apply_process_completion(&mut state, completion)
+                }
+                _ => {
                     return Err(crate::host::HostError::DurableEffectConflict(
-                        "another planned switchover preparation is retained".into(),
+                        "effect outcome is incompatible with durable intent".into(),
                     ));
                 }
-                state.prepared_switchover = Some(handoff);
             }
             let retained = RetainedResult {
                 operation_id: result.operation_id.clone(),
-                effect: pending.effect,
-                result: result.clone(),
+                record: crate::effects::RecordedEffect {
+                    effect: pending.effect,
+                    result: result.clone(),
+                },
             };
             if matches!(
                 retained.effect.action,
@@ -704,6 +1056,18 @@ impl AgentStore for SqliteStore {
                 return Err(crate::host::HostError::DurableEffectConflict(
                     "cancelled runtime effect does not match durable intent".into(),
                 ));
+            }
+            if pending.stage == EffectStage::EffectApplied {
+                let abandoned_build = matches!(
+                    &pending.effect.action,
+                    RuntimeEffectAction::BuildReplica { build_id, .. }
+                        if state.abandoned_builds.contains(build_id)
+                );
+                if !abandoned_build {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "applied effect cancellation requires durable build abandonment".into(),
+                    ));
+                }
             }
             write_agent_state(transaction, &state)
         })
@@ -2081,19 +2445,19 @@ mod tests {
     }
 
     #[test]
-    fn application_binding_schema_five_rejects_schema_four_without_migration() {
+    fn narrow_completion_schema_six_rejects_schema_five_without_migration() {
         let directory = crate::host::tests::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let expected = identity();
         drop(SqliteStore::create_authorized(&path, AgentState::new(expected.clone())).unwrap());
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 4).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
         drop(connection);
         assert!(matches!(
             SqliteStore::open_existing(&path, Some(&expected)),
             Err(crate::host::HostError::SchemaMismatch {
-                expected: 5,
-                observed: 4
+                expected: 6,
+                observed: 5
             })
         ));
     }

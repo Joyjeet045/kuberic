@@ -20,6 +20,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ContractError, ContractResult as Result};
 use crate::transport::{CopyItem, ReplicationItem};
 
+fn deserialize_required_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
 pub(crate) fn validate_build_envelope(
     authority: &BuildAuthority,
     envelope: &CopyItem,
@@ -94,14 +104,16 @@ pub(crate) struct DurableLocalWrite {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AdmittedAuthority {
     pub(crate) local_identity: ReplicaIdentity,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) transition_kind: Option<TransitionKind>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) previous_configuration: Option<ConfigurationDescriptor>,
     pub(crate) current_configuration: ConfigurationDescriptor,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) switchover_handoff: Option<SwitchoverHandoff>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) secondary_removal: Option<SecondaryRemovalEvidence>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) scale_up: Option<Box<ScaleUpConfigurationEvidence>>,
 }
 

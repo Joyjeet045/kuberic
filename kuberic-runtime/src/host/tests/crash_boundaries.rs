@@ -17,13 +17,14 @@ use crate::authority::{
     DurableBuildProgress, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use crate::effects::{
-    RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
-    RuntimeSnapshot,
+    RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectOutcome, RuntimeEffectResult,
+    RuntimeSnapshot, SwitchoverCompletion,
 };
 use crate::engine::{DurableState, RetainedOperationStream};
 use crate::host::command::admit_configuration;
 use crate::host::coordinator::Coordinator;
 use crate::host::hosting::{OutboundReplication, PodRuntime};
+use crate::host::observation::ReplicaRuntimeState;
 use crate::host::recovery::{RecoveryDecision, inspect_recovery, recover_pending};
 use crate::host::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use crate::host::service::{AgentService, SessionRegistry};
@@ -433,8 +434,12 @@ impl AgentStore for ScaleUpProductionCutStore {
         Ok(begun)
     }
 
-    async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> Result<()> {
-        self.inner.mark_effect_applied(effect).await?;
+    async fn mark_effect_applied(
+        &self,
+        effect: &RuntimeEffect,
+        result: &RuntimeEffectResult,
+    ) -> Result<()> {
+        self.inner.mark_effect_applied(effect, result).await?;
         if self.cut.as_deref().is_some_and(|cut| {
             scale_up_effect_cut_matches(
                 cut,
@@ -632,13 +637,13 @@ fn real_handoff_fixture(scenario: &str) -> (AgentState, EnsureConfiguration) {
 }
 
 struct SwitchoverRecoveryRuntime {
-    state: Mutex<RuntimePostcondition>,
+    state: Mutex<ReplicaRuntimeState>,
     crash_after: Option<&'static str>,
 }
 
 impl SwitchoverRecoveryRuntime {
     fn new(state: &AgentState, crash_after: Option<&'static str>) -> Self {
-        let mut snapshot = result().postcondition;
+        let mut snapshot = ReplicaRuntimeState::empty(state.identity.local_identity.clone());
         snapshot.open = true;
         snapshot.role = state.role;
         snapshot.read_status = AccessStatus::ReconfigurationPending;
@@ -678,6 +683,7 @@ impl SwitchoverRecoveryRuntime {
 impl RuntimeEffectExecutor for SwitchoverRecoveryRuntime {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         let mut state = self.state.lock().unwrap();
+        let action = effect.action.clone();
         let stage = match effect.action {
             RuntimeEffectAction::AdmitAuthority(authority) => {
                 state.authority = Some(*authority);
@@ -685,6 +691,7 @@ impl RuntimeEffectExecutor for SwitchoverRecoveryRuntime {
             }
             RuntimeEffectAction::ChangeApplicationRole(role) => {
                 state.role = role;
+                state.role_transition = None;
                 "role"
             }
             RuntimeEffectAction::SetReadStatus(read) => {
@@ -700,10 +707,30 @@ impl RuntimeEffectExecutor for SwitchoverRecoveryRuntime {
                 state.write_status = write;
                 "access"
             }
-            RuntimeEffectAction::RefreshApplicationProgress
-            | RuntimeEffectAction::ChangeReplicatorRole(_)
-            | RuntimeEffectAction::UpdateEpoch
-            | RuntimeEffectAction::WaitForCatchup => "other",
+            RuntimeEffectAction::RefreshApplicationProgress => "other",
+            RuntimeEffectAction::ChangeReplicatorRole(role) => {
+                state.role_transition = Some(RoleTransition {
+                    completed_role: state.role,
+                    target_role: role,
+                    replicator_completed: true,
+                    epoch_completed: role != ReplicaRole::Primary,
+                    application_completed: false,
+                });
+                "other"
+            }
+            RuntimeEffectAction::UpdateEpoch => {
+                state
+                    .role_transition
+                    .as_mut()
+                    .expect("replicator role stage")
+                    .epoch_completed = true;
+                "other"
+            }
+            RuntimeEffectAction::WaitForCatchup => {
+                state.catch_up_boundary = Some(state.current_progress);
+                state.catch_up_complete = true;
+                "other"
+            }
             action => panic!("unexpected recovery effect {action:?}"),
         };
         if self.crash_after == Some(stage) {
@@ -712,8 +739,7 @@ impl RuntimeEffectExecutor for SwitchoverRecoveryRuntime {
         Ok(RuntimeEffectResult {
             operation_id: effect.operation_id,
             sequence: effect.sequence,
-            topology_receipt: None,
-            postcondition: state.clone(),
+            outcome: state.effect_outcome(&action, None, None)?,
         })
     }
 }
@@ -1970,7 +1996,7 @@ const PC_CANDIDATE_BASE: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
     authority_crossed: false,
     role: ReplicaRole::IdleSecondary,
     read_status: AccessStatus::NotPrimary,
-    write_status: AccessStatus::ReconfigurationPending,
+    write_status: AccessStatus::NotPrimary,
     applied_lsn: 1,
     committed_lsn: 1,
     build_retired: false,
@@ -2035,6 +2061,7 @@ const SCALE_UP_CANDIDATE_CUT_SPECS: &[ScaleUpCandidateCutSpec] = &[
         cut: "candidate-pc-cc-authority-after",
         authority_crossed: true,
         read_status: AccessStatus::ReconfigurationPending,
+        write_status: AccessStatus::ReconfigurationPending,
         ..PC_CANDIDATE_BASE
     },
     ScaleUpCandidateCutSpec {
@@ -2718,7 +2745,8 @@ fn assert_scale_up_effect_cut_oracle(
             "{cut}: retained predecessor action tag"
         );
         assert_eq!(
-            retained.result.postcondition.role_transition, None,
+            outcome_role_transition(&retained.result),
+            None,
             "{cut}: predecessor fabricated split-role progress"
         );
     }
@@ -2741,7 +2769,7 @@ fn assert_scale_up_effect_cut_oracle(
             "{cut}: retained split-role action tag"
         );
         assert_eq!(
-            retained.result.postcondition.role_transition,
+            outcome_role_transition(&retained.result),
             Some(RoleTransition {
                 completed_role: runtime_role_before,
                 target_role: scale_up_command_role(command),
@@ -2782,24 +2810,26 @@ fn assert_scale_up_effect_cut_oracle(
         marker.result.sequence, expected_effect_sequence,
         "{cut}: marker result sequence"
     );
-    assert_eq!(
-        marker.result.postcondition.role, runtime_role_after,
-        "{cut}: effect-side role"
-    );
-    assert_eq!(
-        marker.result.postcondition.read_status, runtime_read_after,
-        "{cut}: effect-side read status"
-    );
-    assert_eq!(
-        marker.result.postcondition.write_status, runtime_write_after,
-        "{cut}: effect-side write status"
-    );
-    if let Some(expected) = runtime_verified_lsn_after {
+    if let Some(role) = outcome_role(&marker.result) {
+        assert_eq!(role, runtime_role_after, "{cut}: effect-side role");
+    }
+    if let Some(read_status) = outcome_read_status(&marker.result) {
         assert_eq!(
-            marker.result.postcondition.verified_replication_lsn,
-            Some(expected),
-            "{cut}: effect-side verified progress"
+            read_status, runtime_read_after,
+            "{cut}: effect-side read status"
         );
+    }
+    if let Some(write_status) = outcome_write_status(&marker.result) {
+        assert_eq!(
+            write_status, runtime_write_after,
+            "{cut}: effect-side write status"
+        );
+    }
+    if let (Some(expected), Some(actual)) = (
+        runtime_verified_lsn_after,
+        outcome_verified_lsn(&marker.result),
+    ) {
+        assert_eq!(actual, expected, "{cut}: effect-side verified progress");
     }
 
     let expected_transition = match tag {
@@ -2813,7 +2843,8 @@ fn assert_scale_up_effect_cut_oracle(
         _ => None,
     };
     assert_eq!(
-        marker.result.postcondition.role_transition, expected_transition,
+        outcome_role_transition(&marker.result),
+        expected_transition,
         "{cut}: exact role-transition postcondition"
     );
 
@@ -3038,8 +3069,13 @@ fn scale_up_cut_adapter_matches_real_source_and_candidate_runtime_trace() {
             })
             .await
             .unwrap();
-        assert_eq!(real_result.postcondition.authority, Some(authority));
-        assert_eq!(real_result.postcondition.current_progress, 9);
+        match real_result.outcome {
+            RuntimeEffectOutcome::AuthorityAdmitted(completion) => {
+                assert_eq!(completion.authority, authority);
+            }
+            outcome => panic!("expected authority completion, got {outcome:?}"),
+        }
+        assert_eq!(source_runtime.snapshot().await.current_progress, 9);
         assert_eq!(
             candidate_application.durable_progress().await.unwrap(),
             DurableApplicationProgress {
@@ -3395,6 +3431,7 @@ async fn ensure_scale_up_store_cut(
             .unwrap()
             .retained_result
             .expect("durable candidate build-admission result")
+            .record
             .effect;
         assert_eq!(
             retained_build_effect.action,
@@ -4362,6 +4399,13 @@ async fn open_scale_up_failover_owner(
                 | RuntimeEffectAction::UpdateEpoch
                 | RuntimeEffectAction::ChangeApplicationRole(_)
         )
+    }) || state.pending_effect.as_ref().is_some_and(|pending| {
+        matches!(
+            pending.effect.action,
+            RuntimeEffectAction::ChangeReplicatorRole(_)
+                | RuntimeEffectAction::UpdateEpoch
+                | RuntimeEffectAction::ChangeApplicationRole(_)
+        )
     });
     if needs_split_role_recovery {
         let service = AgentService::new(
@@ -5096,25 +5140,79 @@ fn result() -> RuntimeEffectResult {
     RuntimeEffectResult {
         operation_id: OperationId::new("effect-1"),
         sequence: 1,
-        topology_receipt: None,
-        postcondition: RuntimePostcondition {
-            prepared_secondary_removal: None,
-            retired_authority: None,
-            accepted_secondary_removal: None,
-            open: true,
-            role: ReplicaRole::None,
-            role_transition: None,
-            read_status: AccessStatus::NotPrimary,
-            write_status: AccessStatus::NotPrimary,
-            authority: None,
-            current_progress: 0,
-            verified_replication_lsn: None,
-            committed_lsn: 0,
-            current_configuration_quorum_progress: 0,
-            catch_up_boundary: None,
-            catch_up_complete: false,
-            builds: Vec::new(),
-        },
+        outcome: RuntimeEffectOutcome::Opened,
+    }
+}
+
+fn outcome_role(result: &RuntimeEffectResult) -> Option<ReplicaRole> {
+    match &result.outcome {
+        RuntimeEffectOutcome::RoleChanged(completion)
+        | RuntimeEffectOutcome::ReplicatorRoleChanged(completion) => Some(completion.role),
+        RuntimeEffectOutcome::ApplicationRoleChanged { completion, .. } => Some(completion.role),
+        RuntimeEffectOutcome::AccessChanged(completion) => Some(completion.role),
+        RuntimeEffectOutcome::ReplicaRetired(completion)
+        | RuntimeEffectOutcome::RetirementFenced(completion)
+        | RuntimeEffectOutcome::RetirementCompleted(completion) => Some(completion.role),
+        RuntimeEffectOutcome::Closed(completion) | RuntimeEffectOutcome::Aborted(completion) => {
+            Some(completion.role)
+        }
+        _ => None,
+    }
+}
+
+fn outcome_read_status(result: &RuntimeEffectResult) -> Option<AccessStatus> {
+    match &result.outcome {
+        RuntimeEffectOutcome::AuthorityAdmitted(completion) => Some(completion.read_status),
+        RuntimeEffectOutcome::AccessChanged(completion) => Some(completion.read_status),
+        RuntimeEffectOutcome::ReplicaRetired(completion)
+        | RuntimeEffectOutcome::RetirementFenced(completion)
+        | RuntimeEffectOutcome::RetirementCompleted(completion) => Some(completion.read_status),
+        RuntimeEffectOutcome::Closed(completion) | RuntimeEffectOutcome::Aborted(completion) => {
+            Some(completion.read_status)
+        }
+        _ => None,
+    }
+}
+
+fn outcome_write_status(result: &RuntimeEffectResult) -> Option<AccessStatus> {
+    match &result.outcome {
+        RuntimeEffectOutcome::AuthorityAdmitted(completion) => Some(completion.write_status),
+        RuntimeEffectOutcome::AccessChanged(completion) => Some(completion.write_status),
+        RuntimeEffectOutcome::SwitchoverPrepared(completion) => Some(completion.write_status),
+        RuntimeEffectOutcome::ReplicaRetired(completion)
+        | RuntimeEffectOutcome::RetirementFenced(completion)
+        | RuntimeEffectOutcome::RetirementCompleted(completion) => Some(completion.write_status),
+        RuntimeEffectOutcome::Closed(completion) | RuntimeEffectOutcome::Aborted(completion) => {
+            Some(completion.write_status)
+        }
+        _ => None,
+    }
+}
+
+fn outcome_role_transition(result: &RuntimeEffectResult) -> Option<RoleTransition> {
+    match &result.outcome {
+        RuntimeEffectOutcome::RoleChanged(completion)
+        | RuntimeEffectOutcome::ReplicatorRoleChanged(completion) => {
+            completion.role_transition.clone()
+        }
+        RuntimeEffectOutcome::EpochUpdated(completion) => completion.role_transition.clone(),
+        RuntimeEffectOutcome::ApplicationRoleChanged { completion, .. } => {
+            completion.role_transition.clone()
+        }
+        _ => None,
+    }
+}
+
+fn outcome_verified_lsn(result: &RuntimeEffectResult) -> Option<i64> {
+    match &result.outcome {
+        RuntimeEffectOutcome::FailoverPrefixAuthorized {
+            receipt: Some(receipt),
+            ..
+        } => Some(receipt.verified_lsn),
+        RuntimeEffectOutcome::SecondaryRemovalPrepared(completion) => {
+            completion.verified_replication_lsn
+        }
+        _ => None,
     }
 }
 
@@ -5143,25 +5241,14 @@ fn switchover_result() -> RuntimeEffectResult {
     RuntimeEffectResult {
         operation_id: OperationId::new("prepare-switchover-1"),
         sequence: 1,
-        topology_receipt: None,
-        postcondition: RuntimePostcondition {
-            prepared_secondary_removal: None,
-            retired_authority: None,
-            accepted_secondary_removal: None,
-            open: true,
+        outcome: RuntimeEffectOutcome::SwitchoverPrepared(SwitchoverCompletion {
             role: ReplicaRole::Primary,
-            role_transition: None,
-            read_status: AccessStatus::Granted,
             write_status: AccessStatus::ReconfigurationPending,
             authority: Some(authority),
             current_progress: 9,
-            verified_replication_lsn: Some(9),
             committed_lsn: 7,
-            current_configuration_quorum_progress: 9,
-            catch_up_boundary: None,
-            catch_up_complete: true,
-            builds: Vec::new(),
-        },
+            receipt: None,
+        }),
     }
 }
 
@@ -5265,12 +5352,15 @@ async fn recovery_reissues_committed_intent_without_reporting_completion() {
 }
 
 #[tokio::test]
-async fn recovery_reobserves_effect_applied_before_completion_persistence() {
+async fn recovery_uses_saved_result_after_effect_applied_before_completion_persistence() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let store = SqliteStore::create_authorized(&path, AgentState::new(storage_identity())).unwrap();
     store.begin_effect(&effect()).await.unwrap();
-    store.mark_effect_applied(&effect()).await.unwrap();
+    store
+        .mark_effect_applied(&effect(), &result())
+        .await
+        .unwrap();
     drop(store);
 
     let reopened = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
@@ -5283,7 +5373,7 @@ async fn recovery_reobserves_effect_applied_before_completion_persistence() {
         .await
         .unwrap();
     assert_eq!(recovered, Some(result()));
-    assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         reopened.retained_result().await.unwrap().unwrap().result,
         result()
@@ -5504,11 +5594,13 @@ fn switchover_recovery_boundaries_survive_process_termination() {
                 assert_eq!(state.prepared_switchover, command.switchover_handoff);
             }
             let runtime = Arc::new(SwitchoverRecoveryRuntime::new(&state, None));
+            runtime.state.lock().unwrap().authority =
+                store.load_admitted_authority().await.unwrap();
             let coordinator = Coordinator::new(store.clone(), runtime);
             let completed = coordinator
                 .ensure_configuration(command.clone())
                 .await
-                .unwrap();
+                .unwrap_or_else(|error| panic!("{boundary}: {error:?}"));
             assert_eq!(completed.command, command);
             assert_eq!(
                 coordinator
@@ -6441,13 +6533,16 @@ fn scale_up_crash_helpers_reject_disabled_hooks_and_missing_persistence() {
         .retained_result
         .as_mut()
         .expect("application-role intent retains replicator-role predecessor");
-    retained
-        .result
-        .postcondition
-        .role_transition
-        .as_mut()
-        .expect("replicator-role predecessor transition")
-        .application_completed = true;
+    match &mut retained.result.outcome {
+        RuntimeEffectOutcome::ReplicatorRoleChanged(completion) => {
+            completion
+                .role_transition
+                .as_mut()
+                .expect("replicator-role predecessor transition")
+                .application_completed = true;
+        }
+        outcome => panic!("expected replicator-role completion, got {outcome:?}"),
+    }
     overwrite_agent_state(&candidate_path, &state);
     let mutated = tokio::runtime::Runtime::new()
         .unwrap()
@@ -6975,8 +7070,10 @@ fn switchover_recovery_writer_process() {
         _ => None,
     };
     let runtime = Arc::new(SwitchoverRecoveryRuntime::new(&state, crash_after));
+    let initial_authority = runtime.state.lock().unwrap().authority.clone().unwrap();
     let store = Arc::new(SqliteStore::create_authorized(path, state).unwrap());
     tokio::runtime::Runtime::new().unwrap().block_on(async {
+        store.admit(&initial_authority).await.unwrap();
         if boundary == "compensation-allocation" {
             store.begin_configuration(&command).await.unwrap();
         } else {
@@ -7874,8 +7971,9 @@ fn crash_boundary_writer_process() {
                     BeginConfiguration::Execute(_)
                 ));
                 store.begin_effect(&effect()).await.unwrap();
-                store.mark_effect_applied(&effect()).await.unwrap();
-                store.complete_effect(&result()).await.unwrap();
+                let result = result();
+                store.mark_effect_applied(&effect(), &result).await.unwrap();
+                store.complete_effect(&result).await.unwrap();
             }
             "enclosing-command" => {
                 assert!(matches!(
@@ -7926,11 +8024,13 @@ fn switchover_preparation_writer_process() {
         match boundary.as_str() {
             "pending-effect" => {}
             "effect-applied" => {
-                store.mark_effect_applied(&effect).await.unwrap();
+                let result = switchover_result();
+                store.mark_effect_applied(&effect, &result).await.unwrap();
             }
             "effect-completed" => {
-                store.mark_effect_applied(&effect).await.unwrap();
-                store.complete_effect(&switchover_result()).await.unwrap();
+                let result = switchover_result();
+                store.mark_effect_applied(&effect, &result).await.unwrap();
+                store.complete_effect(&result).await.unwrap();
             }
             _ => panic!("unknown switchover boundary {boundary}"),
         }
@@ -7991,8 +8091,8 @@ fn real_switchover_preparation_writer_process() {
             }
             "effect-applied" => {
                 store.begin_effect(&effect).await.unwrap();
-                pod.apply_effect(effect.clone()).await.unwrap();
-                store.mark_effect_applied(&effect).await.unwrap();
+                let result = pod.apply_effect(effect.clone()).await.unwrap();
+                store.mark_effect_applied(&effect, &result).await.unwrap();
             }
             "effect-completed" => {
                 Coordinator::new(store.clone(), pod)

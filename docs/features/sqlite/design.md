@@ -18,7 +18,8 @@ under `examples/sqlite/src/commit_barrier`. Its opt-in
 `testing` feature uses runtime's isolated fixture API, not private capabilities.
 
 This is an experimental source/runtime migration, not a deployed-data upgrade.
-Use fresh v2 storage with protocol 9 / agent schema 5. There is no v1 data,
+Use fresh v2 storage with protocol 9 / agent schema 6. There is no older agent
+metadata migration and no v1 data,
 authority, or metadata import path. SQLite-specific images, manifests, published
 deployment assets, and live-cluster validation remain separate distribution work.
 

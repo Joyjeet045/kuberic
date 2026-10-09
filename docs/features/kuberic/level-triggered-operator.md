@@ -491,7 +491,7 @@ scheduling are [deferred](../../proposal/v1-retirement-plan.md#deferred-scale-do
 Scale-up is sequential and restores the first missing positive logical ordinal
 outside accepted authority before allocating a new highest ordinal.
 
-Protocol 9 and agent store schema 5 require a **fresh coordinated deployment**;
+Protocol 9 and agent store schema 6 require a **fresh coordinated deployment**;
 protocol 8 and earlier are rejected, as are older schemas, with no migration or
 mixed-version mode.
 Schema 3 persists scale-up build and admission authority in addition to the
@@ -697,13 +697,13 @@ semantics. Filesystems that cannot provide those semantics, including
 unsupported network-filesystem arrangements, are not valid production
 storage.
 
-The current schema is **5** and accepts only its exact version. The migration hook records
+The current schema is **6** and accepts only its exact version. The migration hook records
 an idempotent current-version migration; it does not upgrade older schemas.
-Older schemas are rejected without conversion. Schema 5 retains committed
-snapshot boundaries for default-engine replica builds and adds durable
-application-path binding and one-way initialization permission. The applied suffix
-follows as retained catch-up. Use a fresh deployment for protocol 9 / schema 5;
-no rolling upgrade or existing-data migration is provided.
+Older schemas are rejected without conversion. Schema 6 retains the existing
+build and application-path durability while replacing broad effect results with
+operation-specific canonical outcomes and persisting the exact applied result
+before completion. Use a fresh deployment for protocol 9 / schema 6; no rolling
+upgrade or existing-data migration is provided.
 
 Crash injection is test-only. `KUBERIC_CRASH_WRITER_PATH` and
 `KUBERIC_CRASH_BOUNDARY` are consumed only by the

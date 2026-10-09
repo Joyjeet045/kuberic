@@ -4,7 +4,7 @@ metadata:
   name: kvstore2
 spec:
   replicas: 3
-  # Protocol 9 / agent store schema 5: use a fresh coordinated deployment.
+  # Protocol 9 / agent store schema 6: use a fresh coordinated deployment.
   # After Ready, lower replicas to 2, then 1 for secondary-only scale-down.
   # PVC object deletion: no retention/import path; not a physical-erasure guarantee.
   # A singleton has no redundancy; raise replicas to restore one fresh ordinal at a time.

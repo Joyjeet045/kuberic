@@ -96,6 +96,7 @@ pub(crate) trait ManagedReplicatorLifecycle: Send + Sync {
         expected: &ManagedOperationFence,
     ) -> Result<ManagedFenceGuard>;
     async fn native_fence(&self) -> Result<ManagedOperationFence>;
+    async fn current_engine_fence(&self) -> ManagedOperationFence;
     async fn progress_status(&self) -> NativeProgressStatus;
     async fn topology_status(&self) -> NativeTopologyStatus;
     async fn prepare_replica_configuration(
@@ -274,15 +275,13 @@ pub(crate) struct ManagedHistoricalRemovalAcceptanceOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedRetirementFenceOutcome {
-    pub(crate) engine_session_id: String,
-    pub(crate) engine_generation: u64,
+    pub(crate) fence: ManagedOperationFence,
     pub(crate) retired: RetiredAuthority,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedRetirementCompletionOutcome {
-    pub(crate) engine_session_id: String,
-    pub(crate) engine_generation: u64,
+    pub(crate) fence: ManagedOperationFence,
     pub(crate) retired: RetiredAuthority,
 }
 

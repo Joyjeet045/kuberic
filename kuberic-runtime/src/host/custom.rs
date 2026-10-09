@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use crate::authority::{AdmittedAuthority, BuildAuthority, BuildSelection, DurableBuildProgress};
 use crate::effects::{
-    BuildPostcondition, RuntimeEffectAction, RuntimePostcondition, RuntimeSnapshot,
+    BuildPostcondition, RuntimeEffectAction, RuntimeEffectOutcome, RuntimeSnapshot,
 };
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, OperationId, ProcessSessionId, ReplicaIdentity,
@@ -129,7 +129,7 @@ struct BuildQueueAdmission {
 }
 
 pub(super) struct BuildCompletionConfirmation {
-    pub(super) postcondition: RuntimePostcondition,
+    pub(super) build: BuildPostcondition,
     _native: Option<ManagedFenceGuard>,
 }
 
@@ -336,27 +336,16 @@ fn validate_retirement_receipt(
     receipt: &RetirementReceipt,
     retired: &crate::authority::RetiredAuthority,
     completed: bool,
+    expected: &ManagedOperationFence,
 ) -> Result<()> {
     if &receipt.retired != retired
         || receipt.completed != completed
-        || receipt.engine_session_id.is_empty()
+        || receipt.engine_session_id != expected.engine_session_id
+        || receipt.engine_generation != expected.engine_generation
     {
         return Err(RuntimeError::OperationCancelled);
     }
     Ok(())
-}
-
-fn apply_progress_status(
-    postcondition: &mut RuntimePostcondition,
-    progress: &NativeProgressStatus,
-) {
-    postcondition.current_progress = progress.current_progress;
-    postcondition.verified_replication_lsn = progress.verified_replication_lsn;
-    postcondition.committed_lsn = progress.committed_lsn;
-    postcondition.current_configuration_quorum_progress =
-        progress.current_configuration_quorum_progress;
-    postcondition.catch_up_boundary = progress.catch_up_boundary;
-    postcondition.catch_up_complete = progress.catch_up_complete;
 }
 
 fn cleanup_releases_claim(result: &Result<()>) -> bool {
@@ -869,10 +858,24 @@ impl BuildLifecycle for ManagedLifecycleBackend {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        let mut postcondition = self.common.narrow_postcondition().await;
-        apply_progress_status(&mut postcondition, native_guard.progress());
+        let progress = self
+            .common
+            .host()?
+            .default_dependencies
+            .build_progress_store
+            .load_build_progress(build_id)
+            .await?
+            .filter(|progress| &progress.authority.target == target && progress.completed)
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        let build = BuildPostcondition {
+            authority: progress.authority,
+            last_sequence: progress.last_sequence,
+            durable_lsn: progress.durable_lsn,
+            completed: progress.completed,
+            catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
+        };
         Ok(BuildCompletionConfirmation {
-            postcondition,
+            build,
             _native: Some(native_guard),
         })
     }
@@ -1215,13 +1218,14 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
 
     async fn fence_retirement(&self, retired: crate::authority::RetiredAuthority) -> Result<()> {
         let outcome = self.legacy.fence_retirement(retired.clone()).await?;
+        let expected = self.legacy.current_engine_fence().await;
         let receipt = Box::new(RetirementReceipt {
-            engine_session_id: outcome.engine_session_id,
-            engine_generation: outcome.engine_generation,
+            engine_session_id: outcome.fence.engine_session_id,
+            engine_generation: outcome.fence.engine_generation,
             retired: outcome.retired,
             completed: false,
         });
-        validate_retirement_receipt(&receipt, &retired, false)?;
+        validate_retirement_receipt(&receipt, &retired, false, &expected)?;
         self.common.fence_retirement_state(&retired).await?;
         *self.topology_receipt.write().await = Some(TopologyReceipt::Retirement(receipt));
         Ok(())
@@ -1229,13 +1233,14 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
 
     async fn complete_retirement(&self, retired: crate::authority::RetiredAuthority) -> Result<()> {
         let outcome = self.legacy.complete_retirement(retired.clone()).await?;
+        let expected = self.legacy.current_engine_fence().await;
         let receipt = Box::new(RetirementReceipt {
-            engine_session_id: outcome.engine_session_id,
-            engine_generation: outcome.engine_generation,
+            engine_session_id: outcome.fence.engine_session_id,
+            engine_generation: outcome.fence.engine_generation,
             retired: outcome.retired,
             completed: true,
         });
-        validate_retirement_receipt(&receipt, &retired, true)?;
+        validate_retirement_receipt(&receipt, &retired, true, &expected)?;
         self.common.complete_retirement_state(&retired).await?;
         *self.topology_receipt.write().await = Some(TopologyReceipt::Retirement(receipt));
         Ok(())
@@ -1368,16 +1373,21 @@ impl LifecycleObservation for ManagedLifecycleBackend {
         self.common.outbound_observation().await
     }
 
-    async fn postcondition(&self, progress: Option<&NativeProgressStatus>) -> RuntimePostcondition {
-        let mut postcondition = self.common.narrow_postcondition().await;
-        match progress {
-            Some(progress) => apply_progress_status(&mut postcondition, progress),
-            None => {
-                let progress = self.legacy.progress_status().await;
-                apply_progress_status(&mut postcondition, &progress);
-            }
-        }
-        postcondition
+    async fn effect_outcome(
+        &self,
+        action: &RuntimeEffectAction,
+        progress: Option<&NativeProgressStatus>,
+        receipt: Option<&TopologyReceipt>,
+    ) -> Result<RuntimeEffectOutcome> {
+        let owned_progress = match progress {
+            Some(_) => None,
+            None => Some(self.legacy.progress_status().await),
+        };
+        self.common.effect_state().await.effect_outcome(
+            action,
+            progress.or(owned_progress.as_ref()),
+            receipt,
+        )
     }
 }
 
@@ -3579,18 +3589,25 @@ impl CustomReplicatorHost {
                     && build.durable_lsn >= authority.replication_boundary_lsn
             });
             if authority.target == host.identity && !completed {
-                let read = self.state.read().await.read_status;
+                let (read, write) = {
+                    let state = self.state.read().await;
+                    (state.read_status, state.write_status)
+                };
+                let write = if write == AccessStatus::Granted {
+                    AccessStatus::ReconfigurationPending
+                } else {
+                    write
+                };
                 if self.native_receipts && superseding {
                     let mut state = self.state.write().await;
                     state.read_status = read;
-                    state.write_status = AccessStatus::ReconfigurationPending;
+                    state.write_status = write;
                     drop(state);
                     let mut state = host.state.write().await;
                     state.fallback_snapshot.read_status = read;
-                    state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+                    state.fallback_snapshot.write_status = write;
                 } else {
-                    self.set_access(read, AccessStatus::ReconfigurationPending)
-                        .await?;
+                    self.set_access(read, write).await?;
                 }
             }
             let configure = self.native_receipts || self.state.read().await.authority.is_some();
@@ -4226,15 +4243,18 @@ impl CustomReplicatorHost {
         }
     }
 
-    async fn narrow_postcondition(&self) -> RuntimePostcondition {
-        let mut snapshot = self.snapshot().await;
+    async fn effect_state(&self) -> ReplicaRuntimeState {
+        let mut state = self.state.read().await.clone();
         if let Some(host) = self.host.upgrade() {
             let fallback = host.state.read().await.fallback_snapshot.clone();
-            snapshot.open = fallback.open;
-            snapshot.role = fallback.role;
-            snapshot.role_transition = fallback.role_transition;
+            state.open = fallback.open;
+            state.role = fallback.role;
+            state.role_transition = fallback.role_transition;
+            state.read_status = fallback.read_status;
+            state.write_status = fallback.write_status;
+            state.authority = fallback.authority.or(state.authority);
         }
-        snapshot.into()
+        state
     }
 
     pub(super) async fn cancel_outbound_build(
@@ -4565,8 +4585,23 @@ impl BuildLifecycle for CustomReplicatorHost {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
+        let progress = self
+            .host()?
+            .default_dependencies
+            .build_progress_store
+            .load_build_progress(build_id)
+            .await?
+            .filter(|progress| &progress.authority.target == target && progress.completed)
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        let build = BuildPostcondition {
+            authority: progress.authority,
+            last_sequence: progress.last_sequence,
+            durable_lsn: progress.durable_lsn,
+            completed: progress.completed,
+            catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
+        };
         Ok(BuildCompletionConfirmation {
-            postcondition: self.narrow_postcondition().await,
+            build,
             _native: None,
         })
     }
@@ -4794,11 +4829,15 @@ impl LifecycleObservation for CustomReplicatorHost {
         CustomReplicatorHost::outbound_observation(self).await
     }
 
-    async fn postcondition(
+    async fn effect_outcome(
         &self,
-        _progress: Option<&NativeProgressStatus>,
-    ) -> RuntimePostcondition {
-        self.narrow_postcondition().await
+        action: &RuntimeEffectAction,
+        progress: Option<&NativeProgressStatus>,
+        receipt: Option<&TopologyReceipt>,
+    ) -> Result<RuntimeEffectOutcome> {
+        self.effect_state()
+            .await
+            .effect_outcome(action, progress, receipt)
     }
 }
 
@@ -4838,4 +4877,35 @@ fn unavailable<T>() -> Result<T> {
     Err(RuntimeError::Application(
         "the selected replicator does not support this managed operation".into(),
     ))
+}
+
+#[cfg(test)]
+mod retirement_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn retirement_receipt_requires_exact_engine_session_and_generation() {
+        let intent = crate::removal_fixture::intent(&[1, 2], 1);
+        let retired = crate::authority::RetiredAuthority {
+            committed: crate::removal_fixture::cleanup(&intent),
+            report: crate::removal_fixture::retirement(&intent),
+        };
+        let expected = ManagedOperationFence {
+            configuration: None,
+            engine_session_id: "engine-session".into(),
+            engine_generation: 7,
+        };
+        let mut receipt = RetirementReceipt {
+            engine_session_id: expected.engine_session_id.clone(),
+            engine_generation: expected.engine_generation,
+            retired: retired.clone(),
+            completed: true,
+        };
+        validate_retirement_receipt(&receipt, &retired, true, &expected).unwrap();
+        receipt.engine_generation += 1;
+        assert!(validate_retirement_receipt(&receipt, &retired, true, &expected).is_err());
+        receipt.engine_generation = expected.engine_generation;
+        receipt.engine_session_id = "stale-session".into();
+        assert!(validate_retirement_receipt(&receipt, &retired, true, &expected).is_err());
+    }
 }

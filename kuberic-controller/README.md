@@ -60,7 +60,7 @@ serialize subsequent operations until exact cleanup completes; label loss,
 finalizers, and ambiguous replies cannot overwrite the obligation or authorize
 deletion of same-name replacement UIDs.
 
-Protocol 9 and agent store schema 5 require a fresh coordinated deployment.
+Protocol 9 and agent store schema 6 require a fresh coordinated deployment.
 The production controller configuration enables sequential scale-up: it
 persists one allocation, creates/freeze the annotated canonical PVC before the
 bound Pod, builds from the exact accepted primary through a post-enumeration

@@ -3811,6 +3811,17 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         })
     }
 
+    async fn current_engine_fence(&self) -> ManagedOperationFence {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        let state = self.state.read().await;
+        ManagedOperationFence {
+            configuration: state.authority.clone(),
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+        }
+    }
+
     async fn progress_status(&self) -> NativeProgressStatus {
         let _effect = self.effect_lock.lock().await;
         self.progress_status_unlocked().await
@@ -4140,8 +4151,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         )
         .await?;
         Ok(crate::replicator::ManagedRetirementFenceOutcome {
-            engine_session_id: self.session_id.clone(),
-            engine_generation: self.fence_generation.load(Ordering::Acquire),
+            fence: self.current_engine_fence().await,
             retired,
         })
     }
@@ -4157,8 +4167,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         )
         .await?;
         Ok(crate::replicator::ManagedRetirementCompletionOutcome {
-            engine_session_id: self.session_id.clone(),
-            engine_generation: self.fence_generation.load(Ordering::Acquire),
+            fence: self.current_engine_fence().await,
             retired,
         })
     }

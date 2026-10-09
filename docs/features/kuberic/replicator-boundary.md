@@ -214,11 +214,16 @@ policy does not weaken, replace or reorder this managed-only protocol.
 
 ## Persistence, reporting, and recovery
 
-SQLite persists effect intent before execution and completion only after the
-canonical topology receipt, when present, and the lifecycle postcondition
-validate. Existing
-JSON fields remain backward-readable through serde defaults; this refactor does
-not introduce a database schema migration.
+SQLite persists effect intent before execution. The applied marker then stores
+the exact action-specific canonical result, and completion commits only after
+that saved result, its exact action family and any variant-specific topology
+proof validate
+(`kuberic-runtime/src/effects.rs:250-619`;
+`kuberic-runtime/src/host/state.rs:17-63`;
+`kuberic-runtime/src/host/sqlite_store.rs:417-1003`). Schema 6 replaces the
+broad schema-5 result directly; schema 5 is rejected before agent-state
+deserialization and has no migration path
+(`kuberic-runtime/src/host/sqlite_store.rs:202-209,2413-2429`).
 
 Reporting is strictly read-only. `ReportRuntime` exposes only owner observation
 capture and live partition observation; it has no progress-refresh, access,
@@ -251,7 +256,9 @@ An exact pending restoration may temporarily have durable desired access
 `Granted` while actual access remains `ReconfigurationPending`. Reporting emits
 the actual closed value and accepts that mismatch only while the desired pair,
 authority, configuration/access generations, peer sessions and engine fence
-remain exact
+remain exact. A role or build operation may also leave one denied access reason
+stricter than another (`ReconfigurationPending` versus `NotPrimary`); reporting
+accepts that mismatch because neither state grants access
 (`kuberic-runtime/src/host/observation.rs:135-244`;
 `kuberic-runtime/src/host/report.rs:199-303`).
 
@@ -289,14 +296,14 @@ reopen writes. Managed recovery validates the full durable authority in the
 host, derives executable configuration and reuses the same prepare/commit
 protocol before common restoration or access publication.
 
-`RuntimeSnapshot` remains only in the existing effect-evidence,
-`RuntimePostcondition` and opt-in testing paths. Report, build, peer-discovery,
-outbound and restart-inspection views carry owner observations or narrow
-projections. No durable schema change was required; engine-only fence and
-diagnostic fields do not implement durable serialization
-(`kuberic-runtime/src/effects.rs:104-181`;
-`kuberic-runtime/src/host/observation.rs:50-244`;
-`kuberic-runtime/tests/lifecycle_capability_boundaries.rs:1266-1460`).
+`RuntimeSnapshot` remains only for diagnostics and opt-in testing.
+`RuntimeEffectOutcome` supplies typed role, epoch, access, catch-up, build and
+topology completion; unrelated diagnostic fields never enter its serialized
+identity. Report, build, peer-discovery, outbound and restart-inspection views
+carry owner observations or narrow projections
+(`kuberic-runtime/src/effects.rs:95-436`;
+`kuberic-runtime/src/host/observation.rs:50-377`;
+`kuberic-runtime/tests/lifecycle_capability_boundaries.rs:1518-1606`).
 
 ## Compatibility
 

@@ -1517,6 +1517,86 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
 }
 
 #[test]
+fn effect_completion_contract_is_narrow_and_action_owned() {
+    let effects = source("src/effects.rs");
+    let result = effects
+        .split_once("pub(crate) struct RuntimeEffectResult")
+        .and_then(|(_, rest)| {
+            rest.split_once("impl RuntimeEffectResult")
+                .map(|(body, _)| body)
+        })
+        .expect("RuntimeEffectResult definition");
+    assert!(result.contains("RuntimeEffectOutcome"));
+    for forbidden in ["RuntimeSnapshot", "RuntimePostcondition", "postcondition"] {
+        assert!(
+            !result.contains(forbidden),
+            "effect result must not contain broad correctness field {forbidden}"
+        );
+    }
+    assert!(
+        effects.contains("impl RuntimeEffectAction")
+            && effects.contains("fn completion_family(&self) -> RuntimeEffectFamily")
+            && effects.contains("impl RuntimeEffectOutcome"),
+        "every action and outcome must participate in an exhaustive family mapping"
+    );
+
+    let lifecycle = source("src/host/lifecycle.rs");
+    let evidence = lifecycle
+        .split_once("pub(super) struct EffectEvidenceRuntime")
+        .and_then(|(_, rest)| rest.split_once("#[cfg(test)]").map(|(body, _)| body))
+        .expect("EffectEvidenceRuntime body");
+    assert!(evidence.contains("effect_outcome"));
+    assert!(!evidence.contains("snapshot("));
+    assert!(!evidence.contains("postcondition"));
+
+    let hosting = source("src/host/hosting.rs");
+    let prepare = hosting
+        .split_once("async fn prepare_effect")
+        .and_then(|(_, rest)| {
+            rest.split_once("async fn consume_cancelled_build_effect")
+                .map(|(body, _)| body)
+        })
+        .expect("prepare_effect body");
+    for forbidden in [
+        "snapshot_postcondition",
+        "RuntimePostcondition",
+        "self.snapshot().await.into()",
+    ] {
+        assert!(
+            !prepare.contains(forbidden),
+            "effect execution must not derive completion through {forbidden}"
+        );
+    }
+    assert!(hosting.contains("effect_outcome("));
+
+    let store = source("src/host/sqlite_store.rs");
+    let completion = store
+        .split_once("async fn complete_effect")
+        .and_then(|(_, rest)| {
+            rest.split_once("async fn cancel_effect")
+                .map(|(body, _)| body)
+        })
+        .expect("complete_effect body");
+    assert!(completion.contains("match (&pending.effect.action, &result.outcome)"));
+    for broad_copy in [
+        "state.role = result.",
+        "state.read_status = result.",
+        "state.write_status = result.",
+        "state.current_configuration = result.",
+        "state.build_progress = result.",
+    ] {
+        assert!(
+            !completion.contains(broad_copy),
+            "durable completion must not use unconditional broad copy {broad_copy}"
+        );
+    }
+    assert!(
+        completion.contains("retained.result == *result"),
+        "exact duplicate retained completion must be explicitly idempotent"
+    );
+}
+
+#[test]
 fn managed_replica_runtime_boundary_is_typed() {
     let replicator = source("src/replicator/mod.rs");
     let configuration = source("src/replicator/configuration.rs");

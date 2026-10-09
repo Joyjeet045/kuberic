@@ -17,6 +17,10 @@ use crate::host::state::{
 pub(crate) enum BeginEffect {
     Execute(RuntimeEffect),
     Pending(RuntimeEffect),
+    Applied {
+        effect: RuntimeEffect,
+        result: Box<RuntimeEffectResult>,
+    },
     Completed(Box<RuntimeEffectResult>),
 }
 
@@ -40,7 +44,11 @@ pub(crate) trait AgentStore: Send + Sync {
 
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect>;
 
-    async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> Result<()>;
+    async fn mark_effect_applied(
+        &self,
+        effect: &RuntimeEffect,
+        result: &RuntimeEffectResult,
+    ) -> Result<()>;
 
     async fn complete_effect(&self, result: &RuntimeEffectResult) -> Result<()>;
 

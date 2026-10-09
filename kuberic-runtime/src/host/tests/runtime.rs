@@ -20,7 +20,11 @@ use crate::authority::{
 };
 use crate::capabilities::RuntimeHostToken;
 use crate::control::proto;
-use crate::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
+use crate::effects::{
+    AccessCompletion, BuildCompletion, BuildEffectState, RetirementCompletion, RuntimeEffect,
+    RuntimeEffectAction, RuntimeEffectOutcome, RuntimeEffectResult,
+    SecondaryRemovalPreparationCompletion, SwitchoverCompletion,
+};
 use crate::engine::{DurableState, RetainedOperationStream};
 use crate::error::{ContractError, ContractResult};
 use crate::host::coordinator::Coordinator;
@@ -696,7 +700,12 @@ mod in_process_transport_tests {
             .apply_effect(effect(5, prepare_removal(&intent)))
             .await
             .unwrap();
-        let evidence = removal_evidence(prepared.postcondition.prepared_secondary_removal.unwrap());
+        let evidence = removal_evidence(
+            removal_completion(&prepared)
+                .prepared_secondary_removal
+                .clone()
+                .unwrap(),
+        );
         let mut admitted = AdmittedAuthority {
             local_identity: intent.primary.clone(),
             transition_kind: Some(TransitionKind::SecondaryScaleDown),
@@ -1312,8 +1321,11 @@ async fn sqlite_retirement_tombstone_precedes_host_open_and_cannot_be_reactivate
         ))
         .await
         .unwrap();
-    assert_eq!(replay.postcondition.role, ReplicaRole::None);
-    assert_eq!(replay.postcondition.write_status, AccessStatus::NotPrimary);
+    assert_eq!(retirement_completion(&replay).role, ReplicaRole::None);
+    assert_eq!(
+        retirement_completion(&replay).write_status,
+        AccessStatus::NotPrimary
+    );
 }
 
 #[tokio::test]
@@ -2006,8 +2018,7 @@ async fn secondary_removal_reaches_each_reduced_quorum_and_only_then_grants_fres
             .await
             .unwrap();
         assert_eq!(
-            prepared
-                .postcondition
+            removal_completion(&prepared)
                 .prepared_secondary_removal
                 .as_ref()
                 .unwrap()
@@ -2068,7 +2079,7 @@ async fn secondary_removal_reaches_each_reduced_quorum_and_only_then_grants_fres
         assert_eq!(application.applied.lock().unwrap().len(), 2);
         assert_eq!(
             store.load_secondary_removal().await.unwrap(),
-            prepared.postcondition.prepared_secondary_removal
+            removal_completion(&prepared).prepared_secondary_removal
         );
         let json = serde_json::to_vec(&prepared).unwrap();
         assert_eq!(
@@ -2114,9 +2125,9 @@ async fn secondary_removal_preparation_fences_pending_ack_and_recovers_unknown_w
             .await
             .unwrap();
         assert_eq!(
-            prepared
-                .postcondition
+            removal_completion(&prepared)
                 .prepared_secondary_removal
+                .as_ref()
                 .unwrap()
                 .boundary_lsn,
             1
@@ -2210,13 +2221,11 @@ async fn secondary_removal_preparation_serializes_apply_and_successful_commit_ra
             store.resume_committed_write_notify.notify_one();
             ack_task.await.unwrap().unwrap();
             assert_eq!(pending.committed().await.unwrap().lsn, 1);
+            let prepared = prepare.await.unwrap().unwrap();
             assert_eq!(
-                prepare
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .postcondition
+                removal_completion(&prepared)
                     .prepared_secondary_removal
+                    .clone()
                     .unwrap()
                     .boundary_lsn,
                 1
@@ -2236,13 +2245,11 @@ async fn secondary_removal_preparation_serializes_apply_and_successful_commit_ra
         assert!(!prepare.is_finished());
         application.resume_notify.notify_one();
         let pending = writer.await.unwrap();
+        let prepared = prepare.await.unwrap().unwrap();
         assert_eq!(
-            prepare
-                .await
-                .unwrap()
-                .unwrap()
-                .postcondition
+            removal_completion(&prepared)
                 .prepared_secondary_removal
+                .clone()
                 .unwrap()
                 .boundary_lsn,
             1
@@ -2269,15 +2276,18 @@ async fn secondary_removal_retirement_closes_host_and_survives_reconstruction() 
     );
     let result = target.apply_effect(effect.clone()).await.unwrap();
     assert_eq!(target.apply_effect(effect).await.unwrap(), result);
-    assert!(!result.postcondition.open);
-    assert_eq!(result.postcondition.role, ReplicaRole::None);
-    assert_eq!(result.postcondition.read_status, AccessStatus::NotPrimary);
-    assert_eq!(result.postcondition.write_status, AccessStatus::NotPrimary);
-    assert!(result.postcondition.authority.is_none());
+    assert!(!retirement_completion(&result).open);
+    assert_eq!(retirement_completion(&result).role, ReplicaRole::None);
     assert_eq!(
-        result.postcondition.retired_authority,
-        Some(retired.clone())
+        retirement_completion(&result).read_status,
+        AccessStatus::NotPrimary
     );
+    assert_eq!(
+        retirement_completion(&result).write_status,
+        AccessStatus::NotPrimary
+    );
+    assert!(retirement_completion(&result).authority.is_none());
+    assert_eq!(retirement_completion(&result).retired, retired.clone());
     assert!(
         target
             .apply_effect(self::effect(
@@ -2412,8 +2422,8 @@ async fn secondary_removal_retirement_cancels_unacknowledged_inbound_delivery() 
     .expect("retirement must not wait for the old application acknowledgement")
     .unwrap();
 
-    assert!(!result.postcondition.open);
-    assert_eq!(result.postcondition.role, ReplicaRole::None);
+    assert!(!retirement_completion(&result).open);
+    assert_eq!(retirement_completion(&result).role, ReplicaRole::None);
     assert!(applied.await.unwrap().is_err());
     assert!(
         operation
@@ -2542,9 +2552,9 @@ async fn secondary_removal_preparation_failure_is_closed_and_exactly_replayable(
             .await
             .unwrap();
         assert_eq!(
-            result
-                .postcondition
+            removal_completion(&result)
                 .prepared_secondary_removal
+                .as_ref()
                 .unwrap()
                 .boundary_lsn,
             0
@@ -2744,7 +2754,7 @@ async fn secondary_removal_retirement_persistence_boundary(ambiguous: bool) {
     );
     assert!(target.snapshot().await.retired_authority.is_none());
     let result = target.apply_effect(action).await.unwrap();
-    assert_eq!(result.postcondition.retired_authority, Some(retired));
+    assert_eq!(retirement_completion(&result).retired, retired);
     assert_eq!(
         app.events
             .lock()
@@ -3562,6 +3572,10 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
 
     async fn native_fence(&self) -> Result<crate::replicator::ManagedOperationFence> {
         panic!("registration tests do not request native fencing")
+    }
+
+    async fn current_engine_fence(&self) -> crate::replicator::ManagedOperationFence {
+        panic!("registration tests do not request current engine fencing")
     }
 
     async fn progress_status(&self) -> crate::receipts::NativeProgressStatus {
@@ -10432,13 +10446,10 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         },
     );
     let dispatched = source.apply_effect(build_effect.clone()).await.unwrap();
-    assert!(
-        dispatched
-            .postcondition
-            .builds
-            .iter()
-            .all(|build| !build.completed)
-    );
+    assert!(matches!(
+        build_completion(&dispatched).state,
+        BuildEffectState::Dispatched
+    ));
     let control = source.primary_replicator().await.unwrap();
     let build = {
         let control = control.clone();
@@ -10580,17 +10591,16 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         .unwrap()
         .unwrap()
         .unwrap();
+    let completed = source
+        .observe_build_completion(build_effect.clone())
+        .await
+        .unwrap();
     assert!(
-        source
-            .observe_build_completion(build_effect.clone())
-            .await
-            .unwrap()
-            .postcondition
-            .builds
-            .iter()
-            .any(
-                |build| build.authority.build_id == OperationId::new("sf-build") && build.completed
-            ),
+        matches!(
+            &build_completion(&completed).state,
+            BuildEffectState::Completed(build)
+                if build.authority.build_id == OperationId::new("sf-build") && build.completed
+        ),
         "durable effect reobservation must complete after exact host acceptance"
     );
     timeout(
@@ -10783,9 +10793,13 @@ impl AgentStore for FailingEffectStore {
         Ok(result)
     }
 
-    async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> crate::host::Result<()> {
+    async fn mark_effect_applied(
+        &self,
+        effect: &RuntimeEffect,
+        result: &RuntimeEffectResult,
+    ) -> crate::host::Result<()> {
         self.fail(EffectPersistenceFailure::MarkApplied)?;
-        self.inner.mark_effect_applied(effect).await?;
+        self.inner.mark_effect_applied(effect, result).await?;
         if self
             .failure
             .compare_exchange(
@@ -10979,8 +10993,10 @@ async fn cancelled_access_effect_rolls_back_projection_before_effect_acceptance(
 
     runtime.testing_resume_access_effect_acceptance();
     let accepted = runtime.apply_effect(access).await.unwrap();
-    assert!(accepted.topology_receipt.is_none());
-    assert_eq!(accepted.postcondition.write_status, AccessStatus::Granted);
+    assert_eq!(
+        access_completion(&accepted).write_status,
+        AccessStatus::Granted
+    );
     assert!(runtime.testing_has_applied_effect(6).await);
     runtime
         .data_plane()
@@ -14056,11 +14072,10 @@ async fn default_build_effect_dispatches_without_waiting_for_copy_completion() {
     .expect("build effect dispatch must be non-blocking")
     .unwrap();
     assert!(
-        dispatched
-            .postcondition
-            .builds
-            .iter()
-            .all(|build| !build.completed),
+        matches!(
+            build_completion(&dispatched).state,
+            BuildEffectState::Dispatched
+        ),
         "durable effect completion must remain pending before public/native acceptance"
     );
     assert!(
@@ -14715,6 +14730,43 @@ fn effect(sequence: u64, action: RuntimeEffectAction) -> RuntimeEffect {
         operation_id: OperationId::new(format!("effect-{sequence}")),
         sequence,
         action,
+    }
+}
+
+fn removal_completion(result: &RuntimeEffectResult) -> &SecondaryRemovalPreparationCompletion {
+    match &result.outcome {
+        RuntimeEffectOutcome::SecondaryRemovalPrepared(completion) => completion,
+        outcome => panic!("expected secondary-removal preparation, got {outcome:?}"),
+    }
+}
+
+fn retirement_completion(result: &RuntimeEffectResult) -> &RetirementCompletion {
+    match &result.outcome {
+        RuntimeEffectOutcome::ReplicaRetired(completion)
+        | RuntimeEffectOutcome::RetirementFenced(completion)
+        | RuntimeEffectOutcome::RetirementCompleted(completion) => completion,
+        outcome => panic!("expected retirement completion, got {outcome:?}"),
+    }
+}
+
+fn access_completion(result: &RuntimeEffectResult) -> &AccessCompletion {
+    match &result.outcome {
+        RuntimeEffectOutcome::AccessChanged(completion) => completion,
+        outcome => panic!("expected access completion, got {outcome:?}"),
+    }
+}
+
+fn switchover_completion(result: &RuntimeEffectResult) -> &SwitchoverCompletion {
+    match &result.outcome {
+        RuntimeEffectOutcome::SwitchoverPrepared(completion) => completion,
+        outcome => panic!("expected switchover completion, got {outcome:?}"),
+    }
+}
+
+fn build_completion(result: &RuntimeEffectResult) -> &BuildCompletion {
+    match &result.outcome {
+        RuntimeEffectOutcome::BuildReplica(completion) => completion,
+        outcome => panic!("expected build completion, got {outcome:?}"),
     }
 }
 
@@ -15761,7 +15813,10 @@ async fn caller_supplies_the_control_plane() {
 
     runtime.serve(&mut control_plane).await.unwrap();
     assert_eq!(control_plane.published.len(), 1);
-    assert!(control_plane.published[0].postcondition.open);
+    assert!(matches!(
+        control_plane.published[0].outcome,
+        RuntimeEffectOutcome::Opened
+    ));
 }
 
 #[tokio::test]
@@ -16205,10 +16260,10 @@ async fn switchover_preparation_fences_pending_writes_and_returns_applied_bounda
     let result = runtime.apply_effect(prepare.clone()).await.unwrap();
 
     assert_eq!(
-        result.postcondition.write_status,
+        switchover_completion(&result).write_status,
         AccessStatus::ReconfigurationPending
     );
-    assert!(result.postcondition.current_progress >= pending_lsn);
+    assert!(switchover_completion(&result).current_progress >= pending_lsn);
     assert!(matches!(
         pending.committed().await,
         Err(RuntimeError::WriteClosed(
@@ -16240,8 +16295,8 @@ async fn switchover_preparation_fences_pending_writes_and_returns_applied_bounda
         .unwrap();
     let replayed = restarted.apply_effect(prepare.clone()).await.unwrap();
     assert_eq!(
-        replayed.postcondition.current_progress,
-        result.postcondition.current_progress
+        switchover_completion(&replayed).current_progress,
+        switchover_completion(&result).current_progress
     );
     assert_eq!(runtime.apply_effect(prepare).await.unwrap(), result);
 }
@@ -16315,10 +16370,10 @@ async fn switchover_preparation_boundary_covers_acknowledged_writes() {
         ))
         .await
         .unwrap();
-    assert!(result.postcondition.current_progress >= lsn);
-    assert!(result.postcondition.committed_lsn >= lsn);
+    assert!(switchover_completion(&result).current_progress >= lsn);
+    assert!(switchover_completion(&result).committed_lsn >= lsn);
     assert_eq!(
-        result.postcondition.write_status,
+        switchover_completion(&result).write_status,
         AccessStatus::ReconfigurationPending
     );
 }
@@ -16832,8 +16887,8 @@ async fn switchover_preparation_races_ack_without_success_outside_boundary() {
     acknowledged.unwrap();
     match pending.committed().await {
         Ok(receipt) => {
-            assert!(prepared.postcondition.current_progress >= receipt.lsn);
-            assert!(prepared.postcondition.committed_lsn >= receipt.committed_lsn);
+            assert!(switchover_completion(&prepared).current_progress >= receipt.lsn);
+            assert!(switchover_completion(&prepared).committed_lsn >= receipt.committed_lsn);
         }
         Err(RuntimeError::WriteClosed(AccessStatus::ReconfigurationPending)) => {}
         other => panic!("unexpected racing write result: {other:?}"),
@@ -16957,7 +17012,7 @@ async fn switchover_drain_serializes_durable_boundaries_and_delayed_direct_clien
             target: target.clone(),
             starting_configuration_id: starting.current_configuration.configuration_id.clone(),
             starting_epoch: starting.current_configuration.epoch,
-            handoff_lsn: prepared.postcondition.current_progress,
+            handoff_lsn: switchover_completion(&prepared).current_progress,
         };
         assert_eq!(handoff.handoff_lsn, 1);
         let current = ConfigurationDescriptor::new(
@@ -17011,7 +17066,7 @@ async fn switchover_drain_serializes_durable_boundaries_and_delayed_direct_clien
             Ok(receipt) => {
                 assert!(commit_first, "{boundary}");
                 assert!(receipt.lsn <= handoff.handoff_lsn);
-                assert!(receipt.committed_lsn <= prepared.postcondition.committed_lsn);
+                assert!(receipt.committed_lsn <= switchover_completion(&prepared).committed_lsn);
             }
             Err(RuntimeError::WriteClosed(AccessStatus::ReconfigurationPending)) => {
                 assert!(!commit_first, "{boundary}");
@@ -19717,7 +19772,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
         })
         .await
         .unwrap();
-    assert_eq!(prepared.postcondition.current_progress, 7);
+    assert_eq!(switchover_completion(&prepared).current_progress, 7);
     let mut sequences = [0; 3];
     for index in [0, 2, 1] {
         let runtime = &runtimes[index];

@@ -61,7 +61,7 @@ retained catch-up and restart/rebuild fencing. Fresh v2 storage is required.
 The existing PostgreSQL application was migrated in place as an SF-style
 custom replicator. PostgreSQL owns WAL, physical replication/recovery,
 synchronous policy, replay and promotion; Kuberic owns generic authority and
-lifecycle choreography. Fresh protocol-9/schema-5 storage is required.
+lifecycle choreography. Fresh protocol-9/agent-schema-6 storage is required.
 
 ### KVStore2 Conformance Application
 

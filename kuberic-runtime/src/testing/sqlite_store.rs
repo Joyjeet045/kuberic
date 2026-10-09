@@ -89,9 +89,13 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> crate::host::Result<()> {
+    pub async fn mark_effect_applied(
+        &self,
+        effect: &RuntimeEffect,
+        result: &super::effects::RuntimeEffectResult,
+    ) -> crate::host::Result<()> {
         self.inner
-            .mark_effect_applied(&super::convert(effect))
+            .mark_effect_applied(&super::convert(effect), &super::convert(result))
             .await
     }
 

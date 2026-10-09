@@ -83,6 +83,7 @@ private-path documented variant crate::host::error::HostError::CommandRejected((
 private-path documented variant crate::host::error::HostError::Contract((String))
 private-path documented variant crate::host::error::HostError::Corrupt((String))
 private-path documented variant crate::host::error::HostError::DurableEffectConflict((String))
+private-path documented variant crate::host::error::HostError::StaleEffectCompletion((String))
 private-path documented variant crate::host::error::HostError::IdentityMismatch((String))
 private-path documented variant crate::host::error::HostError::InitializationNotAuthorized((String))
 private-path documented variant crate::host::error::HostError::Io((# [from] std :: io :: Error))

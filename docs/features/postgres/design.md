@@ -6,8 +6,9 @@ host-local subprocess validation. Images, deployment assets and distribution
 remain deferred; there is no PostgreSQL KinD or live-cluster coverage.
 This is experimental software, not a production deployment guide.
 
-Use a **fresh deployment** with protocol 9 / agent schema 5. There is no v1 data
-import, metadata conversion, mixed-version operation or rolling-upgrade contract.
+Use a **fresh deployment** with protocol 9 / agent schema 6. There is no older
+agent-metadata migration, v1 data import, mixed-version operation or
+rolling-upgrade contract.
 
 The current implementation uses a separate checksummed PostgreSQL metadata
 store. The proposed replacement is documented in
