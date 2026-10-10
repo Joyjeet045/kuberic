@@ -22,6 +22,7 @@ Source code reference: `build/service-fabric/` (depth-1 clone).
 
 ## Related Kuberic Documents
 
+- [Stateful API Semantics and Kuberic Conformance](../../features/kuberic/service-fabric-api-semantics.md)
 - [Service Fabric Alignment and Runtime Simplification](../../features/kuberic/service-fabric-alignment.md)
 - [Stateless Default Replicator](../../features/kuberic/stateless-default-replicator.md)
 - [SQLite on a V2 Transactional Replicator](../../features/sqlite/v2-transactional-replicator.md)
