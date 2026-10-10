@@ -1,6 +1,8 @@
 use postgres_replicated::instance::PgInstanceManager;
-use postgres_replicated::testing::{TestDataDir, allocate_port, find_pg_bin};
+use postgres_replicated::testing::{ProcessProbe, TestDataDir, allocate_port, find_pg_bin};
+use postgres_replicated::{PgService, PgServiceConfig};
 use serial_test::serial;
+use std::sync::Arc;
 use test_log::test;
 use tokio::sync::mpsc;
 
@@ -223,7 +225,6 @@ async fn owned_cleanup_preserves_unrelated_postgres_and_rejects_foreign_pid_file
 #[serial]
 async fn cancelled_stop_and_readiness_failure_reap_owned_children() {
     use postgres_replicated::testing::{ProcessProbe, wrapped_pg_bin};
-    use std::sync::Arc;
     use std::time::Duration;
     for readiness in [false, true] {
         let root = TestDataDir::new("owned-cancel");
@@ -348,6 +349,48 @@ async fn readiness_binds_postmaster_without_pid_file() {
             .is_err()
     );
     assert!(instance.connect().await.is_err());
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[serial]
+async fn abort_after_readiness_before_exit_observer_registration_is_not_a_fault() {
+    use postgres_replicated::instance::PgProcessState;
+    use std::time::Duration;
+
+    let root = TestDataDir::new("observer-abort");
+    let service = Arc::new(PgService::deferred(PgServiceConfig {
+        resource_uid: kuberic_runtime::protocol::types::ResourceUid::new("observer-abort"),
+        application_root: root.path().join("application"),
+        pg_data: root.path().join("pgdata"),
+        pg_bin: find_pg_bin(),
+        pg_port: allocate_port().await,
+        replication_address: "http://127.0.0.1:1".into(),
+    }));
+    let instance = service.instance().clone();
+    instance.init_db().await.unwrap();
+    let gate = instance.pause_exit_observer_registration();
+    let (faults, mut reported) = mpsc::channel(8);
+    let starting = tokio::spawn({
+        let instance = instance.clone();
+        async move { instance.start_native(faults).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
+        .await
+        .unwrap();
+    let owned = ProcessProbe::postgres(instance.data_dir());
+    tokio::task::spawn_blocking({
+        let service = service.clone();
+        move || service.abort_and_wait()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    gate.release.notify_one();
+    let error = starting.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("PostgreSQL run was cancelled"));
+    assert_eq!(instance.process_state().await, PgProcessState::Stopped);
+    assert!(reported.try_recv().is_err());
+    owned.assert_reaped();
 }
 
 #[test(tokio::test)]

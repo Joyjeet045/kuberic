@@ -235,6 +235,8 @@ pub struct PgInstanceManager {
     error_hook: ProcessMutex<Option<Arc<ErrorGate>>>,
     #[cfg(feature = "testing")]
     fault_hook: ProcessMutex<Option<Arc<ErrorGate>>>,
+    #[cfg(feature = "testing")]
+    exit_observer_hook: ProcessMutex<Option<Arc<ErrorGate>>>,
     #[cfg(test)]
     pub(crate) clear_pgdata_hook: ProcessMutex<Option<(String, PathBuf)>>,
 }
@@ -288,6 +290,16 @@ impl PgInstanceManager {
     }
 
     #[cfg(feature = "testing")]
+    pub fn pause_exit_observer_registration(&self) -> Arc<ErrorGate> {
+        let gate = Arc::new(ErrorGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.exit_observer_hook.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(feature = "testing")]
     pub fn pause_cleanup(&self) -> CleanupGate {
         let entered = Arc::new(tokio::sync::Notify::new());
         let finished = Arc::new(tokio::sync::Notify::new());
@@ -327,6 +339,8 @@ impl PgInstanceManager {
             error_hook: ProcessMutex::new(None),
             #[cfg(feature = "testing")]
             fault_hook: ProcessMutex::new(None),
+            #[cfg(feature = "testing")]
+            exit_observer_hook: ProcessMutex::new(None),
             #[cfg(test)]
             clear_pgdata_hook: ProcessMutex::new(None),
         }
@@ -920,43 +934,71 @@ impl PgInstanceManager {
             return Err(error.with_cleanup(cleanup).with_generation(generation.id));
         }
 
-        // Observe without reaping: shutdown retains ownership of any descendants.
+        #[cfg(feature = "testing")]
+        let exit_observer_hook = self.exit_observer_hook.lock().unwrap().take();
+        #[cfg(feature = "testing")]
+        if let Some(hook) = exit_observer_hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+
+        let exit_observer = {
+            let _cleanup = generation.cleanup_lock.lock().unwrap();
+            if self.launches_closed.load(Ordering::Acquire)
+                || generation.cleanup_result.lock().unwrap().is_some()
+            {
+                Ok(None)
+            } else {
+                let child = generation.child.lock().unwrap();
+                child
+                    .as_ref()
+                    .ok_or_else(|| PgError::Process("PostgreSQL ownership lost".into()))
+                    .and_then(OwnedProcess::exit_observer)
+                    .map(|observer| {
+                        *generation.state.lock().unwrap() = PgProcessState::Running;
+                        Some(observer)
+                    })
+            }
+        };
+        let exit_observer = match exit_observer {
+            Ok(Some(observer)) => observer,
+            Ok(None) => {
+                return Err(PgError::Process("PostgreSQL run was cancelled".into())
+                    .with_generation(generation.id));
+            }
+            Err(error) => {
+                fault_reporter(PgProcessFault::Permanent);
+                let cleanup = self.retire_owned(false).await;
+                *generation.state.lock().unwrap() = PgProcessState::Faulted;
+                return Err(error.with_cleanup(cleanup).with_generation(generation.id));
+            }
+        };
+
+        // Observe duplicated pidfds without reaping or contending with cleanup.
         {
             let observed = generation.clone();
             let exit_shutdown = shutdown.clone();
             let exit_fault_reporter = fault_reporter.clone();
             let exit_port = self.port;
             let exit_task = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = exit_shutdown.cancelled() => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
-                    }
-                    let exited = match observed.child.try_lock() {
-                        Ok(guard) => guard.as_ref().map(OwnedProcess::exited),
-                        Err(_) => continue,
-                    };
-                    if let Some(exited) = exited {
-                        match exited {
-                            Ok(true) => {
-                                if !exit_shutdown.is_cancelled() {
-                                    tracing::error!(
-                                        port = exit_port,
-                                        "PostgreSQL exited unexpectedly"
-                                    );
-                                    exit_fault_reporter(PgProcessFault::Permanent);
-                                    *observed.state.lock().unwrap() = PgProcessState::Faulted;
-                                }
-                                break;
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                tracing::warn!("process observation error: {}", e);
-                            }
+                let result = tokio::select! {
+                    biased;
+                    _ = exit_shutdown.cancelled() => return,
+                    result = exit_observer.wait() => result,
+                };
+                if !exit_shutdown.is_cancelled() {
+                    match result {
+                        Ok(()) => {
+                            tracing::error!(port = exit_port, "PostgreSQL exited unexpectedly")
                         }
-                    } else {
-                        break;
+                        Err(error) => tracing::error!(
+                            port = exit_port,
+                            %error,
+                            "PostgreSQL exit observation failed"
+                        ),
                     }
+                    exit_fault_reporter(PgProcessFault::Permanent);
+                    *observed.state.lock().unwrap() = PgProcessState::Faulted;
                 }
             });
             generation.monitors.lock().unwrap().push(exit_task);
@@ -1014,7 +1056,6 @@ impl PgInstanceManager {
         });
         generation.monitors.lock().unwrap().push(health_task);
 
-        *generation.state.lock().unwrap() = PgProcessState::Running;
         if let Some((instance, cancellation)) = parameters.cancellation {
             let observed = generation.clone();
             let task = tokio::spawn(async move {

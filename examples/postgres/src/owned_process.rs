@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::process::{Pid, PidfdFlags, Signal, kill_process, pidfd_open, pidfd_send_signal};
+use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 use crate::instance::PgError;
@@ -85,6 +86,22 @@ pub(crate) struct OwnedProcess {
     processes: Vec<Process>,
     postmaster: Option<usize>,
     postmaster_ancestors: Vec<usize>,
+}
+
+pub(crate) struct ProcessExitObserver {
+    supervisor: AsyncFd<OwnedFd>,
+    postmaster: AsyncFd<OwnedFd>,
+}
+
+impl ProcessExitObserver {
+    pub(crate) async fn wait(&self) -> Result<(), PgError> {
+        tokio::select! {
+            result = self.supervisor.readable() => result,
+            result = self.postmaster.readable() => result,
+        }
+        .map(|_| ())
+        .map_err(|error| PgError::Process(format!("observe PostgreSQL exit: {error}")))
+    }
 }
 
 impl OwnedProcess {
@@ -194,6 +211,27 @@ impl OwnedProcess {
                     .map(|postmaster_exited| root_exited || postmaster_exited)
             })
             .map_err(|error| PgError::Process(format!("observe PostgreSQL exit: {error}")))
+    }
+
+    pub(crate) fn exit_observer(&self) -> Result<ProcessExitObserver, PgError> {
+        let postmaster = self
+            .postmaster
+            .ok_or_else(|| PgError::Process("postmaster identity is not bound".into()))?;
+        let duplicate = |index: usize| {
+            self.processes[index].fd.try_clone().map_err(|error| {
+                PgError::Process(format!("retain PostgreSQL exit observer: {error}"))
+            })
+        };
+        let supervisor = AsyncFd::new(duplicate(0)?).map_err(|error| {
+            PgError::Process(format!("register PostgreSQL supervisor observer: {error}"))
+        })?;
+        let postmaster = AsyncFd::new(duplicate(postmaster)?).map_err(|error| {
+            PgError::Process(format!("register PostgreSQL postmaster observer: {error}"))
+        })?;
+        Ok(ProcessExitObserver {
+            supervisor,
+            postmaster,
+        })
     }
 
     pub(crate) fn start(&self) -> Result<(), PgError> {
