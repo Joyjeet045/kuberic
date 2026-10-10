@@ -83,7 +83,6 @@ private-path documented variant crate::host::error::HostError::CommandRejected((
 private-path documented variant crate::host::error::HostError::Contract((String))
 private-path documented variant crate::host::error::HostError::Corrupt((String))
 private-path documented variant crate::host::error::HostError::DurableEffectConflict((String))
-private-path documented variant crate::host::error::HostError::StaleEffectCompletion((String))
 private-path documented variant crate::host::error::HostError::IdentityMismatch((String))
 private-path documented variant crate::host::error::HostError::InitializationNotAuthorized((String))
 private-path documented variant crate::host::error::HostError::Io((# [from] std :: io :: Error))
@@ -93,10 +92,15 @@ private-path documented variant crate::host::error::HostError::SchemaMismatch { 
 private-path documented variant crate::host::error::HostError::Serialization((# [from] serde_json :: Error))
 private-path documented variant crate::host::error::HostError::SessionRejected((String))
 private-path documented variant crate::host::error::HostError::Sqlite((# [from] rusqlite :: Error))
+private-path documented variant crate::host::error::HostError::StaleEffectCompletion((String))
 private-path documented variant crate::host::error::HostError::Uninitialized
 private-path documented variant crate::host::process::ApplicationStorageState::Established
 private-path documented variant crate::host::process::ApplicationStorageState::FreshEmpty
+public-path documented const crate::native::MAX_LEASE_MILLIS: u64
 public-path documented enum crate::application::OpenMode
+public-path documented enum crate::native::NativeError
+public-path documented enum crate::native::NativeHealthObservation
+public-path documented enum crate::native::NativeOperationStatus
 public-path documented enum crate::replicator::ReplicaSetQuorumMode
 public-path documented enum crate::replicator::stream::OperationMetadata
 public-path documented field crate::application::ClientWrite::data: Bytes
@@ -113,6 +117,22 @@ public-path documented field crate::application::Operation::lsn: Lsn
 public-path documented field crate::application::RoleChange::service_address: Option < String >
 public-path documented field crate::application::WriteReceipt::committed_lsn: Lsn
 public-path documented field crate::application::WriteReceipt::lsn: Lsn
+public-path documented field crate::native::NativeAuthority::enabled: bool
+public-path documented field crate::native::NativeAuthority::incarnation: String
+public-path documented field crate::native::NativeAuthority::lease_millis: u64
+public-path documented field crate::native::NativeAuthority::revision: u64
+public-path documented field crate::native::NativeHealth::live: bool
+public-path documented field crate::native::NativeHealth::readable: bool
+public-path documented field crate::native::NativeHealth::ready: bool
+public-path documented field crate::native::NativeHealth::writable: bool
+public-path documented field crate::native::NativeObservation::accepting_clients: bool
+public-path documented field crate::native::NativeObservation::health: NativeHealthObservation
+public-path documented field crate::native::NativeObservation::incarnation: String
+public-path documented field crate::native::NativeObservation::revision: u64
+public-path documented field crate::native::NativeOperation::id: String
+public-path documented field crate::native::NativeOperation::request: serde_json :: Value
+public-path documented field crate::native::NativeOperationCommand::authority: NativeAuthority
+public-path documented field crate::native::NativeOperationCommand::operation: NativeOperation
 public-path documented field crate::replicator::ReplicaInformation::build_id: OperationId
 public-path documented field crate::replicator::ReplicaInformation::catch_up_capability: Lsn
 public-path documented field crate::replicator::ReplicaInformation::current_progress: Lsn
@@ -125,6 +145,13 @@ public-path documented field crate::replicator::ReplicaSetConfiguration::replica
 public-path documented field crate::replicator::ReplicatorSettings::replication_address: String
 public-path documented field crate::replicator::stream::StreamOperation::data: Bytes
 public-path documented field crate::replicator::stream::StreamOperation::metadata: OperationMetadata
+public-path documented impl crate::native::NativeGate::fn admit (& self) -> Result < NativePermit , NativeError >
+public-path documented impl crate::native::NativeGate::fn authorize (& mut self , authority : & NativeAuthority) -> Result < () , NativeError >
+public-path documented impl crate::native::NativeGate::fn close (& mut self)
+public-path documented impl crate::native::NativeGate::fn incarnation (& self) -> & str
+public-path documented impl crate::native::NativeGate::fn new () -> Self
+public-path documented impl crate::native::NativeGate::fn observation (& self , health : Result < NativeHealth , NativeError >) -> NativeObservation
+public-path documented impl crate::native::NativePermit::async fn revoked (& mut self)
 public-path documented impl crate::replicator::DefaultReplicatorFactory::fn new (storage : Arc < dyn DurableState >) -> Self
 public-path documented impl crate::replicator::ReplicaInformation::fn new (build_id : OperationId , identity : ReplicaIdentity , replication_address : String ,) -> Self
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn read_status (& self) -> Result < AccessStatus >
@@ -155,6 +182,7 @@ public-path documented impl crate::replicator::stream::StreamOperation::fn rejec
 public-path documented module crate::application
 public-path documented module crate::engine
 public-path documented module crate::host
+public-path documented module crate::native
 public-path documented module crate::replicator
 public-path documented module crate::replicator::stream
 public-path documented struct crate::application::ClientWrite
@@ -164,6 +192,13 @@ public-path documented struct crate::application::OpenContext
 public-path documented struct crate::application::Operation
 public-path documented struct crate::application::RoleChange
 public-path documented struct crate::application::WriteReceipt
+public-path documented struct crate::native::NativeAuthority
+public-path documented struct crate::native::NativeGate
+public-path documented struct crate::native::NativeHealth
+public-path documented struct crate::native::NativeObservation
+public-path documented struct crate::native::NativeOperation
+public-path documented struct crate::native::NativeOperationCommand
+public-path documented struct crate::native::NativePermit
 public-path documented struct crate::replicator::DefaultReplicator
 public-path documented struct crate::replicator::DefaultReplicatorFactory
 public-path documented struct crate::replicator::ReplicaInformation
@@ -195,6 +230,10 @@ public-path documented trait crate::engine::DurableState::async fn finish_copy (
 public-path documented trait crate::engine::DurableState::async fn get_replication_operations (& self , from_lsn : Lsn , to_lsn : Lsn ,) -> Result < RetainedOperationStream >
 public-path documented trait crate::engine::DurableState::async fn verify_applied (& self , operation : & Operation) -> Result < bool >
 public-path documented trait crate::engine::DurableState::async fn verify_copy_chunk (& self , build_id : & OperationId , sequence : u64 , chunk : & CopyChunk ,) -> Result < bool >
+public-path documented trait crate::native::NativeApplication: Send + Sync
+public-path documented trait crate::native::NativeApplication::async fn close (& self) -> Result < () , NativeError >
+public-path documented trait crate::native::NativeApplication::async fn observe (& self) -> Result < NativeHealth , NativeError >
+public-path documented trait crate::native::NativeApplication::async fn reconcile (& self , operation : & NativeOperation ,) -> Result < NativeOperationStatus , NativeError >
 public-path documented trait crate::replicator::PrimaryReplicator: Replicator
 public-path documented trait crate::replicator::PrimaryReplicator::async fn build_replica (& self , replica : ReplicaInformation) -> Result < () >
 public-path documented trait crate::replicator::PrimaryReplicator::async fn on_data_loss (& self) -> Result < bool >
@@ -230,6 +269,16 @@ public-path documented use crate::host::transport :: { KubernetesDnsResolver , R
 public-path documented use crate::replicator :: { DefaultReplicator , DefaultReplicatorFactory , PrimaryReplicator , Replicator , ReplicatorFactory , ReplicatorInterfaces , StateReplicator , StatefulServicePartition , }
 public-path documented variant crate::application::OpenMode::Existing
 public-path documented variant crate::application::OpenMode::New
+public-path documented variant crate::native::NativeError::Application((String))
+public-path documented variant crate::native::NativeError::Closed
+public-path documented variant crate::native::NativeError::Conflict
+public-path documented variant crate::native::NativeError::Incarnation
+public-path documented variant crate::native::NativeError::Lease
+public-path documented variant crate::native::NativeError::Revision
+public-path documented variant crate::native::NativeHealthObservation::Observed { { health : NativeHealth } }
+public-path documented variant crate::native::NativeHealthObservation::Unavailable { { error : String } }
+public-path documented variant crate::native::NativeOperationStatus::Complete { { evidence : serde_json :: Value } }
+public-path documented variant crate::native::NativeOperationStatus::Pending
 public-path documented variant crate::replicator::ReplicaSetQuorumMode::All
 public-path documented variant crate::replicator::ReplicaSetQuorumMode::WriteQuorum
 public-path documented variant crate::replicator::stream::OperationMetadata::Copy { { build_id : OperationId , sequence : u64 , } }

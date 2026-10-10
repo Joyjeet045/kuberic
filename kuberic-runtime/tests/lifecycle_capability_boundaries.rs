@@ -56,7 +56,9 @@ const HOSTING_VIEW_RULES: &[(&str, &[&str])] = &[
 ];
 
 fn source(path: &str) -> String {
-    fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
+    fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path))
+        .unwrap()
+        .replace("\r\n", "\n")
 }
 
 fn compact<T: ToTokens>(value: &T) -> String {
@@ -1731,6 +1733,7 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         "    async fn settle_primary_prefix(&self) -> Result<()>;\n",
         "    async fn settle_primary_prefix(&self) -> Result<()>;\n    fn build(&self) -> Arc<dyn self::BuildLifecycle>;\n",
     );
+    assert_ne!(trait_escape, lifecycle, "trait mutation anchor must match the source");
     assert_rejected(validate_module_policy(&parsed(&trait_escape), &[], true), "ProcessLifecycle::build");
 
     let harmless_method = format!(
