@@ -21,6 +21,8 @@ mod error;
 pub mod evaluator;
 mod exact_resources;
 pub mod executor;
+#[cfg(feature = "native")]
+pub mod native;
 pub mod normalize;
 pub mod observation;
 pub mod plan;

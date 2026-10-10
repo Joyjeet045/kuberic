@@ -18,6 +18,8 @@ pub mod engine;
 #[cfg(feature = "host")]
 /// Replica process hosting and peer transport, enabled by the `host` feature.
 pub mod host;
+#[cfg(feature = "native")]
+pub mod native;
 pub mod protocol;
 #[cfg(feature = "host")]
 mod receipts;

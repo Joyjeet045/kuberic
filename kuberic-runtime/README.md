@@ -27,6 +27,37 @@ Repository commands enable cross-crate policy proofs through
 configuration is not packaged: default tests of the published runtime run
 without the workspace-only controller dev dependency.
 
+## Native non-log boundary
+
+The opt-in `native` feature provides a separate `native::NativeApplication`
+boundary for engines that own replication without a global log position.
+Its health observations preserve liveness, readiness, read health, and write
+health independently. Native operation completion carries application-owned
+evidence; it does not certify catch-up, healing, or a committed log prefix.
+This boundary is not an implementation of `Replicator` and is not accepted by
+the existing `KubericSet` log-replication controller.
+
+`native::NativeGate` starts closed and binds authority to a fresh process
+incarnation and monotonic, positive revision. Conflicting reuse and stale
+revisions are rejected. Leases are bounded to 30 seconds. Gate consumers must
+both obtain a permit before forwarding client traffic and select on
+`NativePermit::revoked` throughout each connection. Revision changes, expiry,
+explicit closure, and host destruction revoke existing permits. Renewing an
+expired lease cannot resurrect an earlier permit. Native peer traffic must
+use a separate, ungated route. Revocation cannot roll back an operation already
+accepted by the native engine and is not an engine-leadership election.
+
+The controller's opt-in `native` feature supplies a separate reconciler over
+`NativeNodeApi`. It closes every participating gateway before submitting native
+topology commands and requires each node's durable operation evidence before
+reopening. A configured plan maps revision N to fencing revision 2N and final
+access revision 2N+1. Native operation commands carry the exact process
+incarnation and closed authority. Replays query stored operation evidence
+without resubmitting stale authority. Applications provide authenticated
+transport, persistence, native execution, and a single trusted plan source.
+The reconciler does not create Kubernetes resources, synthesize replication
+progress, or translate generic replica-count changes into native pool changes.
+
 ## Service Fabric V1 interfaces and ownership
 
 The implemented public traits preserve the **V1 COM divisions**, rather than

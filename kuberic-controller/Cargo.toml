@@ -10,6 +10,7 @@ readme = "README.md"
 
 [features]
 runtime-test-bridge = []
+native = ["kuberic-runtime/native"]
 
 [[bin]]
 name = "kuberic-controller"
